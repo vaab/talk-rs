@@ -15,8 +15,8 @@ pub struct Config {
     /// Output directory for recordings, screenshots, and clipboard saves.
     pub output_dir: PathBuf,
 
-    /// Mistral API configuration.
-    pub mistral: MistralConfig,
+    /// Transcription providers configuration.
+    pub providers: ProvidersConfig,
 
     /// Audio capture and encoding settings.
     pub audio: AudioConfig,
@@ -26,6 +26,13 @@ pub struct Config {
 
     /// Optional indicator settings.
     pub indicators: Option<IndicatorsConfig>,
+}
+
+/// Transcription providers configuration.
+#[derive(Debug, Deserialize)]
+pub struct ProvidersConfig {
+    /// Mistral API configuration.
+    pub mistral: MistralConfig,
 }
 
 /// Mistral API configuration.
@@ -85,7 +92,7 @@ impl Config {
     ///
     /// Environment variables can override config values:
     /// - TALK_RS_OUTPUT_DIR
-    /// - TALK_RS_MISTRAL_API_KEY
+    /// - TALK_RS_PROVIDERS_MISTRAL_API_KEY
     /// - TALK_RS_AUDIO_SAMPLE_RATE
     /// - TALK_RS_AUDIO_CHANNELS
     /// - TALK_RS_AUDIO_BITRATE
@@ -115,8 +122,8 @@ impl Config {
             config.output_dir = PathBuf::from(value);
         }
 
-        if let Some(value) = env_var_string("TALK_RS_MISTRAL_API_KEY")? {
-            config.mistral.api_key = value;
+        if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
+            config.providers.mistral.api_key = value;
         }
 
         if let Some(value) = env_var_u32("TALK_RS_AUDIO_SAMPLE_RATE")? {
@@ -176,8 +183,10 @@ fn validate_config(config: &Config) -> Result<(), TalkError> {
         return Err(TalkError::Config("output_dir is required".to_string()));
     }
 
-    if config.mistral.api_key.is_empty() {
-        return Err(TalkError::Config("mistral.api_key is required".to_string()));
+    if config.providers.mistral.api_key.is_empty() {
+        return Err(TalkError::Config(
+            "providers.mistral.api_key is required".to_string(),
+        ));
     }
 
     Ok(())
@@ -243,15 +252,16 @@ mod tests {
     fn test_config_load_valid() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
         let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
-        let _guard_api_key = EnvGuard::clear("TALK_RS_MISTRAL_API_KEY")?;
+        let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
         let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
         let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
         let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
 
         let yaml = r#"
 output_dir: /tmp/test-output
-mistral:
-  api_key: test-api-key
+providers:
+  mistral:
+    api_key: test-api-key
 audio:
   sample_rate: 16000
   channels: 1
@@ -261,7 +271,7 @@ audio:
 
         let config = Config::load(Some(file.path()))?;
         assert_eq!(config.output_dir, PathBuf::from("/tmp/test-output"));
-        assert_eq!(config.mistral.api_key, "test-api-key");
+        assert_eq!(config.providers.mistral.api_key, "test-api-key");
         assert_eq!(config.audio.sample_rate, 16000);
         assert_eq!(config.audio.channels, 1);
         assert_eq!(config.audio.bitrate, 32000);
@@ -275,12 +285,13 @@ audio:
         let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
         let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
         let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
-        let _guard_api_key = EnvGuard::set("TALK_RS_MISTRAL_API_KEY", "override-key")?;
+        let _guard_api_key = EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_API_KEY", "override-key")?;
 
         let yaml = r#"
 output_dir: /tmp/test-output
-mistral:
-  api_key: test-api-key
+providers:
+  mistral:
+    api_key: test-api-key
 audio:
   sample_rate: 16000
   channels: 1
@@ -289,7 +300,7 @@ audio:
         let file = write_config(yaml)?;
 
         let config = Config::load(Some(file.path()))?;
-        assert_eq!(config.mistral.api_key, "override-key");
+        assert_eq!(config.providers.mistral.api_key, "override-key");
         Ok(())
     }
 
@@ -297,15 +308,16 @@ audio:
     fn test_config_missing_required_field() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
         let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
-        let _guard_api_key = EnvGuard::clear("TALK_RS_MISTRAL_API_KEY")?;
+        let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
         let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
         let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
         let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
 
         let yaml = r#"
 output_dir: /tmp/test-output
-mistral:
-  api_key: ""
+providers:
+  mistral:
+    api_key: ""
 audio:
   sample_rate: 16000
   channels: 1
@@ -317,7 +329,9 @@ audio:
         match result {
             Ok(_) => Err("Expected missing api_key to fail".into()),
             Err(err) => {
-                assert!(err.to_string().contains("mistral.api_key is required"));
+                assert!(err
+                    .to_string()
+                    .contains("providers.mistral.api_key is required"));
                 Ok(())
             }
         }

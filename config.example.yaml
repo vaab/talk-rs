@@ -9,12 +9,15 @@
 # Must be an absolute path that exists and is writable
 output_dir: <PLACEHOLDER>
 
-# Required: Mistral API Configuration
-# Used for audio transcription and processing
-mistral:
-  # Your Mistral API key for authentication
-  # Get this from: https://console.mistral.ai/
-  api_key: <PLACEHOLDER>
+# Required: Transcription Providers Configuration
+# Configure transcription backends (currently supports Mistral)
+providers:
+  # Mistral API Configuration
+  # Used for audio transcription and processing
+  mistral:
+    # Your Mistral API key for authentication
+    # Get this from: https://console.mistral.ai/
+    api_key: <PLACEHOLDER>
 
 # Required: Audio Capture and Encoding Settings
 # These settings control how audio is captured and processed
