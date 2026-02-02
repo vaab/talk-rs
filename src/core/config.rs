@@ -36,7 +36,7 @@ pub struct ProvidersConfig {
 }
 
 /// Mistral API configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MistralConfig {
     /// API key for Mistral transcription service.
     pub api_key: String,

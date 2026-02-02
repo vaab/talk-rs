@@ -29,5 +29,11 @@ pub enum Commands {
         /// Output file path to save the audio recording (optional)
         #[arg(value_name = "FILE")]
         file: Option<String>,
+        /// Enable chunked mode: split recording into chunks for separate transcription
+        #[arg(long)]
+        chunked: bool,
+        /// Chunk duration in seconds (requires --chunked, overrides config value)
+        #[arg(short = 'n', long = "chunk-seconds", requires = "chunked")]
+        chunk_seconds: Option<u64>,
     },
 }
