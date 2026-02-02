@@ -1,0 +1,18 @@
+* talk-rs
+
+A Rust CLI scaffold for the talk-rs project.
+
+** Installation
+
+- =cargo build=
+- =cargo run -- --help=
+
+** Usage
+
+- =talk-rs --help=
+
+** Development
+
+- =cargo fmt=
+- =cargo clippy --all-targets=
+- =cargo test=

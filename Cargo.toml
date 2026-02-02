@@ -1,0 +1,36 @@
+[package]
+name = "talk-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Valentin Lab <valentin.lab@kalysto.org>"]
+license = "MIT"
+description = "CLI scaffold for talk-rs"
+readme = "README.org"
+
+[lib]
+name = "talk_rs"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "1"
+cpal = "0.15"
+opus = "0.3"
+reqwest = { version = "0.11", features = ["json", "stream"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+directories = "5"
+chrono = "0.4"
+async-trait = "0.1"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+insta = "1"
+tempfile = "3"
+wiremock = "0.6"
