@@ -4,7 +4,10 @@ use crate::core::error::TalkError;
 use tokio::sync::mpsc;
 
 pub mod cpal_capture;
+pub mod encoder;
 pub mod mock;
+
+pub use encoder::{AudioEncoder, MockEncoder, OpusEncoder};
 
 pub(crate) const CHUNK_DURATION_MS: u64 = 20;
 pub(crate) const CHANNEL_CAPACITY: usize = 25;

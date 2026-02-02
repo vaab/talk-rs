@@ -36,7 +36,7 @@ pub struct MistralConfig {
 }
 
 /// Audio configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AudioConfig {
     /// Sample rate in Hz (e.g., 16000).
     pub sample_rate: u32,
