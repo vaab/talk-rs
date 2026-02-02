@@ -5,7 +5,7 @@ use clap::Parser;
 use def::Cli;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
 
-    action::dispatch().await
+    action::dispatch(cli.command).await
 }
