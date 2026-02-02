@@ -72,10 +72,7 @@ async fn test_record_with_mock_capture_creates_file() {
     // Verify file contains Opus data
     // Note: OpusEncoder produces raw Opus frames, not Ogg-wrapped Opus
     let file_content = fs::read(&output_path).expect("read file");
-    assert!(
-        !file_content.is_empty(),
-        "file should contain encoded data"
-    );
+    assert!(!file_content.is_empty(), "file should contain encoded data");
     // Opus frames typically have specific byte patterns, but we just verify non-empty
     // and that it's not all zeros
     assert!(
@@ -232,10 +229,7 @@ async fn test_record_creates_output_file() {
     // Verify file contains Opus data
     // Note: OpusEncoder produces raw Opus frames, not Ogg-wrapped Opus
     let file_content = fs::read(&output_path).expect("read file");
-    assert!(
-        !file_content.is_empty(),
-        "file should contain encoded data"
-    );
+    assert!(!file_content.is_empty(), "file should contain encoded data");
     // Opus frames typically have specific byte patterns, but we just verify non-empty
     // and that it's not all zeros
     assert!(

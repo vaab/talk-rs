@@ -15,4 +15,13 @@ pub enum Commands {
         #[arg(value_name = "FILE")]
         file: Option<String>,
     },
+    /// Transcribe an audio file to text
+    Transcribe {
+        /// Input audio file path
+        #[arg(value_name = "INPUT")]
+        input: String,
+        /// Output file path (optional, defaults to stdout)
+        #[arg(value_name = "OUTPUT")]
+        output: Option<String>,
+    },
 }
