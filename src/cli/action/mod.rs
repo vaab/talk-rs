@@ -1,8 +1,10 @@
+mod dictate;
 mod record;
 mod transcribe;
 
 use crate::cli::def::Commands;
 
+pub use dictate::dictate;
 pub use record::record;
 pub use transcribe::transcribe;
 
@@ -18,6 +20,10 @@ pub async fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error
                 args.push(output_file);
             }
             transcribe(args).await?;
+        }
+        Commands::Dictate { file } => {
+            let args = file.map(|f| vec![f]).unwrap_or_default();
+            dictate(args).await?;
         }
     }
     Ok(())
