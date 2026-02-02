@@ -6,10 +6,13 @@
 use crate::core::config::MistralConfig;
 use crate::core::error::TalkError;
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::Path;
+use std::time::Duration;
 use tokio::fs::File;
+use tokio_stream::wrappers::ReceiverStream;
 
 use super::Transcriber;
 
@@ -126,6 +129,59 @@ impl Transcriber for MistralTranscriber {
 
         Ok(mistral_response.text)
     }
+
+    async fn transcribe_stream(
+        &self,
+        audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        file_name: &str,
+    ) -> Result<String, TalkError> {
+        // Convert the mpsc::Receiver into a Stream of Result<Vec<u8>, io::Error>
+        let byte_stream = ReceiverStream::new(audio_stream).map(Ok::<Vec<u8>, std::io::Error>);
+
+        // Wrap the stream into a reqwest body for streaming upload
+        let body = reqwest::Body::wrap_stream(byte_stream);
+
+        // Create multipart form with streaming audio and model
+        let form = reqwest::multipart::Form::new()
+            .text("model", "voxtral-mini-latest")
+            .part(
+                "file",
+                reqwest::multipart::Part::stream(body).file_name(file_name.to_string()),
+            );
+
+        // Send request to Mistral API with extended timeout for long recordings
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .timeout(Duration::from_secs(600))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|err| {
+                TalkError::Transcription(format!(
+                    "Failed to send streaming request to Mistral API: {}",
+                    err
+                ))
+            })?;
+
+        // Check response status
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(TalkError::Transcription(format!(
+                "Mistral API error ({}): {}",
+                status, body
+            )));
+        }
+
+        // Parse JSON response
+        let mistral_response: MistralResponse = response.json().await.map_err(|err| {
+            TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
+        })?;
+
+        Ok(mistral_response.text)
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +227,45 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "This is a test transcription");
+    }
+
+    #[tokio::test]
+    async fn test_mistral_transcriber_stream_success() {
+        // Start mock server
+        let mock_server = MockServer::start().await;
+
+        // Mock the Mistral API endpoint
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "Streamed transcription result"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Create transcriber with mock server URL
+        let config = MistralConfig {
+            api_key: "test-api-key".to_string(),
+        };
+        let transcriber = MistralTranscriber::with_endpoint(
+            config,
+            format!("{}/v1/audio/transcriptions", mock_server.uri()),
+        );
+
+        // Create a channel and send fake audio data
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            tx.send(vec![0u8; 100]).await.unwrap();
+            tx.send(vec![1u8; 200]).await.unwrap();
+            // Dropping tx closes the channel
+        });
+
+        // Transcribe from the stream
+        let result = transcriber.transcribe_stream(rx, "test.wav").await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Streamed transcription result");
     }
 
     #[tokio::test]
