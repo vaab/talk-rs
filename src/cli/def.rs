@@ -24,4 +24,10 @@ pub enum Commands {
         #[arg(value_name = "OUTPUT")]
         output: Option<String>,
     },
+    /// Record, transcribe, and paste text into the focused application
+    Dictate {
+        /// Output file path to save the audio recording (optional)
+        #[arg(value_name = "FILE")]
+        file: Option<String>,
+    },
 }
