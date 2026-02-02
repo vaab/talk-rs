@@ -24,6 +24,10 @@ pub enum TalkError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Clipboard operation errors.
+    #[error("Clipboard error: {0}")]
+    Clipboard(String),
+
     /// Session management errors.
     #[error("Session error: {0}")]
     Session(String),
