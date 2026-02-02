@@ -33,6 +33,22 @@ pub trait Transcriber: Send + Sync {
     ///
     /// The transcribed text, or a `TalkError` if transcription fails.
     async fn transcribe_file(&self, audio_path: &Path) -> Result<String, TalkError>;
+
+    /// Transcribe audio from a streaming channel and return the text.
+    ///
+    /// # Arguments
+    ///
+    /// * `audio_stream` - A receiver of audio data chunks
+    /// * `file_name` - The file name to use for the multipart upload
+    ///
+    /// # Returns
+    ///
+    /// The transcribed text, or a `TalkError` if transcription fails.
+    async fn transcribe_stream(
+        &self,
+        audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        file_name: &str,
+    ) -> Result<String, TalkError>;
 }
 
 /// Mock transcriber for testing.
@@ -57,6 +73,16 @@ impl Transcriber for MockTranscriber {
     async fn transcribe_file(&self, _audio_path: &Path) -> Result<String, TalkError> {
         Ok(self.response_text.clone())
     }
+
+    async fn transcribe_stream(
+        &self,
+        mut audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        _file_name: &str,
+    ) -> Result<String, TalkError> {
+        // Drain the stream
+        while audio_stream.recv().await.is_some() {}
+        Ok(self.response_text.clone())
+    }
 }
 
 #[cfg(test)]
@@ -70,6 +96,22 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "Hello, world!");
+    }
+
+    #[tokio::test]
+    async fn test_mock_transcriber_stream() {
+        let mock = MockTranscriber::new("Streamed transcription");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+
+        // Send some fake audio data
+        tx.send(vec![0u8; 100]).await.unwrap();
+        tx.send(vec![1u8; 200]).await.unwrap();
+        drop(tx); // Close the channel
+
+        let result = mock.transcribe_stream(rx, "test.wav").await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Streamed transcription");
     }
 
     #[tokio::test]
