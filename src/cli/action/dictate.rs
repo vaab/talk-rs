@@ -4,9 +4,9 @@
 //! into the focused application via clipboard.
 
 use crate::core::audio::cpal_capture::CpalCapture;
-use crate::core::audio::{AudioCapture, AudioEncoder, OpusEncoder};
+use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::core::clipboard::{Clipboard, X11Clipboard};
-use crate::core::config::Config;
+use crate::core::config::{AudioConfig, Config};
 use crate::core::error::TalkError;
 use crate::core::transcription::{MistralTranscriber, Transcriber};
 use std::path::PathBuf;
@@ -87,9 +87,6 @@ pub async fn dictate(
     let mut capture = CpalCapture::new(config.audio.clone());
     let audio_rx = capture.start()?;
 
-    // Initialize audio encoder
-    let encoder = OpusEncoder::new(config.audio.clone())?;
-
     // Optionally create output file for saving audio
     let save_file = if let Some(ref path) = save_path {
         Some(tokio::fs::File::create(path).await.map_err(TalkError::Io)?)
@@ -109,7 +106,7 @@ pub async fn dictate(
 
         dictate_chunked(
             &mut capture,
-            encoder,
+            config.audio.clone(),
             audio_rx,
             save_file,
             chunk_seconds,
@@ -119,7 +116,7 @@ pub async fn dictate(
     } else {
         dictate_streaming(
             &mut capture,
-            encoder,
+            config.audio.clone(),
             audio_rx,
             save_file,
             config.providers.mistral,
@@ -178,7 +175,7 @@ pub async fn dictate(
 /// Encodes audio and streams it directly to a single transcription request.
 async fn dictate_streaming(
     capture: &mut CpalCapture,
-    mut encoder: OpusEncoder,
+    audio_config: AudioConfig,
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     save_file: Option<tokio::fs::File>,
     mistral_config: crate::core::config::MistralConfig,
@@ -186,37 +183,60 @@ async fn dictate_streaming(
     // Create channel for streaming encoded audio to transcriber
     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(25);
 
-    // Spawn encode task: PCM → Opus → stream_tx (+ optional file)
+    // Spawn encode task: PCM → OGG Opus → stream_tx (+ optional file)
     let encode_task = tokio::spawn(async move {
         let mut rx = audio_rx;
         let mut file = save_file;
+        let mut writer = match OggOpusWriter::new(audio_config) {
+            Ok(writer) => writer,
+            Err(err) => {
+                eprintln!("Error creating writer: {}", err);
+                return Err(err);
+            }
+        };
+
+        let header = match writer.header() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("Error creating header: {}", err);
+                return Err(err);
+            }
+        };
+        if stream_tx.send(header.clone()).await.is_err() {
+            eprintln!("Transcription stream closed");
+            return Ok::<(), TalkError>(());
+        }
+        if let Some(ref mut f) = file {
+            if let Err(err) = f.write_all(&header).await {
+                eprintln!("Error writing to file: {}", err);
+            }
+        }
 
         while let Some(pcm_chunk) = rx.recv().await {
-            match encoder.encode(&pcm_chunk) {
-                Ok(encoded_data) => {
-                    if !encoded_data.is_empty() {
-                        // Send to transcription stream
-                        if stream_tx.send(encoded_data.clone()).await.is_err() {
-                            eprintln!("Transcription stream closed");
-                            break;
-                        }
-                        // Optionally write to file
-                        if let Some(ref mut f) = file {
-                            if let Err(err) = f.write_all(&encoded_data).await {
-                                eprintln!("Error writing to file: {}", err);
-                            }
-                        }
-                    }
-                }
+            let encoded_data = match writer.write_pcm(&pcm_chunk) {
+                Ok(data) => data,
                 Err(err) => {
                     eprintln!("Error encoding audio: {}", err);
                     return Err(err);
                 }
+            };
+            if !encoded_data.is_empty() {
+                // Send to transcription stream
+                if stream_tx.send(encoded_data.clone()).await.is_err() {
+                    eprintln!("Transcription stream closed");
+                    break;
+                }
+                // Optionally write to file
+                if let Some(ref mut f) = file {
+                    if let Err(err) = f.write_all(&encoded_data).await {
+                        eprintln!("Error writing to file: {}", err);
+                    }
+                }
             }
         }
 
-        // Flush encoder
-        match encoder.flush() {
+        // Finalize writer
+        match writer.finalize() {
             Ok(remaining) => {
                 if !remaining.is_empty() {
                     let _ = stream_tx.send(remaining.clone()).await;
@@ -226,7 +246,7 @@ async fn dictate_streaming(
                 }
             }
             Err(err) => {
-                eprintln!("Error flushing encoder: {}", err);
+                eprintln!("Error finalizing writer: {}", err);
                 return Err(err);
             }
         }
@@ -287,7 +307,7 @@ async fn dictate_streaming(
 /// and transcribes each chunk separately. Results are accumulated and joined.
 async fn dictate_chunked(
     capture: &mut CpalCapture,
-    mut encoder: OpusEncoder,
+    audio_config: AudioConfig,
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     save_file: Option<tokio::fs::File>,
     chunk_seconds: u64,
@@ -297,52 +317,73 @@ async fn dictate_chunked(
     let accumulated_text = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
     let accumulated_text_clone = accumulated_text.clone();
 
-    // Shared buffer for encoded audio chunks
-    let audio_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    // Shared buffer for raw PCM samples
+    let audio_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<i16>::new()));
     let audio_buffer_encode = audio_buffer.clone();
     let audio_buffer_chunk = audio_buffer.clone();
 
-    // Encode task: PCM → Opus → buffer (+ optional file)
+    // Encode task: PCM → buffer (+ optional file writer)
+    let audio_config_encode = audio_config.clone();
     let encode_task = tokio::spawn(async move {
         let mut rx = audio_rx;
-        let mut file = save_file;
-        while let Some(pcm_chunk) = rx.recv().await {
-            match encoder.encode(&pcm_chunk) {
-                Ok(encoded_data) => {
-                    if !encoded_data.is_empty() {
-                        audio_buffer_encode.lock().await.push(encoded_data.clone());
-                        if let Some(ref mut f) = file {
-                            if let Err(err) = f.write_all(&encoded_data).await {
-                                eprintln!("Error writing to file: {}", err);
-                            }
-                        }
-                    }
-                }
+        let mut file_writer = if let Some(file) = save_file {
+            let mut writer = match OggOpusWriter::new(audio_config_encode.clone()) {
+                Ok(writer) => writer,
                 Err(err) => {
-                    eprintln!("Error encoding audio: {}", err);
+                    eprintln!("Error creating writer: {}", err);
                     return Err(err);
+                }
+            };
+            let header = match writer.header() {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!("Error creating header: {}", err);
+                    return Err(err);
+                }
+            };
+            let mut file = file;
+            if let Err(err) = file.write_all(&header).await {
+                eprintln!("Error writing to file: {}", err);
+            }
+            Some((file, writer))
+        } else {
+            None
+        };
+
+        while let Some(pcm_chunk) = rx.recv().await {
+            audio_buffer_encode
+                .lock()
+                .await
+                .extend_from_slice(&pcm_chunk);
+            if let Some((ref mut f, ref mut writer)) = file_writer {
+                let encoded_data = match writer.write_pcm(&pcm_chunk) {
+                    Ok(data) => data,
+                    Err(err) => {
+                        eprintln!("Error encoding audio: {}", err);
+                        return Err(err);
+                    }
+                };
+                if !encoded_data.is_empty() {
+                    if let Err(err) = f.write_all(&encoded_data).await {
+                        eprintln!("Error writing to file: {}", err);
+                    }
                 }
             }
         }
 
-        // Flush encoder
-        match encoder.flush() {
-            Ok(remaining) => {
-                if !remaining.is_empty() {
-                    audio_buffer_encode.lock().await.push(remaining.clone());
-                    if let Some(ref mut f) = file {
+        // Finalize writer for file if saving
+        if let Some((ref mut f, ref mut writer)) = file_writer {
+            match writer.finalize() {
+                Ok(remaining) => {
+                    if !remaining.is_empty() {
                         let _ = f.write_all(&remaining).await;
                     }
                 }
+                Err(err) => {
+                    eprintln!("Error finalizing writer: {}", err);
+                    return Err(err);
+                }
             }
-            Err(err) => {
-                eprintln!("Error flushing encoder: {}", err);
-                return Err(err);
-            }
-        }
-
-        // Sync file if saving
-        if let Some(ref mut f) = file {
             let _ = f.sync_all().await;
         }
 
@@ -351,6 +392,7 @@ async fn dictate_chunked(
 
     // Chunk timer task: periodically drain buffer and transcribe
     let config_mistral = mistral_config.clone();
+    let audio_config_chunk = audio_config.clone();
     let chunk_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(chunk_duration);
         interval.tick().await; // First tick is immediate, skip it
@@ -359,20 +401,48 @@ async fn dictate_chunked(
             interval.tick().await;
 
             // Drain the buffer
-            let chunks: Vec<Vec<u8>> = {
+            let pcm_samples: Vec<i16> = {
                 let mut buf = audio_buffer_chunk.lock().await;
                 std::mem::take(&mut *buf)
             };
 
-            if chunks.is_empty() {
+            if pcm_samples.is_empty() {
                 continue;
             }
 
-            // Create channel and send all chunks
-            let (tx, rx) = tokio::sync::mpsc::channel(chunks.len() + 1);
-            for chunk in chunks {
-                let _ = tx.send(chunk).await;
+            let mut writer = match OggOpusWriter::new(audio_config_chunk.clone()) {
+                Ok(writer) => writer,
+                Err(err) => {
+                    eprintln!("Error creating writer: {}", err);
+                    continue;
+                }
+            };
+            let mut ogg_bytes = Vec::new();
+            match writer.header() {
+                Ok(bytes) => ogg_bytes.extend(bytes),
+                Err(err) => {
+                    eprintln!("Error creating header: {}", err);
+                    continue;
+                }
             }
+            match writer.write_pcm(&pcm_samples) {
+                Ok(bytes) => ogg_bytes.extend(bytes),
+                Err(err) => {
+                    eprintln!("Error encoding audio: {}", err);
+                    continue;
+                }
+            }
+            match writer.finalize() {
+                Ok(bytes) => ogg_bytes.extend(bytes),
+                Err(err) => {
+                    eprintln!("Error finalizing writer: {}", err);
+                    continue;
+                }
+            }
+
+            // Create channel and send full OGG payload
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let _ = tx.send(ogg_bytes).await;
             drop(tx);
 
             // Transcribe this chunk
@@ -418,16 +488,20 @@ async fn dictate_chunked(
     chunk_task.abort();
 
     // Process final partial chunk (remaining in buffer)
-    let final_chunks: Vec<Vec<u8>> = {
+    let final_pcm: Vec<i16> = {
         let mut buf = audio_buffer.lock().await;
         std::mem::take(&mut *buf)
     };
 
-    if !final_chunks.is_empty() {
-        let (tx, rx) = tokio::sync::mpsc::channel(final_chunks.len() + 1);
-        for chunk in final_chunks {
-            let _ = tx.send(chunk).await;
-        }
+    if !final_pcm.is_empty() {
+        let mut writer = OggOpusWriter::new(audio_config)?;
+        let mut ogg_bytes = Vec::new();
+        ogg_bytes.extend(writer.header()?);
+        ogg_bytes.extend(writer.write_pcm(&final_pcm)?);
+        ogg_bytes.extend(writer.finalize()?);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let _ = tx.send(ogg_bytes).await;
         drop(tx);
 
         let transcriber = MistralTranscriber::new(mistral_config);
@@ -477,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn test_dictate_pipeline_with_mocks() {
         use crate::core::audio::mock::MockAudioCapture;
-        use crate::core::audio::{AudioCapture, AudioEncoder, OpusEncoder};
+        use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
         use crate::core::clipboard::MockClipboard;
         use crate::core::config::AudioConfig;
         use crate::core::transcription::{MockTranscriber, Transcriber};
@@ -493,8 +567,8 @@ mod tests {
             MockAudioCapture::new(audio_config.sample_rate, audio_config.channels, 440.0);
         let audio_rx = capture.start().expect("start capture");
 
-        // Initialize encoder
-        let mut encoder = OpusEncoder::new(audio_config).expect("create encoder");
+        // Initialize writer
+        let mut writer = OggOpusWriter::new(audio_config).expect("create writer");
 
         // Create stream channel
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(25);
@@ -503,22 +577,24 @@ mod tests {
         let encode_task = tokio::spawn(async move {
             let mut rx = audio_rx;
             let mut count = 0;
+            let header = writer.header().expect("header");
+            if stream_tx.send(header).await.is_err() {
+                return;
+            }
             while let Some(pcm_chunk) = rx.recv().await {
-                if let Ok(encoded) = encoder.encode(&pcm_chunk) {
-                    if !encoded.is_empty() && stream_tx.send(encoded).await.is_err() {
-                        break;
-                    }
+                let encoded = writer.write_pcm(&pcm_chunk).expect("encode");
+                if !encoded.is_empty() && stream_tx.send(encoded).await.is_err() {
+                    break;
                 }
                 count += 1;
                 if count >= 3 {
                     break;
                 }
             }
-            // Flush
-            if let Ok(remaining) = encoder.flush() {
-                if !remaining.is_empty() {
-                    let _ = stream_tx.send(remaining).await;
-                }
+            // Finalize
+            let remaining = writer.finalize().expect("finalize");
+            if !remaining.is_empty() {
+                let _ = stream_tx.send(remaining).await;
             }
             // stream_tx dropped here
         });
@@ -561,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn test_chunked_dictate_pipeline_with_mocks() {
         use crate::core::audio::mock::MockAudioCapture;
-        use crate::core::audio::{AudioCapture, AudioEncoder, OpusEncoder};
+        use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
         use crate::core::config::AudioConfig;
         use crate::core::transcription::{MockTranscriber, Transcriber};
 
@@ -576,32 +652,22 @@ mod tests {
             MockAudioCapture::new(audio_config.sample_rate, audio_config.channels, 440.0);
         let audio_rx = capture.start().expect("start capture");
 
-        // Initialize encoder
-        let mut encoder = OpusEncoder::new(audio_config).expect("create encoder");
-
-        // Shared buffer for encoded audio (like chunked mode)
-        let audio_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        // Shared buffer for raw PCM (like chunked mode)
+        let audio_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<i16>::new()));
         let audio_buffer_encode = audio_buffer.clone();
 
-        // Encode task: PCM → Opus → buffer (process a few chunks then stop)
+        // Encode task: PCM → buffer (process a few chunks then stop)
         let encode_task = tokio::spawn(async move {
             let mut rx = audio_rx;
             let mut count = 0;
             while let Some(pcm_chunk) = rx.recv().await {
-                if let Ok(encoded) = encoder.encode(&pcm_chunk) {
-                    if !encoded.is_empty() {
-                        audio_buffer_encode.lock().await.push(encoded);
-                    }
-                }
+                audio_buffer_encode
+                    .lock()
+                    .await
+                    .extend_from_slice(&pcm_chunk);
                 count += 1;
                 if count >= 6 {
                     break;
-                }
-            }
-            // Flush
-            if let Ok(remaining) = encoder.flush() {
-                if !remaining.is_empty() {
-                    audio_buffer_encode.lock().await.push(remaining);
                 }
             }
         });
@@ -611,24 +677,27 @@ mod tests {
         capture.stop().expect("stop capture");
 
         // Simulate chunked transcription: split buffer into two chunks
-        let all_chunks: Vec<Vec<u8>> = {
+        let all_samples: Vec<i16> = {
             let mut buf = audio_buffer.lock().await;
             std::mem::take(&mut *buf)
         };
-        assert!(!all_chunks.is_empty(), "should have encoded audio data");
+        assert!(!all_samples.is_empty(), "should have audio data");
 
-        let mid = all_chunks.len() / 2;
-        let chunk1 = &all_chunks[..mid];
-        let chunk2 = &all_chunks[mid..];
+        let mid = all_samples.len() / 2;
+        let chunk1 = &all_samples[..mid];
+        let chunk2 = &all_samples[mid..];
 
         let mut accumulated_text = Vec::<String>::new();
 
         // Transcribe chunk 1
         {
-            let (tx, rx) = tokio::sync::mpsc::channel(chunk1.len() + 1);
-            for c in chunk1 {
-                tx.send(c.clone()).await.expect("send chunk1");
-            }
+            let mut writer = OggOpusWriter::new(audio_config.clone()).expect("writer");
+            let mut ogg_bytes = Vec::new();
+            ogg_bytes.extend(writer.header().expect("header"));
+            ogg_bytes.extend(writer.write_pcm(chunk1).expect("encode"));
+            ogg_bytes.extend(writer.finalize().expect("finalize"));
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(ogg_bytes).await.expect("send chunk1");
             drop(tx);
 
             let transcriber = MockTranscriber::new("First chunk");
@@ -644,10 +713,13 @@ mod tests {
 
         // Transcribe chunk 2
         {
-            let (tx, rx) = tokio::sync::mpsc::channel(chunk2.len() + 1);
-            for c in chunk2 {
-                tx.send(c.clone()).await.expect("send chunk2");
-            }
+            let mut writer = OggOpusWriter::new(audio_config).expect("writer");
+            let mut ogg_bytes = Vec::new();
+            ogg_bytes.extend(writer.header().expect("header"));
+            ogg_bytes.extend(writer.write_pcm(chunk2).expect("encode"));
+            ogg_bytes.extend(writer.finalize().expect("finalize"));
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(ogg_bytes).await.expect("send chunk2");
             drop(tx);
 
             let transcriber = MockTranscriber::new("Second chunk");
@@ -669,23 +741,22 @@ mod tests {
     #[tokio::test]
     async fn test_chunked_buffer_drain_and_accumulate() {
         // Test that the buffer drain + accumulate pattern works correctly
-        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<i16>::new()));
 
         // Simulate encoding: push some data
         {
             let mut buf = buffer.lock().await;
-            buf.push(vec![1, 2, 3]);
-            buf.push(vec![4, 5, 6]);
+            buf.extend_from_slice(&[1, 2, 3]);
+            buf.extend_from_slice(&[4, 5, 6]);
         }
 
         // Drain (simulating chunk timer)
-        let drained: Vec<Vec<u8>> = {
+        let drained: Vec<i16> = {
             let mut buf = buffer.lock().await;
             std::mem::take(&mut *buf)
         };
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0], vec![1, 2, 3]);
-        assert_eq!(drained[1], vec![4, 5, 6]);
+        assert_eq!(drained.len(), 6);
+        assert_eq!(drained, vec![1, 2, 3, 4, 5, 6]);
 
         // Buffer should be empty after drain
         assert!(buffer.lock().await.is_empty());
@@ -693,15 +764,15 @@ mod tests {
         // Simulate more encoding after drain
         {
             let mut buf = buffer.lock().await;
-            buf.push(vec![7, 8, 9]);
+            buf.extend_from_slice(&[7, 8, 9]);
         }
 
         // Second drain
-        let drained2: Vec<Vec<u8>> = {
+        let drained2: Vec<i16> = {
             let mut buf = buffer.lock().await;
             std::mem::take(&mut *buf)
         };
-        assert_eq!(drained2.len(), 1);
-        assert_eq!(drained2[0], vec![7, 8, 9]);
+        assert_eq!(drained2.len(), 3);
+        assert_eq!(drained2, vec![7, 8, 9]);
     }
 }

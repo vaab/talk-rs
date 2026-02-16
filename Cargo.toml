@@ -21,6 +21,8 @@ tracing-subscriber = "0.3"
 thiserror = "1"
 cpal = "0.15"
 opus = "0.3"
+ogg = "0.9"
+byteorder = "1"
 reqwest = { version = "0.11", features = ["json", "stream", "multipart"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"

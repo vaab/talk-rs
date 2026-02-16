@@ -6,8 +6,10 @@ use tokio::sync::mpsc;
 pub mod cpal_capture;
 pub mod encoder;
 pub mod mock;
+pub mod writer;
 
 pub use encoder::{AudioEncoder, MockEncoder, OpusEncoder};
+pub use writer::{AudioWriter, OggOpusWriter, WavWriter};
 
 pub(crate) const CHUNK_DURATION_MS: u64 = 20;
 pub(crate) const CHANNEL_CAPACITY: usize = 25;

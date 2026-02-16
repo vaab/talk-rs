@@ -4,12 +4,13 @@
 //! Supports graceful shutdown via SIGINT (Ctrl+C).
 
 use crate::core::audio::cpal_capture::CpalCapture;
-use crate::core::audio::{AudioCapture, AudioEncoder, OpusEncoder};
+use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
 use crate::core::config::Config;
 use crate::core::error::TalkError;
 use chrono::Local;
-use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+use std::io::SeekFrom;
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 /// Parse command-line arguments for the record command.
 ///
@@ -29,6 +30,16 @@ pub fn parse_args(args: &[String]) -> Result<PathBuf, TalkError> {
         _ => Err(TalkError::Audio(
             "record command takes at most one argument (output file path)".to_string(),
         )),
+    }
+}
+
+fn create_writer(
+    path: &Path,
+    config: crate::core::config::AudioConfig,
+) -> Result<Box<dyn AudioWriter>, TalkError> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("wav") => Ok(Box::new(WavWriter::new(config))),
+        _ => Ok(Box::new(OggOpusWriter::new(config)?)),
     }
 }
 
@@ -55,8 +66,12 @@ pub async fn record(args: Vec<String>) -> Result<(), TalkError> {
     let mut capture = CpalCapture::new(config.audio.clone());
     let mut rx = capture.start()?;
 
-    // Initialize audio encoder
-    let mut encoder = OpusEncoder::new(config.audio.clone())?;
+    // Initialize audio writer
+    let mut writer = create_writer(&output_path, config.audio.clone())?;
+    let is_wav = matches!(
+        output_path.extension().and_then(|e| e.to_str()),
+        Some("wav")
+    );
 
     // Create output file
     let mut file = tokio::fs::File::create(&output_path)
@@ -65,27 +80,44 @@ pub async fn record(args: Vec<String>) -> Result<(), TalkError> {
 
     // Spawn async task to read from capture channel, encode, and write to file
     let encode_task = tokio::spawn(async move {
+        let header = match writer.header() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("Error creating header: {}", err);
+                return Err(err);
+            }
+        };
+        if let Err(err) = file.write_all(&header).await {
+            eprintln!("Error writing header: {}", err);
+            return Err(TalkError::Io(err));
+        }
+
         while let Some(pcm_chunk) = rx.recv().await {
-            match encoder.encode(&pcm_chunk) {
-                Ok(encoded_data) => {
-                    if !encoded_data.is_empty() {
-                        if let Err(err) = file.write_all(&encoded_data).await {
-                            eprintln!("Error writing to file: {}", err);
-                            return Err(TalkError::Io(err));
-                        }
-                    }
-                }
+            let encoded_data = match writer.write_pcm(&pcm_chunk) {
+                Ok(data) => data,
                 Err(err) => {
                     eprintln!("Error encoding audio: {}", err);
                     return Err(err);
                 }
+            };
+            if !encoded_data.is_empty() {
+                if let Err(err) = file.write_all(&encoded_data).await {
+                    eprintln!("Error writing to file: {}", err);
+                    return Err(TalkError::Io(err));
+                }
             }
         }
 
-        // Flush encoder to write remaining data
-        match encoder.flush() {
+        // Finalize writer to write remaining data
+        match writer.finalize() {
             Ok(remaining_data) => {
                 if !remaining_data.is_empty() {
+                    if is_wav {
+                        if let Err(err) = file.seek(SeekFrom::Start(0)).await {
+                            eprintln!("Error seeking to start: {}", err);
+                            return Err(TalkError::Io(err));
+                        }
+                    }
                     if let Err(err) = file.write_all(&remaining_data).await {
                         eprintln!("Error writing flushed data: {}", err);
                         return Err(TalkError::Io(err));
@@ -93,7 +125,7 @@ pub async fn record(args: Vec<String>) -> Result<(), TalkError> {
                 }
             }
             Err(err) => {
-                eprintln!("Error flushing encoder: {}", err);
+                eprintln!("Error finalizing writer: {}", err);
                 return Err(err);
             }
         }
@@ -174,7 +206,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_pipeline_with_mock_capture() {
-        use crate::core::audio::{mock::MockAudioCapture, AudioCapture};
+        use crate::core::audio::{
+            mock::MockAudioCapture, AudioCapture, AudioWriter, OggOpusWriter,
+        };
         use crate::core::config::AudioConfig;
         use std::fs;
         use tempfile::TempDir;
@@ -195,26 +229,30 @@ mod tests {
             MockAudioCapture::new(audio_config.sample_rate, audio_config.channels, 440.0);
         let mut rx = capture.start().expect("start capture");
 
-        // Initialize encoder
-        let mut encoder = OpusEncoder::new(audio_config).expect("create encoder");
+        // Initialize writer
+        let mut writer = OggOpusWriter::new(audio_config).expect("create writer");
 
         // Create output file
         let mut file = tokio::fs::File::create(&output_path)
             .await
             .expect("create file");
 
+        // Write header
+        let header = writer.header().expect("header");
+        file.write_all(&header).await.expect("write header");
+
         // Simulate encoding a few chunks
         for _ in 0..3 {
             if let Some(pcm_chunk) = rx.recv().await {
-                let encoded_data = encoder.encode(&pcm_chunk).expect("encode");
+                let encoded_data = writer.write_pcm(&pcm_chunk).expect("encode");
                 if !encoded_data.is_empty() {
                     file.write_all(&encoded_data).await.expect("write to file");
                 }
             }
         }
 
-        // Flush encoder
-        let remaining_data = encoder.flush().expect("flush");
+        // Finalize writer
+        let remaining_data = writer.finalize().expect("finalize");
         if !remaining_data.is_empty() {
             file.write_all(&remaining_data)
                 .await
@@ -229,5 +267,12 @@ mod tests {
         // Verify file was created and has content
         let metadata = fs::metadata(&output_path).expect("get file metadata");
         assert!(metadata.len() > 0, "output file should have content");
+
+        let bytes = fs::read(&output_path).expect("read output file");
+        assert!(bytes.starts_with(b"OggS"), "output should start with OggS");
+        let has_opus_head = bytes
+            .windows(b"OpusHead".len())
+            .any(|window| window == b"OpusHead");
+        assert!(has_opus_head, "output should contain OpusHead");
     }
 }
