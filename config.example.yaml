@@ -44,13 +44,6 @@ audio:
   # Only used for compressed audio formats (e.g., MP3, AAC)
   bitrate: <PLACEHOLDER>
 
-# Optional: Dictation Mode Settings
-# Configure behavior when using --chunked mode for long recordings
-dictate:
-  # Size of audio chunks in seconds for processing
-  # Smaller values = more frequent processing, larger values = fewer API calls
-  chunk_seconds: 2
-
 # Optional: Visual and Audio Indicators
 # Configure feedback mechanisms during recording
 indicators:

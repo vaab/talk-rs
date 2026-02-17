@@ -21,9 +21,6 @@ pub struct Config {
     /// Audio capture and encoding settings.
     pub audio: AudioConfig,
 
-    /// Optional dictation mode settings.
-    pub dictate: Option<DictateConfig>,
-
     /// Optional indicator settings.
     pub indicators: Option<IndicatorsConfig>,
 }
@@ -69,13 +66,6 @@ pub struct AudioConfig {
 
     /// Bitrate in bps for compressed formats.
     pub bitrate: u32,
-}
-
-/// Dictation mode configuration.
-#[derive(Debug, Deserialize)]
-pub struct DictateConfig {
-    /// Chunk size in seconds for chunked mode.
-    pub chunk_seconds: u64,
 }
 
 /// Indicator configuration.

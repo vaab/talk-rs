@@ -8,7 +8,9 @@ use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::core::clipboard::{Clipboard, X11Clipboard};
 use crate::core::config::{AudioConfig, Config};
 use crate::core::error::TalkError;
-use crate::core::transcription::{MistralTranscriber, Transcriber};
+use crate::core::transcription::{
+    MistralRealtimeTranscriber, MistralTranscriber, Transcriber, TranscriptionEvent,
+};
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -67,11 +69,7 @@ async fn simulate_paste() -> Result<(), TalkError> {
 }
 
 /// Dictate: record audio, transcribe, and paste into focused application.
-pub async fn dictate(
-    args: Vec<String>,
-    chunked: bool,
-    chunk_seconds_override: Option<u64>,
-) -> Result<(), TalkError> {
+pub async fn dictate(args: Vec<String>, batch: bool) -> Result<(), TalkError> {
     let save_path = parse_args(&args)?;
 
     // Load configuration
@@ -83,37 +81,18 @@ pub async fn dictate(
         eprintln!("Captured active window: {}", wid);
     }
 
-    // Initialize audio capture
-    let mut capture = CpalCapture::new(config.audio.clone());
-    let audio_rx = capture.start()?;
+    let text = if batch {
+        // Batch mode: capture audio, encode, then transcribe
+        let mut capture = CpalCapture::new(config.audio.clone());
+        let audio_rx = capture.start()?;
 
-    // Optionally create output file for saving audio
-    let save_file = if let Some(ref path) = save_path {
-        Some(tokio::fs::File::create(path).await.map_err(TalkError::Io)?)
-    } else {
-        None
-    };
+        // Optionally create output file for saving audio
+        let save_file = if let Some(ref path) = save_path {
+            Some(tokio::fs::File::create(path).await.map_err(TalkError::Io)?)
+        } else {
+            None
+        };
 
-    let text = if chunked {
-        let chunk_seconds = chunk_seconds_override
-            .or_else(|| config.dictate.as_ref().map(|d| d.chunk_seconds))
-            .ok_or_else(|| {
-                TalkError::Config(
-                    "chunk_seconds not specified: use -n flag or set dictate.chunk_seconds in config"
-                        .to_string(),
-                )
-            })?;
-
-        dictate_chunked(
-            &mut capture,
-            config.audio.clone(),
-            audio_rx,
-            save_file,
-            chunk_seconds,
-            config.providers.mistral,
-        )
-        .await?
-    } else {
         dictate_streaming(
             &mut capture,
             config.audio.clone(),
@@ -122,6 +101,14 @@ pub async fn dictate(
             config.providers.mistral,
         )
         .await?
+    } else {
+        // Realtime mode (default): stream audio over WebSocket
+        if save_path.is_some() {
+            eprintln!(
+                "Warning: audio file saving is not supported in realtime mode, ignoring file path"
+            );
+        }
+        dictate_realtime(config).await?
     };
 
     let text = text.trim().to_string();
@@ -170,7 +157,166 @@ pub async fn dictate(
     Ok(())
 }
 
-/// Streaming (non-chunked) dictation mode.
+/// Flush completed sentences from the live buffer to stdout.
+///
+/// Scans the buffer for sentence-ending punctuation (`.` `!` `?` `。` `！` `？`)
+/// followed by whitespace. Everything up to and including the punctuation is
+/// emitted as a line on stdout and appended to `segments`. The remainder stays
+/// in the buffer for further accumulation.
+fn flush_sentences(buffer: &mut String, segments: &mut Vec<String>) {
+    loop {
+        // Find the earliest sentence-ending punctuation followed by whitespace.
+        let boundary = buffer.char_indices().position(|(i, ch)| {
+            if matches!(ch, '。' | '！' | '？') {
+                // CJK sentence-ending punctuation: always a boundary
+                // (no space expected between CJK sentences)
+                true
+            } else if matches!(ch, '.' | '!' | '?') {
+                // Latin sentence-ending punctuation: require whitespace
+                // or end-of-string after it to avoid splitting "3.14"
+                let after = i + ch.len_utf8();
+                after >= buffer.len() || buffer[after..].starts_with(|c: char| c.is_whitespace())
+            } else {
+                false
+            }
+        });
+
+        let Some(pos) = boundary else {
+            break;
+        };
+
+        // Convert char position back to byte offset (including the punctuation char)
+        let (byte_offset, punct_char) = buffer.char_indices().nth(pos).unwrap_or((0, '.'));
+        let split_at = byte_offset + punct_char.len_utf8();
+
+        let sentence = buffer[..split_at].trim().to_string();
+        if !sentence.is_empty() {
+            println!("{}", sentence);
+            segments.push(sentence);
+        }
+
+        // Remove the emitted sentence + any leading whitespace from the remainder
+        let remainder = buffer[split_at..].trim_start().to_string();
+        // Clear stderr live preview
+        let blank = " ".repeat(buffer.len());
+        eprint!("\r{}\r", blank);
+
+        *buffer = remainder;
+        if !buffer.is_empty() {
+            eprint!("\r{}", buffer);
+        }
+    }
+}
+
+/// Realtime dictation mode via WebSocket.
+///
+/// Streams raw PCM audio to the Voxtral Realtime API and receives
+/// incremental transcription events. Returns the accumulated text.
+async fn dictate_realtime(config: Config) -> Result<String, TalkError> {
+    let mut capture = CpalCapture::new(config.audio.clone());
+    let audio_rx = capture.start()?;
+
+    let transcriber = MistralRealtimeTranscriber::new(config.providers.mistral);
+    let mut event_rx = transcriber.transcribe_realtime(audio_rx).await?;
+
+    eprintln!("Recording (realtime)... Press Ctrl+C to stop.");
+
+    let capture_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let capture_stop_clone = capture_stop.clone();
+
+    // Spawn Ctrl+C handler that stops capture
+    let ctrlc_task = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        capture_stop_clone.store(true, std::sync::atomic::Ordering::Release);
+    });
+
+    // Completed sentences/phrases emitted so far.
+    let mut segments: Vec<String> = Vec::new();
+    // Buffer for the current in-progress phrase (live TextDelta).
+    let mut current_line = String::new();
+
+    loop {
+        // Check if Ctrl+C was pressed — stop capture to trigger end-of-audio
+        if capture_stop.load(std::sync::atomic::Ordering::Acquire) {
+            eprintln!("\nStopping recording...");
+            capture.stop()?;
+            // Reset so we don't stop again
+            capture_stop.store(false, std::sync::atomic::Ordering::Release);
+        }
+
+        tokio::select! {
+            event = event_rx.recv() => {
+                match event {
+                    Some(TranscriptionEvent::TextDelta { text }) => {
+                        current_line.push_str(&text);
+                        eprint!("\r{}", current_line);
+
+                        // Flush completed sentences from the buffer.
+                        // Split on sentence-ending punctuation followed by
+                        // whitespace or end-of-string.
+                        flush_sentences(&mut current_line, &mut segments);
+                    }
+                    Some(TranscriptionEvent::SegmentDelta { text, .. }) => {
+                        // If the API sends segment events, use them as
+                        // authoritative sentence boundaries.
+                        let segment_text = text.trim().to_string();
+                        if !segment_text.is_empty() {
+                            println!("{}", segment_text);
+                            segments.push(segment_text);
+                        }
+                        let blank = " ".repeat(current_line.len());
+                        eprint!("\r{}\r", blank);
+                        current_line.clear();
+                    }
+                    Some(TranscriptionEvent::Done) => {
+                        // Flush any trailing text that didn't end with punctuation
+                        let trailing = current_line.trim().to_string();
+                        if !trailing.is_empty() {
+                            println!("{}", trailing);
+                            segments.push(trailing);
+                        }
+                        eprintln!();
+                        break;
+                    }
+                    Some(TranscriptionEvent::Error { message }) => {
+                        return Err(TalkError::Transcription(format!(
+                            "Realtime transcription error: {}",
+                            message
+                        )));
+                    }
+                    Some(TranscriptionEvent::SessionCreated) => {
+                        eprintln!("Session created");
+                    }
+                    Some(TranscriptionEvent::Language { language }) => {
+                        eprintln!("Detected language: {}", language);
+                    }
+                    Some(TranscriptionEvent::Unknown { .. }) => {
+                        // Ignore unknown/future event types
+                    }
+                    None => {
+                        // Channel closed without Done event
+                        let trailing = current_line.trim().to_string();
+                        if !trailing.is_empty() {
+                            println!("{}", trailing);
+                            segments.push(trailing);
+                        }
+                        eprintln!();
+                        break;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                // Periodic check for Ctrl+C flag
+            }
+        }
+    }
+
+    ctrlc_task.abort();
+
+    Ok(segments.join(" "))
+}
+
+/// Batch dictation mode.
 ///
 /// Encodes audio and streams it directly to a single transcription request.
 async fn dictate_streaming(
@@ -301,229 +447,6 @@ async fn dictate_streaming(
     Ok(text)
 }
 
-/// Chunked dictation mode.
-///
-/// Encodes audio into a shared buffer, periodically drains it into chunks,
-/// and transcribes each chunk separately. Results are accumulated and joined.
-async fn dictate_chunked(
-    capture: &mut CpalCapture,
-    audio_config: AudioConfig,
-    audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
-    save_file: Option<tokio::fs::File>,
-    chunk_seconds: u64,
-    mistral_config: crate::core::config::MistralConfig,
-) -> Result<String, TalkError> {
-    let chunk_duration = std::time::Duration::from_secs(chunk_seconds);
-    let accumulated_text = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-    let accumulated_text_clone = accumulated_text.clone();
-
-    // Shared buffer for raw PCM samples
-    let audio_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<i16>::new()));
-    let audio_buffer_encode = audio_buffer.clone();
-    let audio_buffer_chunk = audio_buffer.clone();
-
-    // Encode task: PCM → buffer (+ optional file writer)
-    let audio_config_encode = audio_config.clone();
-    let encode_task = tokio::spawn(async move {
-        let mut rx = audio_rx;
-        let mut file_writer = if let Some(file) = save_file {
-            let mut writer = match OggOpusWriter::new(audio_config_encode.clone()) {
-                Ok(writer) => writer,
-                Err(err) => {
-                    eprintln!("Error creating writer: {}", err);
-                    return Err(err);
-                }
-            };
-            let header = match writer.header() {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    eprintln!("Error creating header: {}", err);
-                    return Err(err);
-                }
-            };
-            let mut file = file;
-            if let Err(err) = file.write_all(&header).await {
-                eprintln!("Error writing to file: {}", err);
-            }
-            Some((file, writer))
-        } else {
-            None
-        };
-
-        while let Some(pcm_chunk) = rx.recv().await {
-            audio_buffer_encode
-                .lock()
-                .await
-                .extend_from_slice(&pcm_chunk);
-            if let Some((ref mut f, ref mut writer)) = file_writer {
-                let encoded_data = match writer.write_pcm(&pcm_chunk) {
-                    Ok(data) => data,
-                    Err(err) => {
-                        eprintln!("Error encoding audio: {}", err);
-                        return Err(err);
-                    }
-                };
-                if !encoded_data.is_empty() {
-                    if let Err(err) = f.write_all(&encoded_data).await {
-                        eprintln!("Error writing to file: {}", err);
-                    }
-                }
-            }
-        }
-
-        // Finalize writer for file if saving
-        if let Some((ref mut f, ref mut writer)) = file_writer {
-            match writer.finalize() {
-                Ok(remaining) => {
-                    if !remaining.is_empty() {
-                        let _ = f.write_all(&remaining).await;
-                    }
-                }
-                Err(err) => {
-                    eprintln!("Error finalizing writer: {}", err);
-                    return Err(err);
-                }
-            }
-            let _ = f.sync_all().await;
-        }
-
-        Ok::<(), TalkError>(())
-    });
-
-    // Chunk timer task: periodically drain buffer and transcribe
-    let config_mistral = mistral_config.clone();
-    let audio_config_chunk = audio_config.clone();
-    let chunk_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(chunk_duration);
-        interval.tick().await; // First tick is immediate, skip it
-
-        loop {
-            interval.tick().await;
-
-            // Drain the buffer
-            let pcm_samples: Vec<i16> = {
-                let mut buf = audio_buffer_chunk.lock().await;
-                std::mem::take(&mut *buf)
-            };
-
-            if pcm_samples.is_empty() {
-                continue;
-            }
-
-            let mut writer = match OggOpusWriter::new(audio_config_chunk.clone()) {
-                Ok(writer) => writer,
-                Err(err) => {
-                    eprintln!("Error creating writer: {}", err);
-                    continue;
-                }
-            };
-            let mut ogg_bytes = Vec::new();
-            match writer.header() {
-                Ok(bytes) => ogg_bytes.extend(bytes),
-                Err(err) => {
-                    eprintln!("Error creating header: {}", err);
-                    continue;
-                }
-            }
-            match writer.write_pcm(&pcm_samples) {
-                Ok(bytes) => ogg_bytes.extend(bytes),
-                Err(err) => {
-                    eprintln!("Error encoding audio: {}", err);
-                    continue;
-                }
-            }
-            match writer.finalize() {
-                Ok(bytes) => ogg_bytes.extend(bytes),
-                Err(err) => {
-                    eprintln!("Error finalizing writer: {}", err);
-                    continue;
-                }
-            }
-
-            // Create channel and send full OGG payload
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            let _ = tx.send(ogg_bytes).await;
-            drop(tx);
-
-            // Transcribe this chunk
-            let transcriber = MistralTranscriber::new(config_mistral.clone());
-            match transcriber.transcribe_stream(rx, "audio.ogg").await {
-                Ok(text) => {
-                    let text = text.trim().to_string();
-                    if !text.is_empty() {
-                        eprintln!("Chunk transcription: {}", text);
-                        accumulated_text_clone.lock().await.push(text);
-                    }
-                }
-                Err(err) => {
-                    eprintln!("Chunk transcription error: {}", err);
-                }
-            }
-        }
-    });
-
-    eprintln!(
-        "Recording (chunked, {}s intervals)... Press Ctrl+C to stop.",
-        chunk_seconds
-    );
-
-    // Wait for SIGINT
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|err| TalkError::Audio(format!("Failed to listen for Ctrl+C: {}", err)))?;
-
-    eprintln!("Stopping recording...");
-
-    // Stop capture
-    capture.stop()?;
-
-    // Wait for encode task
-    match encode_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("Encode error: {}", err),
-        Err(err) => eprintln!("Encode task panicked: {}", err),
-    }
-
-    // Cancel chunk timer
-    chunk_task.abort();
-
-    // Process final partial chunk (remaining in buffer)
-    let final_pcm: Vec<i16> = {
-        let mut buf = audio_buffer.lock().await;
-        std::mem::take(&mut *buf)
-    };
-
-    if !final_pcm.is_empty() {
-        let mut writer = OggOpusWriter::new(audio_config)?;
-        let mut ogg_bytes = Vec::new();
-        ogg_bytes.extend(writer.header()?);
-        ogg_bytes.extend(writer.write_pcm(&final_pcm)?);
-        ogg_bytes.extend(writer.finalize()?);
-
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let _ = tx.send(ogg_bytes).await;
-        drop(tx);
-
-        let transcriber = MistralTranscriber::new(mistral_config);
-        match transcriber.transcribe_stream(rx, "audio.ogg").await {
-            Ok(text) => {
-                let text = text.trim().to_string();
-                if !text.is_empty() {
-                    eprintln!("Final chunk transcription: {}", text);
-                    accumulated_text.lock().await.push(text);
-                }
-            }
-            Err(err) => {
-                eprintln!("Final chunk transcription error: {}", err);
-            }
-        }
-    }
-
-    // Combine all chunk results
-    let all_text = accumulated_text.lock().await.join(" ");
-    Ok(all_text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,145 +557,57 @@ mod tests {
         assert_eq!(restored, "original");
     }
 
-    #[tokio::test]
-    async fn test_chunked_dictate_pipeline_with_mocks() {
-        use crate::core::audio::mock::MockAudioCapture;
-        use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
-        use crate::core::config::AudioConfig;
-        use crate::core::transcription::{MockTranscriber, Transcriber};
-
-        let audio_config = AudioConfig {
-            sample_rate: 16_000,
-            channels: 1,
-            bitrate: 32_000,
-        };
-
-        // Initialize mock capture
-        let mut capture =
-            MockAudioCapture::new(audio_config.sample_rate, audio_config.channels, 440.0);
-        let audio_rx = capture.start().expect("start capture");
-
-        // Shared buffer for raw PCM (like chunked mode)
-        let audio_buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<i16>::new()));
-        let audio_buffer_encode = audio_buffer.clone();
-
-        // Encode task: PCM → buffer (process a few chunks then stop)
-        let encode_task = tokio::spawn(async move {
-            let mut rx = audio_rx;
-            let mut count = 0;
-            while let Some(pcm_chunk) = rx.recv().await {
-                audio_buffer_encode
-                    .lock()
-                    .await
-                    .extend_from_slice(&pcm_chunk);
-                count += 1;
-                if count >= 6 {
-                    break;
-                }
-            }
-        });
-
-        // Wait for encode to finish
-        encode_task.await.expect("encode task");
-        capture.stop().expect("stop capture");
-
-        // Simulate chunked transcription: split buffer into two chunks
-        let all_samples: Vec<i16> = {
-            let mut buf = audio_buffer.lock().await;
-            std::mem::take(&mut *buf)
-        };
-        assert!(!all_samples.is_empty(), "should have audio data");
-
-        let mid = all_samples.len() / 2;
-        let chunk1 = &all_samples[..mid];
-        let chunk2 = &all_samples[mid..];
-
-        let mut accumulated_text = Vec::<String>::new();
-
-        // Transcribe chunk 1
-        {
-            let mut writer = OggOpusWriter::new(audio_config.clone()).expect("writer");
-            let mut ogg_bytes = Vec::new();
-            ogg_bytes.extend(writer.header().expect("header"));
-            ogg_bytes.extend(writer.write_pcm(chunk1).expect("encode"));
-            ogg_bytes.extend(writer.finalize().expect("finalize"));
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            tx.send(ogg_bytes).await.expect("send chunk1");
-            drop(tx);
-
-            let transcriber = MockTranscriber::new("First chunk");
-            let text = transcriber
-                .transcribe_stream(rx, "audio.ogg")
-                .await
-                .expect("transcribe chunk 1");
-            let text = text.trim().to_string();
-            if !text.is_empty() {
-                accumulated_text.push(text);
-            }
-        }
-
-        // Transcribe chunk 2
-        {
-            let mut writer = OggOpusWriter::new(audio_config).expect("writer");
-            let mut ogg_bytes = Vec::new();
-            ogg_bytes.extend(writer.header().expect("header"));
-            ogg_bytes.extend(writer.write_pcm(chunk2).expect("encode"));
-            ogg_bytes.extend(writer.finalize().expect("finalize"));
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-            tx.send(ogg_bytes).await.expect("send chunk2");
-            drop(tx);
-
-            let transcriber = MockTranscriber::new("Second chunk");
-            let text = transcriber
-                .transcribe_stream(rx, "audio.ogg")
-                .await
-                .expect("transcribe chunk 2");
-            let text = text.trim().to_string();
-            if !text.is_empty() {
-                accumulated_text.push(text);
-            }
-        }
-
-        // Verify accumulated results
-        let combined = accumulated_text.join(" ");
-        assert_eq!(combined, "First chunk Second chunk");
+    #[test]
+    fn test_flush_sentences_single_sentence() {
+        let mut buf = "Hello world.".to_string();
+        let mut segs: Vec<String> = Vec::new();
+        flush_sentences(&mut buf, &mut segs);
+        assert_eq!(segs, vec!["Hello world."]);
+        assert_eq!(buf, "");
     }
 
-    #[tokio::test]
-    async fn test_chunked_buffer_drain_and_accumulate() {
-        // Test that the buffer drain + accumulate pattern works correctly
-        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<i16>::new()));
+    #[test]
+    fn test_flush_sentences_trailing_partial() {
+        let mut buf = "First sentence. And then".to_string();
+        let mut segs: Vec<String> = Vec::new();
+        flush_sentences(&mut buf, &mut segs);
+        assert_eq!(segs, vec!["First sentence."]);
+        assert_eq!(buf, "And then");
+    }
 
-        // Simulate encoding: push some data
-        {
-            let mut buf = buffer.lock().await;
-            buf.extend_from_slice(&[1, 2, 3]);
-            buf.extend_from_slice(&[4, 5, 6]);
-        }
+    #[test]
+    fn test_flush_sentences_multiple() {
+        let mut buf = "One. Two! Three? Rest".to_string();
+        let mut segs: Vec<String> = Vec::new();
+        flush_sentences(&mut buf, &mut segs);
+        assert_eq!(segs, vec!["One.", "Two!", "Three?"]);
+        assert_eq!(buf, "Rest");
+    }
 
-        // Drain (simulating chunk timer)
-        let drained: Vec<i16> = {
-            let mut buf = buffer.lock().await;
-            std::mem::take(&mut *buf)
-        };
-        assert_eq!(drained.len(), 6);
-        assert_eq!(drained, vec![1, 2, 3, 4, 5, 6]);
+    #[test]
+    fn test_flush_sentences_no_punctuation() {
+        let mut buf = "no punctuation here".to_string();
+        let mut segs: Vec<String> = Vec::new();
+        flush_sentences(&mut buf, &mut segs);
+        assert!(segs.is_empty());
+        assert_eq!(buf, "no punctuation here");
+    }
 
-        // Buffer should be empty after drain
-        assert!(buffer.lock().await.is_empty());
+    #[test]
+    fn test_flush_sentences_chinese_punctuation() {
+        let mut buf = "你好。世界".to_string();
+        let mut segs: Vec<String> = Vec::new();
+        flush_sentences(&mut buf, &mut segs);
+        assert_eq!(segs, vec!["你好。"]);
+        assert_eq!(buf, "世界");
+    }
 
-        // Simulate more encoding after drain
-        {
-            let mut buf = buffer.lock().await;
-            buf.extend_from_slice(&[7, 8, 9]);
-        }
-
-        // Second drain
-        let drained2: Vec<i16> = {
-            let mut buf = buffer.lock().await;
-            std::mem::take(&mut *buf)
-        };
-        assert_eq!(drained2.len(), 3);
-        assert_eq!(drained2, vec![7, 8, 9]);
+    #[test]
+    fn test_flush_sentences_period_at_end() {
+        let mut buf = "End of text.".to_string();
+        let mut segs: Vec<String> = Vec::new();
+        flush_sentences(&mut buf, &mut segs);
+        assert_eq!(segs, vec!["End of text."]);
+        assert_eq!(buf, "");
     }
 }
