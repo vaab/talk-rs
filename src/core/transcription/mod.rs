@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use std::path::Path;
 
 pub mod mistral;
+pub mod realtime;
 
 pub use mistral::MistralTranscriber;
+pub use realtime::{MistralRealtimeTranscriber, TranscriptionEvent};
 
 /// Result type for transcription operations.
 pub struct TranscriptionResult {
