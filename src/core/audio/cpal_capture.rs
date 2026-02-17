@@ -194,6 +194,12 @@ impl AudioCapture for CpalCapture {
     fn stop(&mut self) -> Result<(), TalkError> {
         self.running.store(false, Ordering::Release);
 
+        // Give the CPAL callback thread one last chance to see the
+        // running=false flag and flush its partial buffer before we
+        // drop the stream.  CPAL callbacks typically fire every 5-20ms,
+        // so 50ms is ample.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
         let mut guard = self
             .stream
             .lock()
@@ -221,19 +227,38 @@ where
     let running_for_data = Arc::clone(&running);
     let running_for_error = Arc::clone(&running);
 
+    // Track whether we have already flushed the final partial buffer so
+    // the callback does it exactly once (the callback may fire several
+    // more times between `running = false` and the stream being dropped).
+    let mut flushed = false;
+
     device
         .build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
-                if !running_for_data.load(Ordering::Acquire) {
+                let is_running = running_for_data.load(Ordering::Acquire);
+
+                if !is_running && flushed {
                     return;
                 }
 
+                // Always convert incoming samples — even if we are
+                // stopping — so the final CPAL buffer is not lost.
                 buffer.extend(data.iter().map(|sample| i16::from_sample(*sample)));
 
+                // Emit full-sized chunks as usual.
                 while buffer.len() >= samples_per_chunk {
                     let chunk: Vec<i16> = buffer.drain(..samples_per_chunk).collect();
                     let _ = sender.try_send(chunk);
+                }
+
+                // When stopping, flush whatever remains in the buffer
+                // (partial chunk) so the end of the recording is not
+                // silently chopped off.
+                if !is_running && !flushed && !buffer.is_empty() {
+                    let remainder: Vec<i16> = std::mem::take(&mut buffer);
+                    let _ = sender.try_send(remainder);
+                    flushed = true;
                 }
             },
             move |err| {
