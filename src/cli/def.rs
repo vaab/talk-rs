@@ -32,5 +32,14 @@ pub enum Commands {
         /// Use batch mode (upload complete recording, transcribe after stop)
         #[arg(long)]
         batch: bool,
+        /// Toggle daemon mode: first call starts recording, second call stops
+        #[arg(long)]
+        toggle: bool,
+        /// Run as daemon process (internal, used by --toggle)
+        #[arg(long, hide = true)]
+        daemon: bool,
+        /// Target window ID for paste (internal, used by --toggle)
+        #[arg(long, hide = true)]
+        target_window: Option<String>,
     },
 }
