@@ -93,12 +93,17 @@ impl Transcriber for MistralTranscriber {
             .to_string();
 
         // Create multipart form with audio file and model
-        let form = reqwest::multipart::Form::new()
-            .text("model", "voxtral-mini-latest")
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", self.config.model.clone())
             .part(
                 "file",
                 reqwest::multipart::Part::stream(file).file_name(file_name),
             );
+
+        // Add context bias if configured
+        if let Some(ref bias) = self.config.context_bias {
+            form = form.text("context_bias", bias.clone());
+        }
 
         // Send request to Mistral API
         let response = self
@@ -142,12 +147,17 @@ impl Transcriber for MistralTranscriber {
         let body = reqwest::Body::wrap_stream(byte_stream);
 
         // Create multipart form with streaming audio and model
-        let form = reqwest::multipart::Form::new()
-            .text("model", "voxtral-mini-latest")
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", self.config.model.clone())
             .part(
                 "file",
                 reqwest::multipart::Part::stream(body).file_name(file_name.to_string()),
             );
+
+        // Add context bias if configured
+        if let Some(ref bias) = self.config.context_bias {
+            form = form.text("context_bias", bias.clone());
+        }
 
         // Send request to Mistral API with extended timeout for long recordings
         let response = self
@@ -216,6 +226,8 @@ mod tests {
         // Create transcriber with mock server URL
         let config = MistralConfig {
             api_key: "test-api-key".to_string(),
+            model: "voxtral-mini-latest".to_string(),
+            context_bias: None,
         };
         let transcriber = MistralTranscriber::with_endpoint(
             config,
@@ -247,6 +259,8 @@ mod tests {
         // Create transcriber with mock server URL
         let config = MistralConfig {
             api_key: "test-api-key".to_string(),
+            model: "voxtral-mini-latest".to_string(),
+            context_bias: None,
         };
         let transcriber = MistralTranscriber::with_endpoint(
             config,
@@ -288,6 +302,8 @@ mod tests {
         // Create transcriber with mock server URL
         let config = MistralConfig {
             api_key: "invalid-key".to_string(),
+            model: "voxtral-mini-latest".to_string(),
+            context_bias: None,
         };
         let transcriber = MistralTranscriber::with_endpoint(
             config,
@@ -305,6 +321,8 @@ mod tests {
     async fn test_mistral_transcriber_file_not_found() {
         let config = MistralConfig {
             api_key: "test-api-key".to_string(),
+            model: "voxtral-mini-latest".to_string(),
+            context_bias: None,
         };
         let transcriber = MistralTranscriber::new(config);
 
@@ -336,6 +354,8 @@ mod tests {
         // Create transcriber with mock server URL
         let config = MistralConfig {
             api_key: "test-api-key".to_string(),
+            model: "voxtral-mini-latest".to_string(),
+            context_bias: None,
         };
         let transcriber = MistralTranscriber::with_endpoint(
             config,

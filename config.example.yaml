@@ -19,6 +19,15 @@ providers:
     # Get this from: https://console.mistral.ai/
     api_key: <PLACEHOLDER>
 
+    # Model name for transcription (optional, defaults to "voxtral-mini-latest")
+    # Available models: voxtral-mini-latest, voxtral-mini-2602
+    # model: voxtral-mini-latest
+
+    # Context bias: comma-separated words/phrases to improve transcription accuracy
+    # Up to 100 words. Useful for proper nouns, technical terms, domain vocabulary.
+    # Optimized for English; experimental for other languages.
+    # context_bias: "Kalysto,talk-rs,Voxtral,cpal,tokio"
+
 # Required: Audio Capture and Encoding Settings
 # These settings control how audio is captured and processed
 audio:
