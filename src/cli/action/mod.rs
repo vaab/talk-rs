@@ -21,13 +21,9 @@ pub async fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error
             }
             transcribe(args).await?;
         }
-        Commands::Dictate {
-            file,
-            chunked,
-            chunk_seconds,
-        } => {
+        Commands::Dictate { file, batch } => {
             let args = file.map(|f| vec![f]).unwrap_or_default();
-            dictate(args, chunked, chunk_seconds).await?;
+            dictate(args, batch).await?;
         }
     }
     Ok(())
