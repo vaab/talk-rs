@@ -11,8 +11,12 @@
 
 use crate::core::error::TalkError;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use tokio_util::sync::CancellationToken;
+
+/// Maximum time to wait for the audio output device to start pulling
+/// samples before giving up.
+const WARMUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 // ── Tone parameters ──────────────────────────────────────────────────
 
@@ -188,6 +192,12 @@ impl SoundPlayer {
         let state = Arc::new(Mutex::new(PlaybackState::new()));
         let state_cb = Arc::clone(&state);
 
+        // Warmup synchronisation: the output callback signals when the
+        // audio device is actually pulling samples so we can guarantee
+        // the pipeline is live before playing any sound.
+        let warmup_pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let warmup_cb = Arc::clone(&warmup_pair);
+
         let stream = device
             .build_output_stream(
                 &cpal::StreamConfig {
@@ -196,6 +206,17 @@ impl SoundPlayer {
                     buffer_size: cpal::BufferSize::Default,
                 },
                 move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    // Signal warmup on first callback invocation.
+                    {
+                        let (lock, cvar) = &*warmup_cb;
+                        if let Ok(mut ready) = lock.lock() {
+                            if !*ready {
+                                *ready = true;
+                                cvar.notify_one();
+                            }
+                        }
+                    }
+
                     // try_lock: if the caller is swapping buffers right now,
                     // output silence for this callback (~5ms) — inaudible.
                     if let Ok(mut guard) = state_cb.try_lock() {
@@ -230,6 +251,28 @@ impl SoundPlayer {
         stream
             .play()
             .map_err(|e| TalkError::Audio(format!("failed to start output stream: {}", e)))?;
+
+        // Block until the audio device has actually invoked the callback
+        // at least once, proving the output pipeline is live. This avoids
+        // the first sound being partially lost to device startup latency.
+        {
+            let (lock, cvar) = &*warmup_pair;
+            let guard = lock
+                .lock()
+                .map_err(|_| TalkError::Audio("warmup lock poisoned".to_string()))?;
+            if !*guard {
+                let (guard, timeout_result) = cvar
+                    .wait_timeout(guard, WARMUP_TIMEOUT)
+                    .map_err(|_| TalkError::Audio("warmup condvar poisoned".to_string()))?;
+                if !*guard && timeout_result.timed_out() {
+                    log::warn!(
+                        "audio output warmup timed out after {}ms — start sound may be clipped",
+                        WARMUP_TIMEOUT.as_millis()
+                    );
+                }
+            }
+            log::debug!("audio output pipeline warm");
+        }
 
         Ok(Self {
             state,
