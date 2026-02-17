@@ -5,7 +5,7 @@
 
 use crate::core::audio::cpal_capture::CpalCapture;
 use crate::core::audio::indicator::SoundPlayer;
-use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
+use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
 use crate::core::clipboard::{Clipboard, X11Clipboard};
 use crate::core::config::{AudioConfig, Config};
 use crate::core::daemon::{self, DaemonStatus};
@@ -16,7 +16,7 @@ use crate::core::transcription::{
 };
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 /// Options for the dictate command.
 pub struct DictateOpts {
@@ -189,10 +189,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         .await?
     } else {
         // Realtime mode (default): stream audio over WebSocket
-        if save_path.is_some() {
-            log::warn!("audio file saving is not supported in realtime mode, ignoring file path");
-        }
-        dictate_realtime(config).await?
+        dictate_realtime(config, save_path.as_deref()).await?
     };
 
     // Stop boop loop and play stop sound (preempts any in-progress boop)
@@ -430,9 +427,54 @@ fn flush_sentences(buffer: &mut String, segments: &mut Vec<String>) {
 ///
 /// Streams raw PCM audio to the Voxtral Realtime API and receives
 /// incremental transcription events. Returns the accumulated text.
-async fn dictate_realtime(config: Config) -> Result<String, TalkError> {
+///
+/// When `save_path` is provided, a debug WAV copy of the captured PCM
+/// is written alongside the transcription so the user can verify that
+/// recording start/stop timing and content are correct.
+async fn dictate_realtime(
+    config: Config,
+    save_path: Option<&std::path::Path>,
+) -> Result<String, TalkError> {
     let mut capture = CpalCapture::new(config.audio.clone());
     let audio_rx = capture.start()?;
+
+    // If a save path is given, tee the audio stream: one copy goes to
+    // the transcriber, the other is written to a WAV file for debugging.
+    let (audio_rx, wav_task) = if let Some(path) = save_path {
+        let wav_path = if path.extension().is_some() {
+            path.to_path_buf()
+        } else {
+            path.with_extension("wav")
+        };
+        log::info!("saving debug audio to: {}", wav_path.display());
+
+        let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
+        let audio_cfg = config.audio.clone();
+        let task = tokio::spawn(audio_tee_to_wav(audio_rx, fwd_tx, wav_path, audio_cfg));
+        (fwd_rx, Some(task))
+    } else {
+        // Also save a debug capture automatically in the cache directory
+        let auto_path = crate::core::daemon::cache_dir()
+            .ok()
+            .map(|d| d.join("debug-capture.wav"));
+        if let Some(ref wav_path) = auto_path {
+            if let Some(parent) = wav_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            log::info!("saving debug audio to: {}", wav_path.display());
+            let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
+            let audio_cfg = config.audio.clone();
+            let task = tokio::spawn(audio_tee_to_wav(
+                audio_rx,
+                fwd_tx,
+                wav_path.clone(),
+                audio_cfg,
+            ));
+            (fwd_rx, Some(task))
+        } else {
+            (audio_rx, None)
+        }
+    };
 
     let transcriber = MistralRealtimeTranscriber::new(config.providers.mistral);
     let mut event_rx = transcriber.transcribe_realtime(audio_rx).await?;
@@ -531,7 +573,75 @@ async fn dictate_realtime(config: Config) -> Result<String, TalkError> {
 
     ctrlc_task.abort();
 
+    // Wait for WAV tee task to finish writing
+    if let Some(task) = wav_task {
+        match task.await {
+            Ok(Ok(())) => log::debug!("debug WAV saved"),
+            Ok(Err(e)) => log::warn!("debug WAV write error: {}", e),
+            Err(e) => log::warn!("debug WAV task panicked: {}", e),
+        }
+    }
+
     Ok(segments.join(" "))
+}
+
+/// Tee audio from `source` into both a WAV file and a forwarding channel.
+///
+/// Each `Vec<i16>` chunk is written as raw PCM s16le to the WAV file and
+/// simultaneously forwarded to `fwd_tx` for the transcriber. When the
+/// source channel closes, the WAV header is patched with the final size.
+async fn audio_tee_to_wav(
+    mut source: tokio::sync::mpsc::Receiver<Vec<i16>>,
+    fwd_tx: tokio::sync::mpsc::Sender<Vec<i16>>,
+    wav_path: PathBuf,
+    audio_config: AudioConfig,
+) -> Result<(), TalkError> {
+    let mut writer = WavWriter::new(audio_config);
+    let header = writer.header()?;
+
+    let mut file = tokio::fs::File::create(&wav_path)
+        .await
+        .map_err(TalkError::Io)?;
+    file.write_all(&header).await.map_err(TalkError::Io)?;
+
+    let mut total_samples: u64 = 0;
+
+    while let Some(pcm_chunk) = source.recv().await {
+        total_samples += pcm_chunk.len() as u64;
+        let pcm_bytes = writer.write_pcm(&pcm_chunk)?;
+        file.write_all(&pcm_bytes).await.map_err(TalkError::Io)?;
+
+        // Forward to transcriber — if it's gone, keep writing the WAV
+        // but stop forwarding
+        if fwd_tx.send(pcm_chunk).await.is_err() {
+            log::debug!("transcriber channel closed, continuing WAV write");
+            break;
+        }
+    }
+
+    // Drain remaining chunks (if we broke out early because transcriber closed)
+    while let Some(pcm_chunk) = source.recv().await {
+        total_samples += pcm_chunk.len() as u64;
+        let pcm_bytes = writer.write_pcm(&pcm_chunk)?;
+        file.write_all(&pcm_bytes).await.map_err(TalkError::Io)?;
+    }
+
+    // Patch WAV header with actual data size
+    let final_header = writer.finalize()?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(TalkError::Io)?;
+    file.write_all(&final_header).await.map_err(TalkError::Io)?;
+    file.sync_all().await.map_err(TalkError::Io)?;
+
+    log::info!(
+        "debug WAV: {} samples ({:.1}s) saved to {}",
+        total_samples,
+        total_samples as f64 / 16000.0,
+        wav_path.display()
+    );
+
+    Ok(())
 }
 
 /// Batch dictation mode.
