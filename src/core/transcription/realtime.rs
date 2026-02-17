@@ -9,8 +9,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 
 /// Default model for realtime transcription.
 const DEFAULT_REALTIME_MODEL: &str = "voxtral-mini-transcribe-realtime-2602";
@@ -20,6 +22,15 @@ const DEFAULT_REALTIME_ENDPOINT: &str = "wss://api.mistral.ai";
 
 /// WebSocket path for realtime transcription.
 const REALTIME_PATH: &str = "/v1/audio/transcriptions/realtime";
+
+/// Timeout for the initial WebSocket connection (TCP + TLS + upgrade).
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Timeout for receiving the `session.created` event after connecting.
+const SESSION_CREATED_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Interval between WebSocket ping frames for keepalive.
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Events received from the Voxtral Realtime API.
 #[derive(Debug, Clone)]
@@ -191,15 +202,34 @@ impl MistralRealtimeTranscriber {
                 TalkError::Transcription(format!("Failed to build WebSocket request: {}", e))
             })?;
 
-        // Connect to the WebSocket server
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| TalkError::Transcription(format!("WebSocket connection failed: {}", e)))?;
+        // [Fix #2] Connect with timeout to avoid hanging on unreachable servers
+        let (ws_stream, _response) = tokio::time::timeout(
+            WS_CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .map_err(|_| {
+            TalkError::Transcription(format!(
+                "WebSocket connection timed out after {}s",
+                WS_CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| TalkError::Transcription(format!("WebSocket connection failed: {}", e)))?;
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
-        // Wait for session.created event
-        let session_event = wait_for_session_created(&mut ws_source).await?;
+        // [Fix #1] Wait for session.created with timeout
+        let session_event = tokio::time::timeout(
+            SESSION_CREATED_TIMEOUT,
+            wait_for_session_created(&mut ws_source),
+        )
+        .await
+        .map_err(|_| {
+            TalkError::Transcription(format!(
+                "Timed out waiting for session.created after {}s",
+                SESSION_CREATED_TIMEOUT.as_secs()
+            ))
+        })??;
         eprintln!("Realtime session established");
 
         // Send session.update with audio format
@@ -225,16 +255,24 @@ impl MistralRealtimeTranscriber {
         // Send the initial session event through the channel
         let _ = event_tx.send(session_event).await;
 
+        // [Fix #5 #7] Shared cancellation token so sender/receiver can
+        // signal each other on failure instead of hanging independently.
+        let cancel = CancellationToken::new();
+
         // Spawn sender task: reads PCM from audio_rx, encodes, sends over WS
-        let sender_task = tokio::spawn(sender_loop(audio_rx, ws_sink));
+        let sender_task = tokio::spawn(sender_loop(audio_rx, ws_sink, cancel.clone()));
 
         // Spawn receiver task: reads WS messages, parses events, sends to event_tx
-        let receiver_task = tokio::spawn(receiver_loop(ws_source, event_tx));
+        let receiver_task = tokio::spawn(receiver_loop(ws_source, event_tx, cancel.clone()));
 
-        // Spawn a cleanup task that waits for both to finish
+        // [Fix #6] Cleanup task that logs panics instead of swallowing them
         tokio::spawn(async move {
-            let _ = sender_task.await;
-            let _ = receiver_task.await;
+            if let Err(e) = sender_task.await {
+                eprintln!("Sender task panicked: {}", e);
+            }
+            if let Err(e) = receiver_task.await {
+                eprintln!("Receiver task panicked: {}", e);
+            }
         });
 
         Ok(event_rx)
@@ -277,77 +315,140 @@ where
 }
 
 /// Sender loop: reads PCM chunks, base64-encodes, sends as JSON over WebSocket.
-async fn sender_loop<S>(mut audio_rx: mpsc::Receiver<Vec<i16>>, mut ws_sink: SplitSink<S, Message>)
-where
+///
+/// Also sends periodic Ping frames as keepalive to detect silent network
+/// drops. Cancels the shared token on error so the receiver can clean up.
+async fn sender_loop<S>(
+    mut audio_rx: mpsc::Receiver<Vec<i16>>,
+    mut ws_sink: SplitSink<S, Message>,
+    cancel: CancellationToken,
+) where
     S: futures::Sink<Message> + Unpin,
     <S as futures::Sink<Message>>::Error: std::fmt::Display,
 {
-    while let Some(pcm_chunk) = audio_rx.recv().await {
-        let bytes = pcm_to_bytes(&pcm_chunk);
-        let b64 = pcm_bytes_to_base64(&bytes);
+    // [Fix #4] Periodic ping for keepalive
+    let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
+    // Skip the first immediate tick
+    ping_interval.tick().await;
 
-        let msg = serde_json::json!({
-            "type": "input_audio.append",
-            "audio": b64
-        });
+    loop {
+        tokio::select! {
+            chunk = audio_rx.recv() => {
+                match chunk {
+                    Some(pcm_chunk) => {
+                        let bytes = pcm_to_bytes(&pcm_chunk);
+                        let b64 = pcm_bytes_to_base64(&bytes);
 
-        if let Err(e) = ws_sink.send(Message::Text(msg.to_string())).await {
-            eprintln!("WebSocket send error: {}", e);
-            break;
+                        let msg = serde_json::json!({
+                            "type": "input_audio.append",
+                            "audio": b64
+                        });
+
+                        if let Err(e) = ws_sink.send(Message::Text(msg.to_string())).await {
+                            eprintln!("WebSocket send error: {}", e);
+                            cancel.cancel();
+                            return;
+                        }
+                    }
+                    None => break, // Audio channel closed normally
+                }
+            }
+            _ = ping_interval.tick() => {
+                if let Err(e) = ws_sink.send(Message::Ping(vec![])).await {
+                    eprintln!("WebSocket ping failed: {}", e);
+                    cancel.cancel();
+                    return;
+                }
+            }
+            _ = cancel.cancelled() => {
+                // Receiver signalled an error; stop sending.
+                return;
+            }
         }
     }
 
-    // Audio channel closed — send end-of-audio signal
+    // Audio channel closed — send end-of-audio signal.
+    // Do NOT call ws_sink.close() afterwards: that sends a WebSocket
+    // Close frame which tells the server to tear down the connection
+    // immediately — often before it has finished sending the
+    // transcription results. Instead, just drop the sink; the TCP
+    // connection stays alive for the receiver to collect results.
     let end_msg = serde_json::json!({
         "type": "input_audio.end"
     });
     if let Err(e) = ws_sink.send(Message::Text(end_msg.to_string())).await {
         eprintln!("WebSocket send error (input_audio.end): {}", e);
+        cancel.cancel();
     }
-
-    let _ = ws_sink.close().await;
 }
 
 /// Receiver loop: reads WebSocket messages, parses events, forwards to channel.
-async fn receiver_loop<S>(mut ws_source: S, event_tx: mpsc::Sender<TranscriptionEvent>)
-where
+///
+/// Cancels the shared token on error so the sender can clean up. Logs
+/// unexpected stream closures instead of silently dropping.
+async fn receiver_loop<S>(
+    mut ws_source: S,
+    event_tx: mpsc::Sender<TranscriptionEvent>,
+    cancel: CancellationToken,
+) where
     S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    while let Some(msg_result) = ws_source.next().await {
-        let msg = match msg_result {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("WebSocket receive error: {}", e);
-                let _ = event_tx
-                    .send(TranscriptionEvent::Error {
-                        message: format!("WebSocket error: {}", e),
-                    })
-                    .await;
-                break;
-            }
-        };
+    loop {
+        tokio::select! {
+            msg_opt = ws_source.next() => {
+                let msg_result = match msg_opt {
+                    Some(r) => r,
+                    None => {
+                        // [Fix #8] Stream ended without Close frame (TCP RST
+                        // or silent drop). Log it and let the caller collect
+                        // whatever text was accumulated so far.
+                        eprintln!("WebSocket stream ended unexpectedly");
+                        cancel.cancel();
+                        return;
+                    }
+                };
+                let msg = match msg_result {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("WebSocket receive error: {}", e);
+                        let _ = event_tx
+                            .send(TranscriptionEvent::Error {
+                                message: format!("WebSocket error: {}", e),
+                            })
+                            .await;
+                        cancel.cancel();
+                        return;
+                    }
+                };
 
-        match msg {
-            Message::Text(text) => {
-                let event = parse_event(&text);
-                let is_terminal = matches!(
-                    event,
-                    TranscriptionEvent::Done | TranscriptionEvent::Error { .. }
-                );
-                if event_tx.send(event).await.is_err() {
-                    // Receiver dropped
-                    break;
-                }
-                if is_terminal {
-                    break;
+                match msg {
+                    Message::Text(text) => {
+                        let event = parse_event(&text);
+                        let is_terminal = matches!(
+                            event,
+                            TranscriptionEvent::Done | TranscriptionEvent::Error { .. }
+                        );
+                        if event_tx.send(event).await.is_err() {
+                            // Caller dropped the receiver
+                            cancel.cancel();
+                            return;
+                        }
+                        if is_terminal {
+                            return;
+                        }
+                    }
+                    Message::Close(_) => {
+                        let _ = event_tx.send(TranscriptionEvent::Done).await;
+                        return;
+                    }
+                    _ => {
+                        // Ignore binary, ping, pong frames
+                    }
                 }
             }
-            Message::Close(_) => {
-                let _ = event_tx.send(TranscriptionEvent::Done).await;
-                break;
-            }
-            _ => {
-                // Ignore binary, ping, pong frames
+            _ = cancel.cancelled() => {
+                // Sender signalled an error; stop receiving.
+                return;
             }
         }
     }
@@ -509,5 +610,15 @@ mod tests {
             TranscriptionEvent::TextDelta { text } => assert_eq!(text, ""),
             other => panic!("Expected TextDelta, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_timeout_constants_are_reasonable() {
+        assert!(WS_CONNECT_TIMEOUT.as_secs() >= 5);
+        assert!(WS_CONNECT_TIMEOUT.as_secs() <= 60);
+        assert!(SESSION_CREATED_TIMEOUT.as_secs() >= 5);
+        assert!(SESSION_CREATED_TIMEOUT.as_secs() <= 60);
+        assert!(WS_PING_INTERVAL.as_secs() >= 10);
+        assert!(WS_PING_INTERVAL.as_secs() <= 120);
     }
 }

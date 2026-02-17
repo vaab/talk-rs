@@ -19,6 +19,9 @@ use super::Transcriber;
 /// Mistral API transcription endpoint.
 const MISTRAL_API_ENDPOINT: &str = "https://api.mistral.ai/v1/audio/transcriptions";
 
+/// Timeout for batch file upload transcription requests.
+const BATCH_FILE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Response from Mistral API transcription endpoint.
 #[derive(Debug, Deserialize)]
 struct MistralResponse {
@@ -105,11 +108,14 @@ impl Transcriber for MistralTranscriber {
             form = form.text("context_bias", bias.clone());
         }
 
-        // Send request to Mistral API
+        // [Fix #3] Send request with timeout to prevent hanging on
+        // unresponsive servers. Without this, Client::new() has no default
+        // timeout and the request could block forever.
         let response = self
             .client
             .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .timeout(BATCH_FILE_TIMEOUT)
             .multipart(form)
             .send()
             .await
