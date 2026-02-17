@@ -7,10 +7,12 @@ use crate::core::audio::cpal_capture::CpalCapture;
 use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::core::clipboard::{Clipboard, X11Clipboard};
 use crate::core::config::{AudioConfig, Config};
+use crate::core::daemon::{self, DaemonStatus};
 use crate::core::error::TalkError;
 use crate::core::transcription::{
     MistralRealtimeTranscriber, MistralTranscriber, Transcriber, TranscriptionEvent,
 };
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -69,17 +71,36 @@ async fn simulate_paste() -> Result<(), TalkError> {
 }
 
 /// Dictate: record audio, transcribe, and paste into focused application.
-pub async fn dictate(args: Vec<String>, batch: bool) -> Result<(), TalkError> {
+pub async fn dictate(
+    args: Vec<String>,
+    batch: bool,
+    toggle: bool,
+    daemon: bool,
+    target_window_arg: Option<String>,
+) -> Result<(), TalkError> {
+    // Toggle mode: start or stop a daemon
+    if toggle {
+        return toggle_dispatch(batch).await;
+    }
+
     let save_path = parse_args(&args)?;
 
     // Load configuration
     let config = Config::load(None)?;
 
-    // Capture active window before recording starts
-    let target_window = get_active_window().await;
-    if let Some(ref wid) = target_window {
-        eprintln!("Captured active window: {}", wid);
-    }
+    // Determine target window: use --target-window arg (from daemon mode)
+    // or capture the currently active window.
+    let target_window = if let Some(wid) = target_window_arg {
+        Some(wid)
+    } else if !daemon {
+        let wid = get_active_window().await;
+        if let Some(ref w) = wid {
+            eprintln!("Captured active window: {}", w);
+        }
+        wid
+    } else {
+        None
+    };
 
     let text = if batch {
         // Batch mode: capture audio, encode, then transcribe
@@ -154,6 +175,91 @@ pub async fn dictate(args: Vec<String>, batch: bool) -> Result<(), TalkError> {
     // Print transcription to stdout
     println!("{}", text);
 
+    // If running as daemon, clean up PID file on normal exit
+    if daemon {
+        if let Ok(pid_file) = daemon::pid_path() {
+            let _ = daemon::remove_pid_file(&pid_file);
+        }
+    }
+
+    Ok(())
+}
+
+/// Toggle dispatch: start a new daemon or stop a running one.
+async fn toggle_dispatch(batch: bool) -> Result<(), TalkError> {
+    let pid_file = daemon::pid_path()?;
+
+    // Acquire exclusive lock to prevent race between concurrent toggle calls
+    let _lock = daemon::acquire_lock()?;
+
+    match daemon::check_status(&pid_file)? {
+        DaemonStatus::NotRunning => toggle_start(&pid_file, batch).await,
+        DaemonStatus::Running { pid } => toggle_stop(pid, &pid_file),
+    }
+}
+
+/// Start a new daemon: capture window, spawn detached dictate process, write PID.
+async fn toggle_start(pid_file: &std::path::Path, batch: bool) -> Result<(), TalkError> {
+    // Capture active window before spawning daemon
+    let target_window = get_active_window().await;
+
+    // Find our own executable
+    let exe = std::env::current_exe()
+        .map_err(|e| TalkError::Config(format!("failed to determine current executable: {}", e)))?;
+
+    // Build daemon command: talk-rs dictate --daemon [--batch] [--target-window=WID]
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("dictate").arg("--daemon");
+
+    if batch {
+        cmd.arg("--batch");
+    }
+
+    if let Some(ref wid) = target_window {
+        cmd.arg("--target-window").arg(wid);
+    }
+
+    // Redirect stdout/stderr to log file
+    let log_file_path = daemon::log_path()?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .map_err(|e| {
+            TalkError::Config(format!(
+                "failed to open log file {}: {}",
+                log_file_path.display(),
+                e
+            ))
+        })?;
+    let log_stderr = log_file
+        .try_clone()
+        .map_err(|e| TalkError::Config(format!("failed to clone log file handle: {}", e)))?;
+
+    cmd.stdout(std::process::Stdio::from(log_file));
+    cmd.stderr(std::process::Stdio::from(log_stderr));
+    cmd.stdin(std::process::Stdio::null());
+
+    // Create new process group (equivalent to setsid for signal isolation)
+    cmd.process_group(0);
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| TalkError::Config(format!("failed to spawn daemon process: {}", e)))?;
+
+    let child_pid = child.id();
+    daemon::write_pid_file(pid_file, child_pid)?;
+
+    eprintln!("Dictation started (PID {})", child_pid);
+
+    Ok(())
+}
+
+/// Stop a running daemon: SIGINT, wait, SIGTERM fallback, clean up PID file.
+fn toggle_stop(pid: u32, pid_file: &std::path::Path) -> Result<(), TalkError> {
+    eprintln!("Stopping dictation (PID {})...", pid);
+    daemon::stop_daemon(pid, pid_file)?;
+    eprintln!("Dictation stopped");
     Ok(())
 }
 

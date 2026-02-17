@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod clipboard;
 pub mod config;
+pub mod daemon;
 pub mod error;
 pub mod transcription;
 
