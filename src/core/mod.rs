@@ -3,6 +3,7 @@ pub mod clipboard;
 pub mod config;
 pub mod daemon;
 pub mod error;
+pub mod overlay;
 pub mod transcription;
 
 pub use clipboard::{Clipboard, MockClipboard, X11Clipboard};
