@@ -57,7 +57,7 @@ impl OverlayHandle {
             .name("overlay".into())
             .spawn(move || {
                 if let Err(e) = overlay_thread(rx) {
-                    eprintln!("Overlay thread error: {}", e);
+                    log::error!("overlay thread error: {}", e);
                 }
             })
             .map_err(|e| TalkError::Audio(format!("failed to spawn overlay thread: {}", e)))?;

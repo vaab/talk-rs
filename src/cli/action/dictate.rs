@@ -18,6 +18,18 @@ use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
+/// Options for the dictate command.
+pub struct DictateOpts {
+    pub args: Vec<String>,
+    pub batch: bool,
+    pub toggle: bool,
+    pub no_sounds: bool,
+    pub no_overlay: bool,
+    pub daemon: bool,
+    pub target_window: Option<String>,
+    pub verbose: u8,
+}
+
 /// Parse command-line arguments for the dictate command.
 ///
 /// Returns an optional output file path for saving the audio recording.
@@ -73,33 +85,26 @@ async fn simulate_paste() -> Result<(), TalkError> {
 }
 
 /// Dictate: record audio, transcribe, and paste into focused application.
-pub async fn dictate(
-    args: Vec<String>,
-    batch: bool,
-    toggle: bool,
-    no_sounds: bool,
-    no_overlay: bool,
-    daemon: bool,
-    target_window_arg: Option<String>,
-) -> Result<(), TalkError> {
+pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Toggle mode: start or stop a daemon
-    if toggle {
-        return toggle_dispatch(batch, no_sounds, no_overlay).await;
+    if opts.toggle {
+        return toggle_dispatch(opts.batch, opts.no_sounds, opts.no_overlay, opts.verbose).await;
     }
 
-    let save_path = parse_args(&args)?;
+    let save_path = parse_args(&opts.args)?;
 
     // Load configuration
     let config = Config::load(None)?;
 
     // Determine target window: use --target-window arg (from daemon mode)
     // or capture the currently active window.
-    let target_window = if let Some(wid) = target_window_arg {
+    let target_window = if let Some(wid) = opts.target_window {
+        log::debug!("using target window from argument: {}", wid);
         Some(wid)
-    } else if !daemon {
+    } else if !opts.daemon {
         let wid = get_active_window().await;
         if let Some(ref w) = wid {
-            eprintln!("Captured active window: {}", w);
+            log::debug!("captured active window: {}", w);
         }
         wid
     } else {
@@ -107,26 +112,34 @@ pub async fn dictate(
     };
 
     // Initialize sound player (single-channel with preemption)
-    let player = if no_sounds {
+    let player = if opts.no_sounds {
+        log::debug!("sound indicators disabled");
         None
     } else {
         match SoundPlayer::new() {
-            Ok(p) => Some(p),
+            Ok(p) => {
+                log::debug!("sound player initialized");
+                Some(p)
+            }
             Err(e) => {
-                eprintln!("Warning: sound indicators unavailable: {}", e);
+                log::warn!("sound indicators unavailable: {}", e);
                 None
             }
         }
     };
 
     // Initialize overlay (visual indicator on X11)
-    let overlay = if no_overlay {
+    let overlay = if opts.no_overlay {
+        log::debug!("visual overlay disabled");
         None
     } else {
         match OverlayHandle::new() {
-            Ok(h) => Some(h),
+            Ok(h) => {
+                log::debug!("overlay initialized");
+                Some(h)
+            }
             Err(e) => {
-                eprintln!("Warning: visual overlay unavailable: {}", e);
+                log::warn!("visual overlay unavailable: {}", e);
                 None
             }
         }
@@ -134,11 +147,13 @@ pub async fn dictate(
 
     // Play start sound
     if let Some(ref p) = player {
+        log::debug!("playing start sound");
         p.play_start().await;
     }
 
     // Show recording indicator
     if let Some(ref o) = overlay {
+        log::debug!("showing recording overlay");
         o.show(IndicatorKind::Recording);
     }
 
@@ -147,7 +162,12 @@ pub async fn dictate(
         .as_ref()
         .map(|p| p.start_boop_loop(std::time::Duration::from_secs(5)));
 
-    let text = if batch {
+    log::info!(
+        "starting {} transcription",
+        if opts.batch { "batch" } else { "realtime" }
+    );
+
+    let text = if opts.batch {
         // Batch mode: capture audio, encode, then transcribe
         let mut capture = CpalCapture::new(config.audio.clone());
         let audio_rx = capture.start()?;
@@ -170,72 +190,78 @@ pub async fn dictate(
     } else {
         // Realtime mode (default): stream audio over WebSocket
         if save_path.is_some() {
-            eprintln!(
-                "Warning: audio file saving is not supported in realtime mode, ignoring file path"
-            );
+            log::warn!("audio file saving is not supported in realtime mode, ignoring file path");
         }
         dictate_realtime(config).await?
     };
 
     // Stop boop loop and play stop sound (preempts any in-progress boop)
     if let Some(token) = boop_token {
+        log::debug!("stopping boop loop");
         token.cancel();
     }
 
     // Hide recording indicator
     if let Some(ref o) = overlay {
+        log::debug!("hiding overlay");
         o.hide();
     }
 
     if let Some(ref p) = player {
+        log::debug!("playing stop sound");
         p.play_stop().await;
     }
 
     let text = text.trim().to_string();
 
     if text.is_empty() {
-        eprintln!("Empty transcription — nothing to paste");
+        log::warn!("empty transcription — nothing to paste");
         return Ok(());
     }
 
-    eprintln!("Transcription: {}", text);
+    log::info!("transcription: {}", text);
 
     // Paste into focused application
     let clipboard = X11Clipboard::new();
 
     // Refocus target window
     if let Some(ref wid) = target_window {
+        log::debug!("refocusing target window: {}", wid);
         if !focus_window(wid).await {
-            eprintln!("Warning: could not refocus target window");
+            log::warn!("could not refocus target window {}", wid);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     // Save current clipboard
+    log::debug!("saving current clipboard");
     let saved_clipboard = clipboard.get_text().await.ok();
 
     // Set clipboard to transcription
+    log::debug!("setting clipboard to transcription text");
     clipboard.set_text(&text).await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Simulate paste
+    log::debug!("simulating paste (ctrl+shift+v)");
     simulate_paste().await?;
 
     // Restore clipboard after paste
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     if let Some(saved) = saved_clipboard {
+        log::debug!("restoring original clipboard");
         let _ = clipboard.set_text(&saved).await;
     }
 
     if let Some(ref path) = save_path {
-        eprintln!("Audio saved to: {}", path.display());
+        log::info!("audio saved to: {}", path.display());
     }
 
     // Print transcription to stdout
     println!("{}", text);
 
     // If running as daemon, clean up PID file on normal exit
-    if daemon {
+    if opts.daemon {
         if let Ok(pid_file) = daemon::pid_path() {
             let _ = daemon::remove_pid_file(&pid_file);
         }
@@ -245,14 +271,21 @@ pub async fn dictate(
 }
 
 /// Toggle dispatch: start a new daemon or stop a running one.
-async fn toggle_dispatch(batch: bool, no_sounds: bool, no_overlay: bool) -> Result<(), TalkError> {
+async fn toggle_dispatch(
+    batch: bool,
+    no_sounds: bool,
+    no_overlay: bool,
+    verbose: u8,
+) -> Result<(), TalkError> {
     let pid_file = daemon::pid_path()?;
 
     // Acquire exclusive lock to prevent race between concurrent toggle calls
     let _lock = daemon::acquire_lock()?;
 
     match daemon::check_status(&pid_file)? {
-        DaemonStatus::NotRunning => toggle_start(&pid_file, batch, no_sounds, no_overlay).await,
+        DaemonStatus::NotRunning => {
+            toggle_start(&pid_file, batch, no_sounds, no_overlay, verbose).await
+        }
         DaemonStatus::Running { pid } => toggle_stop(pid, &pid_file),
     }
 }
@@ -263,6 +296,7 @@ async fn toggle_start(
     batch: bool,
     no_sounds: bool,
     no_overlay: bool,
+    verbose: u8,
 ) -> Result<(), TalkError> {
     // Capture active window before spawning daemon
     let target_window = get_active_window().await;
@@ -271,8 +305,14 @@ async fn toggle_start(
     let exe = std::env::current_exe()
         .map_err(|e| TalkError::Config(format!("failed to determine current executable: {}", e)))?;
 
-    // Build daemon command: talk-rs dictate --daemon [--batch] [--no-sounds] [--target-window=WID]
+    // Build daemon command: talk-rs [-v...] dictate --daemon [--batch] [--no-sounds] [--target-window=WID]
     let mut cmd = std::process::Command::new(&exe);
+
+    // Forward verbosity level (before subcommand)
+    if verbose > 0 {
+        cmd.arg(format!("-{}", "v".repeat(verbose as usize)));
+    }
+
     cmd.arg("dictate").arg("--daemon");
 
     if batch {
@@ -322,16 +362,16 @@ async fn toggle_start(
     let child_pid = child.id();
     daemon::write_pid_file(pid_file, child_pid)?;
 
-    eprintln!("Dictation started (PID {})", child_pid);
+    log::info!("dictation started (PID {})", child_pid);
 
     Ok(())
 }
 
 /// Stop a running daemon: SIGINT, wait, SIGTERM fallback, clean up PID file.
 fn toggle_stop(pid: u32, pid_file: &std::path::Path) -> Result<(), TalkError> {
-    eprintln!("Stopping dictation (PID {})...", pid);
+    log::info!("stopping dictation (PID {})", pid);
     daemon::stop_daemon(pid, pid_file)?;
-    eprintln!("Dictation stopped");
+    log::info!("dictation stopped");
     Ok(())
 }
 
@@ -397,7 +437,7 @@ async fn dictate_realtime(config: Config) -> Result<String, TalkError> {
     let transcriber = MistralRealtimeTranscriber::new(config.providers.mistral);
     let mut event_rx = transcriber.transcribe_realtime(audio_rx).await?;
 
-    eprintln!("Recording (realtime)... Press Ctrl+C to stop.");
+    log::info!("recording (realtime)... press Ctrl+C to stop");
 
     let capture_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let capture_stop_clone = capture_stop.clone();
@@ -416,7 +456,7 @@ async fn dictate_realtime(config: Config) -> Result<String, TalkError> {
     loop {
         // Check if Ctrl+C was pressed — stop capture to trigger end-of-audio
         if capture_stop.load(std::sync::atomic::Ordering::Acquire) {
-            eprintln!("\nStopping recording...");
+            log::info!("stopping recording");
             capture.stop()?;
             // Reset so we don't stop again
             capture_stop.store(false, std::sync::atomic::Ordering::Release);
@@ -463,10 +503,10 @@ async fn dictate_realtime(config: Config) -> Result<String, TalkError> {
                         )));
                     }
                     Some(TranscriptionEvent::SessionCreated) => {
-                        eprintln!("Session created");
+                        log::debug!("session created event received");
                     }
                     Some(TranscriptionEvent::Language { language }) => {
-                        eprintln!("Detected language: {}", language);
+                        log::info!("detected language: {}", language);
                     }
                     Some(TranscriptionEvent::Unknown { .. }) => {
                         // Ignore unknown/future event types
@@ -514,7 +554,7 @@ async fn dictate_streaming(
         let mut writer = match OggOpusWriter::new(audio_config) {
             Ok(writer) => writer,
             Err(err) => {
-                eprintln!("Error creating writer: {}", err);
+                log::error!("error creating audio writer: {}", err);
                 return Err(err);
             }
         };
@@ -522,17 +562,17 @@ async fn dictate_streaming(
         let header = match writer.header() {
             Ok(bytes) => bytes,
             Err(err) => {
-                eprintln!("Error creating header: {}", err);
+                log::error!("error creating audio header: {}", err);
                 return Err(err);
             }
         };
         if stream_tx.send(header.clone()).await.is_err() {
-            eprintln!("Transcription stream closed");
+            log::warn!("transcription stream closed during header send");
             return Ok::<(), TalkError>(());
         }
         if let Some(ref mut f) = file {
             if let Err(err) = f.write_all(&header).await {
-                eprintln!("Error writing to file: {}", err);
+                log::error!("error writing header to file: {}", err);
             }
         }
 
@@ -540,20 +580,20 @@ async fn dictate_streaming(
             let encoded_data = match writer.write_pcm(&pcm_chunk) {
                 Ok(data) => data,
                 Err(err) => {
-                    eprintln!("Error encoding audio: {}", err);
+                    log::error!("error encoding audio: {}", err);
                     return Err(err);
                 }
             };
             if !encoded_data.is_empty() {
                 // Send to transcription stream
                 if stream_tx.send(encoded_data.clone()).await.is_err() {
-                    eprintln!("Transcription stream closed");
+                    log::warn!("transcription stream closed during audio send");
                     break;
                 }
                 // Optionally write to file
                 if let Some(ref mut f) = file {
                     if let Err(err) = f.write_all(&encoded_data).await {
-                        eprintln!("Error writing to file: {}", err);
+                        log::error!("error writing audio to file: {}", err);
                     }
                 }
             }
@@ -570,7 +610,7 @@ async fn dictate_streaming(
                 }
             }
             Err(err) => {
-                eprintln!("Error finalizing writer: {}", err);
+                log::error!("error finalizing audio writer: {}", err);
                 return Err(err);
             }
         }
@@ -589,23 +629,23 @@ async fn dictate_streaming(
     let transcribe_task =
         tokio::spawn(async move { transcriber.transcribe_stream(stream_rx, "audio.ogg").await });
 
-    eprintln!("Recording... Press Ctrl+C to stop and transcribe.");
+    log::info!("recording (batch)... press Ctrl+C to stop and transcribe");
 
     // Wait for SIGINT
     tokio::signal::ctrl_c()
         .await
         .map_err(|err| TalkError::Audio(format!("Failed to listen for Ctrl+C: {}", err)))?;
 
-    eprintln!("Stopping recording...");
+    log::info!("stopping recording");
 
     // Stop capture (closes audio channel → encode task finishes → stream_tx drops → transcription completes)
     capture.stop()?;
 
     // Wait for encode task
     match encode_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("Encode error: {}", err),
-        Err(err) => eprintln!("Encode task panicked: {}", err),
+        Ok(Ok(())) => log::debug!("encode task completed"),
+        Ok(Err(err)) => log::error!("encode error: {}", err),
+        Err(err) => log::error!("encode task panicked: {}", err),
     }
 
     // Wait for transcription result

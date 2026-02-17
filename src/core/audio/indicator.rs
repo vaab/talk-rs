@@ -221,7 +221,7 @@ impl SoundPlayer {
                     }
                 },
                 |err| {
-                    eprintln!("Audio output error: {}", err);
+                    log::error!("audio output error: {}", err);
                 },
                 None, // no timeout
             )

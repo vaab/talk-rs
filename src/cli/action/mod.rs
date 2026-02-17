@@ -4,11 +4,11 @@ mod transcribe;
 
 use crate::cli::def::Commands;
 
-pub use dictate::dictate;
+pub use dictate::{dictate, DictateOpts};
 pub use record::record;
 pub use transcribe::transcribe;
 
-pub async fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Record { file } => {
             let args = file.map(|f| vec![f]).unwrap_or_default();
@@ -30,16 +30,16 @@ pub async fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error
             daemon,
             target_window,
         } => {
-            let args = file.map(|f| vec![f]).unwrap_or_default();
-            dictate(
-                args,
+            dictate(DictateOpts {
+                args: file.map(|f| vec![f]).unwrap_or_default(),
                 batch,
                 toggle,
                 no_sounds,
                 no_overlay,
                 daemon,
                 target_window,
-            )
+                verbose,
+            })
             .await?;
         }
     }
