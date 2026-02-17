@@ -83,12 +83,12 @@ pub async fn record(args: Vec<String>) -> Result<(), TalkError> {
         let header = match writer.header() {
             Ok(bytes) => bytes,
             Err(err) => {
-                eprintln!("Error creating header: {}", err);
+                log::error!("error creating header: {}", err);
                 return Err(err);
             }
         };
         if let Err(err) = file.write_all(&header).await {
-            eprintln!("Error writing header: {}", err);
+            log::error!("error writing header: {}", err);
             return Err(TalkError::Io(err));
         }
 
@@ -96,13 +96,13 @@ pub async fn record(args: Vec<String>) -> Result<(), TalkError> {
             let encoded_data = match writer.write_pcm(&pcm_chunk) {
                 Ok(data) => data,
                 Err(err) => {
-                    eprintln!("Error encoding audio: {}", err);
+                    log::error!("error encoding audio: {}", err);
                     return Err(err);
                 }
             };
             if !encoded_data.is_empty() {
                 if let Err(err) = file.write_all(&encoded_data).await {
-                    eprintln!("Error writing to file: {}", err);
+                    log::error!("error writing to file: {}", err);
                     return Err(TalkError::Io(err));
                 }
             }
@@ -114,25 +114,25 @@ pub async fn record(args: Vec<String>) -> Result<(), TalkError> {
                 if !remaining_data.is_empty() {
                     if is_wav {
                         if let Err(err) = file.seek(SeekFrom::Start(0)).await {
-                            eprintln!("Error seeking to start: {}", err);
+                            log::error!("error seeking to start: {}", err);
                             return Err(TalkError::Io(err));
                         }
                     }
                     if let Err(err) = file.write_all(&remaining_data).await {
-                        eprintln!("Error writing flushed data: {}", err);
+                        log::error!("error writing flushed data: {}", err);
                         return Err(TalkError::Io(err));
                     }
                 }
             }
             Err(err) => {
-                eprintln!("Error finalizing writer: {}", err);
+                log::error!("error finalizing writer: {}", err);
                 return Err(err);
             }
         }
 
         // Close file
         if let Err(err) = file.sync_all().await {
-            eprintln!("Error syncing file: {}", err);
+            log::error!("error syncing file: {}", err);
             return Err(TalkError::Io(err));
         }
 

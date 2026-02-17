@@ -3,6 +3,10 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "talk-rs", version, about = "Talk CLI")]
 pub struct Cli {
+    /// Increase logging verbosity (-v info, -vv debug, -vvv trace)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
     #[command(subcommand)]
     pub command: Commands,
 }

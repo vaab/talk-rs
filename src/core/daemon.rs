@@ -206,8 +206,8 @@ pub fn stop_daemon(pid: u32, pid_file: &Path) -> Result<(), TalkError> {
         }
         if Instant::now() >= deadline {
             // Phase 3: SIGTERM (forceful)
-            eprintln!(
-                "Daemon did not exit within {}s, sending SIGTERM",
+            log::warn!(
+                "daemon did not exit within {}s, sending SIGTERM",
                 GRACEFUL_TIMEOUT.as_secs()
             );
             let _ = kill(nix_pid, Signal::SIGTERM);

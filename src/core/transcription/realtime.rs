@@ -202,6 +202,8 @@ impl MistralRealtimeTranscriber {
                 TalkError::Transcription(format!("Failed to build WebSocket request: {}", e))
             })?;
 
+        log::debug!("connecting to WebSocket: {}", ws_url);
+
         // [Fix #2] Connect with timeout to avoid hanging on unreachable servers
         let (ws_stream, _response) = tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
@@ -218,6 +220,8 @@ impl MistralRealtimeTranscriber {
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
+        log::debug!("WebSocket connected, waiting for session.created");
+
         // [Fix #1] Wait for session.created with timeout
         let session_event = tokio::time::timeout(
             SESSION_CREATED_TIMEOUT,
@@ -230,7 +234,9 @@ impl MistralRealtimeTranscriber {
                 SESSION_CREATED_TIMEOUT.as_secs()
             ))
         })??;
-        eprintln!("Realtime session established");
+        log::info!("realtime session established");
+
+        log::debug!("sending session.update with pcm_s16le/16000");
 
         // Send session.update with audio format
         let session_update = serde_json::json!({
@@ -268,10 +274,10 @@ impl MistralRealtimeTranscriber {
         // [Fix #6] Cleanup task that logs panics instead of swallowing them
         tokio::spawn(async move {
             if let Err(e) = sender_task.await {
-                eprintln!("Sender task panicked: {}", e);
+                log::error!("sender task panicked: {}", e);
             }
             if let Err(e) = receiver_task.await {
-                eprintln!("Receiver task panicked: {}", e);
+                log::error!("receiver task panicked: {}", e);
             }
         });
 
@@ -337,6 +343,7 @@ async fn sender_loop<S>(
                 match chunk {
                     Some(pcm_chunk) => {
                         let bytes = pcm_to_bytes(&pcm_chunk);
+                        log::trace!("sending audio chunk: {} PCM samples, {} bytes", pcm_chunk.len(), bytes.len());
                         let b64 = pcm_bytes_to_base64(&bytes);
 
                         let msg = serde_json::json!({
@@ -345,7 +352,7 @@ async fn sender_loop<S>(
                         });
 
                         if let Err(e) = ws_sink.send(Message::Text(msg.to_string())).await {
-                            eprintln!("WebSocket send error: {}", e);
+                            log::error!("WebSocket send error: {}", e);
                             cancel.cancel();
                             return;
                         }
@@ -355,7 +362,7 @@ async fn sender_loop<S>(
             }
             _ = ping_interval.tick() => {
                 if let Err(e) = ws_sink.send(Message::Ping(vec![])).await {
-                    eprintln!("WebSocket ping failed: {}", e);
+                    log::warn!("WebSocket ping failed: {}", e);
                     cancel.cancel();
                     return;
                 }
@@ -376,8 +383,9 @@ async fn sender_loop<S>(
     let end_msg = serde_json::json!({
         "type": "input_audio.end"
     });
+    log::debug!("sending input_audio.end");
     if let Err(e) = ws_sink.send(Message::Text(end_msg.to_string())).await {
-        eprintln!("WebSocket send error (input_audio.end): {}", e);
+        log::error!("WebSocket send error (input_audio.end): {}", e);
         cancel.cancel();
     }
 }
@@ -402,7 +410,7 @@ async fn receiver_loop<S>(
                         // [Fix #8] Stream ended without Close frame (TCP RST
                         // or silent drop). Log it and let the caller collect
                         // whatever text was accumulated so far.
-                        eprintln!("WebSocket stream ended unexpectedly");
+                        log::warn!("WebSocket stream ended unexpectedly");
                         cancel.cancel();
                         return;
                     }
@@ -410,7 +418,7 @@ async fn receiver_loop<S>(
                 let msg = match msg_result {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("WebSocket receive error: {}", e);
+                        log::error!("WebSocket receive error: {}", e);
                         let _ = event_tx
                             .send(TranscriptionEvent::Error {
                                 message: format!("WebSocket error: {}", e),
@@ -423,6 +431,7 @@ async fn receiver_loop<S>(
 
                 match msg {
                     Message::Text(text) => {
+                        log::trace!("received WS text: {}", text);
                         let event = parse_event(&text);
                         let is_terminal = matches!(
                             event,
@@ -437,12 +446,16 @@ async fn receiver_loop<S>(
                             return;
                         }
                     }
-                    Message::Close(_) => {
+                    Message::Close(frame) => {
+                        log::debug!("received WS Close frame: {:?}", frame);
                         let _ = event_tx.send(TranscriptionEvent::Done).await;
                         return;
                     }
+                    Message::Pong(_) => {
+                        log::trace!("received WS Pong");
+                    }
                     _ => {
-                        // Ignore binary, ping, pong frames
+                        // Ignore other binary frames
                     }
                 }
             }
