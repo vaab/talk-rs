@@ -10,6 +10,7 @@ use crate::core::clipboard::{Clipboard, X11Clipboard};
 use crate::core::config::{AudioConfig, Config};
 use crate::core::daemon::{self, DaemonStatus};
 use crate::core::error::TalkError;
+use crate::core::overlay::{IndicatorKind, OverlayHandle};
 use crate::core::transcription::{
     MistralRealtimeTranscriber, MistralTranscriber, Transcriber, TranscriptionEvent,
 };
@@ -77,12 +78,13 @@ pub async fn dictate(
     batch: bool,
     toggle: bool,
     no_sounds: bool,
+    no_overlay: bool,
     daemon: bool,
     target_window_arg: Option<String>,
 ) -> Result<(), TalkError> {
     // Toggle mode: start or stop a daemon
     if toggle {
-        return toggle_dispatch(batch, no_sounds).await;
+        return toggle_dispatch(batch, no_sounds, no_overlay).await;
     }
 
     let save_path = parse_args(&args)?;
@@ -117,9 +119,27 @@ pub async fn dictate(
         }
     };
 
+    // Initialize overlay (visual indicator on X11)
+    let overlay = if no_overlay {
+        None
+    } else {
+        match OverlayHandle::new() {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("Warning: visual overlay unavailable: {}", e);
+                None
+            }
+        }
+    };
+
     // Play start sound
     if let Some(ref p) = player {
         p.play_start().await;
+    }
+
+    // Show recording indicator
+    if let Some(ref o) = overlay {
+        o.show(IndicatorKind::Recording);
     }
 
     // Start boop loop (every 5 seconds)
@@ -161,6 +181,12 @@ pub async fn dictate(
     if let Some(token) = boop_token {
         token.cancel();
     }
+
+    // Hide recording indicator
+    if let Some(ref o) = overlay {
+        o.hide();
+    }
+
     if let Some(ref p) = player {
         p.play_stop().await;
     }
@@ -219,14 +245,14 @@ pub async fn dictate(
 }
 
 /// Toggle dispatch: start a new daemon or stop a running one.
-async fn toggle_dispatch(batch: bool, no_sounds: bool) -> Result<(), TalkError> {
+async fn toggle_dispatch(batch: bool, no_sounds: bool, no_overlay: bool) -> Result<(), TalkError> {
     let pid_file = daemon::pid_path()?;
 
     // Acquire exclusive lock to prevent race between concurrent toggle calls
     let _lock = daemon::acquire_lock()?;
 
     match daemon::check_status(&pid_file)? {
-        DaemonStatus::NotRunning => toggle_start(&pid_file, batch, no_sounds).await,
+        DaemonStatus::NotRunning => toggle_start(&pid_file, batch, no_sounds, no_overlay).await,
         DaemonStatus::Running { pid } => toggle_stop(pid, &pid_file),
     }
 }
@@ -236,6 +262,7 @@ async fn toggle_start(
     pid_file: &std::path::Path,
     batch: bool,
     no_sounds: bool,
+    no_overlay: bool,
 ) -> Result<(), TalkError> {
     // Capture active window before spawning daemon
     let target_window = get_active_window().await;
@@ -254,6 +281,10 @@ async fn toggle_start(
 
     if no_sounds {
         cmd.arg("--no-sounds");
+    }
+
+    if no_overlay {
+        cmd.arg("--no-overlay");
     }
 
     if let Some(ref wid) = target_window {

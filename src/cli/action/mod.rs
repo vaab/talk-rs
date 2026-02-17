@@ -26,11 +26,21 @@ pub async fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error
             batch,
             toggle,
             no_sounds,
+            no_overlay,
             daemon,
             target_window,
         } => {
             let args = file.map(|f| vec![f]).unwrap_or_default();
-            dictate(args, batch, toggle, no_sounds, daemon, target_window).await?;
+            dictate(
+                args,
+                batch,
+                toggle,
+                no_sounds,
+                no_overlay,
+                daemon,
+                target_window,
+            )
+            .await?;
         }
     }
     Ok(())

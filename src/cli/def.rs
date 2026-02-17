@@ -38,6 +38,9 @@ pub enum Commands {
         /// Disable sound indicators (start/stop/boop)
         #[arg(long)]
         no_sounds: bool,
+        /// Disable visual overlay indicator
+        #[arg(long)]
+        no_overlay: bool,
         /// Run as daemon process (internal, used by --toggle)
         #[arg(long, hide = true)]
         daemon: bool,
