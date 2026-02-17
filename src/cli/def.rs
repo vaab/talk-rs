@@ -35,6 +35,9 @@ pub enum Commands {
         /// Toggle daemon mode: first call starts recording, second call stops
         #[arg(long)]
         toggle: bool,
+        /// Disable sound indicators (start/stop/boop)
+        #[arg(long)]
+        no_sounds: bool,
         /// Run as daemon process (internal, used by --toggle)
         #[arg(long, hide = true)]
         daemon: bool,
