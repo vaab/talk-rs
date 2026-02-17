@@ -4,6 +4,7 @@
 //! into the focused application via clipboard.
 
 use crate::core::audio::cpal_capture::CpalCapture;
+use crate::core::audio::indicator::SoundPlayer;
 use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::core::clipboard::{Clipboard, X11Clipboard};
 use crate::core::config::{AudioConfig, Config};
@@ -75,12 +76,13 @@ pub async fn dictate(
     args: Vec<String>,
     batch: bool,
     toggle: bool,
+    no_sounds: bool,
     daemon: bool,
     target_window_arg: Option<String>,
 ) -> Result<(), TalkError> {
     // Toggle mode: start or stop a daemon
     if toggle {
-        return toggle_dispatch(batch).await;
+        return toggle_dispatch(batch, no_sounds).await;
     }
 
     let save_path = parse_args(&args)?;
@@ -101,6 +103,29 @@ pub async fn dictate(
     } else {
         None
     };
+
+    // Initialize sound player (single-channel with preemption)
+    let player = if no_sounds {
+        None
+    } else {
+        match SoundPlayer::new() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("Warning: sound indicators unavailable: {}", e);
+                None
+            }
+        }
+    };
+
+    // Play start sound
+    if let Some(ref p) = player {
+        p.play_start().await;
+    }
+
+    // Start boop loop (every 5 seconds)
+    let boop_token = player
+        .as_ref()
+        .map(|p| p.start_boop_loop(std::time::Duration::from_secs(5)));
 
     let text = if batch {
         // Batch mode: capture audio, encode, then transcribe
@@ -131,6 +156,14 @@ pub async fn dictate(
         }
         dictate_realtime(config).await?
     };
+
+    // Stop boop loop and play stop sound (preempts any in-progress boop)
+    if let Some(token) = boop_token {
+        token.cancel();
+    }
+    if let Some(ref p) = player {
+        p.play_stop().await;
+    }
 
     let text = text.trim().to_string();
 
@@ -186,20 +219,24 @@ pub async fn dictate(
 }
 
 /// Toggle dispatch: start a new daemon or stop a running one.
-async fn toggle_dispatch(batch: bool) -> Result<(), TalkError> {
+async fn toggle_dispatch(batch: bool, no_sounds: bool) -> Result<(), TalkError> {
     let pid_file = daemon::pid_path()?;
 
     // Acquire exclusive lock to prevent race between concurrent toggle calls
     let _lock = daemon::acquire_lock()?;
 
     match daemon::check_status(&pid_file)? {
-        DaemonStatus::NotRunning => toggle_start(&pid_file, batch).await,
+        DaemonStatus::NotRunning => toggle_start(&pid_file, batch, no_sounds).await,
         DaemonStatus::Running { pid } => toggle_stop(pid, &pid_file),
     }
 }
 
 /// Start a new daemon: capture window, spawn detached dictate process, write PID.
-async fn toggle_start(pid_file: &std::path::Path, batch: bool) -> Result<(), TalkError> {
+async fn toggle_start(
+    pid_file: &std::path::Path,
+    batch: bool,
+    no_sounds: bool,
+) -> Result<(), TalkError> {
     // Capture active window before spawning daemon
     let target_window = get_active_window().await;
 
@@ -207,12 +244,16 @@ async fn toggle_start(pid_file: &std::path::Path, batch: bool) -> Result<(), Tal
     let exe = std::env::current_exe()
         .map_err(|e| TalkError::Config(format!("failed to determine current executable: {}", e)))?;
 
-    // Build daemon command: talk-rs dictate --daemon [--batch] [--target-window=WID]
+    // Build daemon command: talk-rs dictate --daemon [--batch] [--no-sounds] [--target-window=WID]
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("dictate").arg("--daemon");
 
     if batch {
         cmd.arg("--batch");
+    }
+
+    if no_sounds {
+        cmd.arg("--no-sounds");
     }
 
     if let Some(ref wid) = target_window {
