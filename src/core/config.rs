@@ -40,6 +40,22 @@ pub struct ProvidersConfig {
 pub struct MistralConfig {
     /// API key for Mistral transcription service.
     pub api_key: String,
+
+    /// Model name for transcription (defaults to "voxtral-mini-latest").
+    #[serde(default = "default_mistral_model")]
+    pub model: String,
+
+    /// Context bias words/phrases for improved transcription accuracy.
+    ///
+    /// Comma-separated list of up to 100 words or phrases to guide
+    /// the model toward correct spellings of names, technical terms,
+    /// or domain-specific vocabulary.
+    #[serde(default)]
+    pub context_bias: Option<String>,
+}
+
+fn default_mistral_model() -> String {
+    "voxtral-mini-latest".to_string()
 }
 
 /// Audio configuration.
@@ -93,6 +109,8 @@ impl Config {
     /// Environment variables can override config values:
     /// - TALK_RS_OUTPUT_DIR
     /// - TALK_RS_PROVIDERS_MISTRAL_API_KEY
+    /// - TALK_RS_PROVIDERS_MISTRAL_MODEL
+    /// - TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS
     /// - TALK_RS_AUDIO_SAMPLE_RATE
     /// - TALK_RS_AUDIO_CHANNELS
     /// - TALK_RS_AUDIO_BITRATE
@@ -124,6 +142,14 @@ impl Config {
 
         if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
             config.providers.mistral.api_key = value;
+        }
+
+        if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_MODEL")? {
+            config.providers.mistral.model = value;
+        }
+
+        if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")? {
+            config.providers.mistral.context_bias = Some(value);
         }
 
         if let Some(value) = env_var_u32("TALK_RS_AUDIO_SAMPLE_RATE")? {
@@ -253,6 +279,8 @@ mod tests {
         let _lock = env_lock()?;
         let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
         let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
+        let _guard_model = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?;
+        let _guard_context_bias = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?;
         let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
         let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
         let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
@@ -272,6 +300,8 @@ audio:
         let config = Config::load(Some(file.path()))?;
         assert_eq!(config.output_dir, PathBuf::from("/tmp/test-output"));
         assert_eq!(config.providers.mistral.api_key, "test-api-key");
+        assert_eq!(config.providers.mistral.model, "voxtral-mini-latest");
+        assert!(config.providers.mistral.context_bias.is_none());
         assert_eq!(config.audio.sample_rate, 16000);
         assert_eq!(config.audio.channels, 1);
         assert_eq!(config.audio.bitrate, 32000);
@@ -282,6 +312,8 @@ audio:
     fn test_config_env_override() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
         let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
+        let _guard_model = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?;
+        let _guard_context_bias = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?;
         let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
         let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
         let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
@@ -305,10 +337,79 @@ audio:
     }
 
     #[test]
+    fn test_config_model_and_context_bias() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
+        let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
+        let _guard_model = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?;
+        let _guard_context_bias = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?;
+        let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
+        let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
+        let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+    model: voxtral-mini-2602
+    context_bias: "Kalysto,talk-rs,Voxtral"
+audio:
+  sample_rate: 16000
+  channels: 1
+  bitrate: 32000
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(config.providers.mistral.model, "voxtral-mini-2602");
+        assert_eq!(
+            config.providers.mistral.context_bias.as_deref(),
+            Some("Kalysto,talk-rs,Voxtral")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_env_override_model_and_context_bias() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
+        let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
+        let _guard_model = EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_MODEL", "voxtral-mini-2602")?;
+        let _guard_context_bias =
+            EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS", "custom,terms")?;
+        let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
+        let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
+        let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+audio:
+  sample_rate: 16000
+  channels: 1
+  bitrate: 32000
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(config.providers.mistral.model, "voxtral-mini-2602");
+        assert_eq!(
+            config.providers.mistral.context_bias.as_deref(),
+            Some("custom,terms")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_config_missing_required_field() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
         let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
         let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
+        let _guard_model = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?;
+        let _guard_context_bias = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?;
         let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
         let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
         let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
