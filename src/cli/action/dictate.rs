@@ -17,6 +17,7 @@ use crate::core::transcription::{
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 /// Options for the dictate command.
 pub struct DictateOpts {
@@ -188,11 +189,21 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         )
         .await?
     } else {
-        // Realtime mode (default): stream audio over WebSocket
-        dictate_realtime(config, save_path.as_deref()).await?
+        // Realtime mode (default): stream audio over WebSocket.
+        // Player and boop_token are passed so the stop sound fires
+        // immediately when the user toggles — not after the WebSocket
+        // finishes collecting transcription results.
+        dictate_realtime(
+            config,
+            save_path.as_deref(),
+            player.as_ref(),
+            boop_token.as_ref(),
+        )
+        .await?
     };
 
-    // Stop boop loop and play stop sound (preempts any in-progress boop)
+    // Stop boop loop (idempotent — may already be cancelled by
+    // dictate_realtime for realtime mode).
     if let Some(token) = boop_token {
         log::debug!("stopping boop loop");
         token.cancel();
@@ -204,9 +215,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         o.hide();
     }
 
-    if let Some(ref p) = player {
-        log::debug!("playing stop sound");
-        p.play_stop().await;
+    // For batch mode, play stop sound here (realtime mode already
+    // played it inside dictate_realtime on SIGINT).
+    if opts.batch {
+        if let Some(ref p) = player {
+            log::debug!("playing stop sound");
+            p.play_stop().await;
+        }
     }
 
     let text = text.trim().to_string();
@@ -431,9 +446,15 @@ fn flush_sentences(buffer: &mut String, segments: &mut Vec<String>) {
 /// When `save_path` is provided, a debug WAV copy of the captured PCM
 /// is written alongside the transcription so the user can verify that
 /// recording start/stop timing and content are correct.
+///
+/// `player` and `boop_token` are passed so that when recording stops
+/// (SIGINT), the stop sound fires immediately — the user hears it the
+/// instant they toggle, not after the WebSocket finishes.
 async fn dictate_realtime(
     config: Config,
     save_path: Option<&std::path::Path>,
+    player: Option<&SoundPlayer>,
+    boop_token: Option<&CancellationToken>,
 ) -> Result<String, TalkError> {
     let mut capture = CpalCapture::new(config.audio.clone());
     let audio_rx = capture.start()?;
@@ -499,6 +520,18 @@ async fn dictate_realtime(
         // Check if Ctrl+C was pressed — stop capture to trigger end-of-audio
         if capture_stop.load(std::sync::atomic::Ordering::Acquire) {
             log::info!("stopping recording");
+
+            // Immediate audible + visual feedback: the user hears the
+            // stop sound the instant they toggle, not after the
+            // transcription WebSocket finishes.
+            if let Some(token) = boop_token {
+                token.cancel();
+            }
+            if let Some(p) = player {
+                let stop = p.sounds.stop.clone();
+                p.play(&stop);
+            }
+
             capture.stop()?;
             // Reset so we don't stop again
             capture_stop.store(false, std::sync::atomic::Ordering::Release);
@@ -587,8 +620,9 @@ async fn dictate_realtime(
 
 /// Tee audio from `source` into both a WAV file and a forwarding channel.
 ///
-/// Each `Vec<i16>` chunk is written as raw PCM s16le to the WAV file and
-/// simultaneously forwarded to `fwd_tx` for the transcriber. When the
+/// Each `Vec<i16>` chunk is forwarded to `fwd_tx` for the transcriber
+/// and then written as raw PCM s16le to the WAV file.  The WAV is an
+/// exact mirror of what the API received — not more, not less.  When the
 /// source channel closes, the WAV header is patched with the final size.
 async fn audio_tee_to_wav(
     mut source: tokio::sync::mpsc::Receiver<Vec<i16>>,
@@ -607,24 +641,24 @@ async fn audio_tee_to_wav(
     let mut total_samples: u64 = 0;
 
     while let Some(pcm_chunk) = source.recv().await {
-        total_samples += pcm_chunk.len() as u64;
-        let pcm_bytes = writer.write_pcm(&pcm_chunk)?;
-        file.write_all(&pcm_bytes).await.map_err(TalkError::Io)?;
-
-        // Forward to transcriber — if it's gone, keep writing the WAV
-        // but stop forwarding
+        // Forward to transcriber first.  Only write to the debug WAV
+        // what was successfully forwarded, so the capture is an exact
+        // mirror of what the API received.
+        let wav_chunk = pcm_chunk.clone();
         if fwd_tx.send(pcm_chunk).await.is_err() {
-            log::debug!("transcriber channel closed, continuing WAV write");
+            log::debug!("transcriber channel closed, stopping debug WAV");
             break;
         }
-    }
 
-    // Drain remaining chunks (if we broke out early because transcriber closed)
-    while let Some(pcm_chunk) = source.recv().await {
-        total_samples += pcm_chunk.len() as u64;
-        let pcm_bytes = writer.write_pcm(&pcm_chunk)?;
+        total_samples += wav_chunk.len() as u64;
+        let pcm_bytes = writer.write_pcm(&wav_chunk)?;
         file.write_all(&pcm_bytes).await.map_err(TalkError::Io)?;
     }
+
+    // No drain loop — the WAV contains exactly what was forwarded.
+
+    // Signal end-of-audio to transcriber before WAV finalisation.
+    drop(fwd_tx);
 
     // Patch WAV header with actual data size
     let final_header = writer.finalize()?;
