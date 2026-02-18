@@ -11,6 +11,7 @@ use crate::core::config::{AudioConfig, Config, Provider};
 use crate::core::daemon::{self, DaemonStatus};
 use crate::core::error::TalkError;
 use crate::core::overlay::{IndicatorKind, OverlayHandle};
+use crate::core::recording_cache;
 use crate::core::transcription::{self, BatchTranscriber, TranscriptionEvent};
 use crate::core::visualizer::VisualizerHandle;
 use std::os::unix::process::CommandExt as _;
@@ -20,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Options for the dictate command.
 pub struct DictateOpts {
-    pub args: Vec<String>,
+    pub save: Option<PathBuf>,
     pub provider: Option<Provider>,
     pub model: Option<String>,
     pub realtime: bool,
@@ -46,16 +47,40 @@ fn resolve_provider(cli_provider: Option<Provider>, config: &Config) -> Provider
         .unwrap_or(Provider::Mistral)
 }
 
-/// Parse command-line arguments for the dictate command.
-///
-/// Returns an optional output file path for saving the audio recording.
-pub fn parse_args(args: &[String]) -> Result<Option<PathBuf>, TalkError> {
-    match args.len() {
-        0 => Ok(None),
-        1 => Ok(Some(PathBuf::from(&args[0]))),
-        _ => Err(TalkError::Audio(
-            "dictate command takes at most one argument (output file path)".to_string(),
-        )),
+/// Resolve the effective model name from CLI override or config default.
+fn resolve_model(
+    cli_model: Option<&str>,
+    config: &Config,
+    provider: Provider,
+    realtime: bool,
+) -> String {
+    if let Some(m) = cli_model {
+        return m.to_string();
+    }
+    match provider {
+        Provider::Mistral => config
+            .providers
+            .mistral
+            .as_ref()
+            .map(|c| c.model.clone())
+            .unwrap_or_else(|| "voxtral-mini-latest".to_string()),
+        Provider::OpenAI => {
+            if realtime {
+                config
+                    .providers
+                    .openai
+                    .as_ref()
+                    .map(|c| c.realtime_model.clone())
+                    .unwrap_or_else(|| "gpt-4o-mini-transcribe".to_string())
+            } else {
+                config
+                    .providers
+                    .openai
+                    .as_ref()
+                    .map(|c| c.model.clone())
+                    .unwrap_or_else(|| "whisper-1".to_string())
+            }
+        }
     }
 }
 
@@ -112,12 +137,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.no_overlay,
             opts.amplitude,
             opts.spectrum,
+            opts.save.as_deref(),
             opts.verbose,
         )
         .await;
     }
 
-    let save_path = parse_args(&opts.args)?;
+    let save_path = opts.save;
 
     // Load configuration
     let config = Config::load(None)?;
@@ -214,6 +240,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         .as_ref()
         .map(|p| p.start_boop_loop(std::time::Duration::from_secs(5)));
 
+    // Generate cache recording path (always, even without --save)
+    let (cache_wav_path, cache_timestamp) = recording_cache::generate_recording_path()?;
+    log::info!("cache recording: {}", cache_wav_path.display());
+
+    let provider = resolve_provider(opts.provider, &config);
+    let effective_model = resolve_model(opts.model.as_deref(), &config, provider, opts.realtime);
+
     log::info!(
         "starting {} transcription",
         if opts.realtime { "realtime" } else { "batch" }
@@ -264,12 +297,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // Player and boop_token are passed so the stop sound fires
         // immediately when the user toggles — not after the WebSocket
         // finishes collecting transcription results.
-        let provider = resolve_provider(opts.provider, &config);
         let text = dictate_realtime(
             config,
             provider,
             opts.model.as_deref(),
-            save_path.as_deref(),
+            &cache_wav_path,
             player.as_ref(),
             boop_token.as_ref(),
             Some(seg_tx),
@@ -292,7 +324,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         text
     } else {
         // Batch mode (default): capture audio, encode, then transcribe
-        let provider = resolve_provider(opts.provider, &config);
         let transcriber =
             transcription::create_batch_transcriber(&config, provider, opts.model.as_deref())?;
 
@@ -304,7 +335,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         let mut capture = CpalCapture::new(AudioConfig::new());
         let audio_rx = capture.start()?;
 
-        // Optionally create output file for saving audio
+        // Optionally create output file for saving OGG Opus audio
         let save_file = if let Some(ref path) = save_path {
             Some(tokio::fs::File::create(path).await.map_err(TalkError::Io)?)
         } else {
@@ -316,6 +347,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             AudioConfig::new(),
             audio_rx,
             save_file,
+            &cache_wav_path,
             transcriber,
         )
         .await?
@@ -348,6 +380,34 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     }
 
     let text = text.trim().to_string();
+
+    // Write recording cache metadata and rotate old entries.
+    let cache_wav_filename = cache_wav_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("recording.wav");
+    if let Err(e) = recording_cache::write_metadata(
+        &cache_timestamp,
+        provider,
+        &effective_model,
+        opts.realtime,
+        &text,
+        cache_wav_filename,
+    ) {
+        log::warn!("failed to write recording metadata: {}", e);
+    }
+    if let Err(e) = recording_cache::rotate_cache() {
+        log::warn!("failed to rotate recording cache: {}", e);
+    }
+
+    // Copy cache WAV to --save path if specified
+    if let Some(ref path) = save_path {
+        if let Err(e) = std::fs::copy(&cache_wav_path, path) {
+            log::warn!("failed to copy recording to {}: {}", path.display(), e);
+        } else {
+            log::info!("audio saved to: {}", path.display());
+        }
+    }
 
     if text.is_empty() {
         log::warn!("empty transcription — nothing to paste");
@@ -391,10 +451,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     }
 
-    if let Some(ref path) = save_path {
-        log::info!("audio saved to: {}", path.display());
-    }
-
     // Print transcription to stdout (batch mode only;
     // realtime mode already prints segments as they arrive)
     if !opts.realtime {
@@ -421,6 +477,7 @@ async fn toggle_dispatch(
     no_overlay: bool,
     amplitude: bool,
     spectrum: bool,
+    save: Option<&std::path::Path>,
     verbose: u8,
 ) -> Result<(), TalkError> {
     let pid_file = daemon::pid_path()?;
@@ -432,7 +489,7 @@ async fn toggle_dispatch(
         DaemonStatus::NotRunning => {
             toggle_start(
                 &pid_file, provider, model, realtime, no_sounds, no_overlay, amplitude, spectrum,
-                verbose,
+                save, verbose,
             )
             .await
         }
@@ -451,6 +508,7 @@ async fn toggle_start(
     no_overlay: bool,
     amplitude: bool,
     spectrum: bool,
+    save: Option<&std::path::Path>,
     verbose: u8,
 ) -> Result<(), TalkError> {
     // Pre-flight: validate provider/model before spawning the daemon
@@ -514,6 +572,10 @@ async fn toggle_start(
 
     if spectrum {
         cmd.arg("--spectrum");
+    }
+
+    if let Some(path) = save {
+        cmd.arg("--save").arg(path);
     }
 
     if let Some(ref wid) = target_window {
@@ -624,9 +686,8 @@ fn flush_sentences(buffer: &mut String, segments: &mut Vec<String>) {
 /// Streams raw PCM audio to the Voxtral Realtime API and receives
 /// incremental transcription events. Returns the accumulated text.
 ///
-/// When `save_path` is provided, a debug WAV copy of the captured PCM
-/// is written alongside the transcription so the user can verify that
-/// recording start/stop timing and content are correct.
+/// Audio is always tee'd to `cache_wav_path` so the recording is
+/// cached for later review.
 ///
 /// `player` and `boop_token` are passed so that when recording stops
 /// (SIGINT), the stop sound fires immediately — the user hears it the
@@ -639,7 +700,7 @@ async fn dictate_realtime(
     config: Config,
     provider: Provider,
     model: Option<&str>,
-    save_path: Option<&std::path::Path>,
+    cache_wav_path: &std::path::Path,
     player: Option<&SoundPlayer>,
     boop_token: Option<&CancellationToken>,
     segment_tx: Option<tokio::sync::mpsc::Sender<String>>,
@@ -654,46 +715,16 @@ async fn dictate_realtime(
     let mut capture = CpalCapture::new(AudioConfig::new());
     let audio_rx = capture.start()?;
 
-    // If a save path is given, tee the audio stream: one copy goes to
-    // the transcriber, the other is written to a WAV file for debugging.
-    let (audio_rx, wav_task) = if let Some(path) = save_path {
-        let wav_path = if path.extension().is_some() {
-            path.to_path_buf()
-        } else {
-            path.with_extension("wav")
-        };
-        log::info!("saving debug audio to: {}", wav_path.display());
-
-        let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
-        let task = tokio::spawn(audio_tee_to_wav(
-            audio_rx,
-            fwd_tx,
-            wav_path,
-            AudioConfig::new(),
-        ));
-        (fwd_rx, Some(task))
-    } else {
-        // Also save a debug capture automatically in the cache directory
-        let auto_path = crate::core::daemon::cache_dir()
-            .ok()
-            .map(|d| d.join("debug-capture.wav"));
-        if let Some(ref wav_path) = auto_path {
-            if let Some(parent) = wav_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            log::info!("saving debug audio to: {}", wav_path.display());
-            let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
-            let task = tokio::spawn(audio_tee_to_wav(
-                audio_rx,
-                fwd_tx,
-                wav_path.clone(),
-                AudioConfig::new(),
-            ));
-            (fwd_rx, Some(task))
-        } else {
-            (audio_rx, None)
-        }
-    };
+    // Always tee audio to the cache WAV for recording cache.
+    log::info!("caching audio to: {}", cache_wav_path.display());
+    let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
+    let wav_task = tokio::spawn(audio_tee_to_wav(
+        audio_rx,
+        fwd_tx,
+        cache_wav_path.to_path_buf(),
+        AudioConfig::new(),
+    ));
+    let audio_rx = fwd_rx;
 
     let mut event_rx = transcriber.transcribe_realtime(audio_rx).await?;
 
@@ -834,12 +865,10 @@ async fn dictate_realtime(
     ctrlc_task.abort();
 
     // Wait for WAV tee task to finish writing
-    if let Some(task) = wav_task {
-        match task.await {
-            Ok(Ok(())) => log::debug!("debug WAV saved"),
-            Ok(Err(e)) => log::warn!("debug WAV write error: {}", e),
-            Err(e) => log::warn!("debug WAV task panicked: {}", e),
-        }
+    match wav_task.await {
+        Ok(Ok(())) => log::debug!("cache WAV saved"),
+        Ok(Err(e)) => log::warn!("cache WAV write error: {}", e),
+        Err(e) => log::warn!("cache WAV task panicked: {}", e),
     }
 
     Ok(segments.join(" "))
@@ -908,19 +937,31 @@ async fn audio_tee_to_wav(
 /// Batch dictation mode.
 ///
 /// Encodes audio and streams it directly to a single transcription request.
+/// Audio is also tee'd to `cache_wav_path` for the recording cache.
 async fn dictate_streaming(
     capture: &mut CpalCapture,
     audio_config: AudioConfig,
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     save_file: Option<tokio::fs::File>,
+    cache_wav_path: &std::path::Path,
     transcriber: Box<dyn BatchTranscriber>,
 ) -> Result<String, TalkError> {
+    // Tee raw PCM to cache WAV before encoding
+    log::info!("caching audio to: {}", cache_wav_path.display());
+    let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
+    let cache_wav_task = tokio::spawn(audio_tee_to_wav(
+        audio_rx,
+        fwd_tx,
+        cache_wav_path.to_path_buf(),
+        audio_config.clone(),
+    ));
+
     // Create channel for streaming encoded audio to transcriber
     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(25);
 
     // Spawn encode task: PCM → OGG Opus → stream_tx (+ optional file)
     let encode_task = tokio::spawn(async move {
-        let mut rx = audio_rx;
+        let mut rx = fwd_rx;
         let mut file = save_file;
         let mut writer = match OggOpusWriter::new(audio_config) {
             Ok(writer) => writer,
@@ -1011,7 +1052,12 @@ async fn dictate_streaming(
     // Stop capture (closes audio channel → encode task finishes → stream_tx drops → transcription completes)
     capture.stop()?;
 
-    // Wait for encode task
+    // Wait for cache WAV and encode tasks
+    match cache_wav_task.await {
+        Ok(Ok(())) => log::debug!("cache WAV task completed"),
+        Ok(Err(err)) => log::warn!("cache WAV write error: {}", err),
+        Err(err) => log::warn!("cache WAV task panicked: {}", err),
+    }
     match encode_task.await {
         Ok(Ok(())) => log::debug!("encode task completed"),
         Ok(Err(err)) => log::error!("encode error: {}", err),
@@ -1038,26 +1084,6 @@ async fn dictate_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_args_no_args() {
-        let result = parse_args(&[]).expect("should succeed");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_parse_args_with_file() {
-        let args = vec!["output.ogg".to_string()];
-        let result = parse_args(&args).expect("should succeed");
-        assert_eq!(result, Some(PathBuf::from("output.ogg")));
-    }
-
-    #[test]
-    fn test_parse_args_too_many() {
-        let args = vec!["a.ogg".to_string(), "b.ogg".to_string()];
-        let result = parse_args(&args);
-        assert!(result.is_err());
-    }
 
     #[tokio::test]
     async fn test_dictate_pipeline_with_mocks() {
