@@ -29,6 +29,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
         }
         Commands::Dictate {
             save,
+            input_audio_file,
             provider,
             model,
             realtime,
@@ -42,6 +43,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
         } => {
             dictate(DictateOpts {
                 save: save.map(PathBuf::from),
+                input_audio_file: input_audio_file.map(PathBuf::from),
                 provider,
                 model,
                 realtime,
