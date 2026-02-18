@@ -1,9 +1,10 @@
 //! OpenAI Realtime transcription via WebSocket.
 //!
 //! Connects to the OpenAI Realtime API over WebSocket in
-//! transcription-only mode (`session.type = "transcription"`),
-//! streams PCM audio resampled from 16 kHz to 24 kHz, and
-//! receives incremental transcription events.
+//! transcription-only mode (`?intent=transcription`), configures
+//! the session via `transcription_session.update`, streams PCM
+//! audio resampled from 16 kHz to 24 kHz, and receives
+//! incremental transcription events.
 
 use super::realtime::TranscriptionEvent;
 use super::RealtimeTranscriber;
@@ -26,6 +27,10 @@ const DEFAULT_OPENAI_REALTIME_ENDPOINT: &str = "wss://api.openai.com";
 
 /// WebSocket path for the realtime API.
 const REALTIME_PATH: &str = "/v1/realtime";
+
+/// Query parameter that tells the Realtime API we want a
+/// transcription-only session (no AI responses).
+const REALTIME_INTENT: &str = "intent=transcription";
 
 /// Timeout for the initial WebSocket connection (TCP + TLS + upgrade).
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -112,7 +117,10 @@ pub fn parse_openai_event(json_str: &str) -> TranscriptionEvent {
     let event_type = value.get("type").and_then(|v| v.as_str());
 
     match event_type {
-        Some("session.created") | Some("session.updated") => TranscriptionEvent::SessionCreated,
+        Some("session.created")
+        | Some("session.updated")
+        | Some("transcription_session.created")
+        | Some("transcription_session.updated") => TranscriptionEvent::SessionCreated,
 
         Some("conversation.item.input_audio_transcription.delta") => {
             let text = value
@@ -164,9 +172,13 @@ pub fn parse_openai_event(json_str: &str) -> TranscriptionEvent {
 
 // ── WebSocket URL ───────────────────────────────────────────────────
 
-/// Build the WebSocket URL from a base endpoint and model name.
-pub fn build_ws_url(endpoint: &str, model: &str) -> String {
-    format!("{}{}?model={}", endpoint, REALTIME_PATH, model)
+/// Build the WebSocket URL from a base endpoint.
+///
+/// Uses `?intent=transcription` to create a transcription-only
+/// session.  The transcription model is set separately in
+/// `transcription_session.update`.
+pub fn build_ws_url(endpoint: &str) -> String {
+    format!("{}{}?{}", endpoint, REALTIME_PATH, REALTIME_INTENT)
 }
 
 // ── Transcriber ─────────────────────────────────────────────────────
@@ -213,14 +225,15 @@ impl OpenAIRealtimeTranscriber {
         }
     }
 
-    /// Open a throwaway WebSocket connection, send `session.update`
-    /// with our model config, and wait for the API's answer.
+    /// Open a throwaway WebSocket connection, send
+    /// `transcription_session.update` with our model config, and
+    /// wait for the API's answer.
     ///
     /// Returns `Ok(())` if the API accepts the session configuration,
     /// or an error with the API's message (e.g. "model X is not
     /// supported in realtime mode").
     async fn validate_realtime_session(&self) -> Result<(), TalkError> {
-        let ws_url = build_ws_url(&self.endpoint, &self.model);
+        let ws_url = build_ws_url(&self.endpoint);
 
         let parsed_url = url::Url::parse(&ws_url)
             .map_err(|e| TalkError::Config(format!("Invalid WebSocket URL: {}", e)))?;
@@ -232,6 +245,7 @@ impl OpenAIRealtimeTranscriber {
         let request = tokio_tungstenite::tungstenite::http::Request::builder()
             .uri(&ws_url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("OpenAI-Beta", "realtime=v1")
             .header("Host", &host)
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
@@ -273,11 +287,11 @@ impl OpenAIRealtimeTranscriber {
             ))
         })??;
 
-        // Send session.update with our transcription config.
+        // Send transcription_session.update with flat beta format.
         let session_update = serde_json::json!({
-            "type": "session.update",
+            "type": "transcription_session.update",
             "session": {
-                "type": "transcription",
+                "input_audio_format": "pcm16",
                 "input_audio_transcription": {
                     "model": self.model,
                 },
@@ -286,8 +300,7 @@ impl OpenAIRealtimeTranscriber {
                     "threshold": 0.5,
                     "prefix_padding_ms": 300,
                     "silence_duration_ms": 500
-                },
-                "input_audio_format": "pcm16"
+                }
             }
         });
         sink.send(Message::Text(session_update.to_string()))
@@ -340,7 +353,7 @@ impl OpenAIRealtimeTranscriber {
         &self,
         audio_rx: mpsc::Receiver<Vec<i16>>,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TalkError> {
-        let ws_url = build_ws_url(&self.endpoint, &self.model);
+        let ws_url = build_ws_url(&self.endpoint);
 
         // Parse the URL to extract the host for the HTTP header.
         let parsed_url = url::Url::parse(&ws_url)
@@ -354,6 +367,7 @@ impl OpenAIRealtimeTranscriber {
         let request = tokio_tungstenite::tungstenite::http::Request::builder()
             .uri(&ws_url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("OpenAI-Beta", "realtime=v1")
             .header("Host", &host)
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
@@ -401,11 +415,11 @@ impl OpenAIRealtimeTranscriber {
         })??;
         log::info!("OpenAI realtime session established");
 
-        // Send session.update to configure transcription-only mode.
+        // Send transcription_session.update with flat beta format.
         let session_update = serde_json::json!({
-            "type": "session.update",
+            "type": "transcription_session.update",
             "session": {
-                "type": "transcription",
+                "input_audio_format": "pcm16",
                 "input_audio_transcription": {
                     "model": self.model,
                 },
@@ -414,12 +428,11 @@ impl OpenAIRealtimeTranscriber {
                     "threshold": 0.5,
                     "prefix_padding_ms": 300,
                     "silence_duration_ms": 500
-                },
-                "input_audio_format": "pcm16"
+                }
             }
         });
         log::debug!(
-            "sending session.update with transcription model={}",
+            "sending transcription_session.update with model={}",
             self.model
         );
         ws_sink
@@ -479,10 +492,11 @@ impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
             .replace("ws://", "http://");
         super::openai::validate_openai_model(&self.config.api_key, &self.model, &api_base).await?;
 
-        // Step 2: WebSocket check — connect, send session.update with
-        // our model config, and wait for the API's answer.  This catches
-        // errors like "model X is not supported in realtime mode" that
-        // the REST models endpoint cannot detect.
+        // Step 2: WebSocket check — connect, send
+        // transcription_session.update with our model config, and wait
+        // for the API's answer.  This catches errors like "model X is
+        // not supported in realtime mode" that the REST models endpoint
+        // cannot detect.
         self.validate_realtime_session().await
     }
 
@@ -761,6 +775,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_openai_event_transcription_session_created() {
+        let json = r#"{"type": "transcription_session.created", "session": {}}"#;
+        assert!(matches!(
+            parse_openai_event(json),
+            TranscriptionEvent::SessionCreated
+        ));
+    }
+
+    #[test]
+    fn test_parse_openai_event_transcription_session_updated() {
+        let json = r#"{"type": "transcription_session.updated", "session": {}}"#;
+        assert!(matches!(
+            parse_openai_event(json),
+            TranscriptionEvent::SessionCreated
+        ));
+    }
+
+    #[test]
     fn test_parse_openai_event_transcription_delta() {
         let json =
             r#"{"type": "conversation.item.input_audio_transcription.delta", "delta": "hello "}"#;
@@ -813,17 +845,17 @@ mod tests {
 
     #[test]
     fn test_build_ws_url() {
-        let url = build_ws_url("wss://api.openai.com", "gpt-4o-mini-transcribe");
-        assert_eq!(
-            url,
-            "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-transcribe"
-        );
+        let url = build_ws_url("wss://api.openai.com");
+        assert_eq!(url, "wss://api.openai.com/v1/realtime?intent=transcription");
     }
 
     #[test]
     fn test_build_ws_url_custom_endpoint() {
-        let url = build_ws_url("wss://custom.example.com", "test-model");
-        assert_eq!(url, "wss://custom.example.com/v1/realtime?model=test-model");
+        let url = build_ws_url("wss://custom.example.com");
+        assert_eq!(
+            url,
+            "wss://custom.example.com/v1/realtime?intent=transcription"
+        );
     }
 
     #[test]
