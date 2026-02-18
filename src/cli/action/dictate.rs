@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 /// Options for the dictate command.
 pub struct DictateOpts {
     pub save: Option<PathBuf>,
+    pub output_yaml: Option<PathBuf>,
     pub input_audio_file: Option<PathBuf>,
     pub provider: Option<Provider>,
     pub model: Option<String>,
@@ -394,14 +395,15 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("recording.wav");
-    if let Err(e) = recording_cache::write_metadata(
+    let cache_meta_path = recording_cache::write_metadata(
         &cache_timestamp,
         provider,
         &effective_model,
         opts.realtime,
         &text,
         cache_wav_filename,
-    ) {
+    );
+    if let Err(ref e) = cache_meta_path {
         log::warn!("failed to write recording metadata: {}", e);
     }
     if let Err(e) = recording_cache::rotate_cache() {
@@ -414,6 +416,22 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             log::warn!("failed to copy recording to {}: {}", path.display(), e);
         } else {
             log::info!("audio saved to: {}", path.display());
+        }
+    }
+
+    // Copy cache metadata YAML to --output-yaml path if specified
+    if let Some(ref yaml_path) = opts.output_yaml {
+        match cache_meta_path {
+            Ok(ref src) => {
+                if let Err(e) = std::fs::copy(src, yaml_path) {
+                    log::warn!("failed to copy metadata to {}: {}", yaml_path.display(), e);
+                } else {
+                    log::info!("metadata YAML saved to: {}", yaml_path.display());
+                }
+            }
+            Err(_) => {
+                log::warn!("skipping --output-yaml: cache metadata was not written");
+            }
         }
     }
 
