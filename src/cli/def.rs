@@ -1,3 +1,4 @@
+use crate::core::config::Provider;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -27,12 +28,24 @@ pub enum Commands {
         /// Output file path (optional, defaults to stdout)
         #[arg(value_name = "OUTPUT")]
         output: Option<String>,
+        /// Transcription provider (mistral or openai)
+        #[arg(long, value_parser = clap::value_parser!(Provider))]
+        provider: Option<Provider>,
+        /// Model name (overrides config default for the chosen provider)
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Record, transcribe, and paste text into the focused application
     Dictate {
         /// Output file path to save the audio recording (optional)
         #[arg(value_name = "FILE")]
         file: Option<String>,
+        /// Transcription provider (mistral or openai)
+        #[arg(long, value_parser = clap::value_parser!(Provider))]
+        provider: Option<Provider>,
+        /// Model name (overrides config default for the chosen provider)
+        #[arg(long)]
+        model: Option<String>,
         /// Use realtime mode (stream audio via WebSocket, get incremental text)
         #[arg(long)]
         realtime: bool,

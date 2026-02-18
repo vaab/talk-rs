@@ -8,4 +8,7 @@ pub mod transcription;
 pub mod visualizer;
 
 pub use clipboard::{Clipboard, MockClipboard, X11Clipboard};
-pub use transcription::{MistralTranscriber, MockTranscriber, Transcriber};
+pub use transcription::{
+    BatchTranscriber, MistralBatchTranscriber, MockBatchTranscriber, OpenAIBatchTranscriber,
+    OpenAIRealtimeTranscriber,
+};

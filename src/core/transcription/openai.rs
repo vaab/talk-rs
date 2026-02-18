@@ -1,9 +1,9 @@
-//! Mistral API batch transcription backend.
+//! OpenAI API batch transcription backend.
 //!
 //! This module provides a [`BatchTranscriber`] implementation that uses the
-//! Mistral API to transcribe audio files.
+//! OpenAI API to transcribe audio files (Whisper, GPT-4o-transcribe, etc.).
 
-use crate::core::config::MistralConfig;
+use crate::core::config::OpenAIConfig;
 use crate::core::error::TalkError;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -16,8 +16,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::BatchTranscriber;
 
-/// Mistral API transcription endpoint.
-const MISTRAL_API_ENDPOINT: &str = "https://api.mistral.ai/v1/audio/transcriptions";
+/// OpenAI API transcription endpoint.
+const OPENAI_API_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
 
 /// Timeout for batch file upload transcription requests.
 const BATCH_FILE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -25,33 +25,37 @@ const BATCH_FILE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Timeout for the lightweight model-listing preflight check.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Response from Mistral API transcription endpoint.
+/// Response from OpenAI API transcription endpoint.
 #[derive(Debug, Deserialize)]
-struct MistralResponse {
+struct OpenAIResponse {
     /// The transcribed text.
     text: String,
 }
 
 // ── Shared model validation ─────────────────────────────────────────
 
-/// Response from the Mistral `/v1/models` endpoint.
+/// Response from the OpenAI `/v1/models` endpoint.
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelInfo>,
 }
 
-/// A single entry in the Mistral models list.
+/// A single entry in the models list.
 #[derive(Debug, Deserialize)]
 struct ModelInfo {
     id: String,
 }
 
-/// Validate that `model` is available in the Mistral account reachable
-/// at `api_base` (e.g. `"https://api.mistral.ai"`).
+/// Validate that `model` is available in the OpenAI account reachable
+/// at `api_base` (e.g. `"https://api.openai.com"`).
 ///
 /// On success, returns `Ok(())`.  On failure, returns a helpful error
-/// that lists the available transcription models.
-pub(crate) async fn validate_mistral_model(
+/// that lists the available transcription models so the user can pick
+/// a valid one.
+///
+/// This function is shared between [`OpenAIBatchTranscriber`] and
+/// [`super::openai_realtime::OpenAIRealtimeTranscriber`].
+pub(crate) async fn validate_openai_model(
     api_key: &str,
     model: &str,
     api_base: &str,
@@ -65,20 +69,21 @@ pub(crate) async fn validate_mistral_model(
         .timeout(VALIDATE_TIMEOUT)
         .send()
         .await
-        .map_err(|e| TalkError::Config(format!("Failed to connect to Mistral API: {}", e)))?;
+        .map_err(|e| TalkError::Config(format!("Failed to connect to OpenAI API: {}", e)))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(TalkError::Config(format!(
-            "Mistral API error ({}): {}",
+            "OpenAI API error ({}): {}",
             status, body
         )));
     }
 
-    let models: ModelsResponse = response.json().await.map_err(|e| {
-        TalkError::Config(format!("Failed to parse Mistral models response: {}", e))
-    })?;
+    let models: ModelsResponse = response
+        .json()
+        .await
+        .map_err(|e| TalkError::Config(format!("Failed to parse OpenAI models response: {}", e)))?;
 
     // Check whether the requested model exists.
     if models.data.iter().any(|m| m.id == model) {
@@ -90,13 +95,13 @@ pub(crate) async fn validate_mistral_model(
         .data
         .iter()
         .map(|m| m.id.as_str())
-        .filter(|id| id.contains("voxtral") || id.contains("transcri"))
+        .filter(|id| id.contains("whisper") || id.contains("transcri"))
         .collect();
     transcription_models.sort();
 
     if transcription_models.is_empty() {
         Err(TalkError::Config(format!(
-            "Model '{}' not found in Mistral account",
+            "Model '{}' not found in OpenAI account",
             model
         )))
     } else {
@@ -108,41 +113,41 @@ pub(crate) async fn validate_mistral_model(
     }
 }
 
-/// Transcriber implementation using the Mistral API.
+/// Batch transcriber implementation using the OpenAI API.
 ///
-/// This implementation sends audio files to the Mistral API for transcription
+/// This implementation sends audio files to the OpenAI API for transcription
 /// and parses the JSON response to extract the transcribed text.
-pub struct MistralBatchTranscriber {
-    /// HTTP client for making requests to the Mistral API.
+pub struct OpenAIBatchTranscriber {
+    /// HTTP client for making requests to the OpenAI API.
     client: Client,
-    /// Mistral API configuration (contains API key).
-    config: MistralConfig,
+    /// OpenAI API configuration (contains API key and model).
+    config: OpenAIConfig,
     /// API endpoint URL (can be overridden for testing).
     endpoint: String,
 }
 
-impl MistralBatchTranscriber {
-    /// Create a new Mistral transcriber with the given configuration.
+impl OpenAIBatchTranscriber {
+    /// Create a new OpenAI transcriber with the given configuration.
     ///
     /// # Arguments
     ///
-    /// * `config` - Mistral API configuration containing the API key
-    pub fn new(config: MistralConfig) -> Self {
+    /// * `config` - OpenAI API configuration containing the API key
+    pub fn new(config: OpenAIConfig) -> Self {
         Self {
             client: Client::new(),
             config,
-            endpoint: MISTRAL_API_ENDPOINT.to_string(),
+            endpoint: OPENAI_API_ENDPOINT.to_string(),
         }
     }
 
-    /// Create a new Mistral transcriber with a custom endpoint (for testing).
+    /// Create a new OpenAI transcriber with a custom endpoint (for testing).
     ///
     /// # Arguments
     ///
-    /// * `config` - Mistral API configuration containing the API key
+    /// * `config` - OpenAI API configuration containing the API key
     /// * `endpoint` - Custom API endpoint URL
     #[cfg(test)]
-    pub fn with_endpoint(config: MistralConfig, endpoint: String) -> Self {
+    pub fn with_endpoint(config: OpenAIConfig, endpoint: String) -> Self {
         Self {
             client: Client::new(),
             config,
@@ -152,14 +157,17 @@ impl MistralBatchTranscriber {
 }
 
 #[async_trait]
-impl BatchTranscriber for MistralBatchTranscriber {
+impl BatchTranscriber for OpenAIBatchTranscriber {
     async fn validate(&self) -> Result<(), TalkError> {
+        // Derive the API base URL from the transcription endpoint.
+        // Production: "https://api.openai.com/v1/audio/transcriptions" → "https://api.openai.com"
+        // Test:       "http://127.0.0.1:PORT/v1/audio/transcriptions" → "http://127.0.0.1:PORT"
         let api_base = self
             .endpoint
             .find("/v1/")
             .map(|pos| &self.endpoint[..pos])
             .unwrap_or(&self.endpoint);
-        validate_mistral_model(&self.config.api_key, &self.config.model, api_base).await
+        validate_openai_model(&self.config.api_key, &self.config.model, api_base).await
     }
 
     async fn transcribe_file(&self, audio_path: &Path) -> Result<String, TalkError> {
@@ -180,25 +188,19 @@ impl BatchTranscriber for MistralBatchTranscriber {
         let file_name = audio_path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("audio.wav")
+            .unwrap_or("audio.ogg")
             .to_string();
 
-        // Create multipart form with audio file and model
-        let mut form = reqwest::multipart::Form::new()
+        // Create multipart form with audio file, model, and response format
+        let form = reqwest::multipart::Form::new()
             .text("model", self.config.model.clone())
+            .text("response_format", "json")
             .part(
                 "file",
                 reqwest::multipart::Part::stream(file).file_name(file_name),
             );
 
-        // Add context bias if configured
-        if let Some(ref bias) = self.config.context_bias {
-            form = form.text("context_bias", bias.clone());
-        }
-
-        // [Fix #3] Send request with timeout to prevent hanging on
-        // unresponsive servers. Without this, Client::new() has no default
-        // timeout and the request could block forever.
+        // Send request with timeout
         let response = self
             .client
             .post(&self.endpoint)
@@ -208,7 +210,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .send()
             .await
             .map_err(|err| {
-                TalkError::Transcription(format!("Failed to send request to Mistral API: {}", err))
+                TalkError::Transcription(format!("Failed to send request to OpenAI API: {}", err))
             })?;
 
         // Check response status
@@ -216,17 +218,17 @@ impl BatchTranscriber for MistralBatchTranscriber {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(TalkError::Transcription(format!(
-                "Mistral API error ({}): {}",
+                "OpenAI API error ({}): {}",
                 status, body
             )));
         }
 
         // Parse JSON response
-        let mistral_response: MistralResponse = response.json().await.map_err(|err| {
-            TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
+        let openai_response: OpenAIResponse = response.json().await.map_err(|err| {
+            TalkError::Transcription(format!("Failed to parse OpenAI API response: {}", err))
         })?;
 
-        Ok(mistral_response.text)
+        Ok(openai_response.text)
     }
 
     async fn transcribe_stream(
@@ -240,20 +242,16 @@ impl BatchTranscriber for MistralBatchTranscriber {
         // Wrap the stream into a reqwest body for streaming upload
         let body = reqwest::Body::wrap_stream(byte_stream);
 
-        // Create multipart form with streaming audio and model
-        let mut form = reqwest::multipart::Form::new()
+        // Create multipart form with streaming audio, model, and response format
+        let form = reqwest::multipart::Form::new()
             .text("model", self.config.model.clone())
+            .text("response_format", "json")
             .part(
                 "file",
                 reqwest::multipart::Part::stream(body).file_name(file_name.to_string()),
             );
 
-        // Add context bias if configured
-        if let Some(ref bias) = self.config.context_bias {
-            form = form.text("context_bias", bias.clone());
-        }
-
-        // Send request to Mistral API with extended timeout for long recordings
+        // Send request to OpenAI API with extended timeout for long recordings
         let response = self
             .client
             .post(&self.endpoint)
@@ -264,7 +262,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .await
             .map_err(|err| {
                 TalkError::Transcription(format!(
-                    "Failed to send streaming request to Mistral API: {}",
+                    "Failed to send streaming request to OpenAI API: {}",
                     err
                 ))
             })?;
@@ -274,17 +272,17 @@ impl BatchTranscriber for MistralBatchTranscriber {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(TalkError::Transcription(format!(
-                "Mistral API error ({}): {}",
+                "OpenAI API error ({}): {}",
                 status, body
             )));
         }
 
         // Parse JSON response
-        let mistral_response: MistralResponse = response.json().await.map_err(|err| {
-            TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
+        let openai_response: OpenAIResponse = response.json().await.map_err(|err| {
+            TalkError::Transcription(format!("Failed to parse OpenAI API response: {}", err))
         })?;
 
-        Ok(mistral_response.text)
+        Ok(openai_response.text)
     }
 }
 
@@ -297,114 +295,97 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn test_mistral_transcriber_success() {
-        // Start mock server
+    async fn test_openai_transcriber_success() {
         let mock_server = MockServer::start().await;
 
-        // Mock the Mistral API endpoint
-        // Note: wiremock multipart matching is limited, so we just verify method, path, and auth header
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
-            .and(header("authorization", "Bearer test-api-key"))
+            .and(header("authorization", "Bearer sk-test-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "text": "This is a test transcription"
+                "text": "This is an OpenAI transcription"
             })))
             .mount(&mock_server)
             .await;
 
-        // Create a temporary audio file
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(b"fake audio data").unwrap();
         temp_file.flush().unwrap();
 
-        // Create transcriber with mock server URL
-        let config = MistralConfig {
-            api_key: "test-api-key".to_string(),
-            model: "voxtral-mini-latest".to_string(),
-            context_bias: None,
+        let config = OpenAIConfig {
+            api_key: "sk-test-key".to_string(),
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = OpenAIBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
         );
 
-        // Transcribe the file
         let result = transcriber.transcribe_file(temp_file.path()).await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "This is a test transcription");
+        assert_eq!(result.unwrap(), "This is an OpenAI transcription");
     }
 
     #[tokio::test]
-    async fn test_mistral_transcriber_stream_success() {
-        // Start mock server
+    async fn test_openai_transcriber_stream_success() {
         let mock_server = MockServer::start().await;
 
-        // Mock the Mistral API endpoint
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
-            .and(header("authorization", "Bearer test-api-key"))
+            .and(header("authorization", "Bearer sk-test-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "text": "Streamed transcription result"
+                "text": "Streamed OpenAI transcription"
             })))
             .mount(&mock_server)
             .await;
 
-        // Create transcriber with mock server URL
-        let config = MistralConfig {
-            api_key: "test-api-key".to_string(),
-            model: "voxtral-mini-latest".to_string(),
-            context_bias: None,
+        let config = OpenAIConfig {
+            api_key: "sk-test-key".to_string(),
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = OpenAIBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
         );
 
-        // Create a channel and send fake audio data
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
             tx.send(vec![0u8; 100]).await.unwrap();
             tx.send(vec![1u8; 200]).await.unwrap();
-            // Dropping tx closes the channel
         });
 
-        // Transcribe from the stream
-        let result = transcriber.transcribe_stream(rx, "test.wav").await;
+        let result = transcriber.transcribe_stream(rx, "test.ogg").await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Streamed transcription result");
+        assert_eq!(result.unwrap(), "Streamed OpenAI transcription");
     }
 
     #[tokio::test]
-    async fn test_mistral_transcriber_api_error() {
-        // Start mock server
+    async fn test_openai_transcriber_api_error() {
         let mock_server = MockServer::start().await;
 
-        // Mock the Mistral API endpoint to return an error
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
             .mount(&mock_server)
             .await;
 
-        // Create a temporary audio file
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(b"fake audio data").unwrap();
         temp_file.flush().unwrap();
 
-        // Create transcriber with mock server URL
-        let config = MistralConfig {
+        let config = OpenAIConfig {
             api_key: "invalid-key".to_string(),
-            model: "voxtral-mini-latest".to_string(),
-            context_bias: None,
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = OpenAIBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
         );
 
-        // Transcribe the file
         let result = transcriber.transcribe_file(temp_file.path()).await;
 
         assert!(result.is_err());
@@ -412,16 +393,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mistral_transcriber_file_not_found() {
-        let config = MistralConfig {
-            api_key: "test-api-key".to_string(),
-            model: "voxtral-mini-latest".to_string(),
-            context_bias: None,
+    async fn test_openai_transcriber_file_not_found() {
+        let config = OpenAIConfig {
+            api_key: "sk-test-key".to_string(),
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = MistralBatchTranscriber::new(config);
+        let transcriber = OpenAIBatchTranscriber::new(config);
 
         let result = transcriber
-            .transcribe_file(Path::new("/nonexistent/file.wav"))
+            .transcribe_file(Path::new("/nonexistent/file.ogg"))
             .await;
 
         assert!(result.is_err());
@@ -429,34 +410,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mistral_transcriber_invalid_json_response() {
-        // Start mock server
+    async fn test_openai_transcriber_invalid_json_response() {
         let mock_server = MockServer::start().await;
 
-        // Mock the Mistral API endpoint to return invalid JSON
         Mock::given(method("POST"))
             .and(path("/v1/audio/transcriptions"))
             .respond_with(ResponseTemplate::new(200).set_body_string("invalid json"))
             .mount(&mock_server)
             .await;
 
-        // Create a temporary audio file
         let mut temp_file = NamedTempFile::new().unwrap();
         temp_file.write_all(b"fake audio data").unwrap();
         temp_file.flush().unwrap();
 
-        // Create transcriber with mock server URL
-        let config = MistralConfig {
-            api_key: "test-api-key".to_string(),
-            model: "voxtral-mini-latest".to_string(),
-            context_bias: None,
+        let config = OpenAIConfig {
+            api_key: "sk-test-key".to_string(),
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = OpenAIBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
         );
 
-        // Transcribe the file
         let result = transcriber.transcribe_file(temp_file.path()).await;
 
         assert!(result.is_err());

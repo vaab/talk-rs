@@ -23,13 +23,56 @@ pub struct Config {
 
     /// Optional indicator settings.
     pub indicators: Option<IndicatorsConfig>,
+
+    /// Optional transcription defaults (provider selection, etc.).
+    pub transcription: Option<TranscriptionConfig>,
+}
+
+/// Transcription provider identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    /// Mistral / Voxtral transcription.
+    Mistral,
+    /// OpenAI Whisper / GPT-4o transcription.
+    #[serde(alias = "openai")]
+    OpenAI,
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Provider::Mistral => write!(f, "mistral"),
+            Provider::OpenAI => write!(f, "openai"),
+        }
+    }
+}
+
+impl std::str::FromStr for Provider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "mistral" => Ok(Provider::Mistral),
+            "openai" => Ok(Provider::OpenAI),
+            other => Err(format!(
+                "unknown provider '{}' (expected 'mistral' or 'openai')",
+                other
+            )),
+        }
+    }
 }
 
 /// Transcription providers configuration.
 #[derive(Debug, Deserialize)]
 pub struct ProvidersConfig {
-    /// Mistral API configuration.
-    pub mistral: MistralConfig,
+    /// Mistral API configuration (optional — only required when using Mistral).
+    #[serde(default)]
+    pub mistral: Option<MistralConfig>,
+
+    /// OpenAI API configuration (optional — only required when using OpenAI).
+    #[serde(default)]
+    pub openai: Option<OpenAIConfig>,
 }
 
 /// Mistral API configuration.
@@ -53,6 +96,41 @@ pub struct MistralConfig {
 
 fn default_mistral_model() -> String {
     "voxtral-mini-latest".to_string()
+}
+
+/// OpenAI API configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OpenAIConfig {
+    /// API key for OpenAI transcription service.
+    pub api_key: String,
+
+    /// Model name for batch transcription (defaults to "whisper-1").
+    #[serde(default = "default_openai_model")]
+    pub model: String,
+
+    /// Model name for realtime transcription (defaults to "gpt-4o-mini-transcribe").
+    #[serde(default = "default_openai_realtime_model")]
+    pub realtime_model: String,
+}
+
+fn default_openai_model() -> String {
+    "whisper-1".to_string()
+}
+
+fn default_openai_realtime_model() -> String {
+    "gpt-4o-realtime-preview".to_string()
+}
+
+/// Transcription defaults.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TranscriptionConfig {
+    /// Default transcription provider when `--provider` is not specified.
+    #[serde(default = "default_provider")]
+    pub default_provider: Provider,
+}
+
+fn default_provider() -> Provider {
+    Provider::Mistral
 }
 
 /// Audio configuration.
@@ -101,6 +179,9 @@ impl Config {
     /// - TALK_RS_PROVIDERS_MISTRAL_API_KEY
     /// - TALK_RS_PROVIDERS_MISTRAL_MODEL
     /// - TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS
+    /// - TALK_RS_PROVIDERS_OPENAI_API_KEY
+    /// - TALK_RS_PROVIDERS_OPENAI_MODEL
+    /// - TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL
     /// - TALK_RS_AUDIO_SAMPLE_RATE
     /// - TALK_RS_AUDIO_CHANNELS
     /// - TALK_RS_AUDIO_BITRATE
@@ -130,16 +211,51 @@ impl Config {
             config.output_dir = PathBuf::from(value);
         }
 
-        if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
-            config.providers.mistral.api_key = value;
+        // Mistral env var overrides (only when the section exists).
+        if let Some(ref mut mistral) = config.providers.mistral {
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
+                mistral.api_key = value;
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_MODEL")? {
+                mistral.model = value;
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")? {
+                mistral.context_bias = Some(value);
+            }
+        } else {
+            // Allow creating the Mistral section purely from env vars.
+            if let Some(api_key) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
+                config.providers.mistral = Some(MistralConfig {
+                    api_key,
+                    model: env_var_string("TALK_RS_PROVIDERS_MISTRAL_MODEL")?
+                        .unwrap_or_else(default_mistral_model),
+                    context_bias: env_var_string("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?,
+                });
+            }
         }
 
-        if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_MODEL")? {
-            config.providers.mistral.model = value;
-        }
-
-        if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")? {
-            config.providers.mistral.context_bias = Some(value);
+        // OpenAI env var overrides (only when the section exists).
+        if let Some(ref mut openai) = config.providers.openai {
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_API_KEY")? {
+                openai.api_key = value;
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_MODEL")? {
+                openai.model = value;
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")? {
+                openai.realtime_model = value;
+            }
+        } else {
+            // Allow creating the OpenAI section purely from env vars.
+            if let Some(api_key) = env_var_string("TALK_RS_PROVIDERS_OPENAI_API_KEY")? {
+                config.providers.openai = Some(OpenAIConfig {
+                    api_key,
+                    model: env_var_string("TALK_RS_PROVIDERS_OPENAI_MODEL")?
+                        .unwrap_or_else(default_openai_model),
+                    realtime_model: env_var_string("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?
+                        .unwrap_or_else(default_openai_realtime_model),
+                });
+            }
         }
 
         if let Some(value) = env_var_u32("TALK_RS_AUDIO_SAMPLE_RATE")? {
@@ -199,11 +315,10 @@ fn validate_config(config: &Config) -> Result<(), TalkError> {
         return Err(TalkError::Config("output_dir is required".to_string()));
     }
 
-    if config.providers.mistral.api_key.is_empty() {
-        return Err(TalkError::Config(
-            "providers.mistral.api_key is required".to_string(),
-        ));
-    }
+    // Provider API keys are validated lazily — only when a provider is
+    // actually used via the factory function.  This allows configs that
+    // only define one provider to work without filling in keys for the
+    // other.
 
     Ok(())
 }
@@ -264,16 +379,26 @@ mod tests {
         Ok(file)
     }
 
+    /// Clear all provider-related env vars to prevent cross-test leakage.
+    fn clear_all_provider_env_vars() -> Result<Vec<EnvGuard>, Box<dyn Error>> {
+        Ok(vec![
+            EnvGuard::clear("TALK_RS_OUTPUT_DIR")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_API_KEY")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_MODEL")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?,
+            EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?,
+            EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?,
+            EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?,
+        ])
+    }
+
     #[test]
     fn test_config_load_valid() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
-        let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
-        let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
-        let _guard_model = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?;
-        let _guard_context_bias = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?;
-        let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
-        let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
-        let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
+        let _guards = clear_all_provider_env_vars()?;
 
         let yaml = r#"
 output_dir: /tmp/test-output
@@ -289,9 +414,11 @@ audio:
 
         let config = Config::load(Some(file.path()))?;
         assert_eq!(config.output_dir, PathBuf::from("/tmp/test-output"));
-        assert_eq!(config.providers.mistral.api_key, "test-api-key");
-        assert_eq!(config.providers.mistral.model, "voxtral-mini-latest");
-        assert!(config.providers.mistral.context_bias.is_none());
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        assert_eq!(m.api_key, "test-api-key");
+        assert_eq!(m.model, "voxtral-mini-latest");
+        assert!(m.context_bias.is_none());
+        assert!(config.providers.openai.is_none());
         assert_eq!(config.audio.sample_rate, 16000);
         assert_eq!(config.audio.channels, 1);
         assert_eq!(config.audio.bitrate, 32000);
@@ -301,13 +428,8 @@ audio:
     #[test]
     fn test_config_env_override() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
-        let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
-        let _guard_model = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?;
-        let _guard_context_bias = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?;
-        let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
-        let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
-        let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
-        let _guard_api_key = EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_API_KEY", "override-key")?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _set_key = EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_API_KEY", "override-key")?;
 
         let yaml = r#"
 output_dir: /tmp/test-output
@@ -322,20 +444,15 @@ audio:
         let file = write_config(yaml)?;
 
         let config = Config::load(Some(file.path()))?;
-        assert_eq!(config.providers.mistral.api_key, "override-key");
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        assert_eq!(m.api_key, "override-key");
         Ok(())
     }
 
     #[test]
     fn test_config_model_and_context_bias() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
-        let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
-        let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
-        let _guard_model = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?;
-        let _guard_context_bias = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?;
-        let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
-        let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
-        let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
+        let _guards = clear_all_provider_env_vars()?;
 
         let yaml = r#"
 output_dir: /tmp/test-output
@@ -352,25 +469,18 @@ audio:
         let file = write_config(yaml)?;
 
         let config = Config::load(Some(file.path()))?;
-        assert_eq!(config.providers.mistral.model, "voxtral-mini-2602");
-        assert_eq!(
-            config.providers.mistral.context_bias.as_deref(),
-            Some("Kalysto,talk-rs,Voxtral")
-        );
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        assert_eq!(m.model, "voxtral-mini-2602");
+        assert_eq!(m.context_bias.as_deref(), Some("Kalysto,talk-rs,Voxtral"));
         Ok(())
     }
 
     #[test]
     fn test_config_env_override_model_and_context_bias() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
-        let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
-        let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
-        let _guard_model = EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_MODEL", "voxtral-mini-2602")?;
-        let _guard_context_bias =
-            EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS", "custom,terms")?;
-        let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
-        let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
-        let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _set_model = EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_MODEL", "voxtral-mini-2602")?;
+        let _set_bias = EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS", "custom,terms")?;
 
         let yaml = r#"
 output_dir: /tmp/test-output
@@ -385,30 +495,21 @@ audio:
         let file = write_config(yaml)?;
 
         let config = Config::load(Some(file.path()))?;
-        assert_eq!(config.providers.mistral.model, "voxtral-mini-2602");
-        assert_eq!(
-            config.providers.mistral.context_bias.as_deref(),
-            Some("custom,terms")
-        );
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        assert_eq!(m.model, "voxtral-mini-2602");
+        assert_eq!(m.context_bias.as_deref(), Some("custom,terms"));
         Ok(())
     }
 
     #[test]
     fn test_config_missing_required_field() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
-        let _guard_output_dir = EnvGuard::clear("TALK_RS_OUTPUT_DIR")?;
-        let _guard_api_key = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?;
-        let _guard_model = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?;
-        let _guard_context_bias = EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?;
-        let _guard_sample_rate = EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?;
-        let _guard_channels = EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?;
-        let _guard_bitrate = EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?;
+        let _guards = clear_all_provider_env_vars()?;
 
+        // Empty output_dir should still fail validation.
         let yaml = r#"
-output_dir: /tmp/test-output
-providers:
-  mistral:
-    api_key: ""
+output_dir: ""
+providers: {}
 audio:
   sample_rate: 16000
   channels: 1
@@ -418,13 +519,114 @@ audio:
 
         let result = Config::load(Some(file.path()));
         match result {
-            Ok(_) => Err("Expected missing api_key to fail".into()),
+            Ok(_) => Err("Expected empty output_dir to fail".into()),
             Err(err) => {
-                assert!(err
-                    .to_string()
-                    .contains("providers.mistral.api_key is required"));
+                assert!(err.to_string().contains("output_dir is required"));
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn test_config_openai_provider() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  openai:
+    api_key: sk-test-key
+    model: gpt-4o-transcribe
+audio:
+  sample_rate: 16000
+  channels: 1
+  bitrate: 32000
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert!(config.providers.mistral.is_none());
+        let o = config.providers.openai.as_ref().expect("openai present");
+        assert_eq!(o.api_key, "sk-test-key");
+        assert_eq!(o.model, "gpt-4o-transcribe");
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_openai_env_override() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _set_key = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_API_KEY", "sk-env-key")?;
+
+        // No openai section in YAML — created purely from env vars.
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+audio:
+  sample_rate: 16000
+  channels: 1
+  bitrate: 32000
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let o = config.providers.openai.as_ref().expect("openai from env");
+        assert_eq!(o.api_key, "sk-env-key");
+        assert_eq!(o.model, "whisper-1"); // default
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_both_providers() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: mistral-key
+  openai:
+    api_key: openai-key
+transcription:
+  default_provider: openai
+audio:
+  sample_rate: 16000
+  channels: 1
+  bitrate: 32000
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert!(config.providers.mistral.is_some());
+        assert!(config.providers.openai.is_some());
+        let t = config
+            .transcription
+            .as_ref()
+            .expect("transcription section");
+        assert_eq!(t.default_provider, Provider::OpenAI);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_no_providers() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+audio:
+  sample_rate: 16000
+  channels: 1
+  bitrate: 32000
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert!(config.providers.mistral.is_none());
+        assert!(config.providers.openai.is_none());
+        Ok(())
     }
 }
