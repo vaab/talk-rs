@@ -11,6 +11,87 @@ A Rust CLI scaffold for the talk-rs project.
 
 - =talk-rs --help=
 
+** Configuration
+
+=talk-rs= reads its configuration from
+~$XDG_CONFIG_HOME/talk-rs/config.yaml~ (typically
+~~/.config/talk-rs/config.yaml~).
+
+Copy the example and fill in your values:
+
+#+begin_src sh
+mkdir -p ~/.config/talk-rs
+cp config.example.yaml ~/.config/talk-rs/config.yaml
+#+end_src
+
+Then edit ~~/.config/talk-rs/config.yaml~:
+
+#+begin_src yaml
+output_dir: /home/you/talk-rs-output
+
+providers:
+  mistral:
+    api_key: YOUR_MISTRAL_API_KEY
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  bitrate: 32000
+#+end_src
+
+Required fields:
+
+- ~output_dir~ -- absolute path to a writable directory for recordings
+- ~providers.mistral.api_key~ -- your [[https://console.mistral.ai/][Mistral API]] key
+
+Optional fields:
+
+- ~providers.mistral.model~ -- transcription model (default:
+  ~voxtral-mini-latest~)
+- ~providers.mistral.context_bias~ -- comma-separated words to improve
+  transcription accuracy for domain terms
+- ~indicators.boop_interval_ms~ -- milliseconds between audio feedback
+  beeps (default: ~5000~, set ~0~ to disable)
+- ~indicators.visual_overlay~ -- show visual overlay during recording
+  (default: ~true~)
+
+All config values can be overridden via environment variables (e.g.
+~TALK_RS_PROVIDERS_MISTRAL_API_KEY~, ~TALK_RS_AUDIO_SAMPLE_RATE~).
+
+** GNOME Keyboard Shortcut
+
+To bind ~talk-rs dictate --toggle~ to a key (e.g. =Super+/=), copy-paste
+this block:
+
+#+begin_src sh
+BASE="org.gnome.settings-daemon.plugins.media-keys"
+BPATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings"
+
+CURRENT=$(gsettings get "$BASE" custom-keybindings)
+N=0
+while echo "$CURRENT" | grep -q "custom${N}/"; do
+  N=$((N + 1))
+done
+SLOT="${BPATH}/custom${N}/"
+SCHEMA="${BASE}.custom-keybinding:${SLOT}"
+
+if [ "$CURRENT" = "@as []" ]; then
+  gsettings set "$BASE" custom-keybindings "['${SLOT}']"
+else
+  gsettings set "$BASE" custom-keybindings "$(echo "$CURRENT" | sed "s|]$|, '${SLOT}']|")"
+fi
+
+gsettings set "$SCHEMA" name    'talk-rs dictate'
+gsettings set "$SCHEMA" command 'talk-rs dictate --toggle'
+gsettings set "$SCHEMA" binding '<Super>slash'
+#+end_src
+
+First press starts recording, second press stops, transcribes, and
+pastes into the focused application.
+
+To change the key, replace ~<Super>slash~ with the desired binding
+(e.g. ~<Super>semicolon~, ~<Super>d~).
+
 ** Development
 
 - =cargo fmt=
