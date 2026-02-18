@@ -276,6 +276,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             player.as_ref(),
             boop_token.as_ref(),
             Some(seg_tx),
+            visualizer.as_ref(),
         )
         .await?;
 
@@ -567,12 +568,16 @@ fn flush_sentences(buffer: &mut String, segments: &mut Vec<String>) {
 /// `player` and `boop_token` are passed so that when recording stops
 /// (SIGINT), the stop sound fires immediately — the user hears it the
 /// instant they toggle, not after the WebSocket finishes.
+///
+/// When `visualizer` is provided, the live transcription text is pushed
+/// to the text overlay as words arrive.
 async fn dictate_realtime(
     config: Config,
     save_path: Option<&std::path::Path>,
     player: Option<&SoundPlayer>,
     boop_token: Option<&CancellationToken>,
     segment_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    visualizer: Option<&VisualizerHandle>,
 ) -> Result<String, TalkError> {
     let mut capture = CpalCapture::new(config.audio.clone());
     let audio_rx = capture.start()?;
@@ -662,6 +667,16 @@ async fn dictate_realtime(
                         current_line.push_str(&text);
                         eprint!("\r{}", current_line);
 
+                        // Push live text to the overlay.
+                        if let Some(viz) = visualizer {
+                            let mut live = segments.join(" ");
+                            if !live.is_empty() && !current_line.is_empty() {
+                                live.push(' ');
+                            }
+                            live.push_str(&current_line);
+                            viz.set_text(&live);
+                        }
+
                         // Flush completed sentences from the buffer.
                         // Split on sentence-ending punctuation followed by
                         // whitespace or end-of-string.
@@ -687,6 +702,11 @@ async fn dictate_realtime(
                         let blank = " ".repeat(current_line.len());
                         eprint!("\r{}\r", blank);
                         current_line.clear();
+
+                        // Update overlay with completed segments.
+                        if let Some(viz) = visualizer {
+                            viz.set_text(&segments.join(" "));
+                        }
                     }
                     Some(TranscriptionEvent::Done) => {
                         // Flush any trailing text that didn't end with punctuation
