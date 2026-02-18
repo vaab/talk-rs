@@ -40,6 +40,9 @@ pub enum Commands {
         /// Save audio recording to this file path
         #[arg(long, value_name = "PATH")]
         save: Option<String>,
+        /// Feed a pre-recorded WAV file instead of live microphone capture
+        #[arg(long, value_name = "FILE")]
+        input_audio_file: Option<String>,
         /// Transcription provider (mistral or openai)
         #[arg(long, value_parser = clap::value_parser!(Provider))]
         provider: Option<Provider>,
