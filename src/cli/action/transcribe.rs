@@ -3,9 +3,9 @@
 //! Transcribes an audio file to text using the configured transcription backend.
 //! Supports writing output to stdout or to a file.
 
-use crate::core::config::Config;
+use crate::core::config::{Config, Provider};
 use crate::core::error::TalkError;
-use crate::core::transcription::{MistralTranscriber, Transcriber};
+use crate::core::transcription;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -43,7 +43,11 @@ pub fn parse_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), TalkErr
 /// 3. Initialize MistralTranscriber
 /// 4. Call transcribe_file() on the input audio
 /// 5. Write result to stdout (if no output file) or to output file
-pub async fn transcribe(args: Vec<String>) -> Result<(), TalkError> {
+pub async fn transcribe(
+    args: Vec<String>,
+    cli_provider: Option<Provider>,
+    cli_model: Option<String>,
+) -> Result<(), TalkError> {
     // Parse arguments
     let (input_path, output_path) = parse_args(&args)?;
 
@@ -58,8 +62,18 @@ pub async fn transcribe(args: Vec<String>) -> Result<(), TalkError> {
     // Load configuration
     let config = Config::load(None)?;
 
-    // Initialize transcriber
-    let transcriber = MistralTranscriber::new(config.providers.mistral);
+    // Resolve provider from CLI override or config default
+    let provider = cli_provider
+        .or_else(|| config.transcription.as_ref().map(|t| t.default_provider))
+        .unwrap_or(Provider::Mistral);
+
+    // Create transcriber via factory
+    let transcriber =
+        transcription::create_batch_transcriber(&config, provider, cli_model.as_deref())?;
+
+    // Pre-flight: verify provider connectivity and model validity.
+    log::info!("validating {} provider configuration", provider);
+    transcriber.validate().await?;
 
     // Transcribe the file
     let transcription = transcriber.transcribe_file(&input_path).await?;
@@ -150,7 +164,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transcribe_pipeline_with_mock_transcriber() {
-        use crate::core::transcription::MockTranscriber;
+        use crate::core::transcription::{BatchTranscriber, MockBatchTranscriber};
         use std::fs;
         use tempfile::TempDir;
 
@@ -165,7 +179,7 @@ mod tests {
         let output_path = temp_dir.path().join("transcript.txt");
 
         // Create mock transcriber
-        let mock = MockTranscriber::new("This is a test transcription");
+        let mock = MockBatchTranscriber::new("This is a test transcription");
 
         // Transcribe using mock
         let transcription = mock

@@ -7,13 +7,11 @@ use crate::core::audio::cpal_capture::CpalCapture;
 use crate::core::audio::indicator::SoundPlayer;
 use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
 use crate::core::clipboard::{Clipboard, X11Clipboard};
-use crate::core::config::{AudioConfig, Config};
+use crate::core::config::{AudioConfig, Config, Provider};
 use crate::core::daemon::{self, DaemonStatus};
 use crate::core::error::TalkError;
 use crate::core::overlay::{IndicatorKind, OverlayHandle};
-use crate::core::transcription::{
-    MistralRealtimeTranscriber, MistralTranscriber, Transcriber, TranscriptionEvent,
-};
+use crate::core::transcription::{self, BatchTranscriber, TranscriptionEvent};
 use crate::core::visualizer::VisualizerHandle;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
@@ -23,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 /// Options for the dictate command.
 pub struct DictateOpts {
     pub args: Vec<String>,
+    pub provider: Option<Provider>,
+    pub model: Option<String>,
     pub realtime: bool,
     pub toggle: bool,
     pub no_sounds: bool,
@@ -32,6 +32,18 @@ pub struct DictateOpts {
     pub daemon: bool,
     pub target_window: Option<String>,
     pub verbose: u8,
+}
+
+/// Resolve the effective provider from CLI override or config default.
+fn resolve_provider(cli_provider: Option<Provider>, config: &Config) -> Provider {
+    if let Some(p) = cli_provider {
+        return p;
+    }
+    config
+        .transcription
+        .as_ref()
+        .map(|t| t.default_provider)
+        .unwrap_or(Provider::Mistral)
 }
 
 /// Parse command-line arguments for the dictate command.
@@ -93,6 +105,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Toggle mode: start or stop a daemon
     if opts.toggle {
         return toggle_dispatch(
+            opts.provider,
+            opts.model,
             opts.realtime,
             opts.no_sounds,
             opts.no_overlay,
@@ -250,8 +264,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // Player and boop_token are passed so the stop sound fires
         // immediately when the user toggles — not after the WebSocket
         // finishes collecting transcription results.
+        let provider = resolve_provider(opts.provider, &config);
         let text = dictate_realtime(
             config,
+            provider,
+            opts.model.as_deref(),
             save_path.as_deref(),
             player.as_ref(),
             boop_token.as_ref(),
@@ -275,6 +292,15 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         text
     } else {
         // Batch mode (default): capture audio, encode, then transcribe
+        let provider = resolve_provider(opts.provider, &config);
+        let transcriber =
+            transcription::create_batch_transcriber(&config, provider, opts.model.as_deref())?;
+
+        // Pre-flight: verify provider connectivity and model validity
+        // before starting audio capture.
+        log::info!("validating {} provider configuration", provider);
+        transcriber.validate().await?;
+
         let mut capture = CpalCapture::new(config.audio.clone());
         let audio_rx = capture.start()?;
 
@@ -290,7 +316,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             config.audio.clone(),
             audio_rx,
             save_file,
-            config.providers.mistral,
+            transcriber,
         )
         .await?
     };
@@ -386,7 +412,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 }
 
 /// Toggle dispatch: start a new daemon or stop a running one.
+#[allow(clippy::too_many_arguments)]
 async fn toggle_dispatch(
+    provider: Option<Provider>,
+    model: Option<String>,
     realtime: bool,
     no_sounds: bool,
     no_overlay: bool,
@@ -402,7 +431,8 @@ async fn toggle_dispatch(
     match daemon::check_status(&pid_file)? {
         DaemonStatus::NotRunning => {
             toggle_start(
-                &pid_file, realtime, no_sounds, no_overlay, amplitude, spectrum, verbose,
+                &pid_file, provider, model, realtime, no_sounds, no_overlay, amplitude, spectrum,
+                verbose,
             )
             .await
         }
@@ -411,8 +441,11 @@ async fn toggle_dispatch(
 }
 
 /// Start a new daemon: capture window, spawn detached dictate process, write PID.
+#[allow(clippy::too_many_arguments)]
 async fn toggle_start(
     pid_file: &std::path::Path,
+    provider: Option<Provider>,
+    model: Option<String>,
     realtime: bool,
     no_sounds: bool,
     no_overlay: bool,
@@ -420,6 +453,24 @@ async fn toggle_start(
     spectrum: bool,
     verbose: u8,
 ) -> Result<(), TalkError> {
+    // Pre-flight: validate provider/model before spawning the daemon
+    // so the user gets immediate feedback on misconfiguration.
+    let config = Config::load(None)?;
+    let effective_provider = resolve_provider(provider, &config);
+    log::info!("validating {} provider configuration", effective_provider);
+    if realtime {
+        let t = transcription::create_realtime_transcriber(
+            &config,
+            effective_provider,
+            model.as_deref(),
+        )?;
+        t.validate().await?;
+    } else {
+        let t =
+            transcription::create_batch_transcriber(&config, effective_provider, model.as_deref())?;
+        t.validate().await?;
+    }
+
     // Capture active window before spawning daemon
     let target_window = get_active_window().await;
 
@@ -436,6 +487,14 @@ async fn toggle_start(
     }
 
     cmd.arg("dictate").arg("--daemon");
+
+    if let Some(p) = provider {
+        cmd.arg("--provider").arg(p.to_string());
+    }
+
+    if let Some(ref m) = model {
+        cmd.arg("--model").arg(m);
+    }
 
     if realtime {
         cmd.arg("--realtime");
@@ -492,7 +551,11 @@ async fn toggle_start(
     let child_pid = child.id();
     daemon::write_pid_file(pid_file, child_pid)?;
 
-    log::info!("dictation started (PID {})", child_pid);
+    log::info!(
+        "dictation started (PID {}, logs: {})",
+        child_pid,
+        log_file_path.display()
+    );
 
     Ok(())
 }
@@ -571,14 +634,23 @@ fn flush_sentences(buffer: &mut String, segments: &mut Vec<String>) {
 ///
 /// When `visualizer` is provided, the live transcription text is pushed
 /// to the text overlay as words arrive.
+#[allow(clippy::too_many_arguments)]
 async fn dictate_realtime(
     config: Config,
+    provider: Provider,
+    model: Option<&str>,
     save_path: Option<&std::path::Path>,
     player: Option<&SoundPlayer>,
     boop_token: Option<&CancellationToken>,
     segment_tx: Option<tokio::sync::mpsc::Sender<String>>,
     visualizer: Option<&VisualizerHandle>,
 ) -> Result<String, TalkError> {
+    // Create and validate the transcriber before starting audio capture
+    // so the user gets immediate feedback on misconfiguration.
+    let transcriber = transcription::create_realtime_transcriber(&config, provider, model)?;
+    log::info!("validating {} provider configuration", provider);
+    transcriber.validate().await?;
+
     let mut capture = CpalCapture::new(config.audio.clone());
     let audio_rx = capture.start()?;
 
@@ -620,7 +692,6 @@ async fn dictate_realtime(
         }
     };
 
-    let transcriber = MistralRealtimeTranscriber::new(config.providers.mistral);
     let mut event_rx = transcriber.transcribe_realtime(audio_rx).await?;
 
     log::info!("recording (realtime)... press Ctrl+C to stop");
@@ -839,7 +910,7 @@ async fn dictate_streaming(
     audio_config: AudioConfig,
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     save_file: Option<tokio::fs::File>,
-    mistral_config: crate::core::config::MistralConfig,
+    transcriber: Box<dyn BatchTranscriber>,
 ) -> Result<String, TalkError> {
     // Create channel for streaming encoded audio to transcriber
     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(25);
@@ -922,7 +993,6 @@ async fn dictate_streaming(
     });
 
     // Spawn transcription task
-    let transcriber = MistralTranscriber::new(mistral_config);
     let transcribe_task =
         tokio::spawn(async move { transcriber.transcribe_stream(stream_rx, "audio.ogg").await });
 
@@ -992,7 +1062,7 @@ mod tests {
         use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
         use crate::core::clipboard::MockClipboard;
         use crate::core::config::AudioConfig;
-        use crate::core::transcription::{MockTranscriber, Transcriber};
+        use crate::core::transcription::{BatchTranscriber, MockBatchTranscriber};
 
         let audio_config = AudioConfig {
             sample_rate: 16_000,
@@ -1038,7 +1108,7 @@ mod tests {
         });
 
         // Spawn transcription with mock
-        let transcriber = MockTranscriber::new("Hello world from dictation");
+        let transcriber = MockBatchTranscriber::new("Hello world from dictation");
         let transcribe_task =
             tokio::spawn(
                 async move { transcriber.transcribe_stream(stream_rx, "audio.ogg").await },

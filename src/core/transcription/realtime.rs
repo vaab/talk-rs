@@ -3,8 +3,10 @@
 //! Connects to the Mistral Voxtral Realtime API over WebSocket,
 //! streams raw PCM audio, and receives incremental transcription events.
 
+use super::RealtimeTranscriber;
 use crate::core::config::MistralConfig;
 use crate::core::error::TalkError;
+use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use futures::stream::SplitSink;
@@ -167,6 +169,68 @@ impl MistralRealtimeTranscriber {
         DEFAULT_REALTIME_MODEL
     }
 
+    /// Open a throwaway WebSocket connection and wait for
+    /// `session.created` to confirm the API accepts the model.
+    async fn validate_realtime_session(&self) -> Result<(), TalkError> {
+        let ws_url = build_ws_url(&self.endpoint, self.realtime_model());
+
+        let parsed_url = url::Url::parse(&ws_url)
+            .map_err(|e| TalkError::Config(format!("Invalid WebSocket URL: {}", e)))?;
+        let host = parsed_url
+            .host_str()
+            .ok_or_else(|| TalkError::Config("No host in WebSocket URL".to_string()))?
+            .to_string();
+
+        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(&ws_url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("Host", &host)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .body(())
+            .map_err(|e| TalkError::Config(format!("Failed to build WebSocket request: {}", e)))?;
+
+        log::debug!("validation: connecting to {}", ws_url);
+
+        let (ws_stream, _) = tokio::time::timeout(
+            WS_CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .map_err(|_| {
+            TalkError::Config(format!(
+                "WebSocket connection timed out after {}s",
+                WS_CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| TalkError::Config(format!("WebSocket connection failed: {}", e)))?;
+
+        let (mut sink, mut source) = ws_stream.split();
+
+        // Wait for session.created (or an error).
+        let result = tokio::time::timeout(
+            SESSION_CREATED_TIMEOUT,
+            wait_for_session_created(&mut source),
+        )
+        .await
+        .map_err(|_| {
+            TalkError::Config(format!(
+                "Timed out waiting for session.created after {}s",
+                SESSION_CREATED_TIMEOUT.as_secs()
+            ))
+        })?;
+
+        // Close the validation connection cleanly.
+        let _ = sink.send(Message::Close(None)).await;
+
+        result.map(|_| ())
+    }
+
     /// Connect to the Voxtral Realtime API and stream audio for transcription.
     ///
     /// Reads `Vec<i16>` PCM chunks from `audio_rx`, encodes them as base64,
@@ -282,6 +346,34 @@ impl MistralRealtimeTranscriber {
         });
 
         Ok(event_rx)
+    }
+}
+
+#[async_trait]
+impl RealtimeTranscriber for MistralRealtimeTranscriber {
+    async fn validate(&self) -> Result<(), TalkError> {
+        // Step 1: REST check — validates API key + model existence.
+        let api_base = self
+            .endpoint
+            .replace("wss://", "https://")
+            .replace("ws://", "http://");
+        super::mistral::validate_mistral_model(
+            &self.config.api_key,
+            self.realtime_model(),
+            &api_base,
+        )
+        .await?;
+
+        // Step 2: WebSocket check — connect and wait for
+        // session.created to confirm the API accepts the model.
+        self.validate_realtime_session().await
+    }
+
+    async fn transcribe_realtime(
+        &self,
+        audio_rx: mpsc::Receiver<Vec<i16>>,
+    ) -> Result<mpsc::Receiver<TranscriptionEvent>, TalkError> {
+        self.transcribe_realtime(audio_rx).await
     }
 }
 

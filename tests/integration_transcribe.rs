@@ -8,7 +8,9 @@
 use std::fs;
 use std::path::Path;
 use talk_rs::core::config::MistralConfig;
-use talk_rs::core::transcription::{MistralTranscriber, MockTranscriber, Transcriber};
+use talk_rs::core::transcription::{
+    BatchTranscriber, MistralBatchTranscriber, MockBatchTranscriber,
+};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 
@@ -78,7 +80,7 @@ async fn test_transcribe_with_mock_writes_to_file() {
     let output_path = temp_dir.path().join("transcript.txt");
 
     // Create mock transcriber with test text
-    let mock = MockTranscriber::new("This is a test transcription from mock");
+    let mock = MockBatchTranscriber::new("This is a test transcription from mock");
 
     // Transcribe using mock
     let transcription = mock
@@ -112,7 +114,7 @@ async fn test_transcribe_nonexistent_file_errors() {
         model: "voxtral-mini-latest".to_string(),
         context_bias: None,
     };
-    let transcriber = MistralTranscriber::new(config);
+    let transcriber = MistralBatchTranscriber::new(config);
 
     let result = transcriber
         .transcribe_file(Path::new("/nonexistent/path/to/audio.wav"))
@@ -171,7 +173,11 @@ async fn test_mistral_transcriber_real_api() {
     assert!(file_size > 0, "test WAV file should have content");
 
     // Create transcriber with real API key
-    let transcriber = MistralTranscriber::new(config.providers.mistral);
+    let mistral_config = config
+        .providers
+        .mistral
+        .expect("mistral provider must be configured for this test");
+    let transcriber = MistralBatchTranscriber::new(mistral_config);
 
     // Transcribe the file
     let result = transcriber.transcribe_file(&audio_path).await;

@@ -1,20 +1,85 @@
 * talk-rs
 
-A Rust CLI scaffold for the talk-rs project.
+Voice dictation for Linux. Record, transcribe, and paste text into any
+application -- all from a single keyboard shortcut.
+
+=talk-rs= captures audio from your microphone, sends it to a
+transcription API (Mistral Voxtral or OpenAI Whisper), and types the
+result into the focused window. A small X11 overlay badge shows the
+current state (recording / transcribing) so you always know what is
+happening.
+
+** Features
+
+- *Dictation workflow* -- press a key to start recording, press again
+  to stop; transcribed text is pasted automatically.
+- *Multiple providers* -- Mistral (Voxtral) and OpenAI (Whisper /
+  GPT-4o) for batch transcription; OpenAI realtime streaming via
+  WebSocket.
+- *Visual overlay* -- non-intrusive X11 badge at the top of the screen
+  (works without a compositor).
+- *Audio feedback* -- start/stop tones and periodic boop during
+  recording; fully configurable or disabled.
+- *Context bias* -- supply domain-specific vocabulary to improve
+  transcription accuracy.
+- *Daemon toggle mode* -- first invocation starts recording, second
+  stops and transcribes; ideal for global shortcuts.
+- *Standalone commands* -- ~record~ and ~transcribe~ can be used
+  independently for scripting.
+- *Environment overrides* -- every config value can be set via
+  ~TALK_RS_*~ environment variables.
+
+** Prerequisites
+
+*** Build dependencies
+
+#+begin_src sh
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config libasound2-dev libopus-dev
+
+# Fedora
+sudo dnf install alsa-lib-devel opus-devel pkg-config
+#+end_src
+
+A working Rust toolchain is required (1.70+). Install via
+[[https://rustup.rs][rustup]] if needed.
+
+*** Runtime dependencies
+
+The following tools must be available in ~$PATH~:
+
+- ~xclip~ -- clipboard access
+- ~xdotool~ -- window focus and key simulation
+
+#+begin_src sh
+# Debian / Ubuntu
+sudo apt install xclip xdotool
+
+# Fedora
+sudo dnf install xclip xdotool
+#+end_src
+
+An API key for at least one transcription provider is required:
+
+- [[https://console.mistral.ai/][Mistral]] (default)
+- [[https://platform.openai.com/][OpenAI]]
 
 ** Installation
 
-- =cargo build=
-- =cargo run -- --help=
+#+begin_src sh
+cargo build --release
+#+end_src
 
-** Usage
+The binary is at ~target/release/talk-rs~. Copy it somewhere in your
+~$PATH~:
 
-- =talk-rs --help=
+#+begin_src sh
+cp target/release/talk-rs ~/.local/bin/
+#+end_src
 
 ** Configuration
 
-=talk-rs= reads its configuration from
-~$XDG_CONFIG_HOME/talk-rs/config.yaml~ (typically
+=talk-rs= reads ~$XDG_CONFIG_HOME/talk-rs/config.yaml~ (typically
 ~~/.config/talk-rs/config.yaml~).
 
 Copy the example and fill in your values:
@@ -24,10 +89,10 @@ mkdir -p ~/.config/talk-rs
 cp config.example.yaml ~/.config/talk-rs/config.yaml
 #+end_src
 
-Then edit ~~/.config/talk-rs/config.yaml~:
+Minimal working configuration:
 
 #+begin_src yaml
-output_dir: /home/you/talk-rs-output
+output_dir: ~/talk-rs-output
 
 providers:
   mistral:
@@ -39,29 +104,94 @@ audio:
   bitrate: 32000
 #+end_src
 
-Required fields:
+*** Required fields
 
-- ~output_dir~ -- absolute path to a writable directory for recordings
-- ~providers.mistral.api_key~ -- your [[https://console.mistral.ai/][Mistral API]] key
+| Field                        | Description                                          |
+|------------------------------+------------------------------------------------------|
+| ~output_dir~                 | Absolute path to a writable directory for recordings |
+| ~providers.mistral.api_key~  | Mistral API key (if using Mistral)                   |
+| ~providers.openai.api_key~   | OpenAI API key (if using OpenAI)                     |
+| ~audio.sample_rate~          | Sample rate in Hz (e.g. ~16000~)                     |
+| ~audio.channels~             | Channel count (~1~ = mono)                           |
+| ~audio.bitrate~              | Bitrate in bps (e.g. ~32000~)                        |
 
-Optional fields:
+*** Optional fields
 
-- ~providers.mistral.model~ -- transcription model (default:
-  ~voxtral-mini-latest~)
-- ~providers.mistral.context_bias~ -- comma-separated words to improve
-  transcription accuracy for domain terms
-- ~indicators.boop_interval_ms~ -- milliseconds between audio feedback
-  beeps (default: ~5000~, set ~0~ to disable)
-- ~indicators.visual_overlay~ -- show visual overlay during recording
-  (default: ~true~)
+| Field                              | Default                   | Description                        |
+|------------------------------------+---------------------------+------------------------------------|
+| ~providers.mistral.model~          | ~voxtral-mini-latest~     | Mistral transcription model        |
+| ~providers.mistral.context_bias~   | /none/                    | Comma-separated words for accuracy |
+| ~providers.openai.model~           | ~whisper-1~               | OpenAI batch model                 |
+| ~providers.openai.realtime_model~  | ~gpt-4o-mini-transcribe~  | OpenAI realtime model              |
+| ~transcription.default_provider~   | ~mistral~                 | Default provider when unspecified  |
+| ~indicators.boop_interval_ms~      | ~5000~                    | Boop interval (~0~ to disable)     |
+| ~indicators.visual_overlay~        | ~true~                    | Show X11 overlay badge             |
 
-All config values can be overridden via environment variables (e.g.
-~TALK_RS_PROVIDERS_MISTRAL_API_KEY~, ~TALK_RS_AUDIO_SAMPLE_RATE~).
+*** Environment overrides
 
-** GNOME Keyboard Shortcut
+Every config value can be overridden via environment variables:
 
-To bind ~talk-rs dictate --toggle~ to a key (e.g. =Super+/=), copy-paste
-this block:
+#+begin_src sh
+export TALK_RS_PROVIDERS_MISTRAL_API_KEY="sk-..."
+export TALK_RS_AUDIO_SAMPLE_RATE=44100
+#+end_src
+
+See ~config.example.yaml~ for the full list.
+
+** Usage
+
+*** Dictate (main workflow)
+
+Record, transcribe, and paste into the focused application:
+
+#+begin_src sh
+talk-rs dictate
+#+end_src
+
+Toggle mode (ideal for keyboard shortcuts):
+
+#+begin_src sh
+talk-rs dictate --toggle
+#+end_src
+
+First call starts a background daemon that records. Second call stops
+recording, transcribes, and pastes the result.
+
+Options:
+
+| Flag              | Effect                              |
+|-------------------+-------------------------------------|
+| ~--toggle~        | Daemon toggle mode                  |
+| ~--provider~      | Choose ~mistral~ or ~openai~        |
+| ~--model~         | Override model for this invocation  |
+| ~--realtime~      | Stream audio via WebSocket (OpenAI) |
+| ~--no-sounds~     | Disable audio indicators            |
+| ~--no-overlay~    | Disable visual overlay              |
+| ~--amplitude~     | Show amplitude history visualizer   |
+| ~--spectrum~      | Show spectrum visualizer            |
+
+*** Record
+
+Capture audio to an OGG/Opus file:
+
+#+begin_src sh
+talk-rs record                       # auto-named memo-YYYY-MM-DD-HH-MM-SS.ogg
+talk-rs record meeting-notes.ogg     # custom filename
+#+end_src
+
+*** Transcribe
+
+Transcribe an existing audio file:
+
+#+begin_src sh
+talk-rs transcribe recording.ogg                # print to stdout
+talk-rs transcribe recording.ogg output.txt     # write to file
+talk-rs transcribe recording.ogg --provider openai
+#+end_src
+
+** GNOME keyboard shortcut
+
+Bind ~talk-rs dictate --toggle~ to a key (e.g. =Super+/=):
 
 #+begin_src sh
 BASE="org.gnome.settings-daemon.plugins.media-keys"
@@ -94,6 +224,13 @@ To change the key, replace ~<Super>slash~ with the desired binding
 
 ** Development
 
-- =cargo fmt=
-- =cargo clippy --all-targets=
-- =cargo test=
+#+begin_src sh
+cargo fmt                     # format
+cargo clippy --all-targets    # lint
+cargo test                    # test
+cargo build                   # build
+#+end_src
+
+** License
+
+MIT -- see [[file:LICENSE][LICENSE]].

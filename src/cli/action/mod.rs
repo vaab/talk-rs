@@ -14,15 +14,22 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             let args = file.map(|f| vec![f]).unwrap_or_default();
             record(args).await?;
         }
-        Commands::Transcribe { input, output } => {
+        Commands::Transcribe {
+            input,
+            output,
+            provider,
+            model,
+        } => {
             let mut args = vec![input];
             if let Some(output_file) = output {
                 args.push(output_file);
             }
-            transcribe(args).await?;
+            transcribe(args, provider, model).await?;
         }
         Commands::Dictate {
             file,
+            provider,
+            model,
             realtime,
             toggle,
             no_sounds,
@@ -34,9 +41,10 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
         } => {
             dictate(DictateOpts {
                 args: file.map(|f| vec![f]).unwrap_or_default(),
+                provider,
+                model,
                 realtime,
                 toggle,
-
                 no_sounds,
                 no_overlay,
                 amplitude,

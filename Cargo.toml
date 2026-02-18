@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Valentin Lab <valentin.lab@kalysto.org>"]
 license = "MIT"
-description = "CLI scaffold for talk-rs"
+description = "Voice dictation for Linux -- record, transcribe, and paste"
 readme = "README.org"
 
 [lib]
