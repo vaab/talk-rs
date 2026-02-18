@@ -28,22 +28,6 @@ providers:
     # Optimized for English; experimental for other languages.
     # context_bias: "Kalysto,talk-rs,Voxtral,cpal,tokio"
 
-# Required: Audio Capture and Encoding Settings
-# These settings control how audio is captured and processed
-audio:
-  # Sample rate in Hz (e.g., 16000 for 16kHz, 44100 for CD quality)
-  # Common values: 8000, 16000, 44100, 48000
-  sample_rate: <PLACEHOLDER>
-  
-  # Number of audio channels
-  # 1 = mono (single channel), 2 = stereo (dual channel)
-  channels: <PLACEHOLDER>
-  
-  # Bitrate in bits per second for compressed formats
-  # Common values: 32000, 64000, 128000, 192000
-  # Only used for compressed audio formats (e.g., MP3, AAC)
-  bitrate: <PLACEHOLDER>
-
 # Optional: Visual and Audio Indicators
 # Configure feedback mechanisms during recording
 indicators:

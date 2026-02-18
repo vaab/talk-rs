@@ -97,11 +97,6 @@ output_dir: ~/talk-rs-output
 providers:
   mistral:
     api_key: YOUR_MISTRAL_API_KEY
-
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 #+end_src
 
 *** Required fields
@@ -111,9 +106,6 @@ audio:
 | ~output_dir~                 | Absolute path to a writable directory for recordings |
 | ~providers.mistral.api_key~  | Mistral API key (if using Mistral)                   |
 | ~providers.openai.api_key~   | OpenAI API key (if using OpenAI)                     |
-| ~audio.sample_rate~          | Sample rate in Hz (e.g. ~16000~)                     |
-| ~audio.channels~             | Channel count (~1~ = mono)                           |
-| ~audio.bitrate~              | Bitrate in bps (e.g. ~32000~)                        |
 
 *** Optional fields
 
