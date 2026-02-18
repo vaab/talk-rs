@@ -18,9 +18,6 @@ pub struct Config {
     /// Transcription providers configuration.
     pub providers: ProvidersConfig,
 
-    /// Audio capture and encoding settings.
-    pub audio: AudioConfig,
-
     /// Optional indicator settings.
     pub indicators: Option<IndicatorsConfig>,
 
@@ -134,7 +131,10 @@ fn default_provider() -> Provider {
 }
 
 /// Audio configuration.
-#[derive(Debug, Deserialize, Clone)]
+///
+/// Hardcoded to the only sensible values for voice dictation:
+/// 16 kHz mono at 32 kbps. Making these user-configurable was a footgun.
+#[derive(Debug, Clone)]
 pub struct AudioConfig {
     /// Sample rate in Hz (e.g., 16000).
     pub sample_rate: u32,
@@ -144,6 +144,23 @@ pub struct AudioConfig {
 
     /// Bitrate in bps for compressed formats.
     pub bitrate: u32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioConfig {
+    /// Create a new `AudioConfig` with hardcoded voice-dictation defaults.
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 16_000,
+            channels: 1,
+            bitrate: 32_000,
+        }
+    }
 }
 
 /// Indicator configuration.
@@ -182,9 +199,6 @@ impl Config {
     /// - TALK_RS_PROVIDERS_OPENAI_API_KEY
     /// - TALK_RS_PROVIDERS_OPENAI_MODEL
     /// - TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL
-    /// - TALK_RS_AUDIO_SAMPLE_RATE
-    /// - TALK_RS_AUDIO_CHANNELS
-    /// - TALK_RS_AUDIO_BITRATE
     pub fn load(path: Option<&Path>) -> Result<Self, TalkError> {
         let config_path = match path {
             Some(path) => path.to_path_buf(),
@@ -258,18 +272,6 @@ impl Config {
             }
         }
 
-        if let Some(value) = env_var_u32("TALK_RS_AUDIO_SAMPLE_RATE")? {
-            config.audio.sample_rate = value;
-        }
-
-        if let Some(value) = env_var_u8("TALK_RS_AUDIO_CHANNELS")? {
-            config.audio.channels = value;
-        }
-
-        if let Some(value) = env_var_u32("TALK_RS_AUDIO_BITRATE")? {
-            config.audio.bitrate = value;
-        }
-
         validate_config(&config)?;
 
         Ok(config)
@@ -283,30 +285,6 @@ fn env_var_string(key: &str) -> Result<Option<String>, TalkError> {
         Err(env::VarError::NotUnicode(_)) => {
             Err(TalkError::Config(format!("{} must be valid UTF-8", key)))
         }
-    }
-}
-
-fn env_var_u32(key: &str) -> Result<Option<u32>, TalkError> {
-    match env_var_string(key)? {
-        Some(value) => {
-            let parsed = value
-                .parse::<u32>()
-                .map_err(|err| TalkError::Config(format!("Invalid {}: {}", key, err)))?;
-            Ok(Some(parsed))
-        }
-        None => Ok(None),
-    }
-}
-
-fn env_var_u8(key: &str) -> Result<Option<u8>, TalkError> {
-    match env_var_string(key)? {
-        Some(value) => {
-            let parsed = value
-                .parse::<u8>()
-                .map_err(|err| TalkError::Config(format!("Invalid {}: {}", key, err)))?;
-            Ok(Some(parsed))
-        }
-        None => Ok(None),
     }
 }
 
@@ -389,9 +367,6 @@ mod tests {
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_API_KEY")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_MODEL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?,
-            EnvGuard::clear("TALK_RS_AUDIO_SAMPLE_RATE")?,
-            EnvGuard::clear("TALK_RS_AUDIO_CHANNELS")?,
-            EnvGuard::clear("TALK_RS_AUDIO_BITRATE")?,
         ])
     }
 
@@ -405,10 +380,6 @@ output_dir: /tmp/test-output
 providers:
   mistral:
     api_key: test-api-key
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 "#;
         let file = write_config(yaml)?;
 
@@ -419,9 +390,6 @@ audio:
         assert_eq!(m.model, "voxtral-mini-latest");
         assert!(m.context_bias.is_none());
         assert!(config.providers.openai.is_none());
-        assert_eq!(config.audio.sample_rate, 16000);
-        assert_eq!(config.audio.channels, 1);
-        assert_eq!(config.audio.bitrate, 32000);
         Ok(())
     }
 
@@ -436,10 +404,6 @@ output_dir: /tmp/test-output
 providers:
   mistral:
     api_key: test-api-key
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 "#;
         let file = write_config(yaml)?;
 
@@ -461,10 +425,6 @@ providers:
     api_key: test-api-key
     model: voxtral-mini-2602
     context_bias: "Kalysto,talk-rs,Voxtral"
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 "#;
         let file = write_config(yaml)?;
 
@@ -487,10 +447,6 @@ output_dir: /tmp/test-output
 providers:
   mistral:
     api_key: test-api-key
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 "#;
         let file = write_config(yaml)?;
 
@@ -510,10 +466,6 @@ audio:
         let yaml = r#"
 output_dir: ""
 providers: {}
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 "#;
         let file = write_config(yaml)?;
 
@@ -538,10 +490,6 @@ providers:
   openai:
     api_key: sk-test-key
     model: gpt-4o-transcribe
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 "#;
         let file = write_config(yaml)?;
 
@@ -563,10 +511,6 @@ audio:
         let yaml = r#"
 output_dir: /tmp/test-output
 providers: {}
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 "#;
         let file = write_config(yaml)?;
 
@@ -591,10 +535,6 @@ providers:
     api_key: openai-key
 transcription:
   default_provider: openai
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 "#;
         let file = write_config(yaml)?;
 
@@ -617,10 +557,6 @@ audio:
         let yaml = r#"
 output_dir: /tmp/test-output
 providers: {}
-audio:
-  sample_rate: 16000
-  channels: 1
-  bitrate: 32000
 "#;
         let file = write_config(yaml)?;
 

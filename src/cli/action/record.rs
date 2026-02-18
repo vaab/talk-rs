@@ -5,7 +5,7 @@
 
 use crate::core::audio::cpal_capture::CpalCapture;
 use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
-use crate::core::config::Config;
+use crate::core::config::AudioConfig;
 use crate::core::error::TalkError;
 use chrono::Local;
 use std::io::SeekFrom;
@@ -33,10 +33,7 @@ pub fn parse_args(args: &[String]) -> Result<PathBuf, TalkError> {
     }
 }
 
-fn create_writer(
-    path: &Path,
-    config: crate::core::config::AudioConfig,
-) -> Result<Box<dyn AudioWriter>, TalkError> {
+fn create_writer(path: &Path, config: AudioConfig) -> Result<Box<dyn AudioWriter>, TalkError> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("wav") => Ok(Box::new(WavWriter::new(config))),
         _ => Ok(Box::new(OggOpusWriter::new(config)?)),
@@ -59,15 +56,12 @@ pub async fn record(args: Vec<String>) -> Result<(), TalkError> {
     // Parse arguments
     let output_path = parse_args(&args)?;
 
-    // Load configuration
-    let config = Config::load(None)?;
-
     // Initialize audio capture
-    let mut capture = CpalCapture::new(config.audio.clone());
+    let mut capture = CpalCapture::new(AudioConfig::new());
     let mut rx = capture.start()?;
 
     // Initialize audio writer
-    let mut writer = create_writer(&output_path, config.audio.clone())?;
+    let mut writer = create_writer(&output_path, AudioConfig::new())?;
     let is_wav = matches!(
         output_path.extension().and_then(|e| e.to_str()),
         Some("wav")
@@ -218,11 +212,7 @@ mod tests {
         let output_path = temp_dir.path().join("test-recording.ogg");
 
         // Use test audio config instead of loading from file
-        let audio_config = AudioConfig {
-            sample_rate: 16_000,
-            channels: 1,
-            bitrate: 32_000,
-        };
+        let audio_config = AudioConfig::new();
 
         // Initialize mock capture
         let mut capture =

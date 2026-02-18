@@ -301,7 +301,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         log::info!("validating {} provider configuration", provider);
         transcriber.validate().await?;
 
-        let mut capture = CpalCapture::new(config.audio.clone());
+        let mut capture = CpalCapture::new(AudioConfig::new());
         let audio_rx = capture.start()?;
 
         // Optionally create output file for saving audio
@@ -313,7 +313,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
         dictate_streaming(
             &mut capture,
-            config.audio.clone(),
+            AudioConfig::new(),
             audio_rx,
             save_file,
             transcriber,
@@ -651,7 +651,7 @@ async fn dictate_realtime(
     log::info!("validating {} provider configuration", provider);
     transcriber.validate().await?;
 
-    let mut capture = CpalCapture::new(config.audio.clone());
+    let mut capture = CpalCapture::new(AudioConfig::new());
     let audio_rx = capture.start()?;
 
     // If a save path is given, tee the audio stream: one copy goes to
@@ -665,8 +665,12 @@ async fn dictate_realtime(
         log::info!("saving debug audio to: {}", wav_path.display());
 
         let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
-        let audio_cfg = config.audio.clone();
-        let task = tokio::spawn(audio_tee_to_wav(audio_rx, fwd_tx, wav_path, audio_cfg));
+        let task = tokio::spawn(audio_tee_to_wav(
+            audio_rx,
+            fwd_tx,
+            wav_path,
+            AudioConfig::new(),
+        ));
         (fwd_rx, Some(task))
     } else {
         // Also save a debug capture automatically in the cache directory
@@ -679,12 +683,11 @@ async fn dictate_realtime(
             }
             log::info!("saving debug audio to: {}", wav_path.display());
             let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
-            let audio_cfg = config.audio.clone();
             let task = tokio::spawn(audio_tee_to_wav(
                 audio_rx,
                 fwd_tx,
                 wav_path.clone(),
-                audio_cfg,
+                AudioConfig::new(),
             ));
             (fwd_rx, Some(task))
         } else {
@@ -1064,11 +1067,7 @@ mod tests {
         use crate::core::config::AudioConfig;
         use crate::core::transcription::{BatchTranscriber, MockBatchTranscriber};
 
-        let audio_config = AudioConfig {
-            sample_rate: 16_000,
-            channels: 1,
-            bitrate: 32_000,
-        };
+        let audio_config = AudioConfig::new();
 
         // Initialize mock capture
         let mut capture =
