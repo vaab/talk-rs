@@ -14,6 +14,7 @@ use crate::core::overlay::{IndicatorKind, OverlayHandle};
 use crate::core::transcription::{
     MistralRealtimeTranscriber, MistralTranscriber, Transcriber, TranscriptionEvent,
 };
+use crate::core::visualizer::VisualizerHandle;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -26,6 +27,8 @@ pub struct DictateOpts {
     pub toggle: bool,
     pub no_sounds: bool,
     pub no_overlay: bool,
+    pub amplitude: bool,
+    pub spectrum: bool,
     pub daemon: bool,
     pub target_window: Option<String>,
     pub verbose: u8,
@@ -89,7 +92,15 @@ async fn simulate_paste() -> Result<(), TalkError> {
 pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Toggle mode: start or stop a daemon
     if opts.toggle {
-        return toggle_dispatch(opts.batch, opts.no_sounds, opts.no_overlay, opts.verbose).await;
+        return toggle_dispatch(
+            opts.batch,
+            opts.no_sounds,
+            opts.no_overlay,
+            opts.amplitude,
+            opts.spectrum,
+            opts.verbose,
+        )
+        .await;
     }
 
     let save_path = parse_args(&opts.args)?;
@@ -146,6 +157,26 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     };
 
+    // Initialize visualizer (amplitude / spectrum panels)
+    let visualizer = if opts.amplitude || opts.spectrum {
+        match VisualizerHandle::new(opts.amplitude, opts.spectrum) {
+            Ok(h) => {
+                log::debug!(
+                    "visualizer initialized (amplitude={}, spectrum={})",
+                    opts.amplitude,
+                    opts.spectrum,
+                );
+                Some(h)
+            }
+            Err(e) => {
+                log::warn!("visualizer unavailable: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Play start sound
     if let Some(ref p) = player {
         log::debug!("playing start sound");
@@ -156,6 +187,12 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     if let Some(ref o) = overlay {
         log::debug!("showing recording overlay");
         o.show(IndicatorKind::Recording);
+    }
+
+    // Show visualizer panels (positioned relative to 182px recording badge)
+    if let Some(ref viz) = visualizer {
+        log::debug!("showing visualizer");
+        viz.show(182);
     }
 
     // Start boop loop (every 5 seconds)
@@ -209,10 +246,14 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         token.cancel();
     }
 
-    // Hide recording indicator
+    // Hide recording indicator and visualizer
     if let Some(ref o) = overlay {
         log::debug!("hiding overlay");
         o.hide();
+    }
+    if let Some(ref viz) = visualizer {
+        log::debug!("hiding visualizer");
+        viz.hide();
     }
 
     // For batch mode, play stop sound here (realtime mode already
@@ -287,6 +328,8 @@ async fn toggle_dispatch(
     batch: bool,
     no_sounds: bool,
     no_overlay: bool,
+    amplitude: bool,
+    spectrum: bool,
     verbose: u8,
 ) -> Result<(), TalkError> {
     let pid_file = daemon::pid_path()?;
@@ -296,7 +339,10 @@ async fn toggle_dispatch(
 
     match daemon::check_status(&pid_file)? {
         DaemonStatus::NotRunning => {
-            toggle_start(&pid_file, batch, no_sounds, no_overlay, verbose).await
+            toggle_start(
+                &pid_file, batch, no_sounds, no_overlay, amplitude, spectrum, verbose,
+            )
+            .await
         }
         DaemonStatus::Running { pid } => toggle_stop(pid, &pid_file),
     }
@@ -308,6 +354,8 @@ async fn toggle_start(
     batch: bool,
     no_sounds: bool,
     no_overlay: bool,
+    amplitude: bool,
+    spectrum: bool,
     verbose: u8,
 ) -> Result<(), TalkError> {
     // Capture active window before spawning daemon
@@ -337,6 +385,14 @@ async fn toggle_start(
 
     if no_overlay {
         cmd.arg("--no-overlay");
+    }
+
+    if amplitude {
+        cmd.arg("--amplitude");
+    }
+
+    if spectrum {
+        cmd.arg("--spectrum");
     }
 
     if let Some(ref wid) = target_window {
