@@ -27,6 +27,8 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             toggle,
             no_sounds,
             no_overlay,
+            amplitude,
+            spectrum,
             daemon,
             target_window,
         } => {
@@ -36,6 +38,8 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
                 toggle,
                 no_sounds,
                 no_overlay,
+                amplitude,
+                spectrum,
                 daemon,
                 target_window,
                 verbose,

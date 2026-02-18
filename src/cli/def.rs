@@ -45,6 +45,12 @@ pub enum Commands {
         /// Disable visual overlay indicator
         #[arg(long)]
         no_overlay: bool,
+        /// Show amplitude history visualizer (left of badge)
+        #[arg(long)]
+        amplitude: bool,
+        /// Show spectrum visualizer (right of badge)
+        #[arg(long)]
+        spectrum: bool,
         /// Run as daemon process (internal, used by --toggle)
         #[arg(long, hide = true)]
         daemon: bool,
