@@ -227,16 +227,71 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         .await?
     } else {
         // Realtime mode (default): stream audio over WebSocket.
+        // Each segment is pasted into the focused application as it
+        // arrives, providing real-time feedback while dictating.
+
+        // Save clipboard and focus target window before recording starts
+        let rt_clipboard = X11Clipboard::new();
+        let saved_clipboard = rt_clipboard.get_text().await.ok();
+        if let Some(ref wid) = target_window {
+            log::debug!("pre-focusing target window: {}", wid);
+            if !focus_window(wid).await {
+                log::warn!("could not pre-focus target window {}", wid);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Create segment channel for per-segment pasting
+        let (seg_tx, mut seg_rx) = tokio::sync::mpsc::channel::<String>(32);
+
+        // Spawn paste consumer: each segment is pasted immediately
+        let paste_task = tokio::spawn(async move {
+            let paste_clip = X11Clipboard::new();
+            let mut is_first = true;
+            while let Some(segment) = seg_rx.recv().await {
+                let paste_text = if is_first {
+                    is_first = false;
+                    segment
+                } else {
+                    format!(" {}", segment)
+                };
+                if let Err(e) = paste_clip.set_text(&paste_text).await {
+                    log::warn!("per-segment clipboard set failed: {}", e);
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if let Err(e) = simulate_paste().await {
+                    log::warn!("per-segment paste failed: {}", e);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+
         // Player and boop_token are passed so the stop sound fires
         // immediately when the user toggles — not after the WebSocket
         // finishes collecting transcription results.
-        dictate_realtime(
+        let text = dictate_realtime(
             config,
             save_path.as_deref(),
             player.as_ref(),
             boop_token.as_ref(),
+            Some(seg_tx),
         )
-        .await?
+        .await?;
+
+        // Wait for all pending pastes to complete
+        if let Err(e) = paste_task.await {
+            log::warn!("paste task error: {}", e);
+        }
+
+        // Restore original clipboard
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(saved) = saved_clipboard {
+            log::debug!("restoring original clipboard");
+            let _ = rt_clipboard.set_text(&saved).await;
+        }
+
+        text
     };
 
     // Stop boop loop (idempotent — may already be cancelled by
@@ -274,44 +329,50 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     log::info!("transcription: {}", text);
 
-    // Paste into focused application
-    let clipboard = X11Clipboard::new();
+    // Paste into focused application (batch mode only;
+    // realtime mode pastes per-segment during recording)
+    if opts.batch {
+        let clipboard = X11Clipboard::new();
 
-    // Refocus target window
-    if let Some(ref wid) = target_window {
-        log::debug!("refocusing target window: {}", wid);
-        if !focus_window(wid).await {
-            log::warn!("could not refocus target window {}", wid);
+        // Refocus target window
+        if let Some(ref wid) = target_window {
+            log::debug!("refocusing target window: {}", wid);
+            if !focus_window(wid).await {
+                log::warn!("could not refocus target window {}", wid);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+
+        // Save current clipboard
+        log::debug!("saving current clipboard");
+        let saved_clipboard = clipboard.get_text().await.ok();
+
+        // Set clipboard to transcription
+        log::debug!("setting clipboard to transcription text");
+        clipboard.set_text(&text).await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
 
-    // Save current clipboard
-    log::debug!("saving current clipboard");
-    let saved_clipboard = clipboard.get_text().await.ok();
+        // Simulate paste
+        log::debug!("simulating paste (ctrl+shift+v)");
+        simulate_paste().await?;
 
-    // Set clipboard to transcription
-    log::debug!("setting clipboard to transcription text");
-    clipboard.set_text(&text).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // Simulate paste
-    log::debug!("simulating paste (ctrl+shift+v)");
-    simulate_paste().await?;
-
-    // Restore clipboard after paste
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    if let Some(saved) = saved_clipboard {
-        log::debug!("restoring original clipboard");
-        let _ = clipboard.set_text(&saved).await;
+        // Restore clipboard after paste
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(saved) = saved_clipboard {
+            log::debug!("restoring original clipboard");
+            let _ = clipboard.set_text(&saved).await;
+        }
     }
 
     if let Some(ref path) = save_path {
         log::info!("audio saved to: {}", path.display());
     }
 
-    // Print transcription to stdout
-    println!("{}", text);
+    // Print transcription to stdout (batch mode only;
+    // realtime mode already prints segments as they arrive)
+    if opts.batch {
+        println!("{}", text);
+    }
 
     // If running as daemon, clean up PID file on normal exit
     if opts.daemon {
@@ -511,6 +572,7 @@ async fn dictate_realtime(
     save_path: Option<&std::path::Path>,
     player: Option<&SoundPlayer>,
     boop_token: Option<&CancellationToken>,
+    segment_tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String, TalkError> {
     let mut capture = CpalCapture::new(config.audio.clone());
     let audio_rx = capture.start()?;
@@ -603,7 +665,13 @@ async fn dictate_realtime(
                         // Flush completed sentences from the buffer.
                         // Split on sentence-ending punctuation followed by
                         // whitespace or end-of-string.
+                        let prev_count = segments.len();
                         flush_sentences(&mut current_line, &mut segments);
+                        if let Some(ref tx) = segment_tx {
+                            for seg in &segments[prev_count..] {
+                                let _ = tx.send(seg.clone()).await;
+                            }
+                        }
                     }
                     Some(TranscriptionEvent::SegmentDelta { text, .. }) => {
                         // If the API sends segment events, use them as
@@ -611,6 +679,9 @@ async fn dictate_realtime(
                         let segment_text = text.trim().to_string();
                         if !segment_text.is_empty() {
                             println!("{}", segment_text);
+                            if let Some(ref tx) = segment_tx {
+                                let _ = tx.send(segment_text.clone()).await;
+                            }
                             segments.push(segment_text);
                         }
                         let blank = " ".repeat(current_line.len());
@@ -622,6 +693,9 @@ async fn dictate_realtime(
                         let trailing = current_line.trim().to_string();
                         if !trailing.is_empty() {
                             println!("{}", trailing);
+                            if let Some(ref tx) = segment_tx {
+                                let _ = tx.send(trailing.clone()).await;
+                            }
                             segments.push(trailing);
                         }
                         eprintln!();
@@ -647,6 +721,9 @@ async fn dictate_realtime(
                         let trailing = current_line.trim().to_string();
                         if !trailing.is_empty() {
                             println!("{}", trailing);
+                            if let Some(ref tx) = segment_tx {
+                                let _ = tx.send(trailing.clone()).await;
+                            }
                             segments.push(trailing);
                         }
                         eprintln!();
