@@ -33,9 +33,9 @@ pub enum Commands {
         /// Output file path to save the audio recording (optional)
         #[arg(value_name = "FILE")]
         file: Option<String>,
-        /// Use batch mode (upload complete recording, transcribe after stop)
+        /// Use realtime mode (stream audio via WebSocket, get incremental text)
         #[arg(long)]
-        batch: bool,
+        realtime: bool,
         /// Toggle daemon mode: first call starts recording, second call stops
         #[arg(long)]
         toggle: bool,
