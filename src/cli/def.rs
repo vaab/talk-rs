@@ -40,6 +40,9 @@ pub enum Commands {
         /// Save audio recording to this file path
         #[arg(long, value_name = "PATH")]
         save: Option<String>,
+        /// Write recording metadata YAML to this file path
+        #[arg(long, value_name = "FILE")]
+        output_yaml: Option<String>,
         /// Feed a pre-recorded WAV file instead of live microphone capture
         #[arg(long, value_name = "FILE")]
         input_audio_file: Option<String>,
