@@ -118,7 +118,7 @@ fn default_openai_model() -> String {
 }
 
 fn default_openai_realtime_model() -> String {
-    "gpt-4o-realtime-preview".to_string()
+    "gpt-4o-mini-transcribe".to_string()
 }
 
 /// Transcription defaults.
