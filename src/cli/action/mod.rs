@@ -23,7 +23,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
         }
         Commands::Dictate {
             file,
-            batch,
+            realtime,
             toggle,
             no_sounds,
             no_overlay,
@@ -34,8 +34,9 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
         } => {
             dictate(DictateOpts {
                 args: file.map(|f| vec![f]).unwrap_or_default(),
-                batch,
+                realtime,
                 toggle,
+
                 no_sounds,
                 no_overlay,
                 amplitude,

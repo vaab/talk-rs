@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 /// Options for the dictate command.
 pub struct DictateOpts {
     pub args: Vec<String>,
-    pub batch: bool,
+    pub realtime: bool,
     pub toggle: bool,
     pub no_sounds: bool,
     pub no_overlay: bool,
@@ -93,7 +93,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Toggle mode: start or stop a daemon
     if opts.toggle {
         return toggle_dispatch(
-            opts.batch,
+            opts.realtime,
             opts.no_sounds,
             opts.no_overlay,
             opts.amplitude,
@@ -202,31 +202,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     log::info!(
         "starting {} transcription",
-        if opts.batch { "batch" } else { "realtime" }
+        if opts.realtime { "realtime" } else { "batch" }
     );
 
-    let text = if opts.batch {
-        // Batch mode: capture audio, encode, then transcribe
-        let mut capture = CpalCapture::new(config.audio.clone());
-        let audio_rx = capture.start()?;
-
-        // Optionally create output file for saving audio
-        let save_file = if let Some(ref path) = save_path {
-            Some(tokio::fs::File::create(path).await.map_err(TalkError::Io)?)
-        } else {
-            None
-        };
-
-        dictate_streaming(
-            &mut capture,
-            config.audio.clone(),
-            audio_rx,
-            save_file,
-            config.providers.mistral,
-        )
-        .await?
-    } else {
-        // Realtime mode (default): stream audio over WebSocket.
+    let text = if opts.realtime {
+        // Realtime mode (--realtime): stream audio over WebSocket.
         // Each segment is pasted into the focused application as it
         // arrives, providing real-time feedback while dictating.
 
@@ -293,6 +273,26 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
 
         text
+    } else {
+        // Batch mode (default): capture audio, encode, then transcribe
+        let mut capture = CpalCapture::new(config.audio.clone());
+        let audio_rx = capture.start()?;
+
+        // Optionally create output file for saving audio
+        let save_file = if let Some(ref path) = save_path {
+            Some(tokio::fs::File::create(path).await.map_err(TalkError::Io)?)
+        } else {
+            None
+        };
+
+        dictate_streaming(
+            &mut capture,
+            config.audio.clone(),
+            audio_rx,
+            save_file,
+            config.providers.mistral,
+        )
+        .await?
     };
 
     // Stop boop loop (idempotent — may already be cancelled by
@@ -312,9 +312,9 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         viz.hide();
     }
 
-    // For batch mode, play stop sound here (realtime mode already
-    // played it inside dictate_realtime on SIGINT).
-    if opts.batch {
+    // For batch mode (default), play stop sound here (realtime mode
+    // already played it inside dictate_realtime on SIGINT).
+    if !opts.realtime {
         if let Some(ref p) = player {
             log::debug!("playing stop sound");
             p.play_stop().await;
@@ -332,7 +332,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     // Paste into focused application (batch mode only;
     // realtime mode pastes per-segment during recording)
-    if opts.batch {
+    if !opts.realtime {
         let clipboard = X11Clipboard::new();
 
         // Refocus target window
@@ -371,7 +371,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     // Print transcription to stdout (batch mode only;
     // realtime mode already prints segments as they arrive)
-    if opts.batch {
+    if !opts.realtime {
         println!("{}", text);
     }
 
@@ -387,7 +387,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
 /// Toggle dispatch: start a new daemon or stop a running one.
 async fn toggle_dispatch(
-    batch: bool,
+    realtime: bool,
     no_sounds: bool,
     no_overlay: bool,
     amplitude: bool,
@@ -402,7 +402,7 @@ async fn toggle_dispatch(
     match daemon::check_status(&pid_file)? {
         DaemonStatus::NotRunning => {
             toggle_start(
-                &pid_file, batch, no_sounds, no_overlay, amplitude, spectrum, verbose,
+                &pid_file, realtime, no_sounds, no_overlay, amplitude, spectrum, verbose,
             )
             .await
         }
@@ -413,7 +413,7 @@ async fn toggle_dispatch(
 /// Start a new daemon: capture window, spawn detached dictate process, write PID.
 async fn toggle_start(
     pid_file: &std::path::Path,
-    batch: bool,
+    realtime: bool,
     no_sounds: bool,
     no_overlay: bool,
     amplitude: bool,
@@ -427,7 +427,7 @@ async fn toggle_start(
     let exe = std::env::current_exe()
         .map_err(|e| TalkError::Config(format!("failed to determine current executable: {}", e)))?;
 
-    // Build daemon command: talk-rs [-v...] dictate --daemon [--batch] [--no-sounds] [--target-window=WID]
+    // Build daemon command: talk-rs [-v...] dictate --daemon [--realtime] [--no-sounds] [--target-window=WID]
     let mut cmd = std::process::Command::new(&exe);
 
     // Forward verbosity level (before subcommand)
@@ -437,8 +437,8 @@ async fn toggle_start(
 
     cmd.arg("dictate").arg("--daemon");
 
-    if batch {
-        cmd.arg("--batch");
+    if realtime {
+        cmd.arg("--realtime");
     }
 
     if no_sounds {
