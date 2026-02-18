@@ -160,11 +160,7 @@ mod tests {
     use super::*;
 
     fn test_config() -> AudioConfig {
-        AudioConfig {
-            sample_rate: 16_000,
-            channels: 1,
-            bitrate: 32_000,
-        }
+        AudioConfig::new()
     }
 
     #[test]
