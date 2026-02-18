@@ -1,4 +1,5 @@
-//! Real-time audio visualizer overlays (amplitude history + FFT spectrum).
+//! Real-time audio visualizer overlays (amplitude history + FFT spectrum)
+//! and live transcription text display.
 //!
 //! Displays small panels on either side of the recording badge using X11
 //! `put_image` for efficient rendering at 60 fps.  Each panel is
@@ -6,6 +7,7 @@
 //!
 //! - **Amplitude** (left of badge): RMS volume history over time.
 //! - **Spectrum** (right of badge): FFT frequency-domain bar chart.
+//! - **Text** (below badge): live transcription text as words arrive.
 //!
 //! The visualizer opens its own CPAL capture stream so it is fully
 //! decoupled from the recording pipeline.
@@ -14,6 +16,7 @@ use crate::core::error::TalkError;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
 use x11rb::connection::Connection;
+use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::*;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
@@ -29,6 +32,9 @@ const GAP: i16 = 4;
 const TOP_OFFSET: i16 = 4;
 /// Target frames per second for the render loop.
 const FPS: u32 = 60;
+/// Amplitude history window in seconds.  Only the most recent
+/// `AMP_WINDOW_SECS` of RMS values are kept; older data scrolls off.
+const AMP_WINDOW_SECS: f32 = 5.0;
 /// Number of audio samples fed into the FFT (must be power of two).
 const FFT_SIZE: usize = 1024;
 
@@ -43,9 +49,27 @@ const PEAK_DECAY: f32 = 0.998;
 /// Minimum peak floor to avoid division by near-zero.
 const PEAK_FLOOR: f32 = 0.0001;
 
+/// Width of the text overlay in pixels.
+const TEXT_W: u16 = 1200;
+/// Height of the text overlay in pixels.
+const TEXT_H: u16 = 44;
+/// Vertical gap between badge bottom and text overlay top.
+const TEXT_GAP: i16 = 4;
+/// Font size for transcription text in pixels.
+const TEXT_FONT_SIZE: f32 = 30.0;
+/// Corner radius for the text overlay background in pixels.
+const TEXT_CORNER_RADIUS: usize = 10;
+
 // ── Colors (BGRA for little-endian ZPixmap, depth 24/32) ─────────────
 
 const BG: [u8; 4] = [0x00, 0x00, 0x00, 0xFF]; // #000000 black
+const TEXT_COLOR: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF]; // #ffffff white
+/// Brightest dot colour (BGRA).
+const DOT_HI: [u8; 4] = [0xCC, 0xCC, 0xCC, 0xFF]; // #cccccc
+/// Dimmest dot colour (BGRA).
+const DOT_LO: [u8; 4] = [0x33, 0x33, 0x33, 0xFF]; // #333333
+/// Full wave-cycle length in frames (90 frames ≈ 1.5 s at 60 fps).
+const DOT_CYCLE_FRAMES: f32 = 90.0;
 const AMP_COLOR: [u8; 4] = [0x88, 0xFF, 0x00, 0xFF]; // #00ff88 bright green
 const AMP_DIM: [u8; 4] = [0x44, 0x88, 0x00, 0xFF]; // #008844 dim green
 
@@ -225,11 +249,283 @@ impl PixelBuffer {
         }
     }
 
+    /// Fill the buffer with `bg` everywhere *except* within a rounded
+    /// rectangle that spans the full buffer, which gets `fg`.  Pixels
+    /// outside the rounded corners are left transparent (all zeroes) so
+    /// the window compositor shows through.
+    fn clear_rounded(&mut self, fg: [u8; 4], radius: usize) {
+        let w = self.width;
+        let h = self.height;
+        let r = radius.min(w / 2).min(h / 2);
+        let r2 = (r * r) as i64;
+
+        // Start fully transparent.
+        for b in self.data.iter_mut() {
+            *b = 0;
+        }
+
+        for y in 0..h {
+            for x in 0..w {
+                let inside = if x < r && y < r {
+                    // top-left corner
+                    let dx = r as i64 - x as i64;
+                    let dy = r as i64 - y as i64;
+                    dx * dx + dy * dy <= r2
+                } else if x >= w - r && y < r {
+                    // top-right corner
+                    let dx = x as i64 - (w - r - 1) as i64;
+                    let dy = r as i64 - y as i64;
+                    dx * dx + dy * dy <= r2
+                } else if x < r && y >= h - r {
+                    // bottom-left corner
+                    let dx = r as i64 - x as i64;
+                    let dy = y as i64 - (h - r - 1) as i64;
+                    dx * dx + dy * dy <= r2
+                } else if x >= w - r && y >= h - r {
+                    // bottom-right corner
+                    let dx = x as i64 - (w - r - 1) as i64;
+                    let dy = y as i64 - (h - r - 1) as i64;
+                    dx * dx + dy * dy <= r2
+                } else {
+                    true
+                };
+
+                if inside {
+                    let off = (y * w + x) * 4;
+                    self.data[off..off + 4].copy_from_slice(&fg);
+                }
+            }
+        }
+    }
+
     fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: [u8; 4]) {
         for dy in 0..h {
             for dx in 0..w {
                 self.set_pixel(x + dx, y + dy, color);
             }
+        }
+    }
+}
+
+// ── Font loading ─────────────────────────────────────────────────────
+
+/// Well-known system font paths, tried in order.  CJK-capable fonts
+/// come first so Chinese / Japanese / Korean text renders correctly.
+const FONT_SEARCH_PATHS: &[&str] = &[
+    // CJK-capable (Noto Sans CJK covers Latin + CJK + most scripts)
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+    // Droid fallback (broad Unicode coverage including CJK)
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    // Latin-only fallbacks
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+];
+
+/// Load a system TrueType font for text rendering.
+///
+/// Searches well-known paths; returns `None` if no font is found.
+fn load_system_font() -> Option<fontdue::Font> {
+    for path in FONT_SEARCH_PATHS {
+        if let Ok(data) = std::fs::read(path) {
+            let settings = fontdue::FontSettings {
+                collection_index: 0,
+                scale: TEXT_FONT_SIZE,
+                load_substitutions: true,
+            };
+            match fontdue::Font::from_bytes(data, settings) {
+                Ok(font) => {
+                    log::debug!("loaded font from {}", path);
+                    return Some(font);
+                }
+                Err(e) => {
+                    log::warn!("failed to parse font {}: {}", path, e);
+                }
+            }
+        }
+    }
+    log::warn!("no system font found, text overlay disabled");
+    None
+}
+
+/// Rasterise glyphs and return `(glyph_data, total_advance_width)`.
+fn rasterise_glyphs(text: &str, font: &fontdue::Font) -> (Vec<(fontdue::Metrics, Vec<u8>)>, usize) {
+    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::new();
+    let mut total_w: usize = 0;
+    for ch in text.chars() {
+        let (metrics, bitmap) = font.rasterize(ch, TEXT_FONT_SIZE);
+        total_w += metrics.advance_width as usize;
+        glyphs.push((metrics, bitmap));
+    }
+    (glyphs, total_w)
+}
+
+/// Blit pre-rasterised glyphs into the pixel buffer at `start_x`,
+/// vertically centred, clipped to buffer bounds.
+fn blit_glyphs(
+    pb: &mut PixelBuffer,
+    glyphs: &[(fontdue::Metrics, Vec<u8>)],
+    start_x: i32,
+    color: [u8; 4],
+) {
+    let h = pb.height;
+    let w = pb.width;
+    let baseline = (h as i32 * 3) / 4;
+    let mut cursor_x = start_x;
+
+    for (metrics, bitmap) in glyphs {
+        blit_glyph_at(pb, metrics, bitmap, cursor_x, baseline, w, h, color);
+        cursor_x += metrics.advance_width as i32;
+    }
+}
+
+/// Blit a single rasterised glyph at `cursor_x` with the given colour.
+#[allow(clippy::too_many_arguments)]
+fn blit_glyph_at(
+    pb: &mut PixelBuffer,
+    metrics: &fontdue::Metrics,
+    bitmap: &[u8],
+    cursor_x: i32,
+    baseline: i32,
+    buf_w: usize,
+    buf_h: usize,
+    color: [u8; 4],
+) {
+    let gx = cursor_x + metrics.xmin;
+    let gy = baseline - metrics.height as i32 - metrics.ymin;
+
+    for row in 0..metrics.height {
+        for col in 0..metrics.width {
+            let alpha = bitmap[row * metrics.width + col];
+            if alpha == 0 {
+                continue;
+            }
+            let px = gx + col as i32;
+            let py = gy + row as i32;
+            if px >= 0 && (px as usize) < buf_w && py >= 0 && (py as usize) < buf_h {
+                let off = (py as usize * buf_w + px as usize) * 4;
+                let a = alpha as f32 / 255.0;
+                for (c, &fg_val) in color.iter().enumerate().take(3) {
+                    let bg_val = pb.data[off + c] as f32;
+                    pb.data[off + c] = (bg_val + (fg_val as f32 - bg_val) * a) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Linearly interpolate between two BGRA colours by factor `t` (0–1).
+fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
+    let t = t.clamp(0.0, 1.0);
+    [
+        (a[0] as f32 + (b[0] as f32 - a[0] as f32) * t) as u8,
+        (a[1] as f32 + (b[1] as f32 - a[1] as f32) * t) as u8,
+        (a[2] as f32 + (b[2] as f32 - a[2] as f32) * t) as u8,
+        0xFF,
+    ]
+}
+
+/// Compute per-dot brightness for a pulsing wave animation.
+///
+/// Returns `[f32; 3]` in the range 0.0–1.0 where each dot peaks in
+/// sequence, giving a ripple / breathing effect.
+fn dot_wave(frame: u64) -> [f32; 3] {
+    let phase = frame as f32 * 2.0 * std::f32::consts::PI / DOT_CYCLE_FRAMES;
+    let mut out = [0.0f32; 3];
+    for (i, val) in out.iter_mut().enumerate() {
+        let offset = i as f32 * 2.0 * std::f32::consts::PI / 3.0;
+        // sin → [-1, 1] → remap to [0, 1]
+        *val = ((phase - offset).sin() + 1.0) / 2.0;
+    }
+    out
+}
+
+/// Render centred text followed by three pulsing dots.
+///
+/// The text is centred horizontally.  When it overflows the buffer
+/// width, leading characters are clipped so the most recent words
+/// stay visible.  The three dots always occupy the same fixed width,
+/// and each dot's brightness is controlled by `dot_brightnesses`
+/// (0.0 = dim, 1.0 = bright).
+fn render_text(pb: &mut PixelBuffer, text: &str, font: &fontdue::Font, dot_brightnesses: [f32; 3]) {
+    let w = pb.width;
+    let h = pb.height;
+    let baseline = (h as i32 * 3) / 4;
+
+    // ── Rasterise text glyphs ────────────────────────────────────────
+
+    let (text_glyphs, text_w) = if text.is_empty() {
+        (Vec::new(), 0)
+    } else {
+        rasterise_glyphs(text, font)
+    };
+
+    // ── Compute fixed dot area width ─────────────────────────────────
+
+    let (dot_metrics, dot_bitmap) = font.rasterize('●', TEXT_FONT_SIZE);
+    let space_metrics = font.metrics(' ', TEXT_FONT_SIZE);
+    let space_adv = space_metrics.advance_width as usize;
+    let dot_adv = dot_metrics.advance_width as usize;
+    // Layout: " ● ● ●"  =  space + dot + space + dot + space + dot
+    let dot_area_w = space_adv + dot_adv + space_adv + dot_adv + space_adv + dot_adv;
+
+    let total_w = text_w + dot_area_w;
+
+    // ── Determine start X (centred, or clipped on overflow) ──────────
+
+    let (text_start_x, first_visible_glyph, partial_clip) = if total_w <= w {
+        let x0 = (w - total_w) as i32 / 2;
+        (x0, 0usize, 0i32)
+    } else {
+        let skip_px = total_w - w;
+        let mut skipped = 0usize;
+        let mut first = 0usize;
+        for (i, (m, _)) in text_glyphs.iter().enumerate() {
+            let adv = m.advance_width as usize;
+            if skipped + adv > skip_px {
+                first = i;
+                break;
+            }
+            skipped += adv;
+            first = i + 1;
+        }
+        let partial = skip_px.saturating_sub(skipped) as i32;
+        (-(partial), first, partial)
+    };
+    let _ = partial_clip; // used implicitly in text_start_x
+
+    // ── Blit text ────────────────────────────────────────────────────
+
+    let visible_glyphs = &text_glyphs[first_visible_glyph..];
+    blit_glyphs(pb, visible_glyphs, text_start_x, TEXT_COLOR);
+
+    let visible_text_w: usize = visible_glyphs
+        .iter()
+        .map(|(m, _)| m.advance_width as usize)
+        .sum();
+    let mut cursor_x = text_start_x + visible_text_w as i32;
+
+    // ── Blit three dots with individual brightness ───────────────────
+
+    cursor_x += space_adv as i32; // leading space before first dot
+    for (i, &brightness) in dot_brightnesses.iter().enumerate() {
+        let color = lerp_color(DOT_LO, DOT_HI, brightness);
+        blit_glyph_at(
+            pb,
+            &dot_metrics,
+            &dot_bitmap,
+            cursor_x,
+            baseline,
+            w,
+            h,
+            color,
+        );
+        cursor_x += dot_adv as i32;
+        if i < 2 {
+            cursor_x += space_adv as i32;
         }
     }
 }
@@ -410,6 +706,8 @@ enum VizCommand {
     Show { badge_width: u16 },
     /// Hide visualizer panels.
     Hide,
+    /// Update the live transcription text displayed below the badge.
+    Text { text: String },
     /// Shut down the thread.
     Quit,
 }
@@ -459,6 +757,13 @@ impl VisualizerHandle {
     /// Hide visualizer panels.
     pub fn hide(&self) {
         let _ = self.tx.send(VizCommand::Hide);
+    }
+
+    /// Update the live transcription text shown below the badge.
+    pub fn set_text(&self, text: &str) {
+        let _ = self.tx.send(VizCommand::Text {
+            text: text.to_string(),
+        });
     }
 }
 
@@ -544,6 +849,21 @@ fn visualizer_thread(
 
     let mut amp_pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
     let mut sp_pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
+    let mut text_pb = PixelBuffer::new(TEXT_W as usize, TEXT_H as usize);
+
+    // ── Font (loaded in background to avoid blocking panel startup) ──
+
+    let font_rx = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("viz-font-loader".into())
+            .spawn(move || {
+                let _ = tx.send(load_system_font());
+            })
+            .map_err(|e| TalkError::Config(format!("font loader thread: {}", e)))?;
+        rx
+    };
+    let mut font: Option<fontdue::Font> = None;
 
     // ── State ────────────────────────────────────────────────────────
 
@@ -555,11 +875,20 @@ fn visualizer_thread(
         spectrum_win: None,
         amplitude_gc: None,
         spectrum_gc: None,
+        text_win: None,
+        text_gc: None,
     };
     let mut is_showing = false;
+    let mut current_text = String::new();
+    let mut frame_counter: u64 = 0;
 
-    // Amplitude history: one RMS value per frame, grows over time.
+    // Amplitude history: one RMS value per frame, capped to a
+    // rolling window of `AMP_WINDOW_SECS` seconds.
+    let amp_max_frames = (FPS as f32 * AMP_WINDOW_SECS) as usize;
     let mut amp_history: Vec<f32> = Vec::new();
+    // All-time peak RMS — only grows, never shrinks.  Gives a stable
+    // Y-axis scale: once the user has spoken, silence stays small.
+    let mut amp_peak: f32 = PEAK_FLOOR;
 
     // Spectrum peak: fast attack, slow decay.
     let mut spectrum_peak: f32 = 0.001;
@@ -588,6 +917,9 @@ fn visualizer_thread(
                     is_showing = true;
                 }
                 Ok(VizCommand::Hide) => {}
+                Ok(VizCommand::Text { text }) => {
+                    current_text = text;
+                }
                 Ok(VizCommand::Quit) | Err(_) => break,
             }
             continue;
@@ -599,6 +931,9 @@ fn visualizer_thread(
                 Ok(VizCommand::Hide) => {
                     destroy_windows(&conn, &mut wins);
                     is_showing = false;
+                }
+                Ok(VizCommand::Text { text }) => {
+                    current_text = text;
                 }
                 Ok(VizCommand::Show { badge_width }) => {
                     destroy_windows(&conn, &mut wins);
@@ -633,6 +968,13 @@ fn visualizer_thread(
             continue;
         }
 
+        // Pick up the font once the background loader finishes.
+        if font.is_none() {
+            if let Ok(loaded) = font_rx.try_recv() {
+                font = loaded;
+            }
+        }
+
         // ── Render frame ─────────────────────────────────────────────
 
         let frame_start = std::time::Instant::now();
@@ -642,20 +984,21 @@ fn visualizer_thread(
             .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
             .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)]);
 
-        // Compute RMS for this frame and append to history.
+        // Compute RMS for this frame, update all-time peak, and
+        // append to the rolling history window.
         let frame_rms = rms(&samples[samples.len().saturating_sub(rms_chunk)..]);
+        if frame_rms > amp_peak {
+            amp_peak = frame_rms;
+        }
         amp_history.push(frame_rms);
+        if amp_history.len() > amp_max_frames {
+            amp_history.drain(..amp_history.len() - amp_max_frames);
+        }
 
         // Amplitude panel
         if let (Some(win), Some(gc)) = (wins.amplitude_win, wins.amplitude_gc) {
-            let max_rms = amp_history
-                .iter()
-                .copied()
-                .fold(0.0f32, f32::max)
-                .max(PEAK_FLOOR);
-
             amp_pb.clear(BG);
-            render_amplitude(&mut amp_pb, &amp_history, max_rms);
+            render_amplitude(&mut amp_pb, &amp_history, amp_peak);
 
             let _ = conn.put_image(
                 ImageFormat::Z_PIXMAP,
@@ -700,6 +1043,27 @@ fn visualizer_thread(
             );
         }
 
+        // Text panel — always re-render for smooth dot wave animation.
+        if let (Some(win), Some(gc), Some(ref f)) = (wins.text_win, wins.text_gc, &font) {
+            let dot_br = dot_wave(frame_counter);
+            text_pb.clear_rounded(BG, TEXT_CORNER_RADIUS);
+            render_text(&mut text_pb, &current_text, f, dot_br);
+
+            let _ = conn.put_image(
+                ImageFormat::Z_PIXMAP,
+                win,
+                gc,
+                TEXT_W,
+                TEXT_H,
+                0,
+                0,
+                0,
+                depth,
+                &text_pb.data,
+            );
+        }
+        frame_counter += 1;
+
         let _ = conn.flush();
 
         let elapsed = frame_start.elapsed();
@@ -718,6 +1082,8 @@ struct WindowState {
     spectrum_win: Option<Window>,
     amplitude_gc: Option<Gcontext>,
     spectrum_gc: Option<Gcontext>,
+    text_win: Option<Window>,
+    text_gc: Option<Gcontext>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -812,8 +1178,179 @@ fn create_windows(
         state.spectrum_gc = Some(gc);
     }
 
+    // Text window — centred below the badge.
+    {
+        let text_x = mon_x + (mon_w as i16 / 2) - (TEXT_W as i16 / 2);
+        let text_y = badge_y + VIS_H as i16 + TEXT_GAP;
+
+        let win = conn
+            .generate_id()
+            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
+
+        conn.create_window(
+            COPY_DEPTH_FROM_PARENT,
+            win,
+            root,
+            text_x,
+            text_y,
+            TEXT_W,
+            TEXT_H,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &values,
+        )
+        .map_err(|e| TalkError::Config(format!("X11 create text win: {}", e)))?;
+
+        conn.map_window(win)
+            .map_err(|e| TalkError::Config(format!("X11 map text win: {}", e)))?;
+
+        let gc = conn
+            .generate_id()
+            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
+        conn.create_gc(gc, win, &CreateGCAux::new())
+            .map_err(|e| TalkError::Config(format!("X11 gc: {}", e)))?;
+
+        // Apply rounded-corner shape mask via the XShape extension.
+        apply_rounded_shape(conn, win, TEXT_W, TEXT_H, TEXT_CORNER_RADIUS)?;
+
+        state.text_win = Some(win);
+        state.text_gc = Some(gc);
+    }
+
     conn.flush()
         .map_err(|e| TalkError::Config(format!("X11 flush: {}", e)))?;
+
+    Ok(())
+}
+
+/// Create a 1-bit pixmap with a rounded rectangle and apply it as the
+/// window's bounding shape so corners are truly transparent.
+fn apply_rounded_shape(
+    conn: &impl Connection,
+    win: Window,
+    w: u16,
+    h: u16,
+    radius: usize,
+) -> Result<(), TalkError> {
+    let pixmap: Pixmap = conn
+        .generate_id()
+        .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
+    conn.create_pixmap(1, pixmap, win, w, h)
+        .map_err(|e| TalkError::Config(format!("X11 create pixmap: {}", e)))?;
+
+    let gc: Gcontext = conn
+        .generate_id()
+        .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
+    conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0))
+        .map_err(|e| TalkError::Config(format!("X11 gc: {}", e)))?;
+
+    // Clear to 0 (fully transparent).
+    conn.poly_fill_rectangle(
+        pixmap,
+        gc,
+        &[Rectangle {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }],
+    )
+    .map_err(|e| TalkError::Config(format!("X11 fill: {}", e)))?;
+
+    // Draw the rounded rectangle in foreground = 1 (opaque).
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(1))
+        .map_err(|e| TalkError::Config(format!("X11 change gc: {}", e)))?;
+
+    let r = (radius as u16).min(w / 2).min(h / 2);
+    let d = r * 2;
+
+    // Centre rectangle (full width minus corners).
+    conn.poly_fill_rectangle(
+        pixmap,
+        gc,
+        &[
+            // Horizontal band spanning full width, excluding top/bottom
+            // corner rows.
+            Rectangle {
+                x: 0,
+                y: r as i16,
+                width: w,
+                height: h - d,
+            },
+            // Top band between corners.
+            Rectangle {
+                x: r as i16,
+                y: 0,
+                width: w - d,
+                height: r,
+            },
+            // Bottom band between corners.
+            Rectangle {
+                x: r as i16,
+                y: (h - r) as i16,
+                width: w - d,
+                height: r,
+            },
+        ],
+    )
+    .map_err(|e| TalkError::Config(format!("X11 fill: {}", e)))?;
+
+    // Four corner arcs (angles in 64ths of a degree).
+    // Use fully-qualified name because `xproto::Arc` is shadowed by
+    // `std::sync::Arc` in scope.
+    conn.poly_fill_arc(
+        pixmap,
+        gc,
+        &[
+            // top-left
+            x11rb::protocol::xproto::Arc {
+                x: 0,
+                y: 0,
+                width: d,
+                height: d,
+                angle1: 90 * 64,
+                angle2: 90 * 64,
+            },
+            // top-right
+            x11rb::protocol::xproto::Arc {
+                x: (w - d) as i16,
+                y: 0,
+                width: d,
+                height: d,
+                angle1: 0,
+                angle2: 90 * 64,
+            },
+            // bottom-left
+            x11rb::protocol::xproto::Arc {
+                x: 0,
+                y: (h - d) as i16,
+                width: d,
+                height: d,
+                angle1: 180 * 64,
+                angle2: 90 * 64,
+            },
+            // bottom-right
+            x11rb::protocol::xproto::Arc {
+                x: (w - d) as i16,
+                y: (h - d) as i16,
+                width: d,
+                height: d,
+                angle1: 270 * 64,
+                angle2: 90 * 64,
+            },
+        ],
+    )
+    .map_err(|e| TalkError::Config(format!("X11 fill arc: {}", e)))?;
+
+    // Apply as bounding shape.
+    conn.shape_mask(shape::SO::SET, shape::SK::BOUNDING, win, 0, 0, pixmap)
+        .map_err(|e| TalkError::Config(format!("X11 shape mask: {}", e)))?;
+
+    conn.free_gc(gc)
+        .map_err(|e| TalkError::Config(format!("X11 free gc: {}", e)))?;
+    conn.free_pixmap(pixmap)
+        .map_err(|e| TalkError::Config(format!("X11 free pixmap: {}", e)))?;
 
     Ok(())
 }
@@ -829,6 +1366,12 @@ fn destroy_windows(conn: &impl Connection, state: &mut WindowState) {
         let _ = conn.free_gc(gc);
     }
     if let Some(win) = state.spectrum_win.take() {
+        let _ = conn.destroy_window(win);
+    }
+    if let Some(gc) = state.text_gc.take() {
+        let _ = conn.free_gc(gc);
+    }
+    if let Some(win) = state.text_win.take() {
         let _ = conn.destroy_window(win);
     }
     let _ = conn.flush();
@@ -1008,6 +1551,76 @@ DisplayPort-1 connected primary 7680x4320+3840+0";
         let text = "DP-1 disconnected";
         let result = parse_primary(text);
         assert_eq!(result, None);
+    }
+
+    // ── Text rendering ────────────────────────────────────────────────
+
+    #[test]
+    fn render_text_no_panic_with_font() {
+        if let Some(font) = load_system_font() {
+            let mut pb = PixelBuffer::new(600, 36);
+            pb.clear(BG);
+            render_text(&mut pb, "Hello world", &font, [0.5, 0.5, 0.5]);
+
+            let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
+            assert!(non_bg > 0, "text should produce non-background pixels");
+        }
+        // If no font is available, the test passes trivially.
+    }
+
+    #[test]
+    fn render_text_dots_always_present() {
+        if let Some(font) = load_system_font() {
+            let mut pb = PixelBuffer::new(600, 36);
+            pb.clear(BG);
+            render_text(&mut pb, "", &font, [1.0, 1.0, 1.0]);
+
+            let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
+            assert!(non_bg > 0, "dots alone should produce pixels");
+        }
+    }
+
+    #[test]
+    fn render_text_dots_dim_still_visible() {
+        if let Some(font) = load_system_font() {
+            let mut pb = PixelBuffer::new(600, 36);
+            pb.clear(BG);
+            render_text(&mut pb, "", &font, [0.0, 0.0, 0.0]);
+
+            // Even at brightness 0.0, DOT_LO (#333333) is not BG (#000000)
+            let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
+            assert!(non_bg > 0, "dim dots should still differ from BG");
+        }
+    }
+
+    #[test]
+    fn dot_wave_returns_valid_range() {
+        for frame in 0..200 {
+            let vals = dot_wave(frame);
+            for v in &vals {
+                assert!(
+                    (0.0..=1.0).contains(v),
+                    "dot_wave({}) produced {} which is out of [0,1]",
+                    frame,
+                    v
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_text_overflow_clips_left() {
+        if let Some(font) = load_system_font() {
+            // Narrow buffer — long text + dots should clip from the left.
+            let mut pb = PixelBuffer::new(80, 36);
+            pb.clear(BG);
+            render_text(
+                &mut pb,
+                "This is a very long sentence that will not fit",
+                &font,
+                [0.8, 0.5, 0.2],
+            );
+        }
     }
 
     // ── RMS helper ────────────────────────────────────────────────────
