@@ -3,6 +3,7 @@ mod record;
 mod transcribe;
 
 use crate::cli::def::Commands;
+use std::path::PathBuf;
 
 pub use dictate::{dictate, DictateOpts};
 pub use record::record;
@@ -27,7 +28,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             transcribe(args, provider, model).await?;
         }
         Commands::Dictate {
-            file,
+            save,
             provider,
             model,
             realtime,
@@ -40,7 +41,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             target_window,
         } => {
             dictate(DictateOpts {
-                args: file.map(|f| vec![f]).unwrap_or_default(),
+                save: save.map(PathBuf::from),
                 provider,
                 model,
                 realtime,

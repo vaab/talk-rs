@@ -37,9 +37,9 @@ pub enum Commands {
     },
     /// Record, transcribe, and paste text into the focused application
     Dictate {
-        /// Output file path to save the audio recording (optional)
-        #[arg(value_name = "FILE")]
-        file: Option<String>,
+        /// Save audio recording to this file path
+        #[arg(long, value_name = "PATH")]
+        save: Option<String>,
         /// Transcription provider (mistral or openai)
         #[arg(long, value_parser = clap::value_parser!(Provider))]
         provider: Option<Provider>,
