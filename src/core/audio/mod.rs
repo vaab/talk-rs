@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 pub mod cpal_capture;
 pub mod encoder;
+pub mod file_source;
 pub mod indicator;
 pub mod mock;
 pub mod writer;

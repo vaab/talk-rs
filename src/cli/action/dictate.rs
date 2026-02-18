@@ -4,6 +4,7 @@
 //! into the focused application via clipboard.
 
 use crate::core::audio::cpal_capture::CpalCapture;
+use crate::core::audio::file_source::WavFileSource;
 use crate::core::audio::indicator::SoundPlayer;
 use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
 use crate::core::clipboard::{Clipboard, X11Clipboard};
@@ -22,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 /// Options for the dictate command.
 pub struct DictateOpts {
     pub save: Option<PathBuf>,
+    pub input_audio_file: Option<PathBuf>,
     pub provider: Option<Provider>,
     pub model: Option<String>,
     pub realtime: bool,
@@ -247,9 +249,19 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     let provider = resolve_provider(opts.provider, &config);
     let effective_model = resolve_model(opts.model.as_deref(), &config, provider, opts.realtime);
 
+    // Create audio source: live microphone or WAV file input.
+    let from_file = opts.input_audio_file.is_some();
+    let mut capture: Box<dyn AudioCapture> = if let Some(ref path) = opts.input_audio_file {
+        log::info!("using audio file input: {}", path.display());
+        Box::new(WavFileSource::new(path, &AudioConfig::new())?)
+    } else {
+        Box::new(CpalCapture::new(AudioConfig::new()))
+    };
+
     log::info!(
-        "starting {} transcription",
-        if opts.realtime { "realtime" } else { "batch" }
+        "starting {} transcription{}",
+        if opts.realtime { "realtime" } else { "batch" },
+        if from_file { " (from file)" } else { "" }
     );
 
     let text = if opts.realtime {
@@ -297,11 +309,15 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // Player and boop_token are passed so the stop sound fires
         // immediately when the user toggles — not after the WebSocket
         // finishes collecting transcription results.
+        let audio_rx = capture.start()?;
         let text = dictate_realtime(
             config,
             provider,
             opts.model.as_deref(),
             &cache_wav_path,
+            audio_rx,
+            &mut *capture,
+            from_file,
             player.as_ref(),
             boop_token.as_ref(),
             Some(seg_tx),
@@ -332,21 +348,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         log::info!("validating {} provider configuration", provider);
         transcriber.validate().await?;
 
-        let mut capture = CpalCapture::new(AudioConfig::new());
         let audio_rx = capture.start()?;
 
-        // Optionally create output file for saving OGG Opus audio
-        let save_file = if let Some(ref path) = save_path {
-            Some(tokio::fs::File::create(path).await.map_err(TalkError::Io)?)
-        } else {
-            None
-        };
-
         dictate_streaming(
-            &mut capture,
+            &mut *capture,
+            from_file,
             AudioConfig::new(),
             audio_rx,
-            save_file,
             &cache_wav_path,
             transcriber,
         )
@@ -683,7 +691,7 @@ fn flush_sentences(buffer: &mut String, segments: &mut Vec<String>) {
 
 /// Realtime dictation mode via WebSocket.
 ///
-/// Streams raw PCM audio to the Voxtral Realtime API and receives
+/// Streams raw PCM audio to the transcription API and receives
 /// incremental transcription events. Returns the accumulated text.
 ///
 /// Audio is always tee'd to `cache_wav_path` so the recording is
@@ -701,6 +709,9 @@ async fn dictate_realtime(
     provider: Provider,
     model: Option<&str>,
     cache_wav_path: &std::path::Path,
+    audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
+    capture: &mut dyn AudioCapture,
+    from_file: bool,
     player: Option<&SoundPlayer>,
     boop_token: Option<&CancellationToken>,
     segment_tx: Option<tokio::sync::mpsc::Sender<String>>,
@@ -711,9 +722,6 @@ async fn dictate_realtime(
     let transcriber = transcription::create_realtime_transcriber(&config, provider, model)?;
     log::info!("validating {} provider configuration", provider);
     transcriber.validate().await?;
-
-    let mut capture = CpalCapture::new(AudioConfig::new());
-    let audio_rx = capture.start()?;
 
     // Always tee audio to the cache WAV for recording cache.
     log::info!("caching audio to: {}", cache_wav_path.display());
@@ -728,12 +736,17 @@ async fn dictate_realtime(
 
     let mut event_rx = transcriber.transcribe_realtime(audio_rx).await?;
 
-    log::info!("recording (realtime)... press Ctrl+C to stop");
+    if from_file {
+        log::info!("transcribing audio file (realtime)...");
+    } else {
+        log::info!("recording (realtime)... press Ctrl+C to stop");
+    }
 
     let capture_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let capture_stop_clone = capture_stop.clone();
 
-    // Spawn Ctrl+C handler that stops capture
+    // Spawn Ctrl+C handler that stops capture (also works for file
+    // input — early abort by the user).
     let ctrlc_task = tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         capture_stop_clone.store(true, std::sync::atomic::Ordering::Release);
@@ -938,11 +951,14 @@ async fn audio_tee_to_wav(
 ///
 /// Encodes audio and streams it directly to a single transcription request.
 /// Audio is also tee'd to `cache_wav_path` for the recording cache.
+///
+/// When `from_file` is true, the function waits for the audio source to
+/// exhaust naturally (in addition to allowing Ctrl+C for early abort).
 async fn dictate_streaming(
-    capture: &mut CpalCapture,
+    capture: &mut dyn AudioCapture,
+    from_file: bool,
     audio_config: AudioConfig,
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
-    save_file: Option<tokio::fs::File>,
     cache_wav_path: &std::path::Path,
     transcriber: Box<dyn BatchTranscriber>,
 ) -> Result<String, TalkError> {
@@ -959,10 +975,14 @@ async fn dictate_streaming(
     // Create channel for streaming encoded audio to transcriber
     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(25);
 
-    // Spawn encode task: PCM → OGG Opus → stream_tx (+ optional file)
+    // Oneshot to signal when encoding is done (file source exhausted
+    // or capture stopped).  Enables the stop logic to race Ctrl+C
+    // against natural completion for file input.
+    let (encode_done_tx, encode_done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Spawn encode task: PCM → OGG Opus → stream_tx
     let encode_task = tokio::spawn(async move {
         let mut rx = fwd_rx;
-        let mut file = save_file;
         let mut writer = match OggOpusWriter::new(audio_config) {
             Ok(writer) => writer,
             Err(err) => {
@@ -978,14 +998,10 @@ async fn dictate_streaming(
                 return Err(err);
             }
         };
-        if stream_tx.send(header.clone()).await.is_err() {
+        if stream_tx.send(header).await.is_err() {
             log::warn!("transcription stream closed during header send");
+            let _ = encode_done_tx.send(());
             return Ok::<(), TalkError>(());
-        }
-        if let Some(ref mut f) = file {
-            if let Err(err) = f.write_all(&header).await {
-                log::error!("error writing header to file: {}", err);
-            }
         }
 
         while let Some(pcm_chunk) = rx.recv().await {
@@ -993,21 +1009,13 @@ async fn dictate_streaming(
                 Ok(data) => data,
                 Err(err) => {
                     log::error!("error encoding audio: {}", err);
+                    let _ = encode_done_tx.send(());
                     return Err(err);
                 }
             };
-            if !encoded_data.is_empty() {
-                // Send to transcription stream
-                if stream_tx.send(encoded_data.clone()).await.is_err() {
-                    log::warn!("transcription stream closed during audio send");
-                    break;
-                }
-                // Optionally write to file
-                if let Some(ref mut f) = file {
-                    if let Err(err) = f.write_all(&encoded_data).await {
-                        log::error!("error writing audio to file: {}", err);
-                    }
-                }
+            if !encoded_data.is_empty() && stream_tx.send(encoded_data).await.is_err() {
+                log::warn!("transcription stream closed during audio send");
+                break;
             }
         }
 
@@ -1015,24 +1023,18 @@ async fn dictate_streaming(
         match writer.finalize() {
             Ok(remaining) => {
                 if !remaining.is_empty() {
-                    let _ = stream_tx.send(remaining.clone()).await;
-                    if let Some(ref mut f) = file {
-                        let _ = f.write_all(&remaining).await;
-                    }
+                    let _ = stream_tx.send(remaining).await;
                 }
             }
             Err(err) => {
                 log::error!("error finalizing audio writer: {}", err);
+                let _ = encode_done_tx.send(());
                 return Err(err);
             }
         }
 
-        // Sync file if saving
-        if let Some(ref mut f) = file {
-            let _ = f.sync_all().await;
-        }
-
         // stream_tx is dropped here, closing the channel
+        let _ = encode_done_tx.send(());
         Ok::<(), TalkError>(())
     });
 
@@ -1040,17 +1042,27 @@ async fn dictate_streaming(
     let transcribe_task =
         tokio::spawn(async move { transcriber.transcribe_stream(stream_rx, "audio.ogg").await });
 
-    log::info!("recording (batch)... press Ctrl+C to stop and transcribe");
-
-    // Wait for SIGINT
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|err| TalkError::Audio(format!("Failed to listen for Ctrl+C: {}", err)))?;
-
-    log::info!("stopping recording");
-
-    // Stop capture (closes audio channel → encode task finishes → stream_tx drops → transcription completes)
-    capture.stop()?;
+    // Wait for recording to end: Ctrl+C for live mic, natural
+    // completion for file input, or Ctrl+C to abort file early.
+    if from_file {
+        log::info!("transcribing audio file (batch)...");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("aborting");
+                capture.stop()?;
+            }
+            _ = encode_done_rx => {
+                log::info!("audio file playback complete");
+            }
+        }
+    } else {
+        log::info!("recording (batch)... press Ctrl+C to stop and transcribe");
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|err| TalkError::Audio(format!("Failed to listen for Ctrl+C: {}", err)))?;
+        log::info!("stopping recording");
+        capture.stop()?;
+    }
 
     // Wait for cache WAV and encode tasks
     match cache_wav_task.await {
