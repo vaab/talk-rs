@@ -1,0 +1,28 @@
+recording: 2026-02-19T01-48-28.wav
+provider: openai
+model: gpt-4o-transcribe
+realtime: false
+transcript: Je sais pas si ça fonctionne, je sais pas.
+timestamp: 2026-02-19T01-48-28
+metadata:
+  request_latency_ms: 1418
+  request_id: req_9b2f5f5ac94b4c638aeba0217f016d48
+  provider_processing_ms: 403
+  token_usage:
+    input_tokens: 43
+    output_tokens: 13
+    total_tokens: 56
+provider_api:
+  openai:
+    usage:
+      input_token_details:
+        audio_tokens: 43
+        text_tokens: 0
+      input_tokens: 43
+      output_tokens: 13
+      total_tokens: 56
+      type: tokens
+    rate_limit_headers:
+      x-ratelimit-limit-requests: '500'
+      x-ratelimit-remaining-requests: '499'
+      x-ratelimit-reset-requests: 120ms
