@@ -78,7 +78,7 @@ pub struct MistralConfig {
     /// API key for Mistral transcription service.
     pub api_key: String,
 
-    /// Model name for transcription (defaults to "voxtral-mini-latest").
+    /// Model name for transcription (defaults to "voxtral-mini-2507").
     #[serde(default = "default_mistral_model")]
     pub model: String,
 
@@ -92,7 +92,7 @@ pub struct MistralConfig {
 }
 
 fn default_mistral_model() -> String {
-    "voxtral-mini-latest".to_string()
+    "voxtral-mini-2507".to_string()
 }
 
 /// OpenAI API configuration.
@@ -387,7 +387,7 @@ providers:
         assert_eq!(config.output_dir, PathBuf::from("/tmp/test-output"));
         let m = config.providers.mistral.as_ref().expect("mistral present");
         assert_eq!(m.api_key, "test-api-key");
-        assert_eq!(m.model, "voxtral-mini-latest");
+        assert_eq!(m.model, "voxtral-mini-2507");
         assert!(m.context_bias.is_none());
         assert!(config.providers.openai.is_none());
         Ok(())
