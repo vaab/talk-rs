@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -49,6 +50,15 @@ pub enum TranscriptionEvent {
     },
     /// Detected language.
     Language { language: String },
+    /// Realtime session metadata.
+    SessionInfo {
+        session_id: Option<String>,
+        conversation_id: Option<String>,
+    },
+    /// Realtime rate limit update payload.
+    RateLimitsUpdated { raw: serde_json::Value },
+    /// Transport metadata captured during connection setup.
+    TransportMetadata { headers: BTreeMap<String, String> },
     /// Transcription complete.
     Done,
     /// Error from the API.
@@ -352,20 +362,12 @@ impl MistralRealtimeTranscriber {
 #[async_trait]
 impl RealtimeTranscriber for MistralRealtimeTranscriber {
     async fn validate(&self) -> Result<(), TalkError> {
-        // Step 1: REST check — validates API key + model existence.
-        let api_base = self
-            .endpoint
-            .replace("wss://", "https://")
-            .replace("ws://", "http://");
-        super::mistral::validate_mistral_model(
-            &self.config.api_key,
-            self.realtime_model(),
-            &api_base,
-        )
-        .await?;
-
-        // Step 2: WebSocket check — connect and wait for
-        // session.created to confirm the API accepts the model.
+        // Realtime-only models (e.g. voxtral-mini-transcribe-realtime-2602)
+        // do not appear in the REST `/v1/models` listing, so we skip the
+        // REST model check entirely.  The WebSocket handshake below
+        // validates both the API key and the model name: a bad key
+        // causes a 401 on the upgrade request, and a bad model name
+        // triggers an error event from the server.
         self.validate_realtime_session().await
     }
 

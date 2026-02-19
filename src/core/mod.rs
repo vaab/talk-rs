@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod error;
 pub mod overlay;
+pub mod picker_cache;
 pub mod recording_cache;
 pub mod transcription;
 pub mod visualizer;

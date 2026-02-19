@@ -92,7 +92,7 @@ async fn test_transcribe_with_mock_writes_to_file() {
     let mut file = tokio::fs::File::create(&output_path)
         .await
         .expect("create output file");
-    file.write_all(transcription.as_bytes())
+    file.write_all(transcription.text.as_bytes())
         .await
         .expect("write to file");
     file.sync_all().await.expect("sync file");
@@ -189,7 +189,7 @@ async fn test_mistral_transcriber_real_api() {
         result.err()
     );
 
-    let text = result.unwrap();
+    let text = result.unwrap().text;
     assert!(!text.is_empty(), "transcribed text should not be empty");
 
     // Log the result for debugging
