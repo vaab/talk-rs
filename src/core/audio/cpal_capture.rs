@@ -64,6 +64,61 @@ impl CpalCapture {
             .map(|value| value.clone())
             .map_err(|_| TalkError::Audio("last_error lock poisoned".to_string()))
     }
+
+    /// Query the default input device for its best mono capture rate.
+    ///
+    /// Returns the highest supported rate (capped at 48 kHz) that the
+    /// default input device can deliver for the given channel count.
+    /// Falls back to `fallback` if no device or no matching config is
+    /// found (e.g. headless CI).
+    pub fn preferred_capture_rate(channels: u8, fallback: u32) -> u32 {
+        let host = cpal::default_host();
+        let device = match host.default_input_device() {
+            Some(d) => d,
+            None => {
+                log::warn!("no input device found, using fallback rate {}Hz", fallback);
+                return fallback;
+            }
+        };
+
+        let configs = match device.supported_input_configs() {
+            Ok(c) => c,
+            Err(err) => {
+                log::warn!(
+                    "failed to query input configs: {}, using fallback rate {}Hz",
+                    err,
+                    fallback
+                );
+                return fallback;
+            }
+        };
+
+        let mut best_rate = 0u32;
+        for config in configs {
+            if config.channels() == channels as u16 {
+                best_rate = best_rate.max(config.max_sample_rate().0);
+            }
+        }
+
+        if best_rate == 0 {
+            log::warn!(
+                "no supported input config for {} channel(s), using fallback rate {}Hz",
+                channels,
+                fallback
+            );
+            return fallback;
+        }
+
+        // Cap at 48 kHz — higher rates waste CPU for speech with no
+        // quality benefit (Voxtral accepts at most 16 kHz anyway).
+        let rate = best_rate.min(48_000);
+        log::info!(
+            "preferred capture rate: {}Hz (device max: {}Hz)",
+            rate,
+            best_rate
+        );
+        rate
+    }
 }
 
 impl AudioCapture for CpalCapture {
