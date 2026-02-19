@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Main configuration structure.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Output directory for recordings, screenshots, and clipboard saves.
     pub output_dir: PathBuf,
@@ -61,7 +61,7 @@ impl std::str::FromStr for Provider {
 }
 
 /// Transcription providers configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProvidersConfig {
     /// Mistral API configuration (optional — only required when using Mistral).
     #[serde(default)]
@@ -164,7 +164,7 @@ impl AudioConfig {
 }
 
 /// Indicator configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IndicatorsConfig {
     /// Interval between boop sounds in milliseconds.
     pub boop_interval_ms: u64,
