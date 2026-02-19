@@ -8,6 +8,8 @@ pub mod encoder;
 pub mod file_source;
 pub mod indicator;
 pub mod mock;
+pub mod pipewire_capture;
+pub mod resample;
 pub mod writer;
 
 pub use encoder::{AudioEncoder, MockEncoder, OpusEncoder};

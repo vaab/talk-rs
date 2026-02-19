@@ -21,6 +21,9 @@ fern = "0.6"
 colored = "2"
 thiserror = "1"
 cpal = "0.15"
+pipewire = { version = "0.9", features = ["v0_3_43"] }
+rubato = "1.0"
+audioadapter-buffers = "2.0"
 opus = "0.3"
 ogg = "0.9"
 byteorder = "1"
@@ -40,6 +43,7 @@ x11rb = { version = "0.13", features = ["shape", "xfixes", "randr"] }
 png = "0.17"
 fontdue = "0.9"
 gtk4 = "0.8"
+gdk4-x11 = "0.8"
 
 [dev-dependencies]
 assert_cmd = "2"
