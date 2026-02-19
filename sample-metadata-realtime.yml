@@ -1,0 +1,27 @@
+recording: 2026-02-19T01-59-10.wav
+provider: openai
+model: gpt-4o-transcribe
+realtime: true
+transcript: Je sais pas, on va voir. Je sais pas, on va voir.
+timestamp: 2026-02-19T01-59-10
+metadata:
+  session_elapsed_ms: 11064
+  segment_count: 1
+provider_api:
+  openai:
+    model: gpt-4o-transcribe
+    unknown_event_types:
+    - input_audio_buffer.speech_started
+    - input_audio_buffer.committed
+    - conversation.item.created
+    realtime:
+      session_id: sess_DAmfoNqL3QPa1sxqHPdvQ
+      event_counts:
+        done: 1
+        event:conversation.item.created: 1
+        event:input_audio_buffer.committed: 1
+        event:input_audio_buffer.speech_started: 1
+        segment_delta: 1
+        session_info: 2
+        text_delta: 8
+        unknown: 3
