@@ -5,12 +5,18 @@
 
 use crate::core::config::OpenAIConfig;
 use crate::core::error::TalkError;
+use crate::core::transcription::{
+    OpenAIProviderMetadata, ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata,
+    TranscriptionResult,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::fs::File;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -30,6 +36,66 @@ const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
 struct OpenAIResponse {
     /// The transcribed text.
     text: String,
+    /// Model identifier if returned by API.
+    #[serde(default)]
+    model: Option<String>,
+    /// Detected language code.
+    #[serde(default)]
+    language: Option<String>,
+    /// Input audio duration in seconds.
+    #[serde(default)]
+    duration: Option<f64>,
+    /// Optional list of transcript segments.
+    #[serde(default)]
+    segments: Option<Vec<serde_json::Value>>,
+    /// Optional list of per-word timestamps.
+    #[serde(default)]
+    words: Option<Vec<serde_json::Value>>,
+    /// Usage payload (shape varies by model endpoint).
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
+}
+
+fn parse_u64_field(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|v| {
+        v.as_u64().or_else(|| {
+            v.as_i64()
+                .and_then(|n| if n >= 0 { Some(n as u64) } else { None })
+        })
+    })
+}
+
+fn parse_openai_token_usage(usage: &serde_json::Value) -> Option<TokenUsage> {
+    let input_tokens = parse_u64_field(usage, "input_tokens");
+    let output_tokens = parse_u64_field(usage, "output_tokens");
+    let total_tokens = parse_u64_field(usage, "total_tokens");
+
+    if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+        None
+    } else {
+        Some(TokenUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        })
+    }
+}
+
+fn parse_openai_audio_seconds(usage: &serde_json::Value) -> Option<f64> {
+    usage.get("seconds").and_then(|v| v.as_f64())
+}
+
+fn extract_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (name, value) in headers {
+        let key = name.as_str();
+        if key.starts_with("x-ratelimit-") {
+            if let Ok(v) = value.to_str() {
+                out.insert(key.to_string(), v.to_string());
+            }
+        }
+    }
+    out
 }
 
 // ── Shared model validation ─────────────────────────────────────────
@@ -170,7 +236,7 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
         validate_openai_model(&self.config.api_key, &self.config.model, api_base).await
     }
 
-    async fn transcribe_file(&self, audio_path: &Path) -> Result<String, TalkError> {
+    async fn transcribe_file(&self, audio_path: &Path) -> Result<TranscriptionResult, TalkError> {
         // Verify file exists
         if !audio_path.exists() {
             return Err(TalkError::Transcription(format!(
@@ -200,6 +266,7 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                 reqwest::multipart::Part::stream(file).file_name(file_name),
             );
 
+        let started = Instant::now();
         // Send request with timeout
         let response = self
             .client
@@ -212,6 +279,9 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             .map_err(|err| {
                 TalkError::Transcription(format!("Failed to send request to OpenAI API: {}", err))
             })?;
+
+        let request_latency_ms = started.elapsed().as_millis() as u64;
+        let headers = response.headers().clone();
 
         // Check response status
         if !response.status().is_success() {
@@ -228,14 +298,57 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             TalkError::Transcription(format!("Failed to parse OpenAI API response: {}", err))
         })?;
 
-        Ok(openai_response.text)
+        let token_usage = openai_response
+            .usage
+            .as_ref()
+            .and_then(parse_openai_token_usage);
+        let audio_seconds = openai_response.duration.or_else(|| {
+            openai_response
+                .usage
+                .as_ref()
+                .and_then(parse_openai_audio_seconds)
+        });
+        let segment_count = openai_response.segments.as_ref().map(std::vec::Vec::len);
+        let word_count = openai_response.words.as_ref().map(std::vec::Vec::len);
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let provider_processing_ms = headers
+            .get("openai-processing-ms")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let rate_limit_headers = extract_rate_limit_headers(&headers);
+
+        let text = openai_response.text;
+        Ok(TranscriptionResult {
+            text,
+            metadata: TranscriptionMetadata {
+                request_latency_ms: Some(request_latency_ms),
+                session_elapsed_ms: None,
+                request_id,
+                provider_processing_ms,
+                detected_language: openai_response.language,
+                audio_seconds,
+                segment_count,
+                word_count,
+                token_usage,
+                provider_specific: Some(ProviderSpecificMetadata::OpenAI(OpenAIProviderMetadata {
+                    model: openai_response.model,
+                    usage_raw: openai_response.usage,
+                    rate_limit_headers,
+                    unknown_event_types: Vec::new(),
+                    realtime: None,
+                })),
+            },
+        })
     }
 
     async fn transcribe_stream(
         &self,
         audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
         file_name: &str,
-    ) -> Result<String, TalkError> {
+    ) -> Result<TranscriptionResult, TalkError> {
         // Convert the mpsc::Receiver into a Stream of Result<Vec<u8>, io::Error>
         let byte_stream = ReceiverStream::new(audio_stream).map(Ok::<Vec<u8>, std::io::Error>);
 
@@ -251,6 +364,7 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                 reqwest::multipart::Part::stream(body).file_name(file_name.to_string()),
             );
 
+        let started = Instant::now();
         // Send request to OpenAI API with extended timeout for long recordings
         let response = self
             .client
@@ -267,6 +381,9 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                 ))
             })?;
 
+        let request_latency_ms = started.elapsed().as_millis() as u64;
+        let headers = response.headers().clone();
+
         // Check response status
         if !response.status().is_success() {
             let status = response.status();
@@ -282,7 +399,50 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             TalkError::Transcription(format!("Failed to parse OpenAI API response: {}", err))
         })?;
 
-        Ok(openai_response.text)
+        let token_usage = openai_response
+            .usage
+            .as_ref()
+            .and_then(parse_openai_token_usage);
+        let audio_seconds = openai_response.duration.or_else(|| {
+            openai_response
+                .usage
+                .as_ref()
+                .and_then(parse_openai_audio_seconds)
+        });
+        let segment_count = openai_response.segments.as_ref().map(std::vec::Vec::len);
+        let word_count = openai_response.words.as_ref().map(std::vec::Vec::len);
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let provider_processing_ms = headers
+            .get("openai-processing-ms")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let rate_limit_headers = extract_rate_limit_headers(&headers);
+
+        let text = openai_response.text;
+        Ok(TranscriptionResult {
+            text,
+            metadata: TranscriptionMetadata {
+                request_latency_ms: Some(request_latency_ms),
+                session_elapsed_ms: None,
+                request_id,
+                provider_processing_ms,
+                detected_language: openai_response.language,
+                audio_seconds,
+                segment_count,
+                word_count,
+                token_usage,
+                provider_specific: Some(ProviderSpecificMetadata::OpenAI(OpenAIProviderMetadata {
+                    model: openai_response.model,
+                    usage_raw: openai_response.usage,
+                    rate_limit_headers,
+                    unknown_event_types: Vec::new(),
+                    realtime: None,
+                })),
+            },
+        })
     }
 }
 
@@ -324,7 +484,7 @@ mod tests {
         let result = transcriber.transcribe_file(temp_file.path()).await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "This is an OpenAI transcription");
+        assert_eq!(result.unwrap().text, "This is an OpenAI transcription");
     }
 
     #[tokio::test]
@@ -359,7 +519,7 @@ mod tests {
         let result = transcriber.transcribe_stream(rx, "test.ogg").await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Streamed OpenAI transcription");
+        assert_eq!(result.unwrap().text, "Streamed OpenAI transcription");
     }
 
     #[tokio::test]
