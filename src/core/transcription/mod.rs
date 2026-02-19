@@ -11,6 +11,7 @@
 use crate::core::config::{Config, Provider};
 use crate::core::error::TalkError;
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub mod mistral;
@@ -24,9 +25,80 @@ pub use openai_realtime::OpenAIRealtimeTranscriber;
 pub use realtime::{MistralRealtimeTranscriber, TranscriptionEvent};
 
 /// Result type for transcription operations.
+#[derive(Debug, Clone, Default)]
 pub struct TranscriptionResult {
     /// The transcribed text from the audio file.
     pub text: String,
+    /// Optional metadata extracted from provider responses/headers.
+    pub metadata: TranscriptionMetadata,
+}
+
+/// Provider-agnostic metadata that can be written to YAML.
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptionMetadata {
+    /// End-to-end API call latency measured client-side.
+    pub request_latency_ms: Option<u64>,
+    /// End-to-end realtime session duration measured client-side.
+    pub session_elapsed_ms: Option<u64>,
+    /// Request identifier from provider response headers.
+    pub request_id: Option<String>,
+    /// Provider-side processing duration in milliseconds when available.
+    pub provider_processing_ms: Option<u64>,
+    /// Detected language code if returned by provider.
+    pub detected_language: Option<String>,
+    /// Audio duration reported by provider usage/response.
+    pub audio_seconds: Option<f64>,
+    /// Number of transcript segments returned by provider.
+    pub segment_count: Option<usize>,
+    /// Number of word-level timestamps returned by provider.
+    pub word_count: Option<usize>,
+    /// Token usage summary when available.
+    pub token_usage: Option<TokenUsage>,
+    /// Provider-specific payload for advanced diagnostics.
+    pub provider_specific: Option<ProviderSpecificMetadata>,
+}
+
+/// Common token usage summary.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+/// Provider-specific metadata captured from API responses.
+#[derive(Debug, Clone)]
+pub enum ProviderSpecificMetadata {
+    OpenAI(OpenAIProviderMetadata),
+    Mistral(MistralProviderMetadata),
+}
+
+/// OpenAI-specific metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OpenAIProviderMetadata {
+    pub model: Option<String>,
+    pub usage_raw: Option<serde_json::Value>,
+    pub rate_limit_headers: BTreeMap<String, String>,
+    pub unknown_event_types: Vec<String>,
+    pub realtime: Option<OpenAIRealtimeMetadata>,
+}
+
+/// OpenAI realtime-specific metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OpenAIRealtimeMetadata {
+    pub session_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub event_counts: BTreeMap<String, u64>,
+    pub last_rate_limits: Option<serde_json::Value>,
+    pub ws_upgrade_headers: BTreeMap<String, String>,
+}
+
+/// Mistral-specific metadata.
+#[derive(Debug, Clone, Default)]
+pub struct MistralProviderMetadata {
+    pub model: Option<String>,
+    pub usage_raw: Option<serde_json::Value>,
+    pub unknown_event_types: Vec<String>,
 }
 
 // ── Batch trait ──────────────────────────────────────────────────────
@@ -48,7 +120,7 @@ pub trait BatchTranscriber: Send + Sync {
     async fn validate(&self) -> Result<(), TalkError>;
 
     /// Transcribe an audio file and return the text.
-    async fn transcribe_file(&self, audio_path: &Path) -> Result<String, TalkError>;
+    async fn transcribe_file(&self, audio_path: &Path) -> Result<TranscriptionResult, TalkError>;
 
     /// Transcribe audio from a streaming channel and return the text.
     ///
@@ -59,7 +131,7 @@ pub trait BatchTranscriber: Send + Sync {
         &self,
         audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
         file_name: &str,
-    ) -> Result<String, TalkError>;
+    ) -> Result<TranscriptionResult, TalkError>;
 }
 
 // ── Realtime trait ───────────────────────────────────────────────────
@@ -194,18 +266,24 @@ impl BatchTranscriber for MockBatchTranscriber {
         Ok(())
     }
 
-    async fn transcribe_file(&self, _audio_path: &Path) -> Result<String, TalkError> {
-        Ok(self.response_text.clone())
+    async fn transcribe_file(&self, _audio_path: &Path) -> Result<TranscriptionResult, TalkError> {
+        Ok(TranscriptionResult {
+            text: self.response_text.clone(),
+            metadata: TranscriptionMetadata::default(),
+        })
     }
 
     async fn transcribe_stream(
         &self,
         mut audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
         _file_name: &str,
-    ) -> Result<String, TalkError> {
+    ) -> Result<TranscriptionResult, TalkError> {
         // Drain the stream
         while audio_stream.recv().await.is_some() {}
-        Ok(self.response_text.clone())
+        Ok(TranscriptionResult {
+            text: self.response_text.clone(),
+            metadata: TranscriptionMetadata::default(),
+        })
     }
 }
 
@@ -219,7 +297,7 @@ mod tests {
         let result = mock.transcribe_file(Path::new("/tmp/test.wav")).await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Hello, world!");
+        assert_eq!(result.unwrap().text, "Hello, world!");
     }
 
     #[tokio::test]
@@ -235,7 +313,7 @@ mod tests {
         let result = mock.transcribe_stream(rx, "test.wav").await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Streamed transcription");
+        assert_eq!(result.unwrap().text, "Streamed transcription");
     }
 
     #[tokio::test]
@@ -244,8 +322,8 @@ mod tests {
         let result1 = mock.transcribe_file(Path::new("/path/one.wav")).await;
         let result2 = mock.transcribe_file(Path::new("/path/two.wav")).await;
 
-        assert_eq!(result1.unwrap(), "Fixed response");
-        assert_eq!(result2.unwrap(), "Fixed response");
+        assert_eq!(result1.unwrap().text, "Fixed response");
+        assert_eq!(result2.unwrap().text, "Fixed response");
     }
 
     #[test]

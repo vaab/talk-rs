@@ -5,12 +5,17 @@
 
 use crate::core::config::MistralConfig;
 use crate::core::error::TalkError;
+use crate::core::transcription::{
+    MistralProviderMetadata, ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata,
+    TranscriptionResult,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::fs::File;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -30,6 +35,47 @@ const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
 struct MistralResponse {
     /// The transcribed text.
     text: String,
+    /// Model identifier returned by API.
+    #[serde(default)]
+    model: Option<String>,
+    /// Detected language code.
+    #[serde(default)]
+    language: Option<String>,
+    /// Optional transcript segments.
+    #[serde(default)]
+    segments: Option<Vec<serde_json::Value>>,
+    /// Usage payload returned by Mistral.
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
+}
+
+fn parse_u64_field(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|v| {
+        v.as_u64().or_else(|| {
+            v.as_i64()
+                .and_then(|n| if n >= 0 { Some(n as u64) } else { None })
+        })
+    })
+}
+
+fn parse_mistral_token_usage(usage: &serde_json::Value) -> Option<TokenUsage> {
+    let input_tokens = parse_u64_field(usage, "prompt_tokens");
+    let output_tokens = parse_u64_field(usage, "completion_tokens");
+    let total_tokens = parse_u64_field(usage, "total_tokens");
+
+    if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+        None
+    } else {
+        Some(TokenUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        })
+    }
+}
+
+fn parse_mistral_audio_seconds(usage: &serde_json::Value) -> Option<f64> {
+    usage.get("prompt_audio_seconds").and_then(|v| v.as_f64())
 }
 
 // ── Shared model validation ─────────────────────────────────────────
@@ -162,7 +208,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
         validate_mistral_model(&self.config.api_key, &self.config.model, api_base).await
     }
 
-    async fn transcribe_file(&self, audio_path: &Path) -> Result<String, TalkError> {
+    async fn transcribe_file(&self, audio_path: &Path) -> Result<TranscriptionResult, TalkError> {
         // Verify file exists
         if !audio_path.exists() {
             return Err(TalkError::Transcription(format!(
@@ -196,6 +242,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
             form = form.text("context_bias", bias.clone());
         }
 
+        let started = Instant::now();
         // [Fix #3] Send request with timeout to prevent hanging on
         // unresponsive servers. Without this, Client::new() has no default
         // timeout and the request could block forever.
@@ -210,6 +257,9 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .map_err(|err| {
                 TalkError::Transcription(format!("Failed to send request to Mistral API: {}", err))
             })?;
+
+        let request_latency_ms = started.elapsed().as_millis() as u64;
+        let headers = response.headers().clone();
 
         // Check response status
         if !response.status().is_success() {
@@ -226,14 +276,49 @@ impl BatchTranscriber for MistralBatchTranscriber {
             TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
         })?;
 
-        Ok(mistral_response.text)
+        let token_usage = mistral_response
+            .usage
+            .as_ref()
+            .and_then(parse_mistral_token_usage);
+        let audio_seconds = mistral_response
+            .usage
+            .as_ref()
+            .and_then(parse_mistral_audio_seconds);
+        let segment_count = mistral_response.segments.as_ref().map(std::vec::Vec::len);
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+
+        let text = mistral_response.text;
+        Ok(TranscriptionResult {
+            text,
+            metadata: TranscriptionMetadata {
+                request_latency_ms: Some(request_latency_ms),
+                session_elapsed_ms: None,
+                request_id,
+                provider_processing_ms: None,
+                detected_language: mistral_response.language,
+                audio_seconds,
+                segment_count,
+                word_count: None,
+                token_usage,
+                provider_specific: Some(ProviderSpecificMetadata::Mistral(
+                    MistralProviderMetadata {
+                        model: mistral_response.model,
+                        usage_raw: mistral_response.usage,
+                        unknown_event_types: Vec::new(),
+                    },
+                )),
+            },
+        })
     }
 
     async fn transcribe_stream(
         &self,
         audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
         file_name: &str,
-    ) -> Result<String, TalkError> {
+    ) -> Result<TranscriptionResult, TalkError> {
         // Convert the mpsc::Receiver into a Stream of Result<Vec<u8>, io::Error>
         let byte_stream = ReceiverStream::new(audio_stream).map(Ok::<Vec<u8>, std::io::Error>);
 
@@ -253,6 +338,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
             form = form.text("context_bias", bias.clone());
         }
 
+        let started = Instant::now();
         // Send request to Mistral API with extended timeout for long recordings
         let response = self
             .client
@@ -269,6 +355,9 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 ))
             })?;
 
+        let request_latency_ms = started.elapsed().as_millis() as u64;
+        let headers = response.headers().clone();
+
         // Check response status
         if !response.status().is_success() {
             let status = response.status();
@@ -284,7 +373,42 @@ impl BatchTranscriber for MistralBatchTranscriber {
             TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
         })?;
 
-        Ok(mistral_response.text)
+        let token_usage = mistral_response
+            .usage
+            .as_ref()
+            .and_then(parse_mistral_token_usage);
+        let audio_seconds = mistral_response
+            .usage
+            .as_ref()
+            .and_then(parse_mistral_audio_seconds);
+        let segment_count = mistral_response.segments.as_ref().map(std::vec::Vec::len);
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+
+        let text = mistral_response.text;
+        Ok(TranscriptionResult {
+            text,
+            metadata: TranscriptionMetadata {
+                request_latency_ms: Some(request_latency_ms),
+                session_elapsed_ms: None,
+                request_id,
+                provider_processing_ms: None,
+                detected_language: mistral_response.language,
+                audio_seconds,
+                segment_count,
+                word_count: None,
+                token_usage,
+                provider_specific: Some(ProviderSpecificMetadata::Mistral(
+                    MistralProviderMetadata {
+                        model: mistral_response.model,
+                        usage_raw: mistral_response.usage,
+                        unknown_event_types: Vec::new(),
+                    },
+                )),
+            },
+        })
     }
 }
 
@@ -332,7 +456,7 @@ mod tests {
         let result = transcriber.transcribe_file(temp_file.path()).await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "This is a test transcription");
+        assert_eq!(result.unwrap().text, "This is a test transcription");
     }
 
     #[tokio::test]
@@ -373,7 +497,7 @@ mod tests {
         let result = transcriber.transcribe_stream(rx, "test.wav").await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Streamed transcription result");
+        assert_eq!(result.unwrap().text, "Streamed transcription result");
     }
 
     #[tokio::test]

@@ -46,6 +46,15 @@ pub enum Commands {
         /// Feed a pre-recorded WAV file instead of live microphone capture
         #[arg(long, value_name = "FILE")]
         input_audio_file: Option<String>,
+        /// Reuse the last cached recording as input audio
+        #[arg(long)]
+        retry_last: bool,
+        /// Offer multiple candidate transcriptions in rofi
+        #[arg(long)]
+        pick: bool,
+        /// Delete previous pasted text length before inserting selected text
+        #[arg(long)]
+        replace_last_paste: bool,
         /// Transcription provider (mistral or openai)
         #[arg(long, value_parser = clap::value_parser!(Provider))]
         provider: Option<Provider>,

@@ -15,6 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,7 +121,22 @@ pub fn parse_openai_event(json_str: &str) -> TranscriptionEvent {
         Some("session.created")
         | Some("session.updated")
         | Some("transcription_session.created")
-        | Some("transcription_session.updated") => TranscriptionEvent::SessionCreated,
+        | Some("transcription_session.updated") => {
+            let session_id = value
+                .get("session")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let conversation_id = value
+                .get("conversation")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            TranscriptionEvent::SessionInfo {
+                session_id,
+                conversation_id,
+            }
+        }
 
         Some("conversation.item.input_audio_transcription.delta") => {
             let text = value
@@ -154,6 +170,8 @@ pub fn parse_openai_event(json_str: &str) -> TranscriptionEvent {
             TranscriptionEvent::Error { message }
         }
 
+        Some("rate_limits.updated") => TranscriptionEvent::RateLimitsUpdated { raw: value },
+
         // VAD events — logged by caller, no user-visible event.
         Some("input_audio_buffer.speech_started")
         | Some("input_audio_buffer.speech_stopped")
@@ -168,6 +186,24 @@ pub fn parse_openai_event(json_str: &str) -> TranscriptionEvent {
             raw: json_str.to_string(),
         },
     }
+}
+
+fn extract_ws_upgrade_headers(
+    headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (name, value) in headers {
+        let key = name.as_str();
+        let should_keep = key == "x-request-id"
+            || key == "openai-processing-ms"
+            || key.starts_with("x-ratelimit-");
+        if should_keep {
+            if let Ok(v) = value.to_str() {
+                out.insert(key.to_string(), v.to_string());
+            }
+        }
+    }
+    out
 }
 
 // ── WebSocket URL ───────────────────────────────────────────────────
@@ -316,7 +352,8 @@ impl OpenAIRealtimeTranscriber {
                 if let Message::Text(text) = msg {
                     let event = parse_openai_event(&text);
                     match event {
-                        TranscriptionEvent::SessionCreated => {
+                        TranscriptionEvent::SessionInfo { .. }
+                        | TranscriptionEvent::SessionCreated => {
                             // session.updated → config accepted
                             return Ok(());
                         }
@@ -384,7 +421,7 @@ impl OpenAIRealtimeTranscriber {
         log::debug!("connecting to OpenAI Realtime WebSocket: {}", ws_url);
 
         // Connect with timeout.
-        let (ws_stream, _response) = tokio::time::timeout(
+        let (ws_stream, response) = tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async(request),
         )
@@ -444,6 +481,15 @@ impl OpenAIRealtimeTranscriber {
 
         // Create event channel.
         let (event_tx, event_rx) = mpsc::channel::<TranscriptionEvent>(100);
+
+        let ws_upgrade_headers = extract_ws_upgrade_headers(response.headers());
+        if !ws_upgrade_headers.is_empty() {
+            let _ = event_tx
+                .send(TranscriptionEvent::TransportMetadata {
+                    headers: ws_upgrade_headers,
+                })
+                .await;
+        }
 
         // Forward the initial session event.
         let _ = event_tx.send(session_event).await;
@@ -526,7 +572,9 @@ where
         if let Message::Text(text) = msg {
             let event = parse_openai_event(&text);
             match event {
-                TranscriptionEvent::SessionCreated => return Ok(event),
+                TranscriptionEvent::SessionInfo { .. } | TranscriptionEvent::SessionCreated => {
+                    return Ok(event);
+                }
                 TranscriptionEvent::Error { ref message } => {
                     return Err(TalkError::Transcription(format!(
                         "Server error during session setup: {}",
@@ -679,14 +727,13 @@ async fn receiver_loop<S>(
                         log::trace!("received OpenAI WS text: {}", text);
                         let event = parse_openai_event(&text);
 
-                        // Log VAD events at debug level.
+                        // Log unknown events at debug level.
                         if let TranscriptionEvent::Unknown {
                             event_type: Some(ref t),
                             ..
                         } = event
                         {
                             log::debug!("OpenAI event: {}", t);
-                            continue;
                         }
 
                         let is_error = matches!(event, TranscriptionEvent::Error { .. });
@@ -770,7 +817,7 @@ mod tests {
         let json = r#"{"type": "session.created", "session": {}}"#;
         assert!(matches!(
             parse_openai_event(json),
-            TranscriptionEvent::SessionCreated
+            TranscriptionEvent::SessionInfo { .. }
         ));
     }
 
@@ -779,7 +826,7 @@ mod tests {
         let json = r#"{"type": "transcription_session.created", "session": {}}"#;
         assert!(matches!(
             parse_openai_event(json),
-            TranscriptionEvent::SessionCreated
+            TranscriptionEvent::SessionInfo { .. }
         ));
     }
 
@@ -788,7 +835,16 @@ mod tests {
         let json = r#"{"type": "transcription_session.updated", "session": {}}"#;
         assert!(matches!(
             parse_openai_event(json),
-            TranscriptionEvent::SessionCreated
+            TranscriptionEvent::SessionInfo { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_openai_event_rate_limits_updated() {
+        let json = r#"{"type": "rate_limits.updated", "rate_limits": []}"#;
+        assert!(matches!(
+            parse_openai_event(json),
+            TranscriptionEvent::RateLimitsUpdated { .. }
         ));
     }
 

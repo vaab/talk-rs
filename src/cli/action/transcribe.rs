@@ -85,7 +85,7 @@ pub async fn transcribe(
             let mut file = tokio::fs::File::create(&output_file)
                 .await
                 .map_err(TalkError::Io)?;
-            file.write_all(transcription.as_bytes())
+            file.write_all(transcription.text.as_bytes())
                 .await
                 .map_err(TalkError::Io)?;
             file.sync_all().await.map_err(TalkError::Io)?;
@@ -93,7 +93,7 @@ pub async fn transcribe(
         }
         None => {
             // Write to stdout
-            println!("{}", transcription);
+            println!("{}", transcription.text);
         }
     }
 
@@ -191,7 +191,7 @@ mod tests {
         let mut file = tokio::fs::File::create(&output_path)
             .await
             .expect("create output file");
-        file.write_all(transcription.as_bytes())
+        file.write_all(transcription.text.as_bytes())
             .await
             .expect("write to file");
         file.sync_all().await.expect("sync file");
