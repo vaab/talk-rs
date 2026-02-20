@@ -651,6 +651,16 @@ async fn pick_with_streaming_gtk(
             })
             .unwrap_or_else(|| "alpha(@theme_selected_bg_color, 0.32)".to_string());
 
+        // Foreground: pin to theme_fg_color so selected rows stay
+        // readable.  Without this, some themes switch selected text
+        // to white, which is invisible on our translucent selection
+        // background on light themes.
+        #[allow(deprecated)]
+        let fg_hex = ctx
+            .lookup_color("theme_fg_color")
+            .map(|c| rgba_to_hex(&c))
+            .unwrap_or_else(|| "@theme_fg_color".to_string());
+
         let window = gtk4::Window::builder()
             .title(PICKER_TITLE)
             .default_width(900)
@@ -671,13 +681,14 @@ async fn pick_with_streaming_gtk(
              scrolledwindow, viewport, list, \
              scrolledwindow:backdrop, viewport:backdrop, list:backdrop {{ background-color: transparent; background-image: none; border-radius: 10px; }} \
              row:not(:selected), row:not(:selected):backdrop {{ background-color: transparent; background-image: none; }} \
-             row:selected, row:selected:backdrop {{ background-color: {sel}; }} \
+             row:selected, row:selected:backdrop {{ background-color: {sel}; color: {fg}; }} \
              .transcript {{ font-family: monospace; }} \
              .dim {{ opacity: 0.55; }} \
              .error {{ font-style: italic; color: alpha({err}, 0.8); }} \
              .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }} \
              row {{ border-radius: 8px; }}",
             bg = view_bg_hex,
+            fg = fg_hex,
             err = error_hex,
             sel = sel_hex,
         ));
