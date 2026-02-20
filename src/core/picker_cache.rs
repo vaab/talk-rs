@@ -32,6 +32,8 @@ pub struct PickerCache {
 pub struct SelectedEntry {
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub streaming: bool,
 }
 
 /// A single cached transcription result for one (provider, model) pair.
@@ -40,6 +42,8 @@ pub struct CachedResult {
     pub provider: String,
     pub model: String,
     pub text: String,
+    #[serde(default)]
+    pub streaming: bool,
 }
 
 /// Return the cache file path for a given audio file.
@@ -154,13 +158,19 @@ pub fn write_results(audio_path: &Path, results: &[CachedResult]) -> Result<(), 
     write_to_disk(audio_path, &cache)
 }
 
-/// Record which (provider, model) the user last selected, preserving
-/// the existing results.
-pub fn write_selected(audio_path: &Path, provider: &str, model: &str) -> Result<(), TalkError> {
+/// Record which (provider, model, streaming) the user last selected,
+/// preserving the existing results.
+pub fn write_selected(
+    audio_path: &Path,
+    provider: &str,
+    model: &str,
+    streaming: bool,
+) -> Result<(), TalkError> {
     let mut cache = read(audio_path);
     cache.selected = Some(SelectedEntry {
         provider: provider.to_string(),
         model: model.to_string(),
+        streaming,
     });
     write_to_disk(audio_path, &cache)
 }
@@ -187,16 +197,19 @@ mod tests {
                     provider: "openai".into(),
                     model: "whisper-1".into(),
                     text: "hello world".into(),
+                    streaming: false,
                 },
                 CachedResult {
                     provider: "mistral".into(),
                     model: "voxtral-mini-2507".into(),
                     text: "bonjour monde".into(),
+                    streaming: false,
                 },
             ],
             selected: Some(SelectedEntry {
                 provider: "mistral".into(),
                 model: "voxtral-mini-2507".into(),
+                streaming: false,
             }),
         };
 
@@ -223,6 +236,7 @@ mod tests {
             provider: "openai".into(),
             model: "whisper-1".into(),
             text: "legacy text".into(),
+            streaming: false,
         }];
         let json = serde_json::to_string_pretty(&legacy).expect("serialise");
         std::fs::write(&cache_file, &json).expect("write");
@@ -254,6 +268,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "whisper-1".into(),
                 text: "test".into(),
+                streaming: false,
             }],
             selected: None,
         };
