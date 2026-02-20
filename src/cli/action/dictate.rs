@@ -17,8 +17,8 @@ use crate::core::picker_cache;
 use crate::core::recording_cache;
 use crate::core::transcription::{
     self, BatchTranscriber, MistralProviderMetadata, OpenAIProviderMetadata,
-    OpenAIRealtimeMetadata, ProviderSpecificMetadata, TranscriptionEvent, TranscriptionMetadata,
-    TranscriptionResult,
+    OpenAIRealtimeMetadata, ProviderSpecificMetadata, RealtimeTranscriber, TranscriptionEvent,
+    TranscriptionMetadata, TranscriptionResult,
 };
 use crate::core::visualizer::VisualizerHandle;
 use std::os::unix::process::CommandExt as _;
@@ -107,48 +107,121 @@ const OPENAI_TRANSCRIPTION_MODELS: &[&str] =
 /// compare results between generations.
 const MISTRAL_TRANSCRIPTION_MODELS: &[&str] = &["voxtral-mini-2507", "voxtral-mini-2602"];
 
-/// Push all known transcription models for `provider` into `out`.
-fn add_known_models(out: &mut Vec<(Provider, String)>, provider: Provider) {
+/// Known Mistral models that support realtime (WebSocket) transcription.
+const MISTRAL_REALTIME_MODELS: &[&str] = &["voxtral-mini-transcribe-realtime-2602"];
+
+/// Known OpenAI models that support realtime (WebSocket) transcription.
+const OPENAI_REALTIME_MODELS: &[&str] = &["gpt-4o-mini-transcribe", "gpt-4o-transcribe"];
+
+/// Push all known realtime transcription models for `provider` into
+/// `out`.  The third element of each tuple is `true` (streaming).
+fn add_known_realtime_models(out: &mut Vec<(Provider, String, bool)>, provider: Provider) {
     let models = match provider {
-        Provider::OpenAI => OPENAI_TRANSCRIPTION_MODELS,
-        Provider::Mistral => MISTRAL_TRANSCRIPTION_MODELS,
+        Provider::OpenAI => OPENAI_REALTIME_MODELS,
+        Provider::Mistral => MISTRAL_REALTIME_MODELS,
     };
     for m in models {
-        out.push((provider, (*m).to_string()));
+        out.push((provider, (*m).to_string(), true));
     }
+}
+
+/// Read all PCM i16 samples from a 16-bit WAV file.
+///
+/// Skips directly to the `data` chunk and reads every sample as
+/// little-endian i16.  Returns an error if the file is not a valid
+/// WAV or does not contain 16-bit PCM.
+fn read_wav_pcm_samples(path: &std::path::Path) -> Result<Vec<i16>, TalkError> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let err = |msg: &str| TalkError::Audio(format!("{}: {msg}", path.display()));
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| TalkError::Audio(format!("failed to open WAV {}: {e}", path.display())))?;
+
+    // Validate RIFF/WAVE header.
+    let mut tag = [0u8; 4];
+    file.read_exact(&mut tag)
+        .map_err(|_| err("truncated RIFF"))?;
+    if &tag != b"RIFF" {
+        return Err(err("not a WAV file (missing RIFF)"));
+    }
+    file.read_u32::<LittleEndian>()
+        .map_err(|_| err("truncated RIFF"))?; // file size
+    file.read_exact(&mut tag)
+        .map_err(|_| err("truncated WAVE"))?;
+    if &tag != b"WAVE" {
+        return Err(err("not a WAV file (missing WAVE)"));
+    }
+
+    // Walk chunks until we find "data".
+    let data_size: u32 = loop {
+        if file.read_exact(&mut tag).is_err() {
+            return Err(err("data chunk not found"));
+        }
+        let chunk_size = file
+            .read_u32::<LittleEndian>()
+            .map_err(|_| err("truncated chunk header"))?;
+        if &tag == b"data" {
+            break chunk_size;
+        }
+        // Skip unknown chunk (pad to even).
+        let skip = if chunk_size % 2 == 0 {
+            chunk_size as i64
+        } else {
+            chunk_size as i64 + 1
+        };
+        file.seek(SeekFrom::Current(skip))
+            .map_err(|_| err("seek past chunk failed"))?;
+    };
+
+    let num_samples = data_size as usize / 2; // 16-bit = 2 bytes per sample
+    let mut samples = Vec::with_capacity(num_samples);
+    for _ in 0..num_samples {
+        match file.read_i16::<LittleEndian>() {
+            Ok(s) => samples.push(s),
+            Err(_) => break,
+        }
+    }
+    Ok(samples)
 }
 
 fn build_retry_candidates(
     config: &Config,
     cli_provider: Option<Provider>,
     cli_model: Option<&str>,
-) -> Vec<(Provider, String)> {
-    let mut out: Vec<(Provider, String)> = Vec::new();
+) -> Vec<(Provider, String, bool)> {
+    let mut out: Vec<(Provider, String, bool)> = Vec::new();
 
     // If the user explicitly specified a model, include it even if it
     // is not in the known list (e.g. a dated snapshot or new model).
     if let (Some(provider), Some(model)) = (cli_provider, cli_model) {
-        out.push((provider, model.to_string()));
+        out.push((provider, model.to_string(), false));
     }
 
     match cli_provider {
         Some(provider) => {
-            // Specific provider requested: add all known models for it.
-            add_known_models(&mut out, provider);
+            // Specific provider requested: add all known batch + realtime models.
+            add_known_models_with_streaming(&mut out, provider);
+            add_known_realtime_models(&mut out, provider);
         }
         None => {
             // No provider filter: add all known models for every
             // provider, plus the config defaults (in case the user
             // configured a model we do not list).
-            add_known_models(&mut out, Provider::OpenAI);
-            add_known_models(&mut out, Provider::Mistral);
+            add_known_models_with_streaming(&mut out, Provider::OpenAI);
+            add_known_models_with_streaming(&mut out, Provider::Mistral);
+            add_known_realtime_models(&mut out, Provider::OpenAI);
+            add_known_realtime_models(&mut out, Provider::Mistral);
             out.push((
                 Provider::OpenAI,
                 resolve_model(None, config, Provider::OpenAI, false),
+                false,
             ));
             out.push((
                 Provider::Mistral,
                 resolve_model(None, config, Provider::Mistral, false),
+                false,
             ));
         }
     }
@@ -157,9 +230,22 @@ fn build_retry_candidates(
         a.0.to_string()
             .cmp(&b.0.to_string())
             .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
     });
     out.dedup();
     out
+}
+
+/// Push all known batch transcription models for `provider` into `out`
+/// as `(provider, model, streaming=false)` triples.
+fn add_known_models_with_streaming(out: &mut Vec<(Provider, String, bool)>, provider: Provider) {
+    let models = match provider {
+        Provider::OpenAI => OPENAI_TRANSCRIPTION_MODELS,
+        Provider::Mistral => MISTRAL_TRANSCRIPTION_MODELS,
+    };
+    for m in models {
+        out.push((provider, (*m).to_string(), false));
+    }
 }
 
 /// Window title used for the picker — also used for single-instance
@@ -174,16 +260,25 @@ struct PickerCandidate {
     text: String,
     /// When set, the candidate failed and this is the error message.
     error: Option<String>,
+    /// Whether this candidate came from a realtime (streaming) transcriber.
+    streaming: bool,
 }
 
 /// Messages sent from async tasks to the GTK poll loop.
 enum PickerMessage {
     /// A transcription result (success or error).
     Candidate(PickerCandidate),
-    /// All initial transcription tasks have completed.
-    /// The poll loop should mark any remaining spinners as failed
-    /// but keep running to receive retry results.
+    /// All initial batch transcription tasks have completed.
+    /// The poll loop should mark any remaining batch spinners as
+    /// failed but keep running to receive retry results.
     InitialBatchDone,
+    /// Incremental text update from a realtime transcriber.
+    /// Contains the full accumulated text so GTK just replaces the label.
+    StreamUpdate {
+        provider: Provider,
+        model: String,
+        accumulated_text: String,
+    },
 }
 
 /// Centre a known X11 window on the monitor containing the mouse
@@ -413,6 +508,7 @@ struct PickerSelection {
     model: String,
     text: String,
     is_cached: bool,
+    streaming: bool,
 }
 
 /// Show a GTK4 picker window that appears immediately with a spinner,
@@ -434,24 +530,34 @@ struct PickerSelection {
 async fn pick_with_streaming_gtk(
     mut transcribers: Vec<(Provider, String, Box<dyn BatchTranscriber>)>,
     audio_path: PathBuf,
-    mut cached_entries: Vec<(Provider, String, String, bool)>,
+    mut cached_entries: Vec<(Provider, String, String, bool, bool)>,
     config: Config,
+    mut realtime_transcribers: Vec<(Provider, String, Box<dyn RealtimeTranscriber>)>,
 ) -> Result<Option<PickerSelection>, TalkError> {
-    if transcribers.is_empty() && cached_entries.is_empty() {
+    if transcribers.is_empty() && cached_entries.is_empty() && realtime_transcribers.is_empty() {
         return Ok(None);
     }
 
-    // Stable display order: sort by (provider, model) so the list
-    // looks identical every time the picker opens.
-    cached_entries.sort_by(|(pa, ma, _, _), (pb, mb, _, _)| {
-        pa.to_string().cmp(&pb.to_string()).then(ma.cmp(mb))
+    // Stable display order: sort by (provider, model, streaming) so
+    // the list looks identical every time the picker opens.
+    cached_entries.sort_by(|(pa, ma, _, _, sa), (pb, mb, _, _, sb)| {
+        pa.to_string()
+            .cmp(&pb.to_string())
+            .then(ma.cmp(mb))
+            .then(sa.cmp(sb))
     });
     transcribers
+        .sort_by(|(pa, ma, _), (pb, mb, _)| pa.to_string().cmp(&pb.to_string()).then(ma.cmp(mb)));
+    realtime_transcribers
         .sort_by(|(pa, ma, _), (pb, mb, _)| pa.to_string().cmp(&pb.to_string()).then(ma.cmp(mb)));
 
     // Extract (provider, model) labels before transcribers are consumed
     // so the GTK thread can pre-create rows with spinners.
     let pending_info: Vec<(Provider, String)> = transcribers
+        .iter()
+        .map(|(p, m, _)| (*p, m.clone()))
+        .collect();
+    let realtime_pending_info: Vec<(Provider, String)> = realtime_transcribers
         .iter()
         .map(|(p, m, _)| (*p, m.clone()))
         .collect();
@@ -461,14 +567,17 @@ async fn pick_with_streaming_gtk(
     let (sel_tx, sel_rx) = tokio::sync::oneshot::channel::<Option<usize>>();
 
     // Retry channel: GTK thread → async retry listener.
-    let (retry_tx, retry_rx) = std::sync::mpsc::channel::<(Provider, String)>();
+    // The bool indicates whether this is a streaming (realtime) retry.
+    let (retry_tx, retry_rx) = std::sync::mpsc::channel::<(Provider, String, bool)>();
 
     // Shared storage written by the GTK thread after selection,
     // read by the caller after the GTK thread finishes.
+    // Tuple: (provider, model, text, is_primary, is_error, streaming)
     let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
         Provider,
         String,
         String,
+        bool,
         bool,
         bool,
     )>::new()));
@@ -605,15 +714,19 @@ async fn pick_with_streaming_gtk(
         let main_loop = glib::MainLoop::new(None, false);
         let sel_sender: Rc<RefCell<Option<tokio::sync::oneshot::Sender<Option<usize>>>>> =
             Rc::new(RefCell::new(Some(sel_tx)));
-        type CandidateList = Vec<(Provider, String, String, bool, bool)>;
+        type CandidateList = Vec<(Provider, String, String, bool, bool, bool)>;
         let local_candidates: Rc<RefCell<CandidateList>> = Rc::new(RefCell::new(Vec::new()));
         // Transcript cells — used to swap spinner → label when results arrive.
         let transcript_cells: Rc<RefCell<Vec<gtk4::Box>>> = Rc::new(RefCell::new(Vec::new()));
 
-        // Helper: build a row skeleton with provider + model labels.
+        // Helper: build a row skeleton with provider + streaming + model labels.
         // Returns (hbox, transcript_cell) — caller fills the cell
         // with either a spinner or a transcript label.
-        fn make_row_skeleton(provider: &str, model: &str) -> (gtk4::Box, gtk4::Box) {
+        fn make_row_skeleton(
+            provider: &str,
+            model: &str,
+            streaming: bool,
+        ) -> (gtk4::Box, gtk4::Box) {
             use gtk4::prelude::*;
 
             let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
@@ -635,6 +748,15 @@ async fn pick_with_streaming_gtk(
             prov_label.set_selectable(false);
             prov_label.add_css_class("dim");
             hbox.append(&prov_label);
+
+            // Streaming indicator (between provider and model)
+            let stream_label = gtk4::Label::new(Some(if streaming { "\u{26a1}" } else { "" }));
+            stream_label.set_xalign(0.5);
+            stream_label.set_width_chars(3);
+            stream_label.set_max_width_chars(3);
+            stream_label.set_selectable(false);
+            stream_label.add_css_class("dim");
+            hbox.append(&stream_label);
 
             // Model (fixed width for column alignment)
             let model_label = gtk4::Label::new(Some(model));
@@ -669,8 +791,9 @@ async fn pick_with_streaming_gtk(
         // The `is_primary` flag marks the entry that was already
         // pasted in a previous run — it gets pre-selected.
         let mut selected_row = false;
-        for (i, (provider, model, text, is_primary)) in cached_entries.iter().enumerate() {
-            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model);
+        for (i, (provider, model, text, is_primary, streaming)) in cached_entries.iter().enumerate()
+        {
+            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, *streaming);
             cell.append(&make_transcript_label(text));
 
             let row = gtk4::ListBoxRow::new();
@@ -689,13 +812,14 @@ async fn pick_with_streaming_gtk(
                 text.clone(),
                 *is_primary,
                 false,
+                *streaming,
             ));
             transcript_cells.borrow_mut().push(cell);
         }
 
-        // Pending entries: row with spinner in transcript cell.
+        // Pending batch entries: row with spinner in transcript cell.
         for (provider, model) in &pending_info {
-            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model);
+            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, false);
             let spinner = gtk4::Spinner::new();
             spinner.start();
             cell.append(&spinner);
@@ -710,6 +834,28 @@ async fn pick_with_streaming_gtk(
                 String::new(),
                 false,
                 false,
+                false,
+            ));
+            transcript_cells.borrow_mut().push(cell);
+        }
+
+        // Pending realtime entries: row with empty transcript label
+        // (text fills incrementally, no spinner).
+        for (provider, model) in &realtime_pending_info {
+            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, true);
+            cell.append(&make_transcript_label(""));
+
+            let row = gtk4::ListBoxRow::new();
+            row.set_child(Some(&hbox));
+            list.append(&row);
+
+            local_candidates.borrow_mut().push((
+                *provider,
+                model.clone(),
+                String::new(),
+                false,
+                false,
+                true,
             ));
             transcript_cells.borrow_mut().push(cell);
         }
@@ -732,7 +878,7 @@ async fn pick_with_streaming_gtk(
                 let ready = cands
                     .borrow()
                     .get(idx)
-                    .is_some_and(|(_, _, text, _, is_error)| !text.is_empty() && !is_error);
+                    .is_some_and(|(_, _, text, _, is_error, _)| !text.is_empty() && !is_error);
                 if ready {
                     win.set_visible(false);
                     if let Some(tx) = sel.borrow_mut().take() {
@@ -795,6 +941,8 @@ async fn pick_with_streaming_gtk(
                 let err = gtk4::Label::new(Some(msg));
                 err.set_xalign(0.0);
                 err.set_hexpand(true);
+                err.set_wrap(true);
+                err.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
                 err.add_css_class("error");
                 hbox.append(&err);
 
@@ -807,20 +955,28 @@ async fn pick_with_streaming_gtk(
                     let cells_ref = Rc::clone(&cells_for_err);
                     retry_btn.connect_clicked(move |_| {
                         let mut cands = cands_ref.borrow_mut();
-                        if let Some((provider, model, text, _, is_error)) = cands.get_mut(idx) {
-                            let _ = tx.send((*provider, model.clone()));
+                        if let Some((provider, model, text, _, is_error, streaming)) =
+                            cands.get_mut(idx)
+                        {
+                            let _ = tx.send((*provider, model.clone(), *streaming));
                             // Reset row state.
                             text.clear();
                             *is_error = false;
-                            // Replace error with spinner.
+                            // Replace error with spinner (batch) or
+                            // empty label (realtime).
+                            let is_streaming = *streaming;
                             let cells = cells_ref.borrow();
                             if let Some(cell) = cells.get(idx) {
                                 while let Some(child) = cell.first_child() {
                                     cell.remove(&child);
                                 }
-                                let spinner = gtk4::Spinner::new();
-                                spinner.start();
-                                cell.append(&spinner);
+                                if is_streaming {
+                                    cell.append(&make_transcript_label(""));
+                                } else {
+                                    let spinner = gtk4::Spinner::new();
+                                    spinner.start();
+                                    cell.append(&spinner);
+                                }
                             }
                         }
                     });
@@ -840,12 +996,13 @@ async fn pick_with_streaming_gtk(
                 loop {
                     match msg_rx.try_recv() {
                         Ok(PickerMessage::Candidate(c)) => {
-                            // Find the pre-created row by (provider, model).
+                            // Find the pre-created row by
+                            // (provider, model, streaming).
                             let idx = {
                                 let cands = cands.borrow();
-                                cands
-                                    .iter()
-                                    .position(|(p, m, _, _, _)| *p == c.provider && *m == c.model)
+                                cands.iter().position(|(p, m, _, _, _, s)| {
+                                    *p == c.provider && *m == c.model && *s == c.streaming
+                                })
                             };
                             if let Some(idx) = idx {
                                 // Clear cell content (spinner or previous error).
@@ -868,15 +1025,44 @@ async fn pick_with_streaming_gtk(
                                 }
                             }
                         }
+                        Ok(PickerMessage::StreamUpdate {
+                            provider,
+                            model,
+                            accumulated_text,
+                        }) => {
+                            // Find the realtime row by
+                            // (provider, model, streaming=true).
+                            let idx = {
+                                let cands = cands.borrow();
+                                cands.iter().position(|(p, m, _, _, _, s)| {
+                                    *p == provider && *m == model && *s
+                                })
+                            };
+                            if let Some(idx) = idx {
+                                // Replace cell content with updated text.
+                                {
+                                    let cells = cells.borrow();
+                                    if let Some(cell) = cells.get(idx) {
+                                        while let Some(child) = cell.first_child() {
+                                            cell.remove(&child);
+                                        }
+                                        cell.append(&make_transcript_label(&accumulated_text));
+                                    }
+                                }
+                                cands.borrow_mut()[idx].2 = accumulated_text;
+                            }
+                        }
                         Ok(PickerMessage::InitialBatchDone) => {
-                            // Mark remaining spinners as failed.
+                            // Mark remaining batch spinners as failed.
+                            // Realtime rows (streaming=true) may still
+                            // be receiving data — skip them.
                             let failed: Vec<usize> = {
                                 let mut cands = cands.borrow_mut();
                                 let indices: Vec<usize> = cands
                                     .iter()
                                     .enumerate()
-                                    .filter(|(_, (_, _, text, _, is_error))| {
-                                        text.is_empty() && !*is_error
+                                    .filter(|(_, (_, _, text, _, is_error, streaming))| {
+                                        text.is_empty() && !*is_error && !*streaming
                                     })
                                     .map(|(i, _)| i)
                                     .collect();
@@ -889,7 +1075,8 @@ async fn pick_with_streaming_gtk(
                                 make_err(&cells.borrow()[idx], idx, "no response");
                             }
                             list.grab_focus();
-                            // Keep polling — retries may still arrive.
+                            // Keep polling — retries and realtime
+                            // results may still arrive.
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             return glib::ControlFlow::Continue;
@@ -941,7 +1128,7 @@ async fn pick_with_streaming_gtk(
     // ── Parallel transcriptions ─────────────────────────────────
     let audio_path_for_cache = audio_path.clone();
 
-    // Helper: run one transcription and send the result.
+    // Helper: run one batch transcription and send the result.
     fn spawn_transcription(
         tasks: &mut tokio::task::JoinSet<()>,
         tx: std::sync::mpsc::Sender<PickerMessage>,
@@ -967,6 +1154,7 @@ async fn pick_with_streaming_gtk(
                         model,
                         text,
                         error: None,
+                        streaming: false,
                     })
                 }
                 Ok(Err(e)) => {
@@ -976,6 +1164,7 @@ async fn pick_with_streaming_gtk(
                         model,
                         text: String::new(),
                         error: Some(format!("{e}")),
+                        streaming: false,
                     })
                 }
                 Err(_) => {
@@ -985,6 +1174,7 @@ async fn pick_with_streaming_gtk(
                         model,
                         text: String::new(),
                         error: Some("timed out".into()),
+                        streaming: false,
                     })
                 }
             };
@@ -995,6 +1185,146 @@ async fn pick_with_streaming_gtk(
     // Fire initial batch.
     let done_tx = msg_tx.clone();
     let retry_msg_tx = msg_tx.clone();
+
+    // Read WAV samples once for realtime transcribers (shared via Arc).
+    let wav_samples = if !realtime_transcribers.is_empty() {
+        match read_wav_pcm_samples(&audio_path) {
+            Ok(samples) => Some(std::sync::Arc::new(samples)),
+            Err(e) => {
+                log::warn!("failed to read WAV for realtime: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Spawn realtime transcription tasks.
+    for (provider, model, transcriber) in realtime_transcribers {
+        let tx = msg_tx.clone();
+        let samples = wav_samples.clone();
+        let model_clone = model.clone();
+        tokio::spawn(async move {
+            let Some(samples) = samples else {
+                let _ = tx.send(PickerMessage::Candidate(PickerCandidate {
+                    provider,
+                    model: model_clone,
+                    text: String::new(),
+                    error: Some("failed to read WAV samples".into()),
+                    streaming: true,
+                }));
+                return;
+            };
+
+            // Create audio channel and start realtime transcription.
+            let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
+            let event_rx = match transcriber.transcribe_realtime(audio_rx).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    log::warn!(
+                        "realtime {}:{} connect failed: {}",
+                        provider,
+                        model_clone,
+                        e
+                    );
+                    let _ = tx.send(PickerMessage::Candidate(PickerCandidate {
+                        provider,
+                        model: model_clone,
+                        text: String::new(),
+                        error: Some(format!("{e}")),
+                        streaming: true,
+                    }));
+                    return;
+                }
+            };
+
+            // Spawn feeder: send PCM chunks (480 samples = 30ms at 16kHz).
+            let feeder_samples = samples.clone();
+            tokio::spawn(async move {
+                const CHUNK_SIZE: usize = 480;
+                let data = &*feeder_samples;
+                let mut offset = 0;
+                while offset < data.len() {
+                    let end = (offset + CHUNK_SIZE).min(data.len());
+                    let chunk = data[offset..end].to_vec();
+                    if audio_tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                    offset = end;
+                    // Pace the feed to avoid overwhelming the WebSocket.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                // Drop audio_tx to signal end-of-audio.
+            });
+
+            // Listen for events and forward to GTK.
+            let mut event_rx = event_rx;
+            let mut accumulated = String::new();
+            loop {
+                match event_rx.recv().await {
+                    Some(TranscriptionEvent::TextDelta { text }) => {
+                        accumulated.push_str(&text);
+                        let _ = tx.send(PickerMessage::StreamUpdate {
+                            provider,
+                            model: model_clone.clone(),
+                            accumulated_text: accumulated.clone(),
+                        });
+                    }
+                    Some(TranscriptionEvent::SegmentDelta { text, .. }) => {
+                        // Use segment text as authoritative.
+                        if !text.is_empty() {
+                            if !accumulated.is_empty() {
+                                accumulated.push(' ');
+                            }
+                            accumulated.push_str(text.trim());
+                            let _ = tx.send(PickerMessage::StreamUpdate {
+                                provider,
+                                model: model_clone.clone(),
+                                accumulated_text: accumulated.clone(),
+                            });
+                        }
+                    }
+                    Some(TranscriptionEvent::Done) => {
+                        let final_text = accumulated.trim().to_string();
+                        let _ = tx.send(PickerMessage::Candidate(PickerCandidate {
+                            provider,
+                            model: model_clone,
+                            text: final_text,
+                            error: None,
+                            streaming: true,
+                        }));
+                        return;
+                    }
+                    Some(TranscriptionEvent::Error { message }) => {
+                        let _ = tx.send(PickerMessage::Candidate(PickerCandidate {
+                            provider,
+                            model: model_clone,
+                            text: String::new(),
+                            error: Some(message),
+                            streaming: true,
+                        }));
+                        return;
+                    }
+                    None => {
+                        // Channel closed without Done — use what we have.
+                        let final_text = accumulated.trim().to_string();
+                        let _ = tx.send(PickerMessage::Candidate(PickerCandidate {
+                            provider,
+                            model: model_clone,
+                            text: final_text,
+                            error: None,
+                            streaming: true,
+                        }));
+                        return;
+                    }
+                    _ => {
+                        // Ignore SessionCreated, Language, etc.
+                    }
+                }
+            }
+        });
+    }
+
     drop(msg_tx); // only clones survive from here
     tokio::spawn({
         let audio = audio_path.clone();
@@ -1013,46 +1343,192 @@ async fn pick_with_streaming_gtk(
             }
             drop(tx);
             while (tasks.join_next().await).is_some() {}
-            // All initial tasks finished — notify GTK.
+            // All initial batch tasks finished — notify GTK.
             let _ = done_tx.send(PickerMessage::InitialBatchDone);
         }
     });
 
     // ── Retry listener ──────────────────────────────────────────
-    // Receives (provider, model) from the GTK retry button and
-    // fires a new transcription, reusing the same result channel.
+    // Receives (provider, model, streaming) from the GTK retry button
+    // and fires a new transcription, reusing the same result channel.
     {
         let audio = audio_path;
         let tx = retry_msg_tx;
+        let wav_for_retry = wav_samples;
         tokio::spawn(async move {
-            while let Ok((provider, model)) = retry_rx.recv() {
-                log::info!("retrying {}:{}", provider, model);
-                match transcription::create_batch_transcriber(&config, provider, Some(&model)) {
-                    Ok(transcriber) => {
-                        let mut tasks = tokio::task::JoinSet::new();
-                        spawn_transcription(
-                            &mut tasks,
-                            tx.clone(),
-                            audio.clone(),
-                            provider,
-                            model,
-                            transcriber,
-                        );
-                        while (tasks.join_next().await).is_some() {}
+            while let Ok((provider, model, streaming)) = retry_rx.recv() {
+                log::info!("retrying {}:{} (streaming={})", provider, model, streaming);
+                if streaming {
+                    // Realtime retry: re-stream WAV samples.
+                    let samples = match wav_for_retry {
+                        Some(ref s) => s.clone(),
+                        None => {
+                            let _ = tx.send(PickerMessage::Candidate(PickerCandidate {
+                                provider,
+                                model,
+                                text: String::new(),
+                                error: Some("WAV samples unavailable".into()),
+                                streaming: true,
+                            }));
+                            continue;
+                        }
+                    };
+                    match transcription::create_realtime_transcriber(
+                        &config,
+                        provider,
+                        Some(&model),
+                    ) {
+                        Ok(transcriber) => {
+                            let tx = tx.clone();
+                            let model_clone = model.clone();
+                            tokio::spawn(async move {
+                                let (audio_tx, audio_rx) =
+                                    tokio::sync::mpsc::channel::<Vec<i16>>(100);
+                                let event_rx = match transcriber.transcribe_realtime(audio_rx).await
+                                {
+                                    Ok(rx) => rx,
+                                    Err(e) => {
+                                        let _ =
+                                            tx.send(PickerMessage::Candidate(PickerCandidate {
+                                                provider,
+                                                model: model_clone,
+                                                text: String::new(),
+                                                error: Some(format!("{e}")),
+                                                streaming: true,
+                                            }));
+                                        return;
+                                    }
+                                };
+                                let feeder_samples = samples.clone();
+                                tokio::spawn(async move {
+                                    const CHUNK_SIZE: usize = 480;
+                                    let data = &*feeder_samples;
+                                    let mut offset = 0;
+                                    while offset < data.len() {
+                                        let end = (offset + CHUNK_SIZE).min(data.len());
+                                        let chunk = data[offset..end].to_vec();
+                                        if audio_tx.send(chunk).await.is_err() {
+                                            break;
+                                        }
+                                        offset = end;
+                                        tokio::time::sleep(std::time::Duration::from_millis(10))
+                                            .await;
+                                    }
+                                });
+                                let mut event_rx = event_rx;
+                                let mut accumulated = String::new();
+                                loop {
+                                    match event_rx.recv().await {
+                                        Some(TranscriptionEvent::TextDelta { text }) => {
+                                            accumulated.push_str(&text);
+                                            let _ = tx.send(PickerMessage::StreamUpdate {
+                                                provider,
+                                                model: model_clone.clone(),
+                                                accumulated_text: accumulated.clone(),
+                                            });
+                                        }
+                                        Some(TranscriptionEvent::SegmentDelta { text, .. }) => {
+                                            if !text.is_empty() {
+                                                if !accumulated.is_empty() {
+                                                    accumulated.push(' ');
+                                                }
+                                                accumulated.push_str(text.trim());
+                                                let _ = tx.send(PickerMessage::StreamUpdate {
+                                                    provider,
+                                                    model: model_clone.clone(),
+                                                    accumulated_text: accumulated.clone(),
+                                                });
+                                            }
+                                        }
+                                        Some(TranscriptionEvent::Done) => {
+                                            let final_text = accumulated.trim().to_string();
+                                            let _ = tx.send(PickerMessage::Candidate(
+                                                PickerCandidate {
+                                                    provider,
+                                                    model: model_clone,
+                                                    text: final_text,
+                                                    error: None,
+                                                    streaming: true,
+                                                },
+                                            ));
+                                            return;
+                                        }
+                                        Some(TranscriptionEvent::Error { message }) => {
+                                            let _ = tx.send(PickerMessage::Candidate(
+                                                PickerCandidate {
+                                                    provider,
+                                                    model: model_clone,
+                                                    text: String::new(),
+                                                    error: Some(message),
+                                                    streaming: true,
+                                                },
+                                            ));
+                                            return;
+                                        }
+                                        None => {
+                                            let final_text = accumulated.trim().to_string();
+                                            let _ = tx.send(PickerMessage::Candidate(
+                                                PickerCandidate {
+                                                    provider,
+                                                    model: model_clone,
+                                                    text: final_text,
+                                                    error: None,
+                                                    streaming: true,
+                                                },
+                                            ));
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "retry {}:{} realtime transcriber creation failed: {}",
+                                provider,
+                                model,
+                                e
+                            );
+                            let _ = tx.send(PickerMessage::Candidate(PickerCandidate {
+                                provider,
+                                model,
+                                text: String::new(),
+                                error: Some(format!("{e}")),
+                                streaming: true,
+                            }));
+                        }
                     }
-                    Err(e) => {
-                        log::warn!(
-                            "retry {}:{} transcriber creation failed: {}",
-                            provider,
-                            model,
-                            e
-                        );
-                        let _ = tx.send(PickerMessage::Candidate(PickerCandidate {
-                            provider,
-                            model,
-                            text: String::new(),
-                            error: Some(format!("{e}")),
-                        }));
+                } else {
+                    // Batch retry (existing logic).
+                    match transcription::create_batch_transcriber(&config, provider, Some(&model)) {
+                        Ok(transcriber) => {
+                            let mut tasks = tokio::task::JoinSet::new();
+                            spawn_transcription(
+                                &mut tasks,
+                                tx.clone(),
+                                audio.clone(),
+                                provider,
+                                model,
+                                transcriber,
+                            );
+                            while (tasks.join_next().await).is_some() {}
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "retry {}:{} transcriber creation failed: {}",
+                                provider,
+                                model,
+                                e
+                            );
+                            let _ = tx.send(PickerMessage::Candidate(PickerCandidate {
+                                provider,
+                                model,
+                                text: String::new(),
+                                error: Some(format!("{e}")),
+                                streaming: false,
+                            }));
+                        }
                     }
                 }
             }
@@ -1078,11 +1554,12 @@ async fn pick_with_streaming_gtk(
             .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
         let to_cache: Vec<picker_cache::CachedResult> = items
             .iter()
-            .filter(|(_, _, text, _, is_error)| !text.is_empty() && !*is_error)
-            .map(|(p, m, t, _, _)| picker_cache::CachedResult {
+            .filter(|(_, _, text, _, is_error, _)| !text.is_empty() && !*is_error)
+            .map(|(p, m, t, _, _, s)| picker_cache::CachedResult {
                 provider: p.to_string(),
                 model: m.clone(),
                 text: t.clone(),
+                streaming: *s,
             })
             .collect();
         if let Err(e) = picker_cache::write_results(&audio_path_for_cache, &to_cache) {
@@ -1096,12 +1573,13 @@ async fn pick_with_streaming_gtk(
                 .lock()
                 .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
             if idx < items.len() {
-                let (p, m, t, cached, _is_error) = items[idx].clone();
+                let (p, m, t, cached, _is_error, streaming) = items[idx].clone();
                 Ok(Some(PickerSelection {
                     provider: p,
                     model: m,
                     text: t,
                     is_cached: cached,
+                    streaming,
                 }))
             } else {
                 Ok(None)
@@ -1116,6 +1594,15 @@ const FOCUS_MAX_RETRIES: u32 = 5;
 
 /// Initial delay between focus retry attempts (doubles each retry).
 const FOCUS_INITIAL_DELAY_MS: u64 = 50;
+
+/// Maximum number of words per clipboard paste operation.
+///
+/// When the text to paste exceeds this limit it is split into
+/// consecutive chunks of this size, each pasted via a separate
+/// Ctrl+Shift+V keystroke.  This mimics the segment-by-segment
+/// behaviour of realtime mode and avoids overwhelming the target
+/// application with a single large paste.
+const PASTE_CHUNK_WORDS: usize = 10;
 
 /// Attempt to focus the target window and verify the active window
 /// matches.  Retries with exponential backoff to give the window
@@ -1161,6 +1648,34 @@ async fn ensure_focus(window_id: &str) -> Result<(), TalkError> {
     )))
 }
 
+/// Split `text` into chunks of at most `max_words` whitespace-delimited
+/// words each.
+///
+/// Every chunk after the first is prefixed with a single space so that
+/// concatenating all chunks reproduces the original word sequence.
+/// If the text is empty (or whitespace-only) a single element containing
+/// the original string is returned so that the caller always has at
+/// least one chunk to paste.
+fn split_into_word_chunks(text: &str, max_words: usize) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    words
+        .chunks(max_words)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let joined = chunk.join(" ");
+            if i == 0 {
+                joined
+            } else {
+                format!(" {joined}")
+            }
+        })
+        .collect()
+}
+
 async fn paste_text_to_target(
     target_window: Option<&String>,
     text: &str,
@@ -1180,10 +1695,19 @@ async fn paste_text_to_target(
     }
 
     let saved_clipboard = clipboard.get_text().await.ok();
-    clipboard.set_text(text).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    simulate_paste().await?;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let chunks = split_into_word_chunks(text, PASTE_CHUNK_WORDS);
+    for chunk in &chunks {
+        clipboard.set_text(chunk).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        simulate_paste().await?;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Extra settle time before restoring the clipboard so the last
+    // paste has time to be consumed by the target application.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     if let Some(saved) = saved_clipboard {
         let _ = clipboard.set_text(&saved).await;
     }
@@ -1318,12 +1842,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             return Ok(());
         }
 
-        if opts.realtime {
-            return Err(TalkError::Config(
-                "--pick is currently supported only in batch mode".to_string(),
-            ));
-        }
-
         let audio_path = input_audio_file.clone().ok_or_else(|| {
             TalkError::Config("--pick requires --input-audio-file or --retry-last".to_string())
         })?;
@@ -1338,31 +1856,39 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // so that reopening the picker skips API calls entirely.
         let picker_cache_data = picker_cache::read(&audio_path);
 
-        // Determine the "already pasted" (provider, model) pair.
+        // Determine the "already pasted" (provider, model, streaming) triple.
         // The picker cache's `selected` field takes precedence
         // (the user may have picked a different model last time).
         // Fall back to the recording metadata otherwise.
-        let selected_key: Option<(Provider, String)> = picker_cache_data
+        let selected_key: Option<(Provider, String, bool)> = picker_cache_data
             .selected
             .as_ref()
-            .and_then(|s| Some((s.provider.parse::<Provider>().ok()?, s.model.clone())))
+            .and_then(|s| {
+                Some((
+                    s.provider.parse::<Provider>().ok()?,
+                    s.model.clone(),
+                    s.streaming,
+                ))
+            })
             .or_else(|| {
                 cached_brief.as_ref().and_then(|b| {
                     Some((
                         b.provider.as_deref()?.parse().ok()?,
                         b.model.as_deref()?.to_string(),
+                        false,
                     ))
                 })
             });
 
         // Collect all available cached transcriptions.
-        let mut all_entries: Vec<(Provider, String, String)> = Vec::new();
+        // Tuple: (provider, model, text, streaming)
+        let mut all_entries: Vec<(Provider, String, String, bool)> = Vec::new();
 
-        // From recording metadata.
+        // From recording metadata (always batch / streaming=false).
         if let Some(ref brief) = cached_brief {
             if let (Some(ps), Some(m)) = (brief.provider.as_deref(), brief.model.as_deref()) {
                 if let Ok(p) = ps.parse::<Provider>() {
-                    all_entries.push((p, m.to_string(), brief.transcript.clone()));
+                    all_entries.push((p, m.to_string(), brief.transcript.clone(), false));
                 }
             }
         }
@@ -1372,9 +1898,9 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             if let Ok(p) = cr.provider.parse::<Provider>() {
                 if !all_entries
                     .iter()
-                    .any(|(ep, em, _)| *ep == p && *em == cr.model)
+                    .any(|(ep, em, _, es)| *ep == p && *em == cr.model && *es == cr.streaming)
                 {
-                    all_entries.push((p, cr.model.clone(), cr.text.clone()));
+                    all_entries.push((p, cr.model.clone(), cr.text.clone(), cr.streaming));
                 }
             }
         }
@@ -1382,43 +1908,53 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // Build cached_entries with is_primary flag.  The selected
         // (already-pasted) entry goes first so it is pre-selected
         // in the GTK list.
-        let mut cached_entries: Vec<(Provider, String, String, bool)> = Vec::new();
-        if let Some((ref sp, ref sm)) = selected_key {
-            if let Some(idx) = all_entries.iter().position(|(p, m, _)| p == sp && m == sm) {
-                let (p, m, t) = all_entries.remove(idx);
-                cached_entries.push((p, m, t, true));
+        // Tuple: (provider, model, text, is_primary, streaming)
+        let mut cached_entries: Vec<(Provider, String, String, bool, bool)> = Vec::new();
+        if let Some((ref sp, ref sm, ss)) = selected_key {
+            if let Some(idx) = all_entries
+                .iter()
+                .position(|(p, m, _, s)| p == sp && m == sm && *s == ss)
+            {
+                let (p, m, t, s) = all_entries.remove(idx);
+                cached_entries.push((p, m, t, true, s));
             }
         }
-        for (p, m, t) in all_entries {
-            cached_entries.push((p, m, t, false));
+        for (p, m, t, s) in all_entries {
+            cached_entries.push((p, m, t, false, s));
         }
 
         log::debug!(
             "picker cache: {} cached entries (primary={}, from_cache={})",
             cached_entries.len(),
-            cached_entries.iter().filter(|(_, _, _, p)| *p).count(),
+            cached_entries.iter().filter(|(_, _, _, p, _)| *p).count(),
             picker_cache_data.results.len(),
         );
-        for (p, m, _, is_primary) in &cached_entries {
-            log::debug!("  cached: {}:{} (primary={})", p, m, is_primary);
+        for (p, m, _, is_primary, streaming) in &cached_entries {
+            log::debug!(
+                "  cached: {}:{} (primary={}, streaming={})",
+                p,
+                m,
+                is_primary,
+                streaming,
+            );
         }
 
         let candidates = build_retry_candidates(&config, opts.provider, opts.model.as_deref());
         log::debug!("picker candidates: {} total", candidates.len());
-        for (p, m) in &candidates {
-            log::debug!("  candidate: {}:{}", p, m);
+        for (p, m, s) in &candidates {
+            log::debug!("  candidate: {}:{} (streaming={})", p, m, s);
         }
 
-        // Filter out every (provider, model) pair that already has a
-        // cached result — no need to re-transcribe.
-        let filtered: Vec<(Provider, String)> = candidates
+        // Filter out every (provider, model, streaming) triple that
+        // already has a cached result — no need to re-transcribe.
+        let filtered: Vec<(Provider, String, bool)> = candidates
             .into_iter()
-            .filter(|(p, m)| {
+            .filter(|(p, m, s)| {
                 let dominated = cached_entries
                     .iter()
-                    .any(|(cp, cm, _, _)| cp == p && cm == m);
+                    .any(|(cp, cm, _, _, cs)| cp == p && cm == m && cs == s);
                 if dominated {
-                    log::debug!("  filtered out (cached): {}:{}", p, m);
+                    log::debug!("  filtered out (cached): {}:{} (streaming={})", p, m, s);
                 }
                 !dominated
             })
@@ -1427,28 +1963,55 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             "picker: {} transcribers needed (after filtering)",
             filtered.len(),
         );
-        for (p, m) in &filtered {
-            log::debug!("  needs API call: {}:{}", p, m);
+        for (p, m, s) in &filtered {
+            log::debug!("  needs API call: {}:{} (streaming={})", p, m, s);
         }
 
-        // Create all transcribers before entering GTK (needs &Config).
+        // Split filtered candidates into batch and realtime groups.
+        let batch_filtered: Vec<(Provider, String)> = filtered
+            .iter()
+            .filter(|(_, _, s)| !s)
+            .map(|(p, m, _)| (*p, m.clone()))
+            .collect();
+        let realtime_filtered: Vec<(Provider, String)> = filtered
+            .iter()
+            .filter(|(_, _, s)| *s)
+            .map(|(p, m, _)| (*p, m.clone()))
+            .collect();
+
+        // Create batch transcribers before entering GTK (needs &Config).
         let mut transcribers: Vec<(Provider, String, Box<dyn BatchTranscriber>)> = Vec::new();
-        for (provider, model) in filtered {
+        for (provider, model) in batch_filtered {
             match transcription::create_batch_transcriber(&config, provider, Some(&model)) {
                 Ok(t) => transcribers.push((provider, model, t)),
-                Err(e) => log::warn!("skipping {}:{}: {}", provider, model, e),
+                Err(e) => log::warn!("skipping batch {}:{}: {}", provider, model, e),
             }
         }
 
-        if transcribers.is_empty() && cached_entries.is_empty() {
+        // Create realtime transcribers.
+        let mut rt_transcribers: Vec<(Provider, String, Box<dyn RealtimeTranscriber>)> = Vec::new();
+        for (provider, model) in realtime_filtered {
+            match transcription::create_realtime_transcriber(&config, provider, Some(&model)) {
+                Ok(t) => rt_transcribers.push((provider, model, t)),
+                Err(e) => log::warn!("skipping realtime {}:{}: {}", provider, model, e),
+            }
+        }
+
+        if transcribers.is_empty() && cached_entries.is_empty() && rt_transcribers.is_empty() {
             return Err(TalkError::Transcription(
                 "no transcription providers available".to_string(),
             ));
         }
 
         let audio_path_for_selection = audio_path.clone();
-        let selected =
-            pick_with_streaming_gtk(transcribers, audio_path, cached_entries, config).await?;
+        let selected = pick_with_streaming_gtk(
+            transcribers,
+            audio_path,
+            cached_entries,
+            config,
+            rt_transcribers,
+        )
+        .await?;
         let selection = match selected {
             Some(s) => s,
             None => return Ok(()),
@@ -1460,6 +2023,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             &audio_path_for_selection,
             &selection.provider.to_string(),
             &selection.model,
+            selection.streaming,
         ) {
             log::warn!("failed to update picker selection: {}", e);
         }
@@ -1544,29 +2108,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         None
     };
 
-    // Play start sound
-    if let Some(ref p) = player {
-        log::debug!("playing start sound");
-        p.play_start().await;
-    }
-
-    // Show recording indicator
-    if let Some(ref o) = overlay {
-        log::debug!("showing recording overlay");
-        o.show(IndicatorKind::Recording);
-    }
-
-    // Show visualizer panels (positioned relative to 182px recording badge)
-    if let Some(ref viz) = visualizer {
-        log::debug!("showing visualizer");
-        viz.show(182);
-    }
-
-    // Start boop loop (every 5 seconds)
-    let boop_token = player
-        .as_ref()
-        .map(|p| p.start_boop_loop(std::time::Duration::from_secs(5)));
-
     // Generate cache recording path (always, even without --save)
     let (cache_wav_path, cache_timestamp) = recording_cache::generate_recording_path()?;
     log::info!("cache recording: {}", cache_wav_path.display());
@@ -1609,11 +2150,51 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             )
         };
 
+    // Start capture BEFORE the start sound so that audio is already
+    // being buffered while the sound plays.  The channel holds ~500 ms
+    // of data (25 × 20 ms chunks), which is more than enough for the
+    // setup that follows before the resample task drains it.
+    let raw_audio_rx = capture.start()?;
+
     log::info!(
         "starting {} transcription{}",
         if opts.realtime { "realtime" } else { "batch" },
         if from_file { " (from file)" } else { "" }
     );
+
+    // Play start sound — recording is already active so the user can
+    // start speaking as soon as they hear the tone.
+    if let Some(ref p) = player {
+        log::debug!("playing start sound");
+        p.play_start().await;
+    }
+
+    // Show recording indicator
+    if let Some(ref o) = overlay {
+        log::debug!("showing recording overlay");
+        o.show(IndicatorKind::Recording);
+    }
+
+    // Show visualizer panels (positioned relative to 182px recording badge)
+    if let Some(ref viz) = visualizer {
+        log::debug!("showing visualizer");
+        viz.show(182);
+    }
+
+    // Start boop loop (every 5 seconds)
+    let boop_token = player
+        .as_ref()
+        .map(|p| p.start_boop_loop(std::time::Duration::from_secs(5)));
+
+    // Set up the resample pipeline (common to both modes).  Audio has
+    // been buffering in the capture channel since capture.start() above.
+    let capture_chunk = (capture_rate as usize * CHUNK_DURATION_MS as usize) / 1000;
+    let audio_rx = resample::spawn_resample_task(
+        capture_rate,
+        encode_config.sample_rate,
+        raw_audio_rx,
+        capture_chunk,
+    )?;
 
     let result = if opts.realtime {
         // Realtime mode (--realtime): stream audio over WebSocket.
@@ -1657,17 +2238,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             }
         });
 
-        // Player and boop_token are passed so the stop sound fires
-        // immediately when the user toggles — not after the WebSocket
-        // finishes collecting transcription results.
-        let raw_audio_rx = capture.start()?;
-        let capture_chunk = (capture_rate as usize * CHUNK_DURATION_MS as usize) / 1000;
-        let audio_rx = resample::spawn_resample_task(
-            capture_rate,
-            encode_config.sample_rate,
-            raw_audio_rx,
-            capture_chunk,
-        )?;
         let result = dictate_realtime(
             config,
             provider,
@@ -1697,23 +2267,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
         result
     } else {
-        // Batch mode (default): capture audio, encode, then transcribe
+        // Batch mode (default): capture audio, encode, then transcribe.
+        // Provider validation is handled by toggle_validate() in the
+        // caller — no network round-trip here.
         let transcriber =
             transcription::create_batch_transcriber(&config, provider, opts.model.as_deref())?;
-
-        // Pre-flight: verify provider connectivity and model validity
-        // before starting audio capture.
-        log::info!("validating {} provider configuration", provider);
-        transcriber.validate().await?;
-
-        let raw_audio_rx = capture.start()?;
-        let capture_chunk = (capture_rate as usize * CHUNK_DURATION_MS as usize) / 1000;
-        let audio_rx = resample::spawn_resample_task(
-            capture_rate,
-            encode_config.sample_rate,
-            raw_audio_rx,
-            capture_chunk,
-        )?;
 
         dictate_streaming(
             &mut *capture,
@@ -1821,15 +2379,22 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         println!("{}", text);
     }
 
-    // If running as daemon, clean up PID file on normal exit
+    // If running as daemon, clean up PID file on normal exit — but only
+    // if we still own it.  Between our SIGINT and this cleanup a new daemon
+    // may have spawned and written its own PID, so blindly removing the
+    // file would orphan it.
     if opts.daemon {
         if let Ok(pid_file) = daemon::pid_path() {
-            let _ = daemon::remove_pid_file(&pid_file);
+            let _ = daemon::remove_pid_file_if_owner(std::process::id(), &pid_file);
         }
     }
 
     Ok(())
 }
+
+/// Minimum time (ms) to keep a validation error visible in the target
+/// window before returning, so the user has time to read it.
+const VALIDATION_ERROR_DISPLAY_MS: u64 = 2000;
 
 /// Toggle dispatch: start a new daemon or stop a running one.
 #[allow(clippy::too_many_arguments)]
@@ -1846,24 +2411,55 @@ async fn toggle_dispatch(
 ) -> Result<(), TalkError> {
     let pid_file = daemon::pid_path()?;
 
-    // Acquire exclusive lock to prevent race between concurrent toggle calls
-    let _lock = daemon::acquire_lock()?;
+    // Phase 1 — under lock: check status + spawn daemon / stop daemon.
+    // The lock is scoped so it is released as soon as the PID file is
+    // written (start) or removed (stop).  This avoids blocking a
+    // subsequent toggle press while the network validation is in flight.
+    let spawn_ctx: Option<SpawnContext> = {
+        let _lock = daemon::acquire_lock()?;
 
-    match daemon::check_status(&pid_file)? {
-        DaemonStatus::NotRunning => {
-            toggle_start(
-                &pid_file, provider, model, realtime, no_sounds, no_overlay, amplitude, spectrum,
-                save, verbose,
-            )
-            .await
+        match daemon::check_status(&pid_file)? {
+            DaemonStatus::NotRunning => Some(
+                toggle_spawn(
+                    &pid_file, provider, model, realtime, no_sounds, no_overlay, amplitude,
+                    spectrum, save, verbose,
+                )
+                .await?,
+            ),
+            DaemonStatus::Running { pid } => {
+                toggle_stop(pid, &pid_file)?;
+                None
+            }
         }
-        DaemonStatus::Running { pid } => toggle_stop(pid, &pid_file),
+    }; // _lock dropped — second toggle can proceed immediately
+
+    // Phase 2 — without lock: validate the provider configuration.
+    // The daemon is already recording; validation runs concurrently.
+    if let Some(ctx) = spawn_ctx {
+        toggle_validate(ctx).await?;
     }
+
+    Ok(())
 }
 
-/// Start a new daemon: capture window, spawn detached dictate process, write PID.
+/// Everything [`toggle_validate`] needs after the daemon has been
+/// spawned (and the lock released).
+struct SpawnContext {
+    child_pid: u32,
+    pid_file: std::path::PathBuf,
+    config: Config,
+    effective_provider: Provider,
+    model: Option<String>,
+    realtime: bool,
+}
+
+/// Spawn the daemon process and write the PID file.
+///
+/// This runs **under the exclusive lock** and must stay fast — no
+/// network I/O.  Returns context needed for the subsequent validation
+/// phase.
 #[allow(clippy::too_many_arguments)]
-async fn toggle_start(
+async fn toggle_spawn(
     pid_file: &std::path::Path,
     provider: Option<Provider>,
     model: Option<String>,
@@ -1874,24 +2470,10 @@ async fn toggle_start(
     spectrum: bool,
     save: Option<&std::path::Path>,
     verbose: u8,
-) -> Result<(), TalkError> {
-    // Pre-flight: validate provider/model before spawning the daemon
-    // so the user gets immediate feedback on misconfiguration.
+) -> Result<SpawnContext, TalkError> {
+    // Instant local checks only — no network I/O.
     let config = Config::load(None)?;
     let effective_provider = resolve_provider(provider, &config);
-    log::info!("validating {} provider configuration", effective_provider);
-    if realtime {
-        let t = transcription::create_realtime_transcriber(
-            &config,
-            effective_provider,
-            model.as_deref(),
-        )?;
-        t.validate().await?;
-    } else {
-        let t =
-            transcription::create_batch_transcriber(&config, effective_provider, model.as_deref())?;
-        t.validate().await?;
-    }
 
     // Capture active window before spawning daemon
     let target_window = get_active_window().await;
@@ -1970,6 +2552,8 @@ async fn toggle_start(
     // Create new process group (equivalent to setsid for signal isolation)
     cmd.process_group(0);
 
+    // Spawn daemon immediately — recording starts without waiting for
+    // network validation.
     let child = cmd
         .spawn()
         .map_err(|e| TalkError::Config(format!("failed to spawn daemon process: {}", e)))?;
@@ -1983,14 +2567,82 @@ async fn toggle_start(
         log_file_path.display()
     );
 
-    Ok(())
+    Ok(SpawnContext {
+        child_pid,
+        pid_file: pid_file.to_path_buf(),
+        config,
+        effective_provider,
+        model,
+        realtime,
+    })
 }
 
-/// Stop a running daemon: SIGINT, wait, SIGTERM fallback, clean up PID file.
+/// Validate the provider configuration after the daemon has been
+/// spawned.  Runs **without the lock** so a concurrent toggle (stop)
+/// is not blocked by the network round-trip.
+///
+/// On failure the daemon is killed and the error message is pasted
+/// into the target window where the transcription would normally
+/// appear.
+async fn toggle_validate(ctx: SpawnContext) -> Result<(), TalkError> {
+    log::info!(
+        "validating {} provider configuration",
+        ctx.effective_provider
+    );
+
+    let validation_result: Result<(), TalkError> = async {
+        if ctx.realtime {
+            let t = transcription::create_realtime_transcriber(
+                &ctx.config,
+                ctx.effective_provider,
+                ctx.model.as_deref(),
+            )?;
+            t.validate().await
+        } else {
+            let t = transcription::create_batch_transcriber(
+                &ctx.config,
+                ctx.effective_provider,
+                ctx.model.as_deref(),
+            )?;
+            t.validate().await
+        }
+    }
+    .await;
+
+    if let Err(ref e) = validation_result {
+        log::warn!("provider validation failed, stopping daemon: {}", e);
+        let _ = daemon::stop_if_owner(ctx.child_pid, &ctx.pid_file);
+
+        // Show error in a temporary visualizer overlay so the user gets
+        // visible feedback without injecting text into their window.
+        let error_msg = format!("[talk-rs] {e}");
+        match VisualizerHandle::new(false, false) {
+            Ok(viz) => {
+                viz.show(0);
+                viz.set_text(&error_msg);
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    VALIDATION_ERROR_DISPLAY_MS,
+                ))
+                .await;
+            }
+            Err(viz_err) => {
+                log::warn!("could not show error overlay ({}): {}", viz_err, error_msg);
+            }
+        }
+    }
+
+    validation_result
+}
+
+/// Signal a running daemon to stop and remove the PID file.
+///
+/// Returns immediately — the daemon finishes its transcription and
+/// paste in the background, so a new toggle-on can proceed without
+/// waiting.
 fn toggle_stop(pid: u32, pid_file: &std::path::Path) -> Result<(), TalkError> {
     log::info!("stopping dictation (PID {})", pid);
-    daemon::stop_daemon(pid, pid_file)?;
-    log::info!("dictation stopped");
+    daemon::signal_daemon(pid, pid_file)?;
+    log::info!("dictation stop signalled");
     Ok(())
 }
 
@@ -2457,9 +3109,7 @@ async fn dictate_streaming(
                     return Err(err);
                 }
             };
-            if !encoded_data.is_empty()
-                && stream_tx.send(encoded_data).await.is_err()
-            {
+            if !encoded_data.is_empty() && stream_tx.send(encoded_data).await.is_err() {
                 log::warn!("transcription stream closed during audio send");
                 break;
             }
@@ -2678,5 +3328,67 @@ mod tests {
         flush_sentences(&mut buf, &mut segs);
         assert_eq!(segs, vec!["End of text."]);
         assert_eq!(buf, "");
+    }
+
+    // ── split_into_word_chunks ──────────────────────────────────────
+
+    #[test]
+    fn test_chunk_fewer_words_than_limit() {
+        let chunks = split_into_word_chunks("hello world", 10);
+        assert_eq!(chunks, vec!["hello world"]);
+    }
+
+    #[test]
+    fn test_chunk_exactly_at_limit() {
+        let text = "one two three four five six seven eight nine ten";
+        let chunks = split_into_word_chunks(text, 10);
+        assert_eq!(chunks, vec![text]);
+    }
+
+    #[test]
+    fn test_chunk_splits_beyond_limit() {
+        let text = "one two three four five six seven eight nine ten eleven twelve";
+        let chunks = split_into_word_chunks(text, 10);
+        assert_eq!(
+            chunks,
+            vec![
+                "one two three four five six seven eight nine ten",
+                " eleven twelve",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_chunk_multiple_full_chunks() {
+        // 6 words, chunk size 2 → 3 chunks
+        let text = "a b c d e f";
+        let chunks = split_into_word_chunks(text, 2);
+        assert_eq!(chunks, vec!["a b", " c d", " e f"]);
+    }
+
+    #[test]
+    fn test_chunk_concatenation_reproduces_original() {
+        let text = "The quick brown fox jumps over the lazy dog and then some more words follow";
+        let chunks = split_into_word_chunks(text, 5);
+        let reassembled: String = chunks.concat();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn test_chunk_empty_string() {
+        let chunks = split_into_word_chunks("", 10);
+        assert_eq!(chunks, vec![""]);
+    }
+
+    #[test]
+    fn test_chunk_whitespace_only() {
+        let chunks = split_into_word_chunks("   ", 10);
+        assert_eq!(chunks, vec!["   "]);
+    }
+
+    #[test]
+    fn test_chunk_single_word() {
+        let chunks = split_into_word_chunks("hello", 10);
+        assert_eq!(chunks, vec!["hello"]);
     }
 }
