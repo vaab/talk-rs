@@ -3,6 +3,7 @@ pub mod clipboard;
 pub mod config;
 pub mod daemon;
 pub mod error;
+pub mod monitor;
 pub mod overlay;
 pub mod picker_cache;
 pub mod recording_cache;
