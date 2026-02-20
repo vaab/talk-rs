@@ -48,15 +48,18 @@ pub struct OverlayHandle {
 impl OverlayHandle {
     /// Spawn the overlay thread and open an X11 connection.
     ///
+    /// Monitor geometry is queried via GDK4 **before** spawning the
+    /// thread (GDK must be called from the main thread) and passed in.
+    ///
     /// Returns `Err` if the X11 display cannot be opened.
     pub fn new() -> Result<Self, TalkError> {
-        // Test that X11 is reachable before spawning the thread
+        let geom = crate::core::monitor::primary_monitor_geometry()?;
         let (tx, rx) = mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("overlay".into())
             .spawn(move || {
-                if let Err(e) = overlay_thread(rx) {
+                if let Err(e) = overlay_thread(rx, geom) {
                     log::error!("overlay thread error: {}", e);
                 }
             })
@@ -138,73 +141,13 @@ fn decode_png(bytes: &[u8]) -> Result<RgbaImage, TalkError> {
     })
 }
 
-// ── Screen geometry ──────────────────────────────────────────────────
-
-/// Get primary monitor geometry by parsing `xrandr --query` output.
-///
-/// Returns `(x, y, width, height)` of the primary monitor.
-fn primary_monitor_geometry() -> Result<(i16, i16, u16, u16), TalkError> {
-    let output = std::process::Command::new("xrandr")
-        .arg("--query")
-        .output()
-        .map_err(|e| TalkError::Config(format!("failed to run xrandr: {}", e)))?;
-
-    let text = String::from_utf8_lossy(&output.stdout);
-
-    // Try "primary WxH+X+Y" first
-    for line in text.lines() {
-        if line.contains(" primary ") {
-            if let Some(geom) = parse_geometry(line) {
-                return Ok(geom);
-            }
-        }
-    }
-
-    // Fallback: first "connected WxH+X+Y"
-    for line in text.lines() {
-        if line.contains(" connected ") {
-            if let Some(geom) = parse_geometry(line) {
-                return Ok(geom);
-            }
-        }
-    }
-
-    // Ultimate fallback
-    Ok((0, 0, 1920, 1080))
-}
-
-/// Parse "WxH+X+Y" from an xrandr output line.
-fn parse_geometry(line: &str) -> Option<(i16, i16, u16, u16)> {
-    // Match patterns like "3840x2160+0+0" or "1920x1080+3840+0"
-    let re_pattern = |s: &str| -> Option<(i16, i16, u16, u16)> {
-        let parts: Vec<&str> = s.split('+').collect();
-        if parts.len() >= 3 {
-            let wh: Vec<&str> = parts[0].split('x').collect();
-            if wh.len() == 2 {
-                let w = wh[0].parse::<u16>().ok()?;
-                let h = wh[1].parse::<u16>().ok()?;
-                let x = parts[1].parse::<i16>().ok()?;
-                let y = parts[2].parse::<i16>().ok()?;
-                return Some((x, y, w, h));
-            }
-        }
-        None
-    };
-
-    for word in line.split_whitespace() {
-        if word.contains('x') && word.contains('+') {
-            if let Some(geom) = re_pattern(word) {
-                return Some(geom);
-            }
-        }
-    }
-    None
-}
-
 // ── X11 overlay thread ──────────────────────────────────────────────
 
 /// Main loop for the overlay background thread.
-fn overlay_thread(rx: mpsc::Receiver<Command>) -> Result<(), TalkError> {
+fn overlay_thread(
+    rx: mpsc::Receiver<Command>,
+    geom: crate::core::monitor::MonitorGeometry,
+) -> Result<(), TalkError> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::*;
     use x11rb::wrapper::ConnectionExt as _;
@@ -220,8 +163,7 @@ fn overlay_thread(rx: mpsc::Receiver<Command>) -> Result<(), TalkError> {
     let recording_img = decode_png(RECORDING_PNG)?;
     let transcribing_img = decode_png(TRANSCRIBING_PNG)?;
 
-    // Get primary monitor geometry for centering
-    let (mon_x, mon_y, mon_w, _mon_h) = primary_monitor_geometry()?;
+    let (mon_x, mon_y, mon_w, _mon_h) = geom;
 
     let mut current_window: Option<Window> = None;
 
@@ -506,28 +448,6 @@ mod tests {
             "expected transparent pixels for rounded corners, got {}",
             transparent_count
         );
-    }
-
-    #[test]
-    fn test_parse_geometry_primary() {
-        let line =
-            "eDP-1 connected primary 3840x2160+0+0 (normal left inverted right x axis y axis)";
-        let geom = parse_geometry(line);
-        assert_eq!(geom, Some((0, 0, 3840, 2160)));
-    }
-
-    #[test]
-    fn test_parse_geometry_offset() {
-        let line = "HDMI-1 connected 1920x1080+3840+0 (normal left)";
-        let geom = parse_geometry(line);
-        assert_eq!(geom, Some((3840, 0, 1920, 1080)));
-    }
-
-    #[test]
-    fn test_parse_geometry_no_match() {
-        let line = "DP-1 disconnected (normal left)";
-        let geom = parse_geometry(line);
-        assert_eq!(geom, None);
     }
 
     #[test]

@@ -644,60 +644,6 @@ fn render_spectrum(pb: &mut PixelBuffer, magnitudes: &[f32], peak: f32) {
     }
 }
 
-// ── Monitor geometry ─────────────────────────────────────────────────
-
-/// Detect primary monitor `(x, y, width)` via xrandr.
-///
-/// Two-pass: first look for the explicit "primary" output, then fall
-/// back to the first "connected" output.
-fn primary_monitor_geometry() -> (i16, i16, u16) {
-    let output = std::process::Command::new("xrandr").arg("--query").output();
-
-    match output {
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            parse_primary(&text).unwrap_or((0, 0, 1920))
-        }
-        Err(_) => (0, 0, 1920),
-    }
-}
-
-fn parse_primary(text: &str) -> Option<(i16, i16, u16)> {
-    for line in text.lines() {
-        if line.contains(" primary ") {
-            if let Some(g) = parse_geom_word(line) {
-                return Some(g);
-            }
-        }
-    }
-    for line in text.lines() {
-        if line.contains(" connected ") {
-            if let Some(g) = parse_geom_word(line) {
-                return Some(g);
-            }
-        }
-    }
-    None
-}
-
-fn parse_geom_word(line: &str) -> Option<(i16, i16, u16)> {
-    for word in line.split_whitespace() {
-        if word.contains('x') && word.contains('+') {
-            let parts: Vec<&str> = word.split('+').collect();
-            if parts.len() >= 3 {
-                let wh: Vec<&str> = parts[0].split('x').collect();
-                if wh.len() == 2 {
-                    let w = wh[0].parse::<u16>().ok()?;
-                    let x = parts[1].parse::<i16>().ok()?;
-                    let y = parts[2].parse::<i16>().ok()?;
-                    return Some((x, y, w));
-                }
-            }
-        }
-    }
-    None
-}
-
 // ── Public API ───────────────────────────────────────────────────────
 
 /// Commands from the main thread to the visualizer thread.
@@ -731,12 +677,13 @@ impl VisualizerHandle {
     ///
     /// Returns `Err` if X11 or the audio device is unreachable.
     pub fn new(amplitude: bool, spectrum: bool) -> Result<Self, TalkError> {
+        let geom = crate::core::monitor::primary_monitor_geometry()?;
         let (tx, rx) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("visualizer".into())
             .spawn(move || {
-                if let Err(e) = visualizer_thread(rx, amplitude, spectrum) {
+                if let Err(e) = visualizer_thread(rx, amplitude, spectrum, geom) {
                     log::error!("visualizer thread error: {}", e);
                 }
             })
@@ -787,6 +734,7 @@ fn visualizer_thread(
     rx: std::sync::mpsc::Receiver<VizCommand>,
     enable_amplitude: bool,
     enable_spectrum: bool,
+    geom: crate::core::monitor::MonitorGeometry,
 ) -> Result<(), TalkError> {
     // ── Audio capture ────────────────────────────────────────────────
 
@@ -843,7 +791,7 @@ fn visualizer_thread(
     let root = screen.root;
     let depth = screen.root_depth;
 
-    let (mon_x, mon_y, mon_w) = primary_monitor_geometry();
+    let (mon_x, mon_y, mon_w, _mon_h) = geom;
 
     // ── Pixel buffers ────────────────────────────────────────────────
 
@@ -1524,33 +1472,6 @@ mod tests {
 
         // Out of bounds — should not panic
         pb.set_pixel(10, 10, [0xFF; 4]);
-    }
-
-    // ── Monitor geometry parsing ─────────────────────────────────────
-
-    #[test]
-    fn parse_primary_monitor() {
-        let text = "\
-Screen 0: minimum 320 x 200, current 7680 x 4320
-eDP connected 3840x2560+0+1760
-DisplayPort-1 connected primary 7680x4320+3840+0";
-
-        let result = parse_primary(text);
-        assert_eq!(result, Some((3840, 0, 7680)));
-    }
-
-    #[test]
-    fn parse_primary_fallback_to_connected() {
-        let text = "eDP connected 1920x1080+0+0 (normal)";
-        let result = parse_primary(text);
-        assert_eq!(result, Some((0, 0, 1920)));
-    }
-
-    #[test]
-    fn parse_primary_no_match() {
-        let text = "DP-1 disconnected";
-        let result = parse_primary(text);
-        assert_eq!(result, None);
     }
 
     // ── Text rendering ────────────────────────────────────────────────
