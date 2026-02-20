@@ -674,16 +674,17 @@ impl VisualizerHandle {
     ///
     /// * `amplitude` — enable the amplitude history panel (left of badge).
     /// * `spectrum` — enable the spectrum panel (right of badge).
+    /// * `text` — enable the live transcription text panel (below badge).
     ///
     /// Returns `Err` if X11 or the audio device is unreachable.
-    pub fn new(amplitude: bool, spectrum: bool) -> Result<Self, TalkError> {
+    pub fn new(amplitude: bool, spectrum: bool, text: bool) -> Result<Self, TalkError> {
         let geom = crate::core::monitor::primary_monitor_geometry()?;
         let (tx, rx) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("visualizer".into())
             .spawn(move || {
-                if let Err(e) = visualizer_thread(rx, amplitude, spectrum, geom) {
+                if let Err(e) = visualizer_thread(rx, amplitude, spectrum, text, geom) {
                     log::error!("visualizer thread error: {}", e);
                 }
             })
@@ -734,6 +735,7 @@ fn visualizer_thread(
     rx: std::sync::mpsc::Receiver<VizCommand>,
     enable_amplitude: bool,
     enable_spectrum: bool,
+    enable_text: bool,
     geom: crate::core::monitor::MonitorGeometry,
 ) -> Result<(), TalkError> {
     // ── Audio capture ────────────────────────────────────────────────
@@ -860,6 +862,7 @@ fn visualizer_thread(
                         badge_width,
                         enable_amplitude,
                         enable_spectrum,
+                        enable_text,
                         &mut wins,
                     )?;
                     is_showing = true;
@@ -897,6 +900,7 @@ fn visualizer_thread(
                         badge_width,
                         enable_amplitude,
                         enable_spectrum,
+                        enable_text,
                         &mut wins,
                     )?;
                 }
@@ -1046,6 +1050,7 @@ fn create_windows(
     badge_width: u16,
     enable_amplitude: bool,
     enable_spectrum: bool,
+    enable_text: bool,
     state: &mut WindowState,
 ) -> Result<(), TalkError> {
     // Badge position (must match overlay.rs logic)
@@ -1126,8 +1131,8 @@ fn create_windows(
         state.spectrum_gc = Some(gc);
     }
 
-    // Text window — centred below the badge.
-    {
+    // Text window — centred below the badge (only in realtime mode).
+    if enable_text {
         let text_x = mon_x + (mon_w as i16 / 2) - (TEXT_W as i16 / 2);
         let text_y = badge_y + VIS_H as i16 + TEXT_GAP;
 

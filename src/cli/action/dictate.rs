@@ -2116,12 +2116,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     // Initialize visualizer (amplitude / spectrum panels)
     let visualizer = if opts.amplitude || opts.spectrum {
-        match VisualizerHandle::new(opts.amplitude, opts.spectrum) {
+        match VisualizerHandle::new(opts.amplitude, opts.spectrum, opts.realtime) {
             Ok(h) => {
                 log::debug!(
-                    "visualizer initialized (amplitude={}, spectrum={})",
+                    "visualizer initialized (amplitude={}, spectrum={}, text={})",
                     opts.amplitude,
                     opts.spectrum,
+                    opts.realtime,
                 );
                 Some(h)
             }
@@ -2642,7 +2643,7 @@ async fn toggle_validate(ctx: SpawnContext) -> Result<(), TalkError> {
         // Show error in a temporary visualizer overlay so the user gets
         // visible feedback without injecting text into their window.
         let error_msg = format!("[talk-rs] {e}");
-        match VisualizerHandle::new(false, false) {
+        match VisualizerHandle::new(false, false, true) {
             Ok(viz) => {
                 viz.show(0);
                 viz.set_text(&error_msg);
