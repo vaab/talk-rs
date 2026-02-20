@@ -168,6 +168,93 @@ pub fn remove_pid_file(pid_file: &Path) -> Result<(), TalkError> {
     }
 }
 
+/// Remove the PID file only if it still belongs to `expected_pid`.
+///
+/// Re-acquires the lock, reads the file, and removes it only when the
+/// stored PID matches.  Returns `true` if the file was removed, `false`
+/// if it was missing or belonged to a different process.
+pub fn remove_pid_file_if_owner(expected_pid: u32, pid_file: &Path) -> Result<bool, TalkError> {
+    let _lock = acquire_lock()?;
+
+    match read_pid_file(pid_file)? {
+        Some(current_pid) if current_pid == expected_pid => {
+            remove_pid_file(pid_file)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Stop a daemon **only** if the PID file still contains the expected PID.
+///
+/// This is safe to call after releasing the lock: it re-acquires the lock,
+/// verifies ownership, then delegates to [`stop_daemon`].  If the PID file
+/// is missing or belongs to a different daemon the process is killed
+/// directly (SIGINT) without touching the PID file.
+///
+/// Returns `true` if the PID file was ours and was cleaned up, `false` if
+/// another daemon now owns it.
+pub fn stop_if_owner(expected_pid: u32, pid_file: &Path) -> Result<bool, TalkError> {
+    let _lock = acquire_lock()?;
+
+    match read_pid_file(pid_file)? {
+        Some(current_pid) if current_pid == expected_pid => {
+            // PID file still ours — full graceful stop.
+            stop_daemon(expected_pid, pid_file)?;
+            Ok(true)
+        }
+        _ => {
+            // PID file gone or recycled for a different daemon.
+            // Just kill our process directly without touching the file.
+            let _ = kill(Pid::from_raw(expected_pid as i32), Signal::SIGINT);
+            Ok(false)
+        }
+    }
+}
+
+/// Signal a running daemon to stop (SIGINT) and remove its PID file.
+///
+/// Unlike [`stop_daemon`], this returns immediately without waiting for the
+/// process to exit.  The daemon finishes its current work (transcription,
+/// paste) and exits gracefully on its own.  Its cleanup path uses
+/// [`remove_pid_file_if_owner`] so it will not clobber a PID file written
+/// by a newly spawned daemon.
+///
+/// Caller MUST hold the lock.
+pub fn signal_daemon(pid: u32, pid_file: &Path) -> Result<(), TalkError> {
+    let nix_pid = Pid::from_raw(-(pid as i32));
+
+    // Send SIGINT to the process group.
+    if let Err(e) = kill(nix_pid, Signal::SIGINT) {
+        if e == nix::errno::Errno::ESRCH {
+            // Process group gone — try individual PID.
+            let individual = Pid::from_raw(pid as i32);
+            if let Err(e2) = kill(individual, Signal::SIGINT) {
+                if e2 == nix::errno::Errno::ESRCH {
+                    // Already dead — just clean up PID file.
+                    remove_pid_file(pid_file)?;
+                    return Ok(());
+                }
+                return Err(TalkError::Config(format!(
+                    "failed to send SIGINT to PID {}: {}",
+                    pid, e2
+                )));
+            }
+        } else {
+            return Err(TalkError::Config(format!(
+                "failed to send SIGINT to process group {}: {}",
+                pid, e
+            )));
+        }
+    }
+
+    // Remove PID file immediately so the next toggle-on sees NotRunning.
+    // The exiting daemon uses remove_pid_file_if_owner which is safe
+    // against this pre-removal and against a new daemon's PID file.
+    remove_pid_file(pid_file)?;
+    Ok(())
+}
+
 /// Stop a running daemon by sending SIGINT, waiting, then escalating to SIGTERM.
 ///
 /// Signals the entire process group (negative PID). Caller MUST hold the lock.
@@ -322,5 +409,117 @@ mod tests {
     fn test_is_process_alive_dead() {
         // PID 4000000 is almost certainly not alive
         assert!(!is_process_alive(4_000_000));
+    }
+
+    #[test]
+    fn test_signal_daemon_dead_process() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = test_pid_path(&dir);
+
+        // Use a PID that is dead so SIGINT is harmless.
+        let fake_pid: u32 = 4_000_000;
+        write_pid_file(&path, fake_pid).expect("write pid");
+
+        signal_daemon(fake_pid, &path).expect("signal_daemon");
+        assert!(
+            !path.exists(),
+            "PID file should be removed after signal_daemon"
+        );
+    }
+
+    #[test]
+    fn test_signal_daemon_no_pid_file() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = test_pid_path(&dir);
+
+        // PID file does not exist — signal_daemon should still succeed
+        // (the SIGINT to a dead PID yields ESRCH which triggers the
+        // "already dead" path that calls remove_pid_file, which is a
+        // no-op on a missing file).
+        signal_daemon(4_000_000, &path).expect("signal_daemon");
+    }
+
+    #[test]
+    fn test_stop_if_owner_matching_pid() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = test_pid_path(&dir);
+
+        // Use a PID that is dead so SIGINT is harmless
+        let fake_pid: u32 = 4_000_000;
+        write_pid_file(&path, fake_pid).expect("write pid");
+
+        let owned = stop_if_owner(fake_pid, &path).expect("stop_if_owner");
+        assert!(owned, "should report ownership when PID matches");
+        assert!(
+            !path.exists(),
+            "PID file should be removed after owned stop"
+        );
+    }
+
+    #[test]
+    fn test_stop_if_owner_different_pid() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = test_pid_path(&dir);
+
+        // PID file contains a *different* PID than the one we claim to own.
+        let file_pid: u32 = 4_000_001;
+        let our_pid: u32 = 4_000_000;
+        write_pid_file(&path, file_pid).expect("write pid");
+
+        let owned = stop_if_owner(our_pid, &path).expect("stop_if_owner");
+        assert!(!owned, "should report non-ownership when PIDs differ");
+        // PID file must still exist — it belongs to the other daemon.
+        assert!(
+            path.exists(),
+            "PID file should be preserved for the other daemon"
+        );
+
+        let stored = read_pid_file(&path).expect("read").expect("some pid");
+        assert_eq!(stored, file_pid, "PID file content must be untouched");
+    }
+
+    #[test]
+    fn test_stop_if_owner_missing_pid_file() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = test_pid_path(&dir);
+
+        // No PID file at all — should not panic, just return false.
+        let owned = stop_if_owner(4_000_000, &path).expect("stop_if_owner");
+        assert!(
+            !owned,
+            "should report non-ownership when PID file is missing"
+        );
+    }
+
+    #[test]
+    fn test_remove_pid_file_if_owner_matching() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = test_pid_path(&dir);
+
+        write_pid_file(&path, 12345).expect("write pid");
+        let removed = remove_pid_file_if_owner(12345, &path).expect("remove_pid_file_if_owner");
+        assert!(removed, "should remove when PID matches");
+        assert!(!path.exists(), "PID file should be gone");
+    }
+
+    #[test]
+    fn test_remove_pid_file_if_owner_different() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = test_pid_path(&dir);
+
+        write_pid_file(&path, 12345).expect("write pid");
+        let removed = remove_pid_file_if_owner(99999, &path).expect("remove_pid_file_if_owner");
+        assert!(!removed, "should not remove when PID differs");
+        assert!(path.exists(), "PID file should remain");
+    }
+
+    #[test]
+    fn test_remove_pid_file_if_owner_missing() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = test_pid_path(&dir);
+
+        // No PID file — should succeed with false.
+        let removed = remove_pid_file_if_owner(12345, &path).expect("remove_pid_file_if_owner");
+        assert!(!removed, "should return false when PID file is missing");
     }
 }
