@@ -1595,14 +1595,15 @@ const FOCUS_MAX_RETRIES: u32 = 5;
 /// Initial delay between focus retry attempts (doubles each retry).
 const FOCUS_INITIAL_DELAY_MS: u64 = 50;
 
-/// Maximum number of words per clipboard paste operation.
+/// Maximum number of characters per clipboard paste operation.
 ///
 /// When the text to paste exceeds this limit it is split into
-/// consecutive chunks of this size, each pasted via a separate
-/// Ctrl+Shift+V keystroke.  This mimics the segment-by-segment
-/// behaviour of realtime mode and avoids overwhelming the target
-/// application with a single large paste.
-const PASTE_CHUNK_WORDS: usize = 10;
+/// consecutive chunks, each pasted via a separate Ctrl+Shift+V
+/// keystroke.  Splits happen on word boundaries so words are never
+/// cut in half.  Keeping chunks under 150 characters avoids
+/// triggering paste-summary behaviour in terminal applications
+/// that collapse large pastes into an opaque block.
+const PASTE_CHUNK_CHARS: usize = 150;
 
 /// Attempt to focus the target window and verify the active window
 /// matches.  Retries with exponential backoff to give the window
@@ -1648,32 +1649,47 @@ async fn ensure_focus(window_id: &str) -> Result<(), TalkError> {
     )))
 }
 
-/// Split `text` into chunks of at most `max_words` whitespace-delimited
-/// words each.
+/// Split `text` into chunks of at most `max_chars` characters each,
+/// breaking on word boundaries so words are never cut in half.
 ///
 /// Every chunk after the first is prefixed with a single space so that
 /// concatenating all chunks reproduces the original word sequence.
 /// If the text is empty (or whitespace-only) a single element containing
 /// the original string is returned so that the caller always has at
-/// least one chunk to paste.
-fn split_into_word_chunks(text: &str, max_words: usize) -> Vec<String> {
+/// least one chunk to paste.  A single word longer than `max_chars` is
+/// emitted as-is (never split mid-word).
+fn split_into_char_chunks(text: &str, max_chars: usize) -> Vec<String> {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
         return vec![text.to_string()];
     }
 
-    words
-        .chunks(max_words)
-        .enumerate()
-        .map(|(i, chunk)| {
-            let joined = chunk.join(" ");
-            if i == 0 {
-                joined
-            } else {
-                format!(" {joined}")
-            }
-        })
-        .collect()
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for word in &words {
+        let candidate_len = if current.is_empty() {
+            word.len()
+        } else {
+            current.len() + 1 + word.len() // +1 for the space
+        };
+
+        if !current.is_empty() && candidate_len > max_chars {
+            chunks.push(current);
+            current = format!(" {word}");
+        } else if current.is_empty() {
+            current = (*word).to_string();
+        } else {
+            current.push(' ');
+            current.push_str(word);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
 }
 
 async fn paste_text_to_target(
@@ -1696,7 +1712,7 @@ async fn paste_text_to_target(
 
     let saved_clipboard = clipboard.get_text().await.ok();
 
-    let chunks = split_into_word_chunks(text, PASTE_CHUNK_WORDS);
+    let chunks = split_into_char_chunks(text, PASTE_CHUNK_CHARS);
     for chunk in &chunks {
         clipboard.set_text(chunk).await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2070,6 +2086,16 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             }
         }
     };
+
+    // Ensure GTK4/GDK4 is initialised so the overlay and visualizer can
+    // query monitor geometry via GDK.  `gtk4::init()` is idempotent —
+    // safe to call even if the picker path already initialised it.
+    if let Err(e) = gtk4::init() {
+        log::warn!(
+            "GTK4 init failed (overlay/visualizer may be unavailable): {}",
+            e
+        );
+    }
 
     // Initialize overlay (visual indicator on X11)
     let overlay = if opts.no_overlay {
@@ -3330,65 +3356,68 @@ mod tests {
         assert_eq!(buf, "");
     }
 
-    // ── split_into_word_chunks ──────────────────────────────────────
+    // ── split_into_char_chunks ───────────────────────────────────────
 
     #[test]
-    fn test_chunk_fewer_words_than_limit() {
-        let chunks = split_into_word_chunks("hello world", 10);
+    fn test_chunk_short_text_fits_in_one() {
+        let chunks = split_into_char_chunks("hello world", 150);
         assert_eq!(chunks, vec!["hello world"]);
     }
 
     #[test]
     fn test_chunk_exactly_at_limit() {
-        let text = "one two three four five six seven eight nine ten";
-        let chunks = split_into_word_chunks(text, 10);
+        // 20 chars exactly, limit 20
+        let text = "one two three four f";
+        assert_eq!(text.len(), 20);
+        let chunks = split_into_char_chunks(text, 20);
         assert_eq!(chunks, vec![text]);
     }
 
     #[test]
-    fn test_chunk_splits_beyond_limit() {
-        let text = "one two three four five six seven eight nine ten eleven twelve";
-        let chunks = split_into_word_chunks(text, 10);
-        assert_eq!(
-            chunks,
-            vec![
-                "one two three four five six seven eight nine ten",
-                " eleven twelve",
-            ]
-        );
+    fn test_chunk_splits_on_word_boundary() {
+        // "hello world" = 11 chars, limit 8 → split before "world"
+        let chunks = split_into_char_chunks("hello world", 8);
+        assert_eq!(chunks, vec!["hello", " world"]);
     }
 
     #[test]
-    fn test_chunk_multiple_full_chunks() {
-        // 6 words, chunk size 2 → 3 chunks
-        let text = "a b c d e f";
-        let chunks = split_into_word_chunks(text, 2);
-        assert_eq!(chunks, vec!["a b", " c d", " e f"]);
+    fn test_chunk_long_word_exceeds_limit() {
+        // A single word longer than the limit is emitted as-is
+        let chunks = split_into_char_chunks("supercalifragilistic", 5);
+        assert_eq!(chunks, vec!["supercalifragilistic"]);
+    }
+
+    #[test]
+    fn test_chunk_multiple_chunks() {
+        // limit 10: "aaa bbb" (7) fits, "aaa bbb ccc" (11) doesn't
+        let text = "aaa bbb ccc ddd eee fff";
+        let chunks = split_into_char_chunks(text, 10);
+        assert_eq!(chunks, vec!["aaa bbb", " ccc ddd", " eee fff"]);
     }
 
     #[test]
     fn test_chunk_concatenation_reproduces_original() {
-        let text = "The quick brown fox jumps over the lazy dog and then some more words follow";
-        let chunks = split_into_word_chunks(text, 5);
+        let text = "The quick brown fox jumps over the lazy dog and then some more words follow after that";
+        let chunks = split_into_char_chunks(text, 30);
         let reassembled: String = chunks.concat();
         assert_eq!(reassembled, text);
     }
 
     #[test]
     fn test_chunk_empty_string() {
-        let chunks = split_into_word_chunks("", 10);
+        let chunks = split_into_char_chunks("", 150);
         assert_eq!(chunks, vec![""]);
     }
 
     #[test]
     fn test_chunk_whitespace_only() {
-        let chunks = split_into_word_chunks("   ", 10);
+        let chunks = split_into_char_chunks("   ", 150);
         assert_eq!(chunks, vec!["   "]);
     }
 
     #[test]
     fn test_chunk_single_word() {
-        let chunks = split_into_word_chunks("hello", 10);
+        let chunks = split_into_char_chunks("hello", 150);
         assert_eq!(chunks, vec!["hello"]);
     }
 }
