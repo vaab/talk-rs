@@ -33,6 +33,10 @@ happening.
   stops and transcribes; ideal for global shortcuts.
 - *Retry last* -- re-transcribe the last cached recording without
   speaking again (~--retry-last~).
+- *Recordings browser* -- ~record --ui~ opens a GTK4 window listing
+  all recordings (OGG from ~output_dir~) and dictation cache (WAV).
+  Play, delete, or open in the file manager; sections auto-refresh
+  via inotify when files change externally.
 - *Standalone commands* -- ~record~ and ~transcribe~ can be used
   independently for scripting.
 - *Environment overrides* -- every config value can be set via
@@ -204,6 +208,7 @@ Options:
 | Flag        | Effect                                           |
 |-------------+--------------------------------------------------|
 | ~--monitor~ | Mix system audio (monitor) with microphone input |
+| ~--ui~      | Open GTK4 recordings browser (play, delete, open folder) |
 
 *** Transcribe
 
