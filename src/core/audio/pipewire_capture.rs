@@ -200,7 +200,7 @@ fn run_capture_loop(
 }
 
 /// Serialize `AudioInfoRaw` into a SPA Pod byte vector.
-fn serialize_audio_info(info: AudioInfoRaw) -> Result<Vec<u8>, TalkError> {
+pub(crate) fn serialize_audio_info(info: AudioInfoRaw) -> Result<Vec<u8>, TalkError> {
     use spa::pod::serialize::PodSerializer;
     use std::io;
 

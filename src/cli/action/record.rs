@@ -4,6 +4,7 @@
 //! Supports graceful shutdown via SIGINT (Ctrl+C).
 
 use crate::core::audio::cpal_capture::CpalCapture;
+use crate::core::audio::monitor_capture::MonitorCapture;
 use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
 use crate::core::config::AudioConfig;
 use crate::core::error::TalkError;
@@ -52,12 +53,17 @@ fn create_writer(path: &Path, config: AudioConfig) -> Result<Box<dyn AudioWriter
 /// 4. Spawn async task to read from capture channel, encode, and write to file
 /// 5. Wait for SIGINT (Ctrl+C) to gracefully shutdown
 /// 6. Flush encoder and close file
-pub async fn record(args: Vec<String>) -> Result<(), TalkError> {
+pub async fn record(args: Vec<String>, monitor: bool) -> Result<(), TalkError> {
     // Parse arguments
     let output_path = parse_args(&args)?;
 
     // Initialize audio capture
-    let mut capture = CpalCapture::new(AudioConfig::new());
+    let mut capture: Box<dyn AudioCapture> = if monitor {
+        log::info!("recording with mic+monitor (PipeWire)");
+        Box::new(MonitorCapture::new(AudioConfig::new()))
+    } else {
+        Box::new(CpalCapture::new(AudioConfig::new()))
+    };
     let mut rx = capture.start()?;
 
     // Initialize audio writer
