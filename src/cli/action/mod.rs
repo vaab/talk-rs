@@ -1,5 +1,6 @@
 mod dictate;
 mod record;
+mod record_ui;
 mod transcribe;
 
 use crate::cli::def::Commands;
@@ -7,13 +8,18 @@ use std::path::PathBuf;
 
 pub use dictate::{dictate, DictateOpts};
 pub use record::record;
+pub use record_ui::record_ui;
 pub use transcribe::transcribe;
 
 pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Commands::Record { file, monitor } => {
-            let args = file.map(|f| vec![f]).unwrap_or_default();
-            record(args, monitor).await?;
+        Commands::Record { file, monitor, ui } => {
+            if ui {
+                record_ui().await?;
+            } else {
+                let args = file.map(|f| vec![f]).unwrap_or_default();
+                record(args, monitor).await?;
+            }
         }
         Commands::Transcribe {
             input,
