@@ -14,16 +14,22 @@ happening.
 - *Dictation workflow* -- press a key to start recording, press again
   to stop; transcribed text is pasted automatically.
 - *Multiple providers* -- Mistral (Voxtral) and OpenAI (Whisper /
-  GPT-4o) for batch transcription; OpenAI realtime streaming via
-  WebSocket.
+  GPT-4o) for batch transcription; Mistral and OpenAI realtime
+  streaming via WebSocket.
+- *Multi-candidate picker* -- with ~--pick~, run several providers in
+  parallel and choose the best transcription from a GTK picker window.
 - *Visual overlay* -- non-intrusive X11 badge at the top of the screen
   (works without a compositor).
+- *Audio visualizers* -- optional amplitude history and spectrum panels
+  flanking the overlay badge (~--amplitude~, ~--spectrum~).
 - *Audio feedback* -- start/stop tones and periodic boop during
   recording; fully configurable or disabled.
 - *Context bias* -- supply domain-specific vocabulary to improve
   transcription accuracy.
 - *Daemon toggle mode* -- first invocation starts recording, second
   stops and transcribes; ideal for global shortcuts.
+- *Retry last* -- re-transcribe the last cached recording without
+  speaking again (~--retry-last~).
 - *Standalone commands* -- ~record~ and ~transcribe~ can be used
   independently for scripting.
 - *Environment overrides* -- every config value can be set via
@@ -35,10 +41,12 @@ happening.
 
 #+begin_src sh
 # Debian / Ubuntu
-sudo apt install build-essential pkg-config libasound2-dev libopus-dev
+sudo apt install build-essential pkg-config libasound2-dev libopus-dev \
+  libgtk-4-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev
 
 # Fedora
-sudo dnf install alsa-lib-devel opus-devel pkg-config
+sudo dnf install alsa-lib-devel opus-devel pkg-config \
+  gtk4-devel pipewire-devel spa-devel clang-devel
 #+end_src
 
 A working Rust toolchain is required (1.70+). Install via
@@ -58,6 +66,9 @@ sudo apt install xclip xdotool
 # Fedora
 sudo dnf install xclip xdotool
 #+end_src
+
+=PipeWire= must be running (used for audio capture). Most modern Linux
+desktops ship with PipeWire by default.
 
 An API key for at least one transcription provider is required:
 
@@ -125,12 +136,18 @@ Every config value can be overridden via environment variables:
 
 #+begin_src sh
 export TALK_RS_PROVIDERS_MISTRAL_API_KEY="sk-..."
-export TALK_RS_AUDIO_SAMPLE_RATE=44100
+export TALK_RS_PROVIDERS_OPENAI_API_KEY="sk-..."
 #+end_src
 
 See ~config.example.yaml~ for the full list.
 
 ** Usage
+
+*** Global options
+
+| Flag | Effect                                              |
+|------+-----------------------------------------------------|
+| ~-v~ | Increase logging verbosity (~-vv~ debug, ~-vvv~ trace) |
 
 *** Dictate (main workflow)
 
@@ -151,16 +168,23 @@ recording, transcribes, and pastes the result.
 
 Options:
 
-| Flag              | Effect                              |
-|-------------------+-------------------------------------|
-| ~--toggle~        | Daemon toggle mode                  |
-| ~--provider~      | Choose ~mistral~ or ~openai~        |
-| ~--model~         | Override model for this invocation  |
-| ~--realtime~      | Stream audio via WebSocket (OpenAI) |
-| ~--no-sounds~     | Disable audio indicators            |
-| ~--no-overlay~    | Disable visual overlay              |
-| ~--amplitude~     | Show amplitude history visualizer   |
-| ~--spectrum~      | Show spectrum visualizer            |
+| Flag                        | Effect                                          |
+|-----------------------------+-------------------------------------------------|
+| ~--toggle~                  | Daemon toggle mode                              |
+| ~--provider~                | Choose ~mistral~ or ~openai~                    |
+| ~--model~                   | Override model for this invocation               |
+| ~--realtime~                | Stream audio via WebSocket (incremental text)   |
+| ~--pick~                    | Show multi-candidate picker (GTK window)        |
+| ~--retry-last~              | Re-transcribe the last cached recording         |
+| ~--replace-last-paste~      | Delete previous paste before inserting new text |
+| ~--save <PATH>~             | Save audio recording to a file                  |
+| ~--output-yaml <FILE>~      | Write transcription metadata YAML               |
+| ~--input-audio-file <FILE>~ | Feed a pre-recorded WAV instead of live mic     |
+| ~--monitor~                 | Mix system audio (monitor) with mic input       |
+| ~--no-sounds~               | Disable audio indicators                        |
+| ~--no-overlay~              | Disable visual overlay                          |
+| ~--amplitude~               | Show amplitude history visualizer               |
+| ~--spectrum~                | Show spectrum visualizer                        |
 
 *** Record
 
@@ -171,6 +195,12 @@ talk-rs record                       # auto-named memo-YYYY-MM-DD-HH-MM-SS.ogg
 talk-rs record meeting-notes.ogg     # custom filename
 #+end_src
 
+Options:
+
+| Flag        | Effect                                           |
+|-------------+--------------------------------------------------|
+| ~--monitor~ | Mix system audio (monitor) with microphone input |
+
 *** Transcribe
 
 Transcribe an existing audio file:
@@ -180,6 +210,13 @@ talk-rs transcribe recording.ogg                # print to stdout
 talk-rs transcribe recording.ogg output.txt     # write to file
 talk-rs transcribe recording.ogg --provider openai
 #+end_src
+
+Options:
+
+| Flag         | Effect                             |
+|--------------+------------------------------------|
+| ~--provider~ | Choose ~mistral~ or ~openai~       |
+| ~--model~    | Override model for this invocation |
 
 ** GNOME keyboard shortcut
 
@@ -204,7 +241,7 @@ else
 fi
 
 gsettings set "$SCHEMA" name    'talk-rs dictate'
-gsettings set "$SCHEMA" command 'talk-rs dictate --toggle'
+gsettings set "$SCHEMA" command 'talk-rs dictate --toggle --amplitude --spectrum'
 gsettings set "$SCHEMA" binding '<Super>slash'
 #+end_src
 
@@ -212,7 +249,8 @@ First press starts recording, second press stops, transcribes, and
 pastes into the focused application.
 
 To change the key, replace ~<Super>slash~ with the desired binding
-(e.g. ~<Super>semicolon~, ~<Super>d~).
+(e.g. ~<Super>semicolon~, ~<Super>d~). Add ~--realtime~ to use
+streaming transcription instead of batch mode.
 
 ** Development
 
