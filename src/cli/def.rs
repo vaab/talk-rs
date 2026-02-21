@@ -19,6 +19,9 @@ pub enum Commands {
         /// Output file path (optional, defaults to memo-YYYY-MM-DD-HH-MM-SS.ogg)
         #[arg(value_name = "FILE")]
         file: Option<String>,
+        /// Mix system audio (monitor) with microphone input
+        #[arg(long)]
+        monitor: bool,
     },
     /// Transcribe an audio file to text
     Transcribe {
@@ -70,6 +73,9 @@ pub enum Commands {
         /// Disable sound indicators (start/stop/boop)
         #[arg(long)]
         no_sounds: bool,
+        /// Mix system audio (monitor) with microphone input
+        #[arg(long)]
+        monitor: bool,
         /// Disable visual overlay indicator
         #[arg(long)]
         no_overlay: bool,

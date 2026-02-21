@@ -8,6 +8,7 @@ pub mod encoder;
 pub mod file_source;
 pub mod indicator;
 pub mod mock;
+pub mod monitor_capture;
 pub mod pipewire_capture;
 pub mod resample;
 pub mod writer;
