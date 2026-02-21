@@ -42,7 +42,7 @@ nix = { version = "0.28", features = ["signal", "process", "fs"] }
 x11rb = { version = "0.13", features = ["shape", "xfixes", "randr"] }
 png = "0.17"
 fontdue = "0.9"
-gtk4 = "0.8"
+gtk4 = { version = "0.8", features = ["v4_10"] }
 gdk4-x11 = "0.8"
 
 [dev-dependencies]

@@ -22,6 +22,9 @@ pub enum Commands {
         /// Mix system audio (monitor) with microphone input
         #[arg(long)]
         monitor: bool,
+        /// Open GTK recordings browser to manage cached recordings
+        #[arg(long)]
+        ui: bool,
     },
     /// Transcribe an audio file to text
     Transcribe {
