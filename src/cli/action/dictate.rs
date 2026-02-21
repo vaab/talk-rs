@@ -2214,6 +2214,22 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             }
         };
 
+    // Register SIGINT handler early — before any long-running resources
+    // (PipeWire capture, sound playback) — so that a quick toggle-off
+    // is never missed.  Without this, there is a ~1 s race window
+    // between capture.start() and the ctrl_c().await inside
+    // dictate_streaming/dictate_realtime where SIGINT has no handler
+    // and the daemon becomes an unkillable orphan.
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+    let daemon_pid = std::process::id();
+    tokio::spawn(async move {
+        log::warn!("[DBG] daemon {}: ctrl_c handler task polled, registering handler", daemon_pid);
+        let _ = tokio::signal::ctrl_c().await;
+        log::warn!("[DBG] daemon {}: SIGINT received! cancelling shutdown token", daemon_pid);
+        shutdown_clone.cancel();
+    });
+
     // Start capture BEFORE the start sound so that audio is already
     // being buffered while the sound plays.  The channel holds ~500 ms
     // of data (25 × 20 ms chunks), which is more than enough for the
@@ -2322,6 +2338,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             boop_token.as_ref(),
             Some(seg_tx),
             visualizer.as_ref(),
+            &shutdown,
         )
         .await?;
 
@@ -2356,6 +2373,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             audio_rx,
             &cache_wav_path,
             transcriber,
+            &shutdown,
         )
         .await?
     };
@@ -2438,6 +2456,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     }
 
     if text.is_empty() {
+        log::warn!("[DBG] daemon {}: empty transcription, exiting normally", std::process::id());
         log::warn!("empty transcription — nothing to paste");
         return Ok(());
     }
@@ -2498,7 +2517,15 @@ async fn toggle_dispatch(
     let spawn_ctx: Option<SpawnContext> = {
         let _lock = daemon::acquire_lock()?;
 
-        match daemon::check_status(&pid_file)? {
+        let status = daemon::check_status(&pid_file)?;
+        // Write to daemon.log directly (toggle process stderr is invisible).
+        if let Ok(log_path) = daemon::log_path() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+                let _ = writeln!(f, "[DBG] toggle_dispatch: check_status = {:?}", status);
+            }
+        }
+        match status {
             DaemonStatus::NotRunning => Some(
                 toggle_spawn(
                     &pid_file, provider, model, diarize, realtime, no_sounds, monitor, no_overlay,
@@ -2733,9 +2760,22 @@ async fn toggle_validate(ctx: SpawnContext) -> Result<(), TalkError> {
 /// paste in the background, so a new toggle-on can proceed without
 /// waiting.
 fn toggle_stop(pid: u32, pid_file: &std::path::Path) -> Result<(), TalkError> {
-    log::info!("stopping dictation (PID {})", pid);
+    // Write traces directly to daemon.log so they appear alongside
+    // daemon-side traces (toggle process stderr goes to the terminal
+    // which may be invisible for keybinding-triggered invocations).
+    if let Ok(log_path) = daemon::log_path() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+            let _ = writeln!(f, "[DBG] toggle_stop: sending SIGINT to daemon PID {}", pid);
+        }
+    }
     daemon::signal_daemon(pid, pid_file)?;
-    log::info!("dictation stop signalled");
+    if let Ok(log_path) = daemon::log_path() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+            let _ = writeln!(f, "[DBG] toggle_stop: signal_daemon returned OK for PID {}", pid);
+        }
+    }
     Ok(())
 }
 
@@ -2817,6 +2857,7 @@ async fn dictate_realtime(
     boop_token: Option<&CancellationToken>,
     segment_tx: Option<tokio::sync::mpsc::Sender<String>>,
     visualizer: Option<&VisualizerHandle>,
+    shutdown: &CancellationToken,
 ) -> Result<TranscriptionResult, TalkError> {
     // Create and validate the transcriber before starting audio capture
     // so the user gets immediate feedback on misconfiguration.
@@ -2847,10 +2888,14 @@ async fn dictate_realtime(
     let capture_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let capture_stop_clone = capture_stop.clone();
 
-    // Spawn Ctrl+C handler that stops capture (also works for file
-    // input — early abort by the user).
+    // Wait for the shared shutdown token (registered early in dictate())
+    // instead of a local ctrl_c() handler.  This avoids a race window
+    // where SIGINT arrives before this task is spawned.
+    let shutdown_clone = shutdown.clone();
     let ctrlc_task = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        log::warn!("[DBG] dictate_realtime: waiting on shutdown token");
+        shutdown_clone.cancelled().await;
+        log::warn!("[DBG] dictate_realtime: shutdown token fired, setting capture_stop");
         capture_stop_clone.store(true, std::sync::atomic::Ordering::Release);
     });
 
@@ -3151,6 +3196,7 @@ async fn dictate_streaming(
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     cache_wav_path: &std::path::Path,
     transcriber: Box<dyn BatchTranscriber>,
+    shutdown: &CancellationToken,
 ) -> Result<TranscriptionResult, TalkError> {
     // Tee raw PCM to cache WAV before encoding
     log::info!("caching audio to: {}", cache_wav_path.display());
@@ -3232,12 +3278,14 @@ async fn dictate_streaming(
     let transcribe_task =
         tokio::spawn(async move { transcriber.transcribe_stream(stream_rx, "audio.ogg").await });
 
-    // Wait for recording to end: Ctrl+C for live mic, natural
-    // completion for file input, or Ctrl+C to abort file early.
+    // Wait for recording to end: SIGINT (via shared shutdown token)
+    // for live mic, natural completion for file input, or SIGINT to
+    // abort file early.  The shutdown token is registered early in
+    // dictate() so there is no race window.
     if from_file {
         log::info!("transcribing audio file (batch)...");
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown.cancelled() => {
                 log::info!("aborting");
                 capture.stop()?;
             }
@@ -3246,12 +3294,11 @@ async fn dictate_streaming(
             }
         }
     } else {
-        log::info!("recording (batch)... press Ctrl+C to stop and transcribe");
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(|err| TalkError::Audio(format!("Failed to listen for Ctrl+C: {}", err)))?;
-        log::info!("stopping recording");
+        log::warn!("[DBG] dictate_streaming: waiting on shutdown token");
+        shutdown.cancelled().await;
+        log::warn!("[DBG] dictate_streaming: shutdown token fired, calling capture.stop()");
         capture.stop()?;
+        log::warn!("[DBG] dictate_streaming: capture.stop() returned");
     }
 
     // Wait for cache WAV and encode tasks
