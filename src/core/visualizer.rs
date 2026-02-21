@@ -541,12 +541,13 @@ fn rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt()
 }
 
-/// Render amplitude history as vertical bars.
+/// Render amplitude history as a symmetrical waveform.
 ///
 /// Maps `history` (one RMS value per frame) onto the panel width.
-/// At the start bars are wide/stretched; as recording progresses,
-/// more time is compressed into the same width.  Normalised against
-/// `max_rms` so speech fills the panel and silence is tiny.
+/// Each column draws a bar centred on the vertical midline, extending
+/// equally upward and downward — producing a mirror-image waveform.
+/// Normalised against `max_rms` so speech fills the panel height and
+/// silence stays thin.
 fn render_amplitude(pb: &mut PixelBuffer, history: &[f32], max_rms: f32) {
     if history.is_empty() || max_rms < PEAK_FLOOR {
         return;
@@ -555,6 +556,9 @@ fn render_amplitude(pb: &mut PixelBuffer, history: &[f32], max_rms: f32) {
     let h = pb.height;
     let w = pb.width;
     let n = history.len();
+    let center = h / 2;
+    // Maximum half-height leaves 1 px margin top and bottom.
+    let max_half = center.saturating_sub(1);
 
     for col in 0..w {
         let start = col * n / w;
@@ -569,11 +573,12 @@ fn render_amplitude(pb: &mut PixelBuffer, history: &[f32], max_rms: f32) {
         };
 
         let norm = (avg_rms / max_rms).clamp(0.0, 1.0);
-        let bar_height = (norm * (h - 2) as f32) as usize;
-        let bar_y = h - 1 - bar_height;
+        let half_height = (norm * max_half as f32) as usize;
 
         let color = if norm > 0.5 { AMP_COLOR } else { AMP_DIM };
-        for y in bar_y..h {
+        let top = center - half_height;
+        let bottom = center + half_height;
+        for y in top..=bottom {
             pb.set_pixel(col, y, color);
         }
     }
@@ -835,7 +840,7 @@ fn visualizer_thread(
     // Amplitude history: one RMS value per frame, capped to a
     // rolling window of `AMP_WINDOW_SECS` seconds.
     let amp_max_frames = (FPS as f32 * AMP_WINDOW_SECS) as usize;
-    let mut amp_history: Vec<f32> = Vec::new();
+    let mut amp_history: Vec<f32> = vec![0.0; amp_max_frames];
     // All-time peak RMS — only grows, never shrinks.  Gives a stable
     // Y-axis scale: once the user has spoken, silence stays small.
     let mut amp_peak: f32 = PEAK_FLOOR;
@@ -851,6 +856,7 @@ fn visualizer_thread(
             match rx.recv() {
                 Ok(VizCommand::Show { badge_width }) => {
                     amp_history.clear();
+                    amp_history.resize(amp_max_frames, 0.0);
                     create_windows(
                         &conn,
                         screen,
@@ -889,6 +895,7 @@ fn visualizer_thread(
                 Ok(VizCommand::Show { badge_width }) => {
                     destroy_windows(&conn, &mut wins);
                     amp_history.clear();
+                    amp_history.resize(amp_max_frames, 0.0);
                     create_windows(
                         &conn,
                         screen,
@@ -1604,19 +1611,94 @@ mod tests {
     }
 
     #[test]
-    fn render_amplitude_stretches_few_values() {
-        let mut pb = PixelBuffer::new(200, 52);
+    fn render_amplitude_prepadded_leaves_left_empty() {
+        // Simulates the fixed behavior: a full-length history where
+        // only the rightmost entries have data (the rest are zero).
+        // The left portion of the panel must stay empty (all BG).
+        let window_frames = (FPS as f32 * AMP_WINDOW_SECS) as usize; // 300
+        let active_frames = 10;
+        let mut history = vec![0.0f32; window_frames];
+        for val in &mut history[window_frames - active_frames..] {
+            *val = 0.8;
+        }
+
+        let mut pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
         pb.clear(BG);
-        // Only 3 history values — should stretch across 200 columns
-        let history = vec![0.5, 1.0, 0.3];
         render_amplitude(&mut pb, &history, 1.0);
 
-        let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
+        // The leftmost 80% of columns should have at most a 1-pixel
+        // centre line per column (render_amplitude draws a min-height
+        // bar at the midline even for zero RMS).  The right side
+        // should have real symmetric bars.
+        let check_cols = pb.width * 80 / 100;
+        let mut left_non_bg = 0usize;
+        for x in 0..check_cols {
+            for y in 0..pb.height {
+                let off = (y * pb.width + x) * 4;
+                if pb.data[off..off + 4] != BG {
+                    left_non_bg += 1;
+                }
+            }
+        }
+        // At most 1 pixel per column (the baseline).
         assert!(
-            non_bg > 100,
-            "3 values should stretch to fill most columns, got {} non-bg pixels",
-            non_bg,
+            left_non_bg <= check_cols,
+            "left 80% should only have baseline pixels, got {} non-bg for {} cols",
+            left_non_bg,
+            check_cols
         );
+
+        // The rightmost columns must have substantially taller bars
+        // (more than just the 1-pixel baseline).
+        let right_cols = 5;
+        let mut right_non_bg = 0usize;
+        for x in (pb.width - right_cols)..pb.width {
+            for y in 0..pb.height {
+                let off = (y * pb.width + x) * 4;
+                if pb.data[off..off + 4] != BG {
+                    right_non_bg += 1;
+                }
+            }
+        }
+        assert!(
+            right_non_bg > right_cols * 2,
+            "rightmost columns should have amplitude bars taller than baseline, got {} pixels for {} cols",
+            right_non_bg,
+            right_cols
+        );
+    }
+
+    #[test]
+    fn render_amplitude_symmetric_around_center() {
+        let mut pb = PixelBuffer::new(200, 52);
+        pb.clear(BG);
+        let history = vec![0.8f32; 60];
+        render_amplitude(&mut pb, &history, 1.0);
+
+        let center = pb.height / 2;
+        // For each column, count non-bg pixels above and below centre.
+        for col in 0..pb.width {
+            let mut above = 0usize;
+            let mut below = 0usize;
+            for y in 0..center {
+                let off = (y * pb.width + col) * 4;
+                if pb.data[off..off + 4] != BG {
+                    above += 1;
+                }
+            }
+            // Skip the centre pixel itself (shared), count below.
+            for y in (center + 1)..pb.height {
+                let off = (y * pb.width + col) * 4;
+                if pb.data[off..off + 4] != BG {
+                    below += 1;
+                }
+            }
+            assert_eq!(
+                above, below,
+                "column {} should be symmetric: {} above vs {} below centre",
+                col, above, below
+            );
+        }
     }
 
     #[test]
