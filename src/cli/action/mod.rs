@@ -11,9 +11,9 @@ pub use transcribe::transcribe;
 
 pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Commands::Record { file } => {
+        Commands::Record { file, monitor } => {
             let args = file.map(|f| vec![f]).unwrap_or_default();
-            record(args).await?;
+            record(args, monitor).await?;
         }
         Commands::Transcribe {
             input,
@@ -39,6 +39,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             realtime,
             toggle,
             no_sounds,
+            monitor,
             no_overlay,
             amplitude,
             spectrum,
@@ -57,6 +58,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
                 realtime,
                 toggle,
                 no_sounds,
+                monitor,
                 no_overlay,
                 amplitude,
                 spectrum,

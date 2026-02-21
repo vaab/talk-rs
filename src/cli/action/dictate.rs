@@ -5,6 +5,7 @@
 
 use crate::core::audio::file_source::WavFileSource;
 use crate::core::audio::indicator::SoundPlayer;
+use crate::core::audio::monitor_capture::MonitorCapture;
 use crate::core::audio::pipewire_capture::PipeWireCapture;
 use crate::core::audio::resample;
 use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter, CHUNK_DURATION_MS};
@@ -39,6 +40,7 @@ pub struct DictateOpts {
     pub realtime: bool,
     pub toggle: bool,
     pub no_sounds: bool,
+    pub monitor: bool,
     pub no_overlay: bool,
     pub amplitude: bool,
     pub spectrum: bool,
@@ -1818,6 +1820,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.model,
             opts.realtime,
             opts.no_sounds,
+            opts.monitor,
             opts.no_overlay,
             opts.amplitude,
             opts.spectrum,
@@ -2181,15 +2184,27 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                 channels: encode_config.channels,
                 bitrate: encode_config.bitrate,
             };
-            log::info!(
-                "capture at {}Hz (PipeWire), target {}Hz",
-                rate,
-                encode_config.sample_rate
-            );
-            (
-                Box::new(PipeWireCapture::new(capture_config)) as Box<dyn AudioCapture>,
-                rate,
-            )
+            if opts.monitor {
+                log::info!(
+                    "capture at {}Hz (PipeWire, mic+monitor), target {}Hz",
+                    rate,
+                    encode_config.sample_rate
+                );
+                (
+                    Box::new(MonitorCapture::new(capture_config)) as Box<dyn AudioCapture>,
+                    rate,
+                )
+            } else {
+                log::info!(
+                    "capture at {}Hz (PipeWire), target {}Hz",
+                    rate,
+                    encode_config.sample_rate
+                );
+                (
+                    Box::new(PipeWireCapture::new(capture_config)) as Box<dyn AudioCapture>,
+                    rate,
+                )
+            }
         };
 
     // Start capture BEFORE the start sound so that audio is already
@@ -2445,6 +2460,7 @@ async fn toggle_dispatch(
     model: Option<String>,
     realtime: bool,
     no_sounds: bool,
+    monitor: bool,
     no_overlay: bool,
     amplitude: bool,
     spectrum: bool,
@@ -2463,8 +2479,8 @@ async fn toggle_dispatch(
         match daemon::check_status(&pid_file)? {
             DaemonStatus::NotRunning => Some(
                 toggle_spawn(
-                    &pid_file, provider, model, realtime, no_sounds, no_overlay, amplitude,
-                    spectrum, save, verbose,
+                    &pid_file, provider, model, realtime, no_sounds, monitor, no_overlay,
+                    amplitude, spectrum, save, verbose,
                 )
                 .await?,
             ),
@@ -2507,6 +2523,7 @@ async fn toggle_spawn(
     model: Option<String>,
     realtime: bool,
     no_sounds: bool,
+    monitor: bool,
     no_overlay: bool,
     amplitude: bool,
     spectrum: bool,
@@ -2548,6 +2565,10 @@ async fn toggle_spawn(
 
     if no_sounds {
         cmd.arg("--no-sounds");
+    }
+
+    if monitor {
+        cmd.arg("--monitor");
     }
 
     if no_overlay {
