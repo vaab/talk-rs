@@ -16,6 +16,9 @@ happening.
 - *Multiple providers* -- Mistral (Voxtral) and OpenAI (Whisper /
   GPT-4o) for batch transcription; Mistral and OpenAI realtime
   streaming via WebSocket.
+- *Speaker diarization* -- identify who is speaking (~--diarize~);
+  output is tagged with speaker labels.  Currently supported with
+  Mistral V2 models in batch mode.
 - *Multi-candidate picker* -- with ~--pick~, run several providers in
   parallel and choose the best transcription from a GTK picker window.
 - *Visual overlay* -- non-intrusive X11 badge at the top of the screen
@@ -122,7 +125,7 @@ providers:
 
 | Field                              | Default                   | Description                        |
 |------------------------------------+---------------------------+------------------------------------|
-| ~providers.mistral.model~          | ~voxtral-mini-latest~     | Mistral transcription model        |
+| ~providers.mistral.model~          | ~voxtral-mini-2507~       | Mistral transcription model        |
 | ~providers.mistral.context_bias~   | /none/                    | Comma-separated words for accuracy |
 | ~providers.openai.model~           | ~whisper-1~               | OpenAI batch model                 |
 | ~providers.openai.realtime_model~  | ~gpt-4o-mini-transcribe~  | OpenAI realtime model              |
@@ -173,6 +176,7 @@ Options:
 | ~--toggle~                  | Daemon toggle mode                              |
 | ~--provider~                | Choose ~mistral~ or ~openai~                    |
 | ~--model~                   | Override model for this invocation               |
+| ~--diarize~                 | Enable speaker diarization (batch mode only)    |
 | ~--realtime~                | Stream audio via WebSocket (incremental text)   |
 | ~--pick~                    | Show multi-candidate picker (GTK window)        |
 | ~--retry-last~              | Re-transcribe the last cached recording         |
@@ -213,10 +217,11 @@ talk-rs transcribe recording.ogg --provider openai
 
 Options:
 
-| Flag         | Effect                             |
-|--------------+------------------------------------|
-| ~--provider~ | Choose ~mistral~ or ~openai~       |
-| ~--model~    | Override model for this invocation |
+| Flag         | Effect                                       |
+|--------------+----------------------------------------------|
+| ~--provider~ | Choose ~mistral~ or ~openai~                 |
+| ~--model~    | Override model for this invocation            |
+| ~--diarize~  | Enable speaker diarization (tag by speaker)  |
 
 ** GNOME keyboard shortcut
 

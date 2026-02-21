@@ -37,6 +37,7 @@ pub struct DictateOpts {
     pub replace_last_paste: bool,
     pub provider: Option<Provider>,
     pub model: Option<String>,
+    pub diarize: bool,
     pub realtime: bool,
     pub toggle: bool,
     pub no_sounds: bool,
@@ -1518,7 +1519,12 @@ async fn pick_with_streaming_gtk(
                     }
                 } else {
                     // Batch retry (existing logic).
-                    match transcription::create_batch_transcriber(&config, provider, Some(&model)) {
+                    match transcription::create_batch_transcriber(
+                        &config,
+                        provider,
+                        Some(&model),
+                        false,
+                    ) {
                         Ok(transcriber) => {
                             let mut tasks = tokio::task::JoinSet::new();
                             spawn_transcription(
@@ -1818,6 +1824,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         return toggle_dispatch(
             opts.provider,
             opts.model,
+            opts.diarize,
             opts.realtime,
             opts.no_sounds,
             opts.monitor,
@@ -2016,7 +2023,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // Create batch transcribers before entering GTK (needs &Config).
         let mut transcribers: Vec<(Provider, String, Box<dyn BatchTranscriber>)> = Vec::new();
         for (provider, model) in batch_filtered {
-            match transcription::create_batch_transcriber(&config, provider, Some(&model)) {
+            match transcription::create_batch_transcriber(&config, provider, Some(&model), false) {
                 Ok(t) => transcribers.push((provider, model, t)),
                 Err(e) => log::warn!("skipping batch {}:{}: {}", provider, model, e),
             }
@@ -2253,6 +2260,14 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         capture_chunk,
     )?;
 
+    if opts.diarize && opts.realtime {
+        return Err(TalkError::Config(
+            "--diarize is not supported with --realtime: \
+             the Mistral realtime WebSocket endpoint does not support speaker diarization"
+                .to_string(),
+        ));
+    }
+
     let result = if opts.realtime {
         // Realtime mode (--realtime): stream audio over WebSocket.
         // Each segment is pasted into the focused application as it
@@ -2327,8 +2342,12 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // Batch mode (default): capture audio, encode, then transcribe.
         // Provider validation is handled by toggle_validate() in the
         // caller — no network round-trip here.
-        let transcriber =
-            transcription::create_batch_transcriber(&config, provider, opts.model.as_deref())?;
+        let transcriber = transcription::create_batch_transcriber(
+            &config,
+            provider,
+            opts.model.as_deref(),
+            opts.diarize,
+        )?;
 
         dictate_streaming(
             &mut *capture,
@@ -2367,8 +2386,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     }
 
+    let text = crate::cli::action::transcribe::format_transcription_output(&result)
+        .trim()
+        .to_string();
     let metadata = result.metadata;
-    let text = result.text.trim().to_string();
 
     // Write recording cache metadata and rotate old entries.
     let cache_wav_filename = cache_wav_path
@@ -2458,6 +2479,7 @@ const VALIDATION_ERROR_DISPLAY_MS: u64 = 2000;
 async fn toggle_dispatch(
     provider: Option<Provider>,
     model: Option<String>,
+    diarize: bool,
     realtime: bool,
     no_sounds: bool,
     monitor: bool,
@@ -2479,7 +2501,7 @@ async fn toggle_dispatch(
         match daemon::check_status(&pid_file)? {
             DaemonStatus::NotRunning => Some(
                 toggle_spawn(
-                    &pid_file, provider, model, realtime, no_sounds, monitor, no_overlay,
+                    &pid_file, provider, model, diarize, realtime, no_sounds, monitor, no_overlay,
                     amplitude, spectrum, save, verbose,
                 )
                 .await?,
@@ -2508,6 +2530,7 @@ struct SpawnContext {
     config: Config,
     effective_provider: Provider,
     model: Option<String>,
+    diarize: bool,
     realtime: bool,
 }
 
@@ -2521,6 +2544,7 @@ async fn toggle_spawn(
     pid_file: &std::path::Path,
     provider: Option<Provider>,
     model: Option<String>,
+    diarize: bool,
     realtime: bool,
     no_sounds: bool,
     monitor: bool,
@@ -2557,6 +2581,10 @@ async fn toggle_spawn(
 
     if let Some(ref m) = model {
         cmd.arg("--model").arg(m);
+    }
+
+    if diarize {
+        cmd.arg("--diarize");
     }
 
     if realtime {
@@ -2636,6 +2664,7 @@ async fn toggle_spawn(
         config,
         effective_provider,
         model,
+        diarize,
         realtime,
     })
 }
@@ -2666,6 +2695,7 @@ async fn toggle_validate(ctx: SpawnContext) -> Result<(), TalkError> {
                 &ctx.config,
                 ctx.effective_provider,
                 ctx.model.as_deref(),
+                ctx.diarize,
             )?;
             t.validate().await
         }
@@ -3043,6 +3073,7 @@ async fn dictate_realtime(
             token_usage: None,
             provider_specific,
         },
+        diarization: None,
     })
 }
 
