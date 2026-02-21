@@ -341,6 +341,7 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                     realtime: None,
                 })),
             },
+            diarization: None,
         })
     }
 
@@ -442,6 +443,7 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                     realtime: None,
                 })),
             },
+            diarization: None,
         })
     }
 }

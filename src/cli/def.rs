@@ -37,6 +37,9 @@ pub enum Commands {
         /// Model name (overrides config default for the chosen provider)
         #[arg(long)]
         model: Option<String>,
+        /// Enable speaker diarization (identify who is speaking)
+        #[arg(long)]
+        diarize: bool,
     },
     /// Record, transcribe, and paste text into the focused application
     Dictate {
@@ -52,7 +55,7 @@ pub enum Commands {
         /// Reuse the last cached recording as input audio
         #[arg(long)]
         retry_last: bool,
-        /// Offer multiple candidate transcriptions in rofi
+        /// Offer multiple candidate transcriptions in a GTK picker window
         #[arg(long)]
         pick: bool,
         /// Delete previous pasted text length before inserting selected text
@@ -64,6 +67,9 @@ pub enum Commands {
         /// Model name (overrides config default for the chosen provider)
         #[arg(long)]
         model: Option<String>,
+        /// Enable speaker diarization (identify who is speaking)
+        #[arg(long)]
+        diarize: bool,
         /// Use realtime mode (stream audio via WebSocket, get incremental text)
         #[arg(long)]
         realtime: bool,

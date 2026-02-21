@@ -31,6 +31,25 @@ pub struct TranscriptionResult {
     pub text: String,
     /// Optional metadata extracted from provider responses/headers.
     pub metadata: TranscriptionMetadata,
+    /// Speaker-diarized segments, when diarization was requested and
+    /// supported by the provider.
+    pub diarization: Option<Vec<DiarizationSegment>>,
+}
+
+/// A single speaker-attributed segment from diarization.
+///
+/// Provider-agnostic: each provider maps its native speaker labels
+/// into this structure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiarizationSegment {
+    /// Speaker identifier (e.g. `"SPEAKER_00"`).
+    pub speaker: String,
+    /// Segment start time in seconds.
+    pub start: f64,
+    /// Segment end time in seconds.
+    pub end: f64,
+    /// Transcribed text for this segment.
+    pub text: String,
 }
 
 /// Provider-agnostic metadata that can be written to YAML.
@@ -157,11 +176,14 @@ pub trait RealtimeTranscriber: Send + Sync {
 /// Create a batch transcriber for the given provider.
 ///
 /// When `model` is `Some`, it overrides the config default for that
-/// provider (the `--model` CLI flag).
+/// provider (the `--model` CLI flag).  When `diarize` is `true`, the
+/// transcriber will request speaker diarization (if supported by the
+/// provider).
 pub fn create_batch_transcriber(
     config: &Config,
     provider: Provider,
     model: Option<&str>,
+    diarize: bool,
 ) -> Result<Box<dyn BatchTranscriber>, TalkError> {
     match provider {
         Provider::Mistral => {
@@ -178,7 +200,7 @@ pub fn create_batch_transcriber(
             if let Some(m) = model {
                 cfg.model = m.to_string();
             }
-            Ok(Box::new(MistralBatchTranscriber::new(cfg)))
+            Ok(Box::new(MistralBatchTranscriber::new(cfg, diarize)))
         }
         Provider::OpenAI => {
             let mut cfg = config.providers.openai.clone().ok_or_else(|| {
@@ -270,6 +292,7 @@ impl BatchTranscriber for MockBatchTranscriber {
         Ok(TranscriptionResult {
             text: self.response_text.clone(),
             metadata: TranscriptionMetadata::default(),
+            diarization: None,
         })
     }
 
@@ -283,6 +306,7 @@ impl BatchTranscriber for MockBatchTranscriber {
         Ok(TranscriptionResult {
             text: self.response_text.clone(),
             metadata: TranscriptionMetadata::default(),
+            diarization: None,
         })
     }
 }

@@ -10,23 +10,33 @@
 output_dir: <PLACEHOLDER>
 
 # Required: Transcription Providers Configuration
-# Configure transcription backends (currently supports Mistral)
+# Configure at least one provider (Mistral or OpenAI)
 providers:
   # Mistral API Configuration
-  # Used for audio transcription and processing
   mistral:
     # Your Mistral API key for authentication
     # Get this from: https://console.mistral.ai/
     api_key: <PLACEHOLDER>
 
-    # Model name for transcription (optional, defaults to "voxtral-mini-latest")
-    # Available models: voxtral-mini-latest, voxtral-mini-2602
-    # model: voxtral-mini-latest
+    # Model name for transcription (optional, defaults to "voxtral-mini-2507")
+    # Available models: voxtral-mini-2507, voxtral-mini-2602, voxtral-mini-latest
+    # V2 models (2602+) support speaker diarization via --diarize
+    # model: voxtral-mini-2507
 
     # Context bias: comma-separated words/phrases to improve transcription accuracy
     # Up to 100 words. Useful for proper nouns, technical terms, domain vocabulary.
     # Optimized for English; experimental for other languages.
     # context_bias: "Kalysto,talk-rs,Voxtral,cpal,tokio"
+
+  # OpenAI API Configuration (optional)
+  # openai:
+  #   api_key: <PLACEHOLDER>
+  #   model: whisper-1                          # batch model (whisper-1, gpt-4o-transcribe)
+  #   realtime_model: gpt-4o-mini-transcribe    # realtime WebSocket model
+
+# Optional: Default provider when --provider is not specified
+# transcription:
+#   default_provider: mistral
 
 # Optional: Visual and Audio Indicators
 # Configure feedback mechanisms during recording

@@ -6,8 +6,8 @@
 use crate::core::config::MistralConfig;
 use crate::core::error::TalkError;
 use crate::core::transcription::{
-    MistralProviderMetadata, ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata,
-    TranscriptionResult,
+    DiarizationSegment, MistralProviderMetadata, ProviderSpecificMetadata, TokenUsage,
+    TranscriptionMetadata, TranscriptionResult,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -76,6 +76,39 @@ fn parse_mistral_token_usage(usage: &serde_json::Value) -> Option<TokenUsage> {
 
 fn parse_mistral_audio_seconds(usage: &serde_json::Value) -> Option<f64> {
     usage.get("prompt_audio_seconds").and_then(|v| v.as_f64())
+}
+
+/// Extract diarization segments from the Mistral response segments.
+///
+/// Each segment is expected to have `speaker_id`, `start`, `end`, and
+/// `text` fields when diarization was requested.  Segments without a
+/// `speaker_id` are skipped (they come from non-diarized responses).
+fn parse_diarization_segments(segments: &[serde_json::Value]) -> Option<Vec<DiarizationSegment>> {
+    let mut result = Vec::new();
+    for seg in segments {
+        let speaker = seg.get("speaker_id").and_then(|v| v.as_str());
+        let Some(speaker) = speaker else {
+            continue;
+        };
+        let start = seg.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let end = seg.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let text = seg
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        result.push(DiarizationSegment {
+            speaker: speaker.to_string(),
+            start,
+            end,
+            text,
+        });
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 // ── Shared model validation ─────────────────────────────────────────
@@ -165,6 +198,8 @@ pub struct MistralBatchTranscriber {
     config: MistralConfig,
     /// API endpoint URL (can be overridden for testing).
     endpoint: String,
+    /// Whether to request speaker diarization (V2 models only).
+    diarize: bool,
 }
 
 impl MistralBatchTranscriber {
@@ -173,11 +208,13 @@ impl MistralBatchTranscriber {
     /// # Arguments
     ///
     /// * `config` - Mistral API configuration containing the API key
-    pub fn new(config: MistralConfig) -> Self {
+    /// * `diarize` - Request speaker diarization (requires V2 model)
+    pub fn new(config: MistralConfig, diarize: bool) -> Self {
         Self {
             client: Client::new(),
             config,
             endpoint: MISTRAL_API_ENDPOINT.to_string(),
+            diarize,
         }
     }
 
@@ -187,12 +224,14 @@ impl MistralBatchTranscriber {
     ///
     /// * `config` - Mistral API configuration containing the API key
     /// * `endpoint` - Custom API endpoint URL
+    /// * `diarize` - Request speaker diarization
     #[cfg(test)]
-    pub fn with_endpoint(config: MistralConfig, endpoint: String) -> Self {
+    pub fn with_endpoint(config: MistralConfig, endpoint: String, diarize: bool) -> Self {
         Self {
             client: Client::new(),
             config,
             endpoint,
+            diarize,
         }
     }
 }
@@ -240,6 +279,13 @@ impl BatchTranscriber for MistralBatchTranscriber {
         // Add context bias if configured
         if let Some(ref bias) = self.config.context_bias {
             form = form.text("context_bias", bias.clone());
+        }
+
+        // Add diarization parameters (V2 models only)
+        if self.diarize {
+            form = form
+                .text("diarize", "true")
+                .text("timestamp_granularities", "segment");
         }
 
         let started = Instant::now();
@@ -290,6 +336,11 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
 
+        let diarization = mistral_response
+            .segments
+            .as_deref()
+            .and_then(parse_diarization_segments);
+
         let text = mistral_response.text;
         Ok(TranscriptionResult {
             text,
@@ -311,6 +362,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
                     },
                 )),
             },
+            diarization,
         })
     }
 
@@ -336,6 +388,13 @@ impl BatchTranscriber for MistralBatchTranscriber {
         // Add context bias if configured
         if let Some(ref bias) = self.config.context_bias {
             form = form.text("context_bias", bias.clone());
+        }
+
+        // Add diarization parameters (V2 models only)
+        if self.diarize {
+            form = form
+                .text("diarize", "true")
+                .text("timestamp_granularities", "segment");
         }
 
         let started = Instant::now();
@@ -387,6 +446,11 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
 
+        let diarization = mistral_response
+            .segments
+            .as_deref()
+            .and_then(parse_diarization_segments);
+
         let text = mistral_response.text;
         Ok(TranscriptionResult {
             text,
@@ -408,6 +472,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
                     },
                 )),
             },
+            diarization,
         })
     }
 }
@@ -450,6 +515,7 @@ mod tests {
         let transcriber = MistralBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            false,
         );
 
         // Transcribe the file
@@ -483,6 +549,7 @@ mod tests {
         let transcriber = MistralBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            false,
         );
 
         // Create a channel and send fake audio data
@@ -526,6 +593,7 @@ mod tests {
         let transcriber = MistralBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            false,
         );
 
         // Transcribe the file
@@ -542,7 +610,7 @@ mod tests {
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::new(config);
+        let transcriber = MistralBatchTranscriber::new(config, false);
 
         let result = transcriber
             .transcribe_file(Path::new("/nonexistent/file.wav"))
@@ -578,6 +646,7 @@ mod tests {
         let transcriber = MistralBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            false,
         );
 
         // Transcribe the file
@@ -585,5 +654,105 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("parse"));
+    }
+
+    #[tokio::test]
+    async fn test_mistral_diarization_segments_parsed() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "Hello. I am fine.",
+                "segments": [
+                    {
+                        "speaker_id": "SPEAKER_00",
+                        "start": 0.0,
+                        "end": 1.5,
+                        "text": "Hello."
+                    },
+                    {
+                        "speaker_id": "SPEAKER_01",
+                        "start": 1.5,
+                        "end": 3.0,
+                        "text": "I am fine."
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"fake audio data").unwrap();
+        temp_file.flush().unwrap();
+
+        let config = MistralConfig {
+            api_key: "test-api-key".to_string(),
+            model: "voxtral-mini-2602".to_string(),
+            context_bias: None,
+        };
+        let transcriber = MistralBatchTranscriber::with_endpoint(
+            config,
+            format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            true,
+        );
+
+        let result = transcriber.transcribe_file(temp_file.path()).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.text, "Hello. I am fine.");
+
+        let segments = result.diarization.expect("diarization segments present");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].speaker, "SPEAKER_00");
+        assert_eq!(segments[0].text, "Hello.");
+        assert_eq!(segments[0].start, 0.0);
+        assert_eq!(segments[0].end, 1.5);
+        assert_eq!(segments[1].speaker, "SPEAKER_01");
+        assert_eq!(segments[1].text, "I am fine.");
+    }
+
+    #[tokio::test]
+    async fn test_mistral_no_diarization_without_speaker_id() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "Hello world.",
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.5,
+                        "text": "Hello world."
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"fake audio data").unwrap();
+        temp_file.flush().unwrap();
+
+        let config = MistralConfig {
+            api_key: "test-api-key".to_string(),
+            model: "voxtral-mini-2602".to_string(),
+            context_bias: None,
+        };
+        let transcriber = MistralBatchTranscriber::with_endpoint(
+            config,
+            format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            false,
+        );
+
+        let result = transcriber.transcribe_file(temp_file.path()).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        // No speaker_id in segments → diarization is None
+        assert!(result.diarization.is_none());
     }
 }

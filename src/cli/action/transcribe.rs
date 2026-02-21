@@ -5,7 +5,7 @@
 
 use crate::core::config::{Config, Provider};
 use crate::core::error::TalkError;
-use crate::core::transcription;
+use crate::core::transcription::{self, TranscriptionResult};
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -32,6 +32,46 @@ pub fn parse_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), TalkErr
     }
 }
 
+/// Format transcription output, using diarized segments when available.
+///
+/// When diarization segments are present, each line is prefixed with
+/// `[SPEAKER_ID]`.  Adjacent segments from the same speaker are merged
+/// into a single block.  When no diarization is present, returns the
+/// plain transcript text.
+pub fn format_transcription_output(result: &TranscriptionResult) -> String {
+    let Some(ref segments) = result.diarization else {
+        return result.text.clone();
+    };
+
+    if segments.is_empty() {
+        return result.text.clone();
+    }
+
+    let mut lines = Vec::new();
+    let mut current_speaker: Option<&str> = None;
+    let mut current_texts: Vec<&str> = Vec::new();
+
+    for seg in segments {
+        if current_speaker == Some(seg.speaker.as_str()) {
+            current_texts.push(seg.text.trim());
+        } else {
+            // Flush previous speaker block
+            if let Some(speaker) = current_speaker {
+                lines.push(format!("[{}] {}", speaker, current_texts.join(" ")));
+            }
+            current_speaker = Some(&seg.speaker);
+            current_texts.clear();
+            current_texts.push(seg.text.trim());
+        }
+    }
+    // Flush last block
+    if let Some(speaker) = current_speaker {
+        lines.push(format!("[{}] {}", speaker, current_texts.join(" ")));
+    }
+
+    lines.join("\n")
+}
+
 /// Transcribe an audio file to text.
 ///
 /// # Arguments
@@ -47,6 +87,7 @@ pub async fn transcribe(
     args: Vec<String>,
     cli_provider: Option<Provider>,
     cli_model: Option<String>,
+    diarize: bool,
 ) -> Result<(), TalkError> {
     // Parse arguments
     let (input_path, output_path) = parse_args(&args)?;
@@ -69,7 +110,7 @@ pub async fn transcribe(
 
     // Create transcriber via factory
     let transcriber =
-        transcription::create_batch_transcriber(&config, provider, cli_model.as_deref())?;
+        transcription::create_batch_transcriber(&config, provider, cli_model.as_deref(), diarize)?;
 
     // Pre-flight: verify provider connectivity and model validity.
     log::info!("validating {} provider configuration", provider);
@@ -78,6 +119,9 @@ pub async fn transcribe(
     // Transcribe the file
     let transcription = transcriber.transcribe_file(&input_path).await?;
 
+    // Format output: use diarized segments when available, plain text otherwise
+    let output_text = format_transcription_output(&transcription);
+
     // Write output
     match output_path {
         Some(output_file) => {
@@ -85,7 +129,7 @@ pub async fn transcribe(
             let mut file = tokio::fs::File::create(&output_file)
                 .await
                 .map_err(TalkError::Io)?;
-            file.write_all(transcription.text.as_bytes())
+            file.write_all(output_text.as_bytes())
                 .await
                 .map_err(TalkError::Io)?;
             file.sync_all().await.map_err(TalkError::Io)?;
@@ -93,7 +137,7 @@ pub async fn transcribe(
         }
         None => {
             // Write to stdout
-            println!("{}", transcription.text);
+            println!("{}", output_text);
         }
     }
 
@@ -199,5 +243,88 @@ mod tests {
         // Verify output file was created and has correct content
         let content = fs::read_to_string(&output_path).expect("read output file");
         assert_eq!(content, "This is a test transcription");
+    }
+
+    #[test]
+    fn test_format_plain_text_without_diarization() {
+        let result = TranscriptionResult {
+            text: "Hello world.".to_string(),
+            metadata: Default::default(),
+            diarization: None,
+        };
+        assert_eq!(format_transcription_output(&result), "Hello world.");
+    }
+
+    #[test]
+    fn test_format_diarized_output() {
+        use crate::core::transcription::DiarizationSegment;
+
+        let result = TranscriptionResult {
+            text: "Hello. I am fine.".to_string(),
+            metadata: Default::default(),
+            diarization: Some(vec![
+                DiarizationSegment {
+                    speaker: "SPEAKER_00".to_string(),
+                    start: 0.0,
+                    end: 1.5,
+                    text: "Hello.".to_string(),
+                },
+                DiarizationSegment {
+                    speaker: "SPEAKER_01".to_string(),
+                    start: 1.5,
+                    end: 3.0,
+                    text: "I am fine.".to_string(),
+                },
+            ]),
+        };
+        assert_eq!(
+            format_transcription_output(&result),
+            "[SPEAKER_00] Hello.\n[SPEAKER_01] I am fine."
+        );
+    }
+
+    #[test]
+    fn test_format_diarized_merges_same_speaker() {
+        use crate::core::transcription::DiarizationSegment;
+
+        let result = TranscriptionResult {
+            text: "Hello. How are you? I am fine.".to_string(),
+            metadata: Default::default(),
+            diarization: Some(vec![
+                DiarizationSegment {
+                    speaker: "SPEAKER_00".to_string(),
+                    start: 0.0,
+                    end: 1.0,
+                    text: "Hello.".to_string(),
+                },
+                DiarizationSegment {
+                    speaker: "SPEAKER_00".to_string(),
+                    start: 1.0,
+                    end: 2.0,
+                    text: "How are you?".to_string(),
+                },
+                DiarizationSegment {
+                    speaker: "SPEAKER_01".to_string(),
+                    start: 2.0,
+                    end: 3.5,
+                    text: "I am fine.".to_string(),
+                },
+            ]),
+        };
+        assert_eq!(
+            format_transcription_output(&result),
+            "[SPEAKER_00] Hello. How are you?\n[SPEAKER_01] I am fine."
+        );
+    }
+
+    #[test]
+    fn test_format_diarized_empty_segments() {
+        let result = TranscriptionResult {
+            text: "Hello world.".to_string(),
+            metadata: Default::default(),
+            diarization: Some(vec![]),
+        };
+        // Empty segments → fall back to plain text
+        assert_eq!(format_transcription_output(&result), "Hello world.");
     }
 }
