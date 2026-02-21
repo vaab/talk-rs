@@ -568,7 +568,11 @@ async fn pick_with_streaming_gtk(
 
     // Retry channel: GTK thread → async retry listener.
     // The bool indicates whether this is a streaming (realtime) retry.
-    let (retry_tx, retry_rx) = std::sync::mpsc::channel::<(Provider, String, bool)>();
+    // Uses tokio unbounded channel so the receiver can `.await` — a
+    // std::sync::mpsc would block the tokio worker thread and prevent
+    // the runtime from shutting down when the picker closes.
+    let (retry_tx, mut retry_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(Provider, String, bool)>();
 
     // Shared storage written by the GTK thread after selection,
     // read by the caller after the GTK thread finishes.
@@ -1367,7 +1371,7 @@ async fn pick_with_streaming_gtk(
         let tx = retry_msg_tx;
         let wav_for_retry = wav_samples;
         tokio::spawn(async move {
-            while let Ok((provider, model, streaming)) = retry_rx.recv() {
+            while let Some((provider, model, streaming)) = retry_rx.recv().await {
                 log::info!("retrying {}:{} (streaming={})", provider, model, streaming);
                 if streaming {
                     // Realtime retry: re-stream WAV samples.
