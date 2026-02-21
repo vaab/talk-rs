@@ -224,14 +224,34 @@ pub fn stop_if_owner(expected_pid: u32, pid_file: &Path) -> Result<bool, TalkErr
 pub fn signal_daemon(pid: u32, pid_file: &Path) -> Result<(), TalkError> {
     let nix_pid = Pid::from_raw(-(pid as i32));
 
+    // Helper: append a debug trace to daemon.log (the toggle process
+    // does not share the daemon's stderr, so log::warn is invisible).
+    let dbg = |msg: &str| {
+        if let Ok(lp) = log_path() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&lp) {
+                let _ = writeln!(f, "{}", msg);
+            }
+        }
+    };
+
     // Send SIGINT to the process group.
+    dbg(&format!("[DBG] signal_daemon: kill(-{}, SIGINT)", pid));
     if let Err(e) = kill(nix_pid, Signal::SIGINT) {
         if e == nix::errno::Errno::ESRCH {
             // Process group gone — try individual PID.
+            dbg(&format!(
+                "[DBG] signal_daemon: ESRCH on group, trying kill({}, SIGINT)",
+                pid
+            ));
             let individual = Pid::from_raw(pid as i32);
             if let Err(e2) = kill(individual, Signal::SIGINT) {
                 if e2 == nix::errno::Errno::ESRCH {
                     // Already dead — just clean up PID file.
+                    dbg(&format!(
+                        "[DBG] signal_daemon: PID {} already dead (ESRCH)",
+                        pid
+                    ));
                     remove_pid_file(pid_file)?;
                     return Ok(());
                 }
@@ -240,12 +260,18 @@ pub fn signal_daemon(pid: u32, pid_file: &Path) -> Result<(), TalkError> {
                     pid, e2
                 )));
             }
+            dbg(&format!(
+                "[DBG] signal_daemon: kill({}, SIGINT) OK (fallback)",
+                pid
+            ));
         } else {
             return Err(TalkError::Config(format!(
                 "failed to send SIGINT to process group {}: {}",
                 pid, e
             )));
         }
+    } else {
+        dbg(&format!("[DBG] signal_daemon: kill(-{}, SIGINT) OK", pid));
     }
 
     // Remove PID file immediately so the next toggle-on sees NotRunning.
