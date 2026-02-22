@@ -2372,7 +2372,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.diarize,
         )?;
 
-        dictate_streaming(
+        let stream_result = dictate_streaming(
             &mut *capture,
             from_file,
             encode_config.clone(),
@@ -2385,7 +2385,109 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             overlay.as_ref(),
             visualizer.as_ref(),
         )
-        .await?
+        .await;
+
+        // If the initial streaming transcription failed (timeout,
+        // API error, network issue), retry up to 5 times using the
+        // saved WAV file.  Each retry creates a fresh transcriber
+        // and applies the same 5-second timeout.
+        const MAX_RETRIES: u32 = 5;
+        const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        match stream_result {
+            Ok(r) => r,
+            Err(first_err) => {
+                log::warn!("initial transcription failed: {}", first_err);
+                let mut last_err = first_err;
+                let mut succeeded = None;
+
+                for attempt in 1..=MAX_RETRIES {
+                    let reason = last_err.to_string();
+                    let msg = format!(
+                        "Transcription failed: {}. Retrying ({}/{})...",
+                        reason, attempt, MAX_RETRIES,
+                    );
+                    log::warn!("{}", msg);
+                    if let Some(ref viz) = visualizer {
+                        viz.set_text(&msg);
+                    }
+
+                    let retry_transcriber = match transcription::create_batch_transcriber(
+                        &config,
+                        provider,
+                        opts.model.as_deref(),
+                        opts.diarize,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            last_err = e;
+                            continue;
+                        }
+                    };
+
+                    let wav = cache_wav_path.to_path_buf();
+                    let mut task =
+                        tokio::spawn(async move { retry_transcriber.transcribe_file(&wav).await });
+
+                    let outcome = tokio::select! {
+                        res = &mut task => {
+                            match res {
+                                Ok(Ok(r)) => Ok(r),
+                                Ok(Err(e)) => Err(e),
+                                Err(e) => Err(TalkError::Transcription(
+                                    format!("retry task panicked: {}", e),
+                                )),
+                            }
+                        }
+                        _ = tokio::time::sleep(RETRY_TIMEOUT) => {
+                            task.abort();
+                            Err(TalkError::Transcription(
+                                "transcription timed out after 5 s".to_string(),
+                            ))
+                        }
+                    };
+
+                    match outcome {
+                        Ok(r) => {
+                            log::info!("transcription succeeded on retry {}", attempt);
+                            if let Some(ref viz) = visualizer {
+                                viz.set_text("");
+                            }
+                            succeeded = Some(r);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = e;
+                        }
+                    }
+                }
+
+                match succeeded {
+                    Some(r) => r,
+                    None => {
+                        // All retries exhausted — show error, skip YAML/paste,
+                        // preserve WAV for the picker.
+                        let final_msg = format!(
+                            "Transcription failed after {} attempts: {}",
+                            MAX_RETRIES, last_err,
+                        );
+                        log::error!("{}", final_msg);
+                        if let Some(ref viz) = visualizer {
+                            viz.set_text(&format!("Error: {}", final_msg));
+                        }
+                        // Brief pause so the user can read the error.
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        if let Some(ref viz) = visualizer {
+                            viz.hide();
+                        }
+                        if let Some(ref o) = overlay {
+                            o.hide();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
     };
 
     // Stop boop loop (idempotent — may already be cancelled by
@@ -3307,30 +3409,34 @@ async fn dictate_streaming(
     });
 
     // Spawn transcription task
-    let transcribe_task =
+    let mut transcribe_task =
         tokio::spawn(async move { transcriber.transcribe_stream(stream_rx, "audio.ogg").await });
 
     // Wait for recording to end: SIGINT (via shared shutdown token)
     // for live mic, natural completion for file input, or SIGINT to
     // abort file early.  The shutdown token is registered early in
     // dictate() so there is no race window.
+    let rec_start = std::time::Instant::now();
     if from_file {
         log::info!("transcribing audio file (batch)...");
         tokio::select! {
             _ = shutdown.cancelled() => {
-                log::info!("aborting");
+                log::info!("aborting after {:.2}s", rec_start.elapsed().as_secs_f64());
                 capture.stop()?;
             }
             _ = encode_done_rx => {
-                log::info!("audio file playback complete");
+                log::info!("audio file playback complete after {:.2}s", rec_start.elapsed().as_secs_f64());
             }
         }
     } else {
-        log::warn!("[DBG] dictate_streaming: waiting on shutdown token");
+        log::info!("recording — waiting for shutdown signal");
         shutdown.cancelled().await;
-        log::warn!("[DBG] dictate_streaming: shutdown token fired, calling capture.stop()");
+        log::info!(
+            "shutdown signal received after {:.2}s recording — stopping capture",
+            rec_start.elapsed().as_secs_f64()
+        );
         capture.stop()?;
-        log::warn!("[DBG] dictate_streaming: capture.stop() returned");
+        log::info!("capture stopped");
 
         // Immediate audible + visual feedback: the user hears the
         // stop sound and sees the "transcribing" badge the instant
@@ -3349,33 +3455,72 @@ async fn dictate_streaming(
         }
     }
 
-    // Wait for cache WAV and encode tasks
-    match cache_wav_task.await {
-        Ok(Ok(())) => log::debug!("cache WAV task completed"),
-        Ok(Err(err)) => log::warn!("cache WAV write error: {}", err),
-        Err(err) => log::warn!("cache WAV task panicked: {}", err),
-    }
-    match encode_task.await {
-        Ok(Ok(())) => log::debug!("encode task completed"),
-        Ok(Err(err)) => log::error!("encode error: {}", err),
-        Err(err) => log::error!("encode task panicked: {}", err),
-    }
+    // Race the transcription result against a 5-second timeout FIRST.
+    //
+    // We must NOT await encode_task before this: when the API is hung
+    // the transcriber stops reading from stream_rx, so the bounded
+    // channel (capacity 25) fills up and stream_tx.send() inside
+    // encode_task blocks forever.  Awaiting encode_task would therefore
+    // deadlock.  Instead we race the transcription against the timeout,
+    // then clean up the pipeline afterwards.
+    const TRANSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let t0 = std::time::Instant::now();
+    log::info!(
+        "waiting for transcription (timeout: {:?})",
+        TRANSCRIPTION_TIMEOUT
+    );
 
-    // Wait for transcription result
-    let result = match transcribe_task.await {
-        Ok(Ok(result)) => result,
-        Ok(Err(err)) => {
-            return Err(err);
+    let result = tokio::select! {
+        res = &mut transcribe_task => {
+            log::info!("transcription completed after {:.2}s", t0.elapsed().as_secs_f64());
+            match res {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(TalkError::Transcription(format!(
+                    "transcription task panicked: {}", err
+                ))),
+            }
         }
-        Err(err) => {
-            return Err(TalkError::Transcription(format!(
-                "Transcription task panicked: {}",
-                err
-            )));
+        _ = tokio::time::sleep(TRANSCRIPTION_TIMEOUT) => {
+            log::warn!("transcription timed out after {:.2}s — aborting", t0.elapsed().as_secs_f64());
+            transcribe_task.abort();
+            Err(TalkError::Transcription(
+                "transcription timed out after 5 s".to_string(),
+            ))
         }
     };
 
-    Ok(result)
+    // Clean up the pipeline.  Aborting the transcribe_task (on timeout)
+    // drops stream_rx, which unblocks encode_task's stream_tx.send().
+    // Give encode_task a short grace period to finish, then abort it.
+    const CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    match tokio::time::timeout(CLEANUP_GRACE, encode_task).await {
+        Ok(Ok(Ok(()))) => log::debug!("encode task completed"),
+        Ok(Ok(Err(err))) => log::warn!("encode error: {}", err),
+        Ok(Err(err)) => log::warn!("encode task panicked: {}", err),
+        Err(_) => log::warn!(
+            "encode task did not finish within {:?} — abandoned",
+            CLEANUP_GRACE
+        ),
+    }
+
+    match tokio::time::timeout(CLEANUP_GRACE, cache_wav_task).await {
+        Ok(Ok(Ok(()))) => log::debug!("cache WAV task completed"),
+        Ok(Ok(Err(err))) => log::warn!("cache WAV write error: {}", err),
+        Ok(Err(err)) => log::warn!("cache WAV task panicked: {}", err),
+        Err(_) => log::warn!(
+            "cache WAV task did not finish within {:?} — abandoned",
+            CLEANUP_GRACE
+        ),
+    }
+
+    log::info!(
+        "dictate_streaming total elapsed: {:.2}s",
+        t0.elapsed().as_secs_f64()
+    );
+
+    result
 }
 
 #[cfg(test)]
