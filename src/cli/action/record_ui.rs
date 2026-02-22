@@ -987,8 +987,7 @@ fn show_recordings_window(
 
         // ── Inotify via gio::FileMonitor ──
         // Keep monitors alive for the lifetime of the window.
-        let monitors: Rc<RefCell<Vec<gtk4::gio::FileMonitor>>> =
-            Rc::new(RefCell::new(Vec::new()));
+        let monitors: Rc<RefCell<Vec<gtk4::gio::FileMonitor>>> = Rc::new(RefCell::new(Vec::new()));
 
         /// Shared context passed to [`watch_directory`] to avoid exceeding
         /// the clippy argument-count limit.
@@ -1061,7 +1060,13 @@ fn show_recordings_window(
                 active_play_btn: Rc::clone(&active_play_btn),
                 window: window.clone(),
             };
-            watch_directory(&wav_dir, "Dictation cache", &ctx, list_wav_recordings, &monitors);
+            watch_directory(
+                &wav_dir,
+                "Dictation cache",
+                &ctx,
+                list_wav_recordings,
+                &monitors,
+            );
         }
 
         // Watch OGG output directory
@@ -1073,7 +1078,13 @@ fn show_recordings_window(
                 active_play_btn: Rc::clone(&active_play_btn),
                 window: window.clone(),
             };
-            watch_directory(&config.output_dir, "Recordings", &ctx, list_ogg_recordings, &monitors);
+            watch_directory(
+                &config.output_dir,
+                "Recordings",
+                &ctx,
+                list_ogg_recordings,
+                &monitors,
+            );
         }
 
         // Prevent monitors from being dropped
