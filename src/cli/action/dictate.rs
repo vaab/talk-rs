@@ -2224,9 +2224,15 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     let shutdown_clone = shutdown.clone();
     let daemon_pid = std::process::id();
     tokio::spawn(async move {
-        log::warn!("[DBG] daemon {}: ctrl_c handler task polled, registering handler", daemon_pid);
+        log::warn!(
+            "[DBG] daemon {}: ctrl_c handler task polled, registering handler",
+            daemon_pid
+        );
         let _ = tokio::signal::ctrl_c().await;
-        log::warn!("[DBG] daemon {}: SIGINT received! cancelling shutdown token", daemon_pid);
+        log::warn!(
+            "[DBG] daemon {}: SIGINT received! cancelling shutdown token",
+            daemon_pid
+        );
         shutdown_clone.cancel();
     });
 
@@ -2374,35 +2380,39 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             &cache_wav_path,
             transcriber,
             &shutdown,
+            player.as_ref(),
+            boop_token.as_ref(),
+            overlay.as_ref(),
+            visualizer.as_ref(),
         )
         .await?
     };
 
     // Stop boop loop (idempotent — may already be cancelled by
-    // dictate_realtime for realtime mode).
+    // dictate_streaming or dictate_realtime).
     if let Some(token) = boop_token {
         log::debug!("stopping boop loop");
         token.cancel();
     }
 
-    // Hide recording indicator and visualizer
-    if let Some(ref o) = overlay {
-        log::debug!("hiding overlay");
-        o.hide();
-    }
-    if let Some(ref viz) = visualizer {
-        log::debug!("hiding visualizer");
-        viz.hide();
-    }
-
-    // For batch mode (default), play stop sound here (realtime mode
-    // already played it inside dictate_realtime on SIGINT).
-    if !opts.realtime {
+    // For realtime mode, play stop sound and hide visualizer here
+    // (batch mode already did this inside dictate_streaming on SIGINT).
+    if opts.realtime {
         if let Some(ref p) = player {
             log::debug!("playing stop sound");
             p.play_stop().await;
         }
+        if let Some(ref viz) = visualizer {
+            log::debug!("hiding visualizer");
+            viz.hide();
+        }
+        if let Some(ref o) = overlay {
+            log::debug!("hiding overlay");
+            o.hide();
+        }
     }
+    // Batch mode: overlay is still showing "Transcribing" badge —
+    // it will be hidden after paste (below).
 
     let text = crate::cli::action::transcribe::format_transcription_output(&result)
         .trim()
@@ -2456,8 +2466,17 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     }
 
     if text.is_empty() {
-        log::warn!("[DBG] daemon {}: empty transcription, exiting normally", std::process::id());
+        log::warn!(
+            "[DBG] daemon {}: empty transcription, exiting normally",
+            std::process::id()
+        );
         log::warn!("empty transcription — nothing to paste");
+        // Hide transcribing overlay (batch mode keeps it visible until now).
+        if !opts.realtime {
+            if let Some(ref o) = overlay {
+                o.hide();
+            }
+        }
         return Ok(());
     }
 
@@ -2466,6 +2485,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Paste into focused application (batch mode only;
     // realtime mode pastes per-segment during recording)
     if !opts.realtime {
+        // Hide transcribing overlay just before pasting.
+        if let Some(ref o) = overlay {
+            o.hide();
+        }
         paste_text_to_target(target_window.as_ref(), &text, 0).await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
     }
@@ -2773,7 +2796,11 @@ fn toggle_stop(pid: u32, pid_file: &std::path::Path) -> Result<(), TalkError> {
     if let Ok(log_path) = daemon::log_path() {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
-            let _ = writeln!(f, "[DBG] toggle_stop: signal_daemon returned OK for PID {}", pid);
+            let _ = writeln!(
+                f,
+                "[DBG] toggle_stop: signal_daemon returned OK for PID {}",
+                pid
+            );
         }
     }
     Ok(())
@@ -3189,6 +3216,7 @@ async fn audio_tee_to_wav(
 ///
 /// When `from_file` is true, the function waits for the audio source to
 /// exhaust naturally (in addition to allowing Ctrl+C for early abort).
+#[allow(clippy::too_many_arguments)]
 async fn dictate_streaming(
     capture: &mut dyn AudioCapture,
     from_file: bool,
@@ -3197,6 +3225,10 @@ async fn dictate_streaming(
     cache_wav_path: &std::path::Path,
     transcriber: Box<dyn BatchTranscriber>,
     shutdown: &CancellationToken,
+    player: Option<&SoundPlayer>,
+    boop_token: Option<&CancellationToken>,
+    overlay: Option<&OverlayHandle>,
+    visualizer: Option<&VisualizerHandle>,
 ) -> Result<TranscriptionResult, TalkError> {
     // Tee raw PCM to cache WAV before encoding
     log::info!("caching audio to: {}", cache_wav_path.display());
@@ -3299,6 +3331,22 @@ async fn dictate_streaming(
         log::warn!("[DBG] dictate_streaming: shutdown token fired, calling capture.stop()");
         capture.stop()?;
         log::warn!("[DBG] dictate_streaming: capture.stop() returned");
+
+        // Immediate audible + visual feedback: the user hears the
+        // stop sound and sees the "transcribing" badge the instant
+        // they toggle, not after the API call finishes.
+        if let Some(token) = boop_token {
+            token.cancel();
+        }
+        if let Some(p) = player {
+            p.play_stop().await;
+        }
+        if let Some(viz) = visualizer {
+            viz.hide();
+        }
+        if let Some(o) = overlay {
+            o.show(IndicatorKind::Transcribing);
+        }
     }
 
     // Wait for cache WAV and encode tasks
