@@ -134,7 +134,7 @@ providers:
 | ~providers.openai.model~           | ~whisper-1~               | OpenAI batch model                 |
 | ~providers.openai.realtime_model~  | ~gpt-4o-mini-transcribe~  | OpenAI realtime model              |
 | ~transcription.default_provider~   | ~mistral~                 | Default provider when unspecified  |
-| ~indicators.boop_interval_ms~      | ~5000~                    | Boop interval (~0~ to disable)     |
+| ~indicators.boop_interval_ms~      | ~5000~                    | Periodic boop interval in ms (~0~ disables boops; also ~--no-boop~) |
 | ~indicators.visual_overlay~        | ~true~                    | Show X11 overlay badge             |
 
 *** Environment overrides
@@ -190,6 +190,7 @@ Options:
 | ~--input-audio-file <FILE>~ | Feed a pre-recorded WAV instead of live mic     |
 | ~--monitor~                 | Mix system audio (monitor) with mic input       |
 | ~--no-sounds~               | Disable audio indicators                        |
+| ~--no-boop~                 | Disable periodic boop sounds (keep start/stop)  |
 | ~--no-overlay~              | Disable visual overlay                          |
 | ~--amplitude~               | Show amplitude history visualizer               |
 | ~--spectrum~                | Show spectrum visualizer                        |

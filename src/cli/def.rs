@@ -82,6 +82,9 @@ pub enum Commands {
         /// Disable sound indicators (start/stop/boop)
         #[arg(long)]
         no_sounds: bool,
+        /// Disable periodic boop sounds during recording
+        #[arg(long)]
+        no_boop: bool,
         /// Mix system audio (monitor) with microphone input
         #[arg(long)]
         monitor: bool,
