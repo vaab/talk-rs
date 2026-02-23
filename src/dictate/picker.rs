@@ -269,74 +269,11 @@ pub(super) async fn pick_with_streaming_gtk(
 
         gtk4::init().map_err(|e| TalkError::Config(format!("failed to initialize GTK: {}", e)))?;
 
-        // Resolve theme colours to concrete hex values so that the
-        // entire CSS is state-independent (no :backdrop surprises).
-        //
-        // GTK4 themes expose @theme_base_color but NOT libadwaita's
-        // @view_bg_color; we approximate the latter by darkening
-        // (dark themes, ×0.77) or barely tinting (light themes,
-        // ×0.98) the base colour.  The selection highlight reuses
-        // @theme_selected_bg_color at 32 % opacity — the same
-        // treatment libadwaita applies in Nautilus/Files.
-        #[allow(deprecated)]
-        let probe = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        #[allow(deprecated)]
-        let ctx = probe.style_context();
-
-        let rgba_to_hex = |c: &gtk4::gdk::RGBA| -> String {
-            format!(
-                "#{:02x}{:02x}{:02x}",
-                (c.red() * 255.0).round() as u8,
-                (c.green() * 255.0).round() as u8,
-                (c.blue() * 255.0).round() as u8,
-            )
-        };
-
-        #[allow(deprecated)]
-        let view_bg_hex = if let Some(base) = ctx.lookup_color("theme_base_color") {
-            let luma = 0.299 * base.red() + 0.587 * base.green() + 0.114 * base.blue();
-            let factor: f32 = if luma < 0.5 { 0.77 } else { 0.98 };
-            let to_u8 =
-                |v: f32| -> u8 { ((v * factor * 255.0).round() as i32).clamp(0, 255) as u8 };
-            format!(
-                "#{:02x}{:02x}{:02x}",
-                to_u8(base.red()),
-                to_u8(base.green()),
-                to_u8(base.blue()),
-            )
-        } else {
-            "@theme_base_color".to_string()
-        };
-
-        #[allow(deprecated)]
-        let error_hex = ctx
-            .lookup_color("error_color")
-            .map(|c| rgba_to_hex(&c))
-            .unwrap_or_else(|| "@error_color".to_string());
-
-        // Selection: accent at 32 % opacity (matches libadwaita).
-        #[allow(deprecated)]
-        let sel_hex = ctx
-            .lookup_color("theme_selected_bg_color")
-            .map(|c| {
-                format!(
-                    "rgba({},{},{},0.32)",
-                    (c.red() * 255.0).round() as u8,
-                    (c.green() * 255.0).round() as u8,
-                    (c.blue() * 255.0).round() as u8,
-                )
-            })
-            .unwrap_or_else(|| "alpha(@theme_selected_bg_color, 0.32)".to_string());
-
-        // Foreground: pin to theme_fg_color so selected rows stay
-        // readable.  Without this, some themes switch selected text
-        // to white, which is invisible on our translucent selection
-        // background on light themes.
-        #[allow(deprecated)]
-        let fg_hex = ctx
-            .lookup_color("theme_fg_color")
-            .map(|c| rgba_to_hex(&c))
-            .unwrap_or_else(|| "@theme_fg_color".to_string());
+        let theme = crate::gtk_theme::ThemeColors::resolve();
+        let view_bg_hex = &theme.view_bg;
+        let error_hex = &theme.error;
+        let sel_hex = &theme.selection;
+        let fg_hex = &theme.foreground;
 
         let window = gtk4::Window::builder()
             .title(PICKER_TITLE)
