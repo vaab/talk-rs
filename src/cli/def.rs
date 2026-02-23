@@ -85,6 +85,9 @@ pub enum Commands {
         /// Disable periodic boop sounds during recording
         #[arg(long)]
         no_boop: bool,
+        /// Disable chunked pasting (paste all text in one shot)
+        #[arg(long)]
+        no_chunk_paste: bool,
         /// Mix system audio (monitor) with microphone input
         #[arg(long)]
         monitor: bool,
