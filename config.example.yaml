@@ -5,8 +5,9 @@
 # 
 # For more information, see: https://github.com/talk-rs/talk-rs
 
-# Required: Output directory for recordings, screenshots, and clipboard saves
-# Must be an absolute path that exists and is writable
+# Required: Output directory for recordings, screenshots, and clipboard saves.
+# The `record` command saves recordings here by default (memo-YYYY-MM-DD-HH-MM-SS.ogg).
+# Must be an absolute path that exists and is writable.
 output_dir: <PLACEHOLDER>
 
 # Required: Transcription Providers Configuration
