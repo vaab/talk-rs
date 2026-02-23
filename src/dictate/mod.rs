@@ -30,8 +30,9 @@ use crate::core::visualizer::VisualizerHandle;
 use crate::paste::{
     focus_window, get_active_window, paste_text_to_target, simulate_paste, PASTE_CHUNK_CHARS,
 };
+use crate::x11::x11_centre_and_raise;
 use models::{build_retry_candidates, resolve_model, resolve_provider};
-use picker::{pick_with_streaming_gtk, x11_centre_and_raise, PICKER_TITLE};
+use picker::{pick_with_streaming_gtk, PICKER_TITLE};
 use std::path::PathBuf;
 use text::flush_sentences;
 use toggle::toggle_dispatch;

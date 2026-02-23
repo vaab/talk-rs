@@ -1135,7 +1135,7 @@ fn show_recordings_window(
             if let Some(xid) = xid {
                 #[allow(clippy::cast_possible_truncation)]
                 let xid32 = xid as u32;
-                x11_centre_and_raise_xid(xid32);
+                crate::x11::x11_centre_and_raise_xid(xid32);
             }
             window_reveal.set_opacity(1.0);
         });
@@ -1146,135 +1146,6 @@ fn show_recordings_window(
     window.close();
 
     Ok(())
-}
-
-/// Centre an X11 window on the monitor containing the mouse pointer,
-/// set it always-on-top, and activate it.
-fn x11_centre_and_raise_xid(wid: u32) -> bool {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::randr::ConnectionExt as _;
-    use x11rb::protocol::xproto::*;
-
-    let (conn, screen_num) = match x11rb::connect(None) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let screen = &conn.setup().roots[screen_num];
-    let root = screen.root;
-
-    let atom_names: &[&[u8]] = &[
-        b"_NET_WM_STATE",
-        b"_NET_WM_STATE_ABOVE",
-        b"_NET_ACTIVE_WINDOW",
-    ];
-    let cookies: Vec<_> = atom_names
-        .iter()
-        .map(|n| conn.intern_atom(false, n))
-        .collect::<Vec<_>>();
-    let mut atoms = Vec::new();
-    for cookie in cookies {
-        let cookie = match cookie {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        let atom = match cookie.reply() {
-            Ok(r) => r.atom,
-            Err(_) => return false,
-        };
-        atoms.push(atom);
-    }
-    let a_wm_state = atoms[0];
-    let a_above = atoms[1];
-    let a_active = atoms[2];
-
-    let pointer = match conn.query_pointer(root) {
-        Ok(cookie) => match cookie.reply() {
-            Ok(p) => p,
-            Err(_) => return false,
-        },
-        Err(_) => return false,
-    };
-    let px = pointer.root_x as i32;
-    let py = pointer.root_y as i32;
-
-    let (mon_x, mon_y, mon_w, mon_h) = {
-        let default = (0i32, 0i32, 1920i32, 1080i32);
-        let resources = match conn.randr_get_screen_resources(root) {
-            Ok(cookie) => match cookie.reply() {
-                Ok(r) => r,
-                Err(_) => return false,
-            },
-            Err(_) => return false,
-        };
-
-        let mut found = default;
-        let mut any_monitor = false;
-        for &crtc in &resources.crtcs {
-            let info = match conn.randr_get_crtc_info(crtc, 0) {
-                Ok(cookie) => match cookie.reply() {
-                    Ok(i) => i,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
-            };
-            if info.width == 0 || info.height == 0 {
-                continue;
-            }
-            let cx = info.x as i32;
-            let cy = info.y as i32;
-            let cw = info.width as i32;
-            let ch = info.height as i32;
-
-            if !any_monitor {
-                found = (cx, cy, cw, ch);
-                any_monitor = true;
-            }
-
-            if px >= cx && px < cx + cw && py >= cy && py < cy + ch {
-                found = (cx, cy, cw, ch);
-                break;
-            }
-        }
-        found
-    };
-
-    let geom = match conn.get_geometry(wid) {
-        Ok(cookie) => match cookie.reply() {
-            Ok(g) => g,
-            Err(_) => return false,
-        },
-        Err(_) => return false,
-    };
-
-    let win_w = geom.width as i32;
-    let win_h = geom.height as i32;
-    if win_w == 0 || win_h == 0 {
-        return false;
-    }
-
-    let x = mon_x + (mon_w - win_w) / 2;
-    let y = mon_y + (mon_h - win_h) / 2;
-
-    let _ = conn.configure_window(wid, &ConfigureWindowAux::new().x(x).y(y));
-
-    let above_event = ClientMessageEvent::new(32, wid, a_wm_state, [1u32, a_above, 0, 0, 0]);
-    let _ = conn.send_event(
-        false,
-        root,
-        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-        above_event,
-    );
-
-    let activate_event = ClientMessageEvent::new(32, wid, a_active, [1u32, 0, 0, 0, 0]);
-    let _ = conn.send_event(
-        false,
-        root,
-        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-        activate_event,
-    );
-
-    let _ = conn.flush();
-    true
 }
 
 #[cfg(test)]
