@@ -44,6 +44,21 @@ pub fn log_path() -> Result<PathBuf, TalkError> {
     Ok(cache_dir()?.join("daemon.log"))
 }
 
+/// Append a debug trace line to the daemon log.
+///
+/// Best-effort: silently does nothing if the log path cannot be
+/// resolved or the file cannot be opened.  Useful for writing
+/// diagnostic messages from the toggle process whose stderr is
+/// invisible when invoked via a keybinding.
+pub fn trace(msg: &str) {
+    if let Ok(path) = log_path() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&path) {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+
 /// Get the lock file path (`$XDG_CACHE_HOME/talk-rs/daemon.lock`).
 fn lock_path() -> Result<PathBuf, TalkError> {
     Ok(cache_dir()?.join("daemon.lock"))

@@ -1,0 +1,1353 @@
+//! Picker UI for selecting among multiple transcription candidates.
+//!
+//! Extracted from `dictate.rs` — contains the GTK4 picker window,
+//! X11 window centering/raising helpers, and WAV PCM reading used
+//! by the picker's realtime transcription support.
+
+use crate::core::config::{Config, Provider};
+use crate::core::error::TalkError;
+use crate::core::picker_cache;
+use crate::core::transcription::{self, BatchTranscriber, RealtimeTranscriber, TranscriptionEvent};
+use std::path::PathBuf;
+
+/// Window title used for the picker — also used for single-instance
+/// detection via `x11_centre_and_raise`.
+pub(super) const PICKER_TITLE: &str = "talk-rs: select transcription";
+
+/// Candidate transcription result sent from async tasks to the GTK
+/// thread via a `std::sync::mpsc` channel.
+struct PickerCandidate {
+    provider: Provider,
+    model: String,
+    text: String,
+    /// When set, the candidate failed and this is the error message.
+    error: Option<String>,
+    /// Whether this candidate came from a realtime (streaming) transcriber.
+    streaming: bool,
+}
+
+impl PickerCandidate {
+    /// Build a successful transcription candidate.
+    fn success(provider: Provider, model: String, text: String, streaming: bool) -> Self {
+        Self {
+            provider,
+            model,
+            text,
+            error: None,
+            streaming,
+        }
+    }
+
+    /// Build a failed transcription candidate.
+    fn error(provider: Provider, model: String, message: String, streaming: bool) -> Self {
+        Self {
+            provider,
+            model,
+            text: String::new(),
+            error: Some(message),
+            streaming,
+        }
+    }
+}
+
+/// Messages sent from async tasks to the GTK poll loop.
+enum PickerMessage {
+    /// A transcription result (success or error).
+    Candidate(PickerCandidate),
+    /// All initial batch transcription tasks have completed.
+    /// The poll loop should mark any remaining batch spinners as
+    /// failed but keep running to receive retry results.
+    InitialBatchDone,
+    /// Incremental text update from a realtime transcriber.
+    /// Contains the full accumulated text so GTK just replaces the label.
+    StreamUpdate {
+        provider: Provider,
+        model: String,
+        accumulated_text: String,
+    },
+}
+
+/// Centre a known X11 window on the monitor containing the mouse
+/// pointer, set it always-on-top, and activate it.
+///
+/// This is the core positioning helper — callers supply the XID
+/// directly (from GDK or from a title search).
+fn x11_centre_and_raise_xid(wid: u32) -> bool {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::randr::ConnectionExt as _;
+    use x11rb::protocol::xproto::*;
+
+    let (conn, screen_num) = match x11rb::connect(None) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+
+    // ── Intern atoms ────────────────────────────────────────────
+    let atom_names: &[&[u8]] = &[
+        b"_NET_WM_STATE",
+        b"_NET_WM_STATE_ABOVE",
+        b"_NET_ACTIVE_WINDOW",
+    ];
+    let cookies: Vec<_> = atom_names
+        .iter()
+        .map(|n| conn.intern_atom(false, n))
+        .collect::<Vec<_>>();
+    let mut atoms = Vec::new();
+    for cookie in cookies {
+        let cookie = match cookie {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let atom = match cookie.reply() {
+            Ok(r) => r.atom,
+            Err(_) => return false,
+        };
+        atoms.push(atom);
+    }
+    let a_wm_state = atoms[0];
+    let a_above = atoms[1];
+    let a_active = atoms[2];
+
+    // ── Query pointer position ──────────────────────────────────
+    let pointer = match conn.query_pointer(root) {
+        Ok(cookie) => match cookie.reply() {
+            Ok(p) => p,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    let px = pointer.root_x as i32;
+    let py = pointer.root_y as i32;
+
+    // ── Find monitor at pointer via RandR ───────────────────────
+    let (mon_x, mon_y, mon_w, mon_h) = {
+        let default = (0i32, 0i32, 1920i32, 1080i32);
+        let resources = match conn.randr_get_screen_resources(root) {
+            Ok(cookie) => match cookie.reply() {
+                Ok(r) => r,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        };
+
+        let mut found = default;
+        let mut any_monitor = false;
+        for &crtc in &resources.crtcs {
+            let info = match conn.randr_get_crtc_info(crtc, 0) {
+                Ok(cookie) => match cookie.reply() {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            if info.width == 0 || info.height == 0 {
+                continue;
+            }
+            let cx = info.x as i32;
+            let cy = info.y as i32;
+            let cw = info.width as i32;
+            let ch = info.height as i32;
+
+            if !any_monitor {
+                found = (cx, cy, cw, ch);
+                any_monitor = true;
+            }
+
+            if px >= cx && px < cx + cw && py >= cy && py < cy + ch {
+                found = (cx, cy, cw, ch);
+                break;
+            }
+        }
+        found
+    };
+
+    // ── Get physical window geometry ────────────────────────────
+    let geom = match conn.get_geometry(wid) {
+        Ok(cookie) => match cookie.reply() {
+            Ok(g) => g,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+
+    let win_w = geom.width as i32;
+    let win_h = geom.height as i32;
+    if win_w == 0 || win_h == 0 {
+        return false;
+    }
+
+    // ── Centre window on monitor ────────────────────────────────
+    let x = mon_x + (mon_w - win_w) / 2;
+    let y = mon_y + (mon_h - win_h) / 2;
+
+    let _ = conn.configure_window(wid, &ConfigureWindowAux::new().x(x).y(y));
+
+    // ── Set always-on-top (_NET_WM_STATE_ADD ABOVE) ─────────────
+    let above_event = ClientMessageEvent::new(32, wid, a_wm_state, [1u32, a_above, 0, 0, 0]);
+    let _ = conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        above_event,
+    );
+
+    // ── Activate window (_NET_ACTIVE_WINDOW) ────────────────────
+    let activate_event = ClientMessageEvent::new(32, wid, a_active, [1u32, 0, 0, 0, 0]);
+    let _ = conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        activate_event,
+    );
+
+    let _ = conn.flush();
+    true
+}
+
+/// Find the X11 window whose `_NET_WM_NAME` matches `title`, centre
+/// it on the monitor containing the mouse pointer, set it
+/// always-on-top, and activate it.
+///
+/// Used for single-instance detection (raising an already-open
+/// picker).  For newly created windows, prefer
+/// [`x11_centre_and_raise_xid`] with the XID obtained from
+/// [`gdk4_x11`] — it avoids the `_NET_CLIENT_LIST` race entirely.
+pub(super) fn x11_centre_and_raise(title: &str) -> bool {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::*;
+
+    let (conn, screen_num) = match x11rb::connect(None) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+
+    // ── Intern atoms for title search ───────────────────────────
+    let atom_names: &[&[u8]] = &[b"_NET_CLIENT_LIST", b"_NET_WM_NAME", b"UTF8_STRING"];
+    let cookies: Vec<_> = atom_names
+        .iter()
+        .map(|n| conn.intern_atom(false, n))
+        .collect::<Vec<_>>();
+    let mut atoms = Vec::new();
+    for cookie in cookies {
+        let cookie = match cookie {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let atom = match cookie.reply() {
+            Ok(r) => r.atom,
+            Err(_) => return false,
+        };
+        atoms.push(atom);
+    }
+    let a_client_list = atoms[0];
+    let a_wm_name = atoms[1];
+    let a_utf8 = atoms[2];
+
+    // ── Find window by _NET_WM_NAME ─────────────────────────────
+    let client_list = match conn.get_property(false, root, a_client_list, AtomEnum::WINDOW, 0, 1024)
+    {
+        Ok(cookie) => match cookie.reply() {
+            Ok(prop) => prop,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+
+    let wid_vec: Vec<u32> = match client_list.value32() {
+        Some(iter) => iter.collect(),
+        None => return false,
+    };
+
+    for &wid in &wid_vec {
+        // Try _NET_WM_NAME (UTF-8) first.
+        if let Ok(cookie) = conn.get_property(false, wid, a_wm_name, a_utf8, 0, 256) {
+            if let Ok(prop) = cookie.reply() {
+                if String::from_utf8_lossy(&prop.value) == title {
+                    return x11_centre_and_raise_xid(wid);
+                }
+            }
+        }
+        // Fallback: WM_NAME (Latin-1).
+        if let Ok(cookie) =
+            conn.get_property(false, wid, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
+        {
+            if let Ok(prop) = cookie.reply() {
+                if String::from_utf8_lossy(&prop.value) == title {
+                    return x11_centre_and_raise_xid(wid);
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Result of the picker: selected provider/model/text and whether it
+/// was the pre-populated cached entry (in which case the caller should
+/// skip pasting since the text is already in the target window).
+pub(super) struct PickerSelection {
+    pub(super) provider: Provider,
+    pub(super) model: String,
+    pub(super) text: String,
+    pub(super) is_cached: bool,
+    pub(super) streaming: bool,
+}
+
+/// PCM chunk size for realtime WAV feeding (480 samples = 30 ms at
+/// 16 kHz).
+const REALTIME_FEED_CHUNK: usize = 480;
+
+/// Run a realtime transcription session: connect the transcriber,
+/// feed PCM samples from `samples`, and forward transcription events
+/// to the GTK channel via `tx`.
+///
+/// On success the final text is sent as a [`PickerMessage::Candidate`];
+/// on error an error candidate is sent instead.  Intermediate text
+/// updates are forwarded as [`PickerMessage::StreamUpdate`].
+async fn run_realtime_transcription(
+    transcriber: Box<dyn RealtimeTranscriber>,
+    samples: std::sync::Arc<Vec<i16>>,
+    tx: std::sync::mpsc::Sender<PickerMessage>,
+    provider: Provider,
+    model: String,
+) {
+    // Connect to the realtime WebSocket.
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
+    let event_rx = match transcriber.transcribe_realtime(audio_rx).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            log::warn!("realtime {}:{} connect failed: {}", provider, model, e);
+            let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
+                provider,
+                model,
+                format!("{e}"),
+                true,
+            )));
+            return;
+        }
+    };
+
+    // Spawn feeder: send PCM chunks paced at 10 ms intervals.
+    let feeder_samples = samples.clone();
+    tokio::spawn(async move {
+        let data = &*feeder_samples;
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = (offset + REALTIME_FEED_CHUNK).min(data.len());
+            let chunk = data[offset..end].to_vec();
+            if audio_tx.send(chunk).await.is_err() {
+                break;
+            }
+            offset = end;
+            // Pace the feed to avoid overwhelming the WebSocket.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Drop audio_tx to signal end-of-audio.
+    });
+
+    // Listen for events and forward to GTK.
+    let mut event_rx = event_rx;
+    let mut accumulated = String::new();
+    loop {
+        match event_rx.recv().await {
+            Some(TranscriptionEvent::TextDelta { text }) => {
+                accumulated.push_str(&text);
+                let _ = tx.send(PickerMessage::StreamUpdate {
+                    provider,
+                    model: model.clone(),
+                    accumulated_text: accumulated.clone(),
+                });
+            }
+            Some(TranscriptionEvent::SegmentDelta { text, .. }) => {
+                if !text.is_empty() {
+                    if !accumulated.is_empty() {
+                        accumulated.push(' ');
+                    }
+                    accumulated.push_str(text.trim());
+                    let _ = tx.send(PickerMessage::StreamUpdate {
+                        provider,
+                        model: model.clone(),
+                        accumulated_text: accumulated.clone(),
+                    });
+                }
+            }
+            Some(TranscriptionEvent::Done) => {
+                let final_text = accumulated.trim().to_string();
+                let _ = tx.send(PickerMessage::Candidate(PickerCandidate::success(
+                    provider, model, final_text, true,
+                )));
+                return;
+            }
+            Some(TranscriptionEvent::Error { message }) => {
+                let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
+                    provider, model, message, true,
+                )));
+                return;
+            }
+            None => {
+                // Channel closed without Done — use what we have.
+                let final_text = accumulated.trim().to_string();
+                let _ = tx.send(PickerMessage::Candidate(PickerCandidate::success(
+                    provider, model, final_text, true,
+                )));
+                return;
+            }
+            _ => {
+                // Ignore SessionCreated, Language, etc.
+            }
+        }
+    }
+}
+
+/// Show a GTK4 picker window that appears immediately with a spinner,
+/// then progressively fills with transcription candidates as parallel
+/// API calls complete.
+///
+/// The window is undecorated, centered on the active monitor, and
+/// always-on-top.  Layout is a 3-column table: transcript (monospace,
+/// wrapping) | provider | model.
+///
+/// `cached_entries` contains pre-populated results that are shown
+/// immediately (no spinner, no API call).  Each tuple is
+/// `(provider, model, text, is_primary)` where `is_primary` marks the
+/// entry that was already pasted in a previous run (selecting it again
+/// skips re-pasting).
+///
+/// Returns `Some(PickerSelection)` for the selected candidate, or
+/// `None` if the user cancelled.
+pub(super) async fn pick_with_streaming_gtk(
+    mut transcribers: Vec<(Provider, String, Box<dyn BatchTranscriber>)>,
+    audio_path: PathBuf,
+    mut cached_entries: Vec<(Provider, String, String, bool, bool)>,
+    config: Config,
+    mut realtime_transcribers: Vec<(Provider, String, Box<dyn RealtimeTranscriber>)>,
+) -> Result<Option<PickerSelection>, TalkError> {
+    if transcribers.is_empty() && cached_entries.is_empty() && realtime_transcribers.is_empty() {
+        return Ok(None);
+    }
+
+    // Stable display order: sort by (provider, model, streaming) so
+    // the list looks identical every time the picker opens.
+    cached_entries.sort_by(|(pa, ma, _, _, sa), (pb, mb, _, _, sb)| {
+        pa.to_string()
+            .cmp(&pb.to_string())
+            .then(ma.cmp(mb))
+            .then(sa.cmp(sb))
+    });
+    transcribers
+        .sort_by(|(pa, ma, _), (pb, mb, _)| pa.to_string().cmp(&pb.to_string()).then(ma.cmp(mb)));
+    realtime_transcribers
+        .sort_by(|(pa, ma, _), (pb, mb, _)| pa.to_string().cmp(&pb.to_string()).then(ma.cmp(mb)));
+
+    // Extract (provider, model) labels before transcribers are consumed
+    // so the GTK thread can pre-create rows with spinners.
+    let pending_info: Vec<(Provider, String)> = transcribers
+        .iter()
+        .map(|(p, m, _)| (*p, m.clone()))
+        .collect();
+    let realtime_pending_info: Vec<(Provider, String)> = realtime_transcribers
+        .iter()
+        .map(|(p, m, _)| (*p, m.clone()))
+        .collect();
+
+    // Channels: transcription tasks → GTK, GTK → caller.
+    let (msg_tx, msg_rx) = std::sync::mpsc::channel::<PickerMessage>();
+    let (sel_tx, sel_rx) = tokio::sync::oneshot::channel::<Option<usize>>();
+
+    // Retry channel: GTK thread → async retry listener.
+    // The bool indicates whether this is a streaming (realtime) retry.
+    // Uses tokio unbounded channel so the receiver can `.await` — a
+    // std::sync::mpsc would block the tokio worker thread and prevent
+    // the runtime from shutting down when the picker closes.
+    let (retry_tx, mut retry_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(Provider, String, bool)>();
+
+    // Shared storage written by the GTK thread after selection,
+    // read by the caller after the GTK thread finishes.
+    // Tuple: (provider, model, text, is_primary, is_error, streaming)
+    let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
+        Provider,
+        String,
+        String,
+        bool,
+        bool,
+        bool,
+    )>::new()));
+    let results_for_gtk = results.clone();
+
+    // ── GTK window ──────────────────────────────────────────────
+    let gtk_handle = tokio::task::spawn_blocking(move || -> Result<(), TalkError> {
+        use gtk4::glib;
+        use gtk4::prelude::*;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        gtk4::init().map_err(|e| TalkError::Config(format!("failed to initialize GTK: {}", e)))?;
+
+        // Resolve theme colours to concrete hex values so that the
+        // entire CSS is state-independent (no :backdrop surprises).
+        //
+        // GTK4 themes expose @theme_base_color but NOT libadwaita's
+        // @view_bg_color; we approximate the latter by darkening
+        // (dark themes, ×0.77) or barely tinting (light themes,
+        // ×0.98) the base colour.  The selection highlight reuses
+        // @theme_selected_bg_color at 32 % opacity — the same
+        // treatment libadwaita applies in Nautilus/Files.
+        #[allow(deprecated)]
+        let probe = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        #[allow(deprecated)]
+        let ctx = probe.style_context();
+
+        let rgba_to_hex = |c: &gtk4::gdk::RGBA| -> String {
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                (c.red() * 255.0).round() as u8,
+                (c.green() * 255.0).round() as u8,
+                (c.blue() * 255.0).round() as u8,
+            )
+        };
+
+        #[allow(deprecated)]
+        let view_bg_hex = if let Some(base) = ctx.lookup_color("theme_base_color") {
+            let luma = 0.299 * base.red() + 0.587 * base.green() + 0.114 * base.blue();
+            let factor: f32 = if luma < 0.5 { 0.77 } else { 0.98 };
+            let to_u8 =
+                |v: f32| -> u8 { ((v * factor * 255.0).round() as i32).clamp(0, 255) as u8 };
+            format!(
+                "#{:02x}{:02x}{:02x}",
+                to_u8(base.red()),
+                to_u8(base.green()),
+                to_u8(base.blue()),
+            )
+        } else {
+            "@theme_base_color".to_string()
+        };
+
+        #[allow(deprecated)]
+        let error_hex = ctx
+            .lookup_color("error_color")
+            .map(|c| rgba_to_hex(&c))
+            .unwrap_or_else(|| "@error_color".to_string());
+
+        // Selection: accent at 32 % opacity (matches libadwaita).
+        #[allow(deprecated)]
+        let sel_hex = ctx
+            .lookup_color("theme_selected_bg_color")
+            .map(|c| {
+                format!(
+                    "rgba({},{},{},0.32)",
+                    (c.red() * 255.0).round() as u8,
+                    (c.green() * 255.0).round() as u8,
+                    (c.blue() * 255.0).round() as u8,
+                )
+            })
+            .unwrap_or_else(|| "alpha(@theme_selected_bg_color, 0.32)".to_string());
+
+        // Foreground: pin to theme_fg_color so selected rows stay
+        // readable.  Without this, some themes switch selected text
+        // to white, which is invisible on our translucent selection
+        // background on light themes.
+        #[allow(deprecated)]
+        let fg_hex = ctx
+            .lookup_color("theme_fg_color")
+            .map(|c| rgba_to_hex(&c))
+            .unwrap_or_else(|| "@theme_fg_color".to_string());
+
+        let window = gtk4::Window::builder()
+            .title(PICKER_TITLE)
+            .default_width(900)
+            .default_height(500)
+            .decorated(false)
+            .build();
+
+        // CSS notes:
+        //   - GtkListBox CSS node is "list", not "listbox"
+        //   - Every stateful rule is duplicated with :backdrop
+        //     to prevent the theme from lightening on focus loss
+        //   - row:selected uses a translucent accent instead of
+        //     the theme's solid #E95420
+        let css = gtk4::CssProvider::new();
+        css.load_from_data(&format!(
+            "* {{ font-size: 13px; }} \
+             window, window:backdrop {{ border: 1px solid alpha(white, 0.15); border-radius: 12px; background-color: {bg}; }} \
+             scrolledwindow, viewport, list, \
+             scrolledwindow:backdrop, viewport:backdrop, list:backdrop {{ background-color: transparent; background-image: none; border-radius: 10px; }} \
+             row:not(:selected), row:not(:selected):backdrop {{ background-color: transparent; background-image: none; }} \
+             row:selected, row:selected:backdrop {{ background-color: {sel}; color: {fg}; }} \
+             .transcript {{ font-family: monospace; }} \
+             .dim {{ opacity: 0.55; }} \
+             .error {{ font-style: italic; color: alpha({err}, 0.8); }} \
+             .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }} \
+             row {{ border-radius: 8px; }}",
+            bg = view_bg_hex,
+            fg = fg_hex,
+            err = error_hex,
+            sel = sel_hex,
+        ));
+        if let Some(display) = gtk4::gdk::Display::default() {
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &css,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        root.set_margin_top(6);
+        root.set_margin_bottom(6);
+        root.set_margin_start(6);
+        root.set_margin_end(6);
+
+        let scrolled = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+        let list = gtk4::ListBox::new();
+        list.set_selection_mode(gtk4::SelectionMode::Single);
+        list.set_activate_on_single_click(false);
+        scrolled.set_child(Some(&list));
+        root.append(&scrolled);
+
+        // WindowHandle enables dragging the window from any non-
+        // interactive area (help label, table background, margins).
+        let handle = gtk4::WindowHandle::new();
+        handle.set_child(Some(&root));
+        window.set_child(Some(&handle));
+
+        let main_loop = glib::MainLoop::new(None, false);
+        let sel_sender: Rc<RefCell<Option<tokio::sync::oneshot::Sender<Option<usize>>>>> =
+            Rc::new(RefCell::new(Some(sel_tx)));
+        type CandidateList = Vec<(Provider, String, String, bool, bool, bool)>;
+        let local_candidates: Rc<RefCell<CandidateList>> = Rc::new(RefCell::new(Vec::new()));
+        // Transcript cells — used to swap spinner → label when results arrive.
+        let transcript_cells: Rc<RefCell<Vec<gtk4::Box>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Helper: build a row skeleton with provider + streaming + model labels.
+        // Returns (hbox, transcript_cell) — caller fills the cell
+        // with either a spinner or a transcript label.
+        fn make_row_skeleton(
+            provider: &str,
+            model: &str,
+            streaming: bool,
+        ) -> (gtk4::Box, gtk4::Box) {
+            use gtk4::prelude::*;
+
+            let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+            hbox.set_margin_top(4);
+            hbox.set_margin_bottom(4);
+            hbox.set_margin_start(4);
+            hbox.set_margin_end(4);
+
+            // Transcript cell (container swapped between spinner / label)
+            let cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            cell.set_hexpand(true);
+            hbox.append(&cell);
+
+            // Provider (fixed width for column alignment)
+            let prov_label = gtk4::Label::new(Some(provider));
+            prov_label.set_xalign(0.0);
+            prov_label.set_width_chars(8);
+            prov_label.set_max_width_chars(8);
+            prov_label.set_selectable(false);
+            prov_label.add_css_class("dim");
+            hbox.append(&prov_label);
+
+            // Streaming indicator (between provider and model)
+            let stream_label = gtk4::Label::new(Some(if streaming { "\u{26a1}" } else { "" }));
+            stream_label.set_xalign(0.5);
+            stream_label.set_width_chars(3);
+            stream_label.set_max_width_chars(3);
+            stream_label.set_selectable(false);
+            stream_label.add_css_class("dim");
+            hbox.append(&stream_label);
+
+            // Model (fixed width for column alignment)
+            let model_label = gtk4::Label::new(Some(model));
+            model_label.set_xalign(0.0);
+            model_label.set_width_chars(24);
+            model_label.set_max_width_chars(24);
+            model_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            model_label.set_selectable(false);
+            model_label.add_css_class("dim");
+            hbox.append(&model_label);
+
+            (hbox, cell)
+        }
+
+        // Helper: create a monospace transcript label.
+        fn make_transcript_label(text: &str) -> gtk4::Label {
+            use gtk4::prelude::*;
+
+            let label = gtk4::Label::new(Some(text));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_wrap(true);
+            label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            label.set_selectable(false);
+            label.add_css_class("transcript");
+            label
+        }
+
+        // ── Pre-create all rows ─────────────────────────────────
+
+        // Cached entries: rows with transcript already filled.
+        // The `is_primary` flag marks the entry that was already
+        // pasted in a previous run — it gets pre-selected.
+        let mut selected_row = false;
+        for (i, (provider, model, text, is_primary, streaming)) in cached_entries.iter().enumerate()
+        {
+            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, *streaming);
+            cell.append(&make_transcript_label(text));
+
+            let row = gtk4::ListBoxRow::new();
+            row.set_child(Some(&hbox));
+            list.append(&row);
+
+            // Select the primary entry, or the very first one.
+            if *is_primary || (i == 0 && !selected_row) {
+                list.select_row(Some(&row));
+                selected_row = true;
+            }
+
+            local_candidates.borrow_mut().push((
+                *provider,
+                model.clone(),
+                text.clone(),
+                *is_primary,
+                false,
+                *streaming,
+            ));
+            transcript_cells.borrow_mut().push(cell);
+        }
+
+        // Pending batch entries: row with spinner in transcript cell.
+        for (provider, model) in &pending_info {
+            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, false);
+            let spinner = gtk4::Spinner::new();
+            spinner.start();
+            cell.append(&spinner);
+
+            let row = gtk4::ListBoxRow::new();
+            row.set_child(Some(&hbox));
+            list.append(&row);
+
+            local_candidates.borrow_mut().push((
+                *provider,
+                model.clone(),
+                String::new(),
+                false,
+                false,
+                false,
+            ));
+            transcript_cells.borrow_mut().push(cell);
+        }
+
+        // Pending realtime entries: row with empty transcript label
+        // (text fills incrementally, no spinner).
+        for (provider, model) in &realtime_pending_info {
+            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, true);
+            cell.append(&make_transcript_label(""));
+
+            let row = gtk4::ListBoxRow::new();
+            row.set_child(Some(&hbox));
+            list.append(&row);
+
+            local_candidates.borrow_mut().push((
+                *provider,
+                model.clone(),
+                String::new(),
+                false,
+                false,
+                true,
+            ));
+            transcript_cells.borrow_mut().push(cell);
+        }
+
+        // Select first row when there are no cached entries.
+        if !selected_row {
+            if let Some(first) = list.row_at_index(0) {
+                list.select_row(Some(&first));
+            }
+        }
+
+        // Enter / double-click confirms selection (only if text is loaded)
+        {
+            let sel = Rc::clone(&sel_sender);
+            let ml = main_loop.clone();
+            let cands = Rc::clone(&local_candidates);
+            let win = window.clone();
+            list.connect_row_activated(move |_, row| {
+                let idx = row.index() as usize;
+                let ready = cands
+                    .borrow()
+                    .get(idx)
+                    .is_some_and(|(_, _, text, _, is_error, _)| !text.is_empty() && !is_error);
+                if ready {
+                    win.set_visible(false);
+                    if let Some(tx) = sel.borrow_mut().take() {
+                        let _ = tx.send(Some(idx));
+                    }
+                    ml.quit();
+                }
+            });
+        }
+
+        // Escape cancels
+        {
+            let sel = Rc::clone(&sel_sender);
+            let ml = main_loop.clone();
+            let win = window.clone();
+            let key_ctl = gtk4::EventControllerKey::new();
+            key_ctl.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk4::gdk::Key::Escape {
+                    win.set_visible(false);
+                    if let Some(tx) = sel.borrow_mut().take() {
+                        let _ = tx.send(None);
+                    }
+                    ml.quit();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            window.add_controller(key_ctl);
+        }
+
+        // Window close
+        {
+            let sel = Rc::clone(&sel_sender);
+            let ml = main_loop.clone();
+            window.connect_close_request(move |win| {
+                win.set_visible(false);
+                if let Some(tx) = sel.borrow_mut().take() {
+                    let _ = tx.send(None);
+                }
+                ml.quit();
+                glib::Propagation::Proceed
+            });
+        }
+
+        // Build an error cell with a retry button (↻).
+        //
+        // Clicking the button replaces the error with a spinner and
+        // sends a retry request through `retry_tx`.
+        let make_error_cell = {
+            let retry_tx = retry_tx.clone();
+            let cands_for_err = Rc::clone(&local_candidates);
+            let cells_for_err = Rc::clone(&transcript_cells);
+            move |cell: &gtk4::Box, idx: usize, msg: &str| {
+                while let Some(child) = cell.first_child() {
+                    cell.remove(&child);
+                }
+                let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+
+                let err = gtk4::Label::new(Some(msg));
+                err.set_xalign(0.0);
+                err.set_hexpand(true);
+                err.set_wrap(true);
+                err.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                err.add_css_class("error");
+                hbox.append(&err);
+
+                let retry_btn = gtk4::Button::with_label("↻");
+                retry_btn.set_tooltip_text(Some("Retry transcription"));
+                retry_btn.add_css_class("retry-btn");
+                {
+                    let tx = retry_tx.clone();
+                    let cands_ref = Rc::clone(&cands_for_err);
+                    let cells_ref = Rc::clone(&cells_for_err);
+                    retry_btn.connect_clicked(move |_| {
+                        let mut cands = cands_ref.borrow_mut();
+                        if let Some((provider, model, text, _, is_error, streaming)) =
+                            cands.get_mut(idx)
+                        {
+                            let _ = tx.send((*provider, model.clone(), *streaming));
+                            // Reset row state.
+                            text.clear();
+                            *is_error = false;
+                            // Replace error with spinner (batch) or
+                            // empty label (realtime).
+                            let is_streaming = *streaming;
+                            let cells = cells_ref.borrow();
+                            if let Some(cell) = cells.get(idx) {
+                                while let Some(child) = cell.first_child() {
+                                    cell.remove(&child);
+                                }
+                                if is_streaming {
+                                    cell.append(&make_transcript_label(""));
+                                } else {
+                                    let spinner = gtk4::Spinner::new();
+                                    spinner.start();
+                                    cell.append(&spinner);
+                                }
+                            }
+                        }
+                    });
+                }
+                hbox.append(&retry_btn);
+                cell.append(&hbox);
+            }
+        };
+
+        // Poll transcription results — update existing rows in-place.
+        {
+            let list = list.clone();
+            let cands = Rc::clone(&local_candidates);
+            let cells = Rc::clone(&transcript_cells);
+            let make_err = make_error_cell.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                loop {
+                    match msg_rx.try_recv() {
+                        Ok(PickerMessage::Candidate(c)) => {
+                            // Find the pre-created row by
+                            // (provider, model, streaming).
+                            let idx = {
+                                let cands = cands.borrow();
+                                cands.iter().position(|(p, m, _, _, _, s)| {
+                                    *p == c.provider && *m == c.model && *s == c.streaming
+                                })
+                            };
+                            if let Some(idx) = idx {
+                                // Clear cell content (spinner or previous error).
+                                {
+                                    let cells = cells.borrow();
+                                    if let Some(cell) = cells.get(idx) {
+                                        while let Some(child) = cell.first_child() {
+                                            cell.remove(&child);
+                                        }
+                                    }
+                                }
+
+                                if let Some(ref err_msg) = c.error {
+                                    cands.borrow_mut()[idx].4 = true;
+                                    make_err(&cells.borrow()[idx], idx, err_msg);
+                                } else {
+                                    let mut cands = cands.borrow_mut();
+                                    cands[idx].2 = c.text.clone();
+                                    cells.borrow()[idx].append(&make_transcript_label(&c.text));
+                                }
+                            }
+                        }
+                        Ok(PickerMessage::StreamUpdate {
+                            provider,
+                            model,
+                            accumulated_text,
+                        }) => {
+                            // Find the realtime row by
+                            // (provider, model, streaming=true).
+                            let idx = {
+                                let cands = cands.borrow();
+                                cands.iter().position(|(p, m, _, _, _, s)| {
+                                    *p == provider && *m == model && *s
+                                })
+                            };
+                            if let Some(idx) = idx {
+                                // Replace cell content with updated text.
+                                {
+                                    let cells = cells.borrow();
+                                    if let Some(cell) = cells.get(idx) {
+                                        while let Some(child) = cell.first_child() {
+                                            cell.remove(&child);
+                                        }
+                                        cell.append(&make_transcript_label(&accumulated_text));
+                                    }
+                                }
+                                cands.borrow_mut()[idx].2 = accumulated_text;
+                            }
+                        }
+                        Ok(PickerMessage::InitialBatchDone) => {
+                            // Mark remaining batch spinners as failed.
+                            // Realtime rows (streaming=true) may still
+                            // be receiving data — skip them.
+                            let failed: Vec<usize> = {
+                                let mut cands = cands.borrow_mut();
+                                let indices: Vec<usize> = cands
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, (_, _, text, _, is_error, streaming))| {
+                                        text.is_empty() && !*is_error && !*streaming
+                                    })
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                for &idx in &indices {
+                                    cands[idx].4 = true;
+                                }
+                                indices
+                            };
+                            for idx in failed {
+                                make_err(&cells.borrow()[idx], idx, "no response");
+                            }
+                            list.grab_focus();
+                            // Keep polling — retries and realtime
+                            // results may still arrive.
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            return glib::ControlFlow::Continue;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            // All senders dropped (including retry
+                            // listener) — stop polling.
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Present invisible, then centre + reveal synchronously in
+        // the `map` signal.  The XID is obtained directly from GDK
+        // (no `_NET_CLIENT_LIST` race).
+        window.set_opacity(0.0);
+
+        {
+            let window_reveal = window.clone();
+            window.connect_map(move |w| {
+                let xid = w
+                    .surface()
+                    .and_then(|s| s.downcast_ref::<gdk4_x11::X11Surface>().map(|xs| xs.xid()));
+                if let Some(xid) = xid {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let xid32 = xid as u32;
+                    x11_centre_and_raise_xid(xid32);
+                }
+                window_reveal.set_opacity(1.0);
+            });
+        }
+
+        window.present();
+        list.grab_focus();
+        main_loop.run();
+        window.close();
+
+        // Publish the candidate list so the caller can look up the
+        // selected index after this thread finishes.
+        if let Ok(mut r) = results_for_gtk.lock() {
+            *r = local_candidates.borrow().clone();
+        }
+
+        Ok(())
+    });
+
+    // ── Parallel transcriptions ─────────────────────────────────
+    let audio_path_for_cache = audio_path.clone();
+
+    // Helper: run one batch transcription and send the result.
+    fn spawn_transcription(
+        tasks: &mut tokio::task::JoinSet<()>,
+        tx: std::sync::mpsc::Sender<PickerMessage>,
+        audio: PathBuf,
+        provider: Provider,
+        model: String,
+        transcriber: Box<dyn BatchTranscriber>,
+    ) {
+        tasks.spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                transcriber.transcribe_file(&audio),
+            )
+            .await;
+            let msg = match result {
+                Ok(Ok(res)) => {
+                    let text = res.text.trim().to_string();
+                    if text.is_empty() {
+                        return;
+                    }
+                    PickerMessage::Candidate(PickerCandidate::success(provider, model, text, false))
+                }
+                Ok(Err(e)) => {
+                    log::warn!("candidate {}:{} failed: {}", provider, model, e);
+                    PickerMessage::Candidate(PickerCandidate::error(
+                        provider,
+                        model,
+                        format!("{e}"),
+                        false,
+                    ))
+                }
+                Err(_) => {
+                    log::warn!("candidate {}:{} timed out after 8s", provider, model);
+                    PickerMessage::Candidate(PickerCandidate::error(
+                        provider,
+                        model,
+                        "timed out".into(),
+                        false,
+                    ))
+                }
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    // Fire initial batch.
+    let done_tx = msg_tx.clone();
+    let retry_msg_tx = msg_tx.clone();
+
+    // Read WAV samples once for realtime transcribers (shared via Arc).
+    let wav_samples = if !realtime_transcribers.is_empty() {
+        match read_wav_pcm_samples(&audio_path) {
+            Ok(samples) => Some(std::sync::Arc::new(samples)),
+            Err(e) => {
+                log::warn!("failed to read WAV for realtime: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Spawn realtime transcription tasks.
+    for (provider, model, transcriber) in realtime_transcribers {
+        let tx = msg_tx.clone();
+        let samples = wav_samples.clone();
+        tokio::spawn(async move {
+            let Some(samples) = samples else {
+                let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
+                    provider,
+                    model,
+                    "failed to read WAV samples".into(),
+                    true,
+                )));
+                return;
+            };
+            run_realtime_transcription(transcriber, samples, tx, provider, model).await;
+        });
+    }
+
+    drop(msg_tx); // only clones survive from here
+    tokio::spawn({
+        let audio = audio_path.clone();
+        let tx = done_tx.clone();
+        async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for (provider, model, transcriber) in transcribers {
+                spawn_transcription(
+                    &mut tasks,
+                    tx.clone(),
+                    audio.clone(),
+                    provider,
+                    model,
+                    transcriber,
+                );
+            }
+            drop(tx);
+            while (tasks.join_next().await).is_some() {}
+            // All initial batch tasks finished — notify GTK.
+            let _ = done_tx.send(PickerMessage::InitialBatchDone);
+        }
+    });
+
+    // ── Retry listener ──────────────────────────────────────────
+    // Receives (provider, model, streaming) from the GTK retry button
+    // and fires a new transcription, reusing the same result channel.
+    {
+        let audio = audio_path;
+        let tx = retry_msg_tx;
+        let wav_for_retry = wav_samples;
+        tokio::spawn(async move {
+            while let Some((provider, model, streaming)) = retry_rx.recv().await {
+                log::info!("retrying {}:{} (streaming={})", provider, model, streaming);
+                if streaming {
+                    // Realtime retry: re-stream WAV samples.
+                    let samples = match wav_for_retry {
+                        Some(ref s) => s.clone(),
+                        None => {
+                            let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
+                                provider,
+                                model,
+                                "WAV samples unavailable".into(),
+                                true,
+                            )));
+                            continue;
+                        }
+                    };
+                    match transcription::create_realtime_transcriber(
+                        &config,
+                        provider,
+                        Some(&model),
+                    ) {
+                        Ok(transcriber) => {
+                            let tx = tx.clone();
+                            let model_clone = model.clone();
+                            tokio::spawn(async move {
+                                run_realtime_transcription(
+                                    transcriber,
+                                    samples,
+                                    tx,
+                                    provider,
+                                    model_clone,
+                                )
+                                .await;
+                            });
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "retry {}:{} realtime transcriber creation failed: {}",
+                                provider,
+                                model,
+                                e
+                            );
+                            let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
+                                provider,
+                                model,
+                                format!("{e}"),
+                                true,
+                            )));
+                        }
+                    }
+                } else {
+                    // Batch retry (existing logic).
+                    match transcription::create_batch_transcriber(
+                        &config,
+                        provider,
+                        Some(&model),
+                        false,
+                    ) {
+                        Ok(transcriber) => {
+                            let mut tasks = tokio::task::JoinSet::new();
+                            spawn_transcription(
+                                &mut tasks,
+                                tx.clone(),
+                                audio.clone(),
+                                provider,
+                                model,
+                                transcriber,
+                            );
+                            while (tasks.join_next().await).is_some() {}
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "retry {}:{} transcriber creation failed: {}",
+                                provider,
+                                model,
+                                e
+                            );
+                            let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
+                                provider,
+                                model,
+                                format!("{e}"),
+                                false,
+                            )));
+                        }
+                    }
+                }
+            }
+            // retry_tx dropped (GTK closed) — exit.
+        });
+    }
+
+    // ── Wait for result ─────────────────────────────────────────
+    let selected_index = sel_rx
+        .await
+        .map_err(|_| TalkError::Config("GTK picker closed unexpectedly".into()))?;
+
+    gtk_handle
+        .await
+        .map_err(|e| TalkError::Config(format!("GTK picker task failed: {}", e)))??;
+
+    // Persist all successful transcription results to the picker
+    // cache so that reopening the picker for the same audio file
+    // returns instantly without any API calls.
+    {
+        let items = results
+            .lock()
+            .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
+        let to_cache: Vec<picker_cache::CachedResult> = items
+            .iter()
+            .filter(|(_, _, text, _, is_error, _)| !text.is_empty() && !*is_error)
+            .map(|(p, m, t, _, _, s)| picker_cache::CachedResult {
+                provider: p.to_string(),
+                model: m.clone(),
+                text: t.clone(),
+                streaming: *s,
+            })
+            .collect();
+        if let Err(e) = picker_cache::write_results(&audio_path_for_cache, &to_cache) {
+            log::warn!("failed to write picker cache: {}", e);
+        }
+    }
+
+    match selected_index {
+        Some(idx) => {
+            let items = results
+                .lock()
+                .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
+            if idx < items.len() {
+                let (p, m, t, cached, _is_error, streaming) = items[idx].clone();
+                Ok(Some(PickerSelection {
+                    provider: p,
+                    model: m,
+                    text: t,
+                    is_cached: cached,
+                    streaming,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// Read all PCM i16 samples from a 16-bit WAV file.
+///
+/// Skips directly to the `data` chunk and reads every sample as
+/// little-endian i16.  Returns an error if the file is not a valid
+/// WAV or does not contain 16-bit PCM.
+fn read_wav_pcm_samples(path: &std::path::Path) -> Result<Vec<i16>, TalkError> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let err = |msg: &str| TalkError::Audio(format!("{}: {msg}", path.display()));
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| TalkError::Audio(format!("failed to open WAV {}: {e}", path.display())))?;
+
+    // Validate RIFF/WAVE header.
+    let mut tag = [0u8; 4];
+    file.read_exact(&mut tag)
+        .map_err(|_| err("truncated RIFF"))?;
+    if &tag != b"RIFF" {
+        return Err(err("not a WAV file (missing RIFF)"));
+    }
+    file.read_u32::<LittleEndian>()
+        .map_err(|_| err("truncated RIFF"))?; // file size
+    file.read_exact(&mut tag)
+        .map_err(|_| err("truncated WAVE"))?;
+    if &tag != b"WAVE" {
+        return Err(err("not a WAV file (missing WAVE)"));
+    }
+
+    // Walk chunks until we find "data".
+    let data_size: u32 = loop {
+        if file.read_exact(&mut tag).is_err() {
+            return Err(err("data chunk not found"));
+        }
+        let chunk_size = file
+            .read_u32::<LittleEndian>()
+            .map_err(|_| err("truncated chunk header"))?;
+        if &tag == b"data" {
+            break chunk_size;
+        }
+        // Skip unknown chunk (pad to even).
+        let skip = if chunk_size % 2 == 0 {
+            chunk_size as i64
+        } else {
+            chunk_size as i64 + 1
+        };
+        file.seek(SeekFrom::Current(skip))
+            .map_err(|_| err("seek past chunk failed"))?;
+    };
+
+    let num_samples = data_size as usize / 2; // 16-bit = 2 bytes per sample
+    let mut samples = Vec::with_capacity(num_samples);
+    for _ in 0..num_samples {
+        match file.read_i16::<LittleEndian>() {
+            Ok(s) => samples.push(s),
+            Err(_) => break,
+        }
+    }
+    Ok(samples)
+}

@@ -1,12 +1,12 @@
-mod dictate;
+pub(crate) mod paste;
 mod record;
 mod record_ui;
-mod transcribe;
+pub(crate) mod transcribe;
 
 use crate::cli::def::Commands;
 use std::path::PathBuf;
 
-pub use dictate::{dictate, DictateOpts};
+pub use crate::dictate::{dictate, DictateOpts};
 pub use record::record;
 pub use record_ui::record_ui;
 pub use transcribe::transcribe;
