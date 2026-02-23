@@ -81,4 +81,62 @@ impl ThemeColors {
             error,
         }
     }
+
+    /// Generate the shared base CSS rules, with optional extra rules appended.
+    ///
+    /// The base rules style the window chrome, scrollable list, row
+    /// selection highlight, and the `.dim` utility class.  Callers
+    /// append domain-specific rules via `extra_rules`.
+    pub fn base_css(&self, extra_rules: &str) -> String {
+        format!(
+            "* {{ font-size: 13px; }} \
+             window, window:backdrop {{ border: 1px solid alpha(white, 0.15); border-radius: 12px; background-color: {bg}; }} \
+             scrolledwindow, viewport, list, \
+             scrolledwindow:backdrop, viewport:backdrop, list:backdrop {{ background-color: transparent; background-image: none; border-radius: 10px; }} \
+             row:not(:selected), row:not(:selected):backdrop {{ background-color: transparent; background-image: none; }} \
+             row:selected, row:selected:backdrop {{ background-color: {sel}; color: {fg}; }} \
+             .dim {{ opacity: 0.55; }} \
+             row {{ border-radius: 8px; }} \
+             {extra}",
+            bg = self.view_bg,
+            fg = self.foreground,
+            sel = self.selection,
+            extra = extra_rules,
+        )
+    }
+}
+
+/// Load a CSS string as the application-level style provider.
+pub fn load_css(css_text: &str) {
+    let css = gtk4::CssProvider::new();
+    css.load_from_data(css_text);
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
+/// Present a window centred on the monitor containing the mouse pointer.
+///
+/// The window is initially invisible (`opacity = 0`), then centred and
+/// revealed in the `map` signal so the user never sees a position jump.
+/// Requires an X11 backend (`GDK_BACKEND=x11`).
+pub fn present_centred(window: &gtk4::Window) {
+    window.set_opacity(0.0);
+    let window_reveal = window.clone();
+    window.connect_map(move |w| {
+        let xid = w
+            .surface()
+            .and_then(|s| s.downcast_ref::<gdk4_x11::X11Surface>().map(|xs| xs.xid()));
+        if let Some(xid) = xid {
+            #[allow(clippy::cast_possible_truncation)]
+            let xid32 = xid as u32;
+            crate::x11::x11_centre_and_raise_xid(xid32);
+        }
+        window_reveal.set_opacity(1.0);
+    });
+    window.present();
 }

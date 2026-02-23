@@ -270,10 +270,7 @@ pub(super) async fn pick_with_streaming_gtk(
         gtk4::init().map_err(|e| TalkError::Config(format!("failed to initialize GTK: {}", e)))?;
 
         let theme = crate::gtk_theme::ThemeColors::resolve();
-        let view_bg_hex = &theme.view_bg;
         let error_hex = &theme.error;
-        let sel_hex = &theme.selection;
-        let fg_hex = &theme.foreground;
 
         let window = gtk4::Window::builder()
             .title(PICKER_TITLE)
@@ -288,31 +285,12 @@ pub(super) async fn pick_with_streaming_gtk(
         //     to prevent the theme from lightening on focus loss
         //   - row:selected uses a translucent accent instead of
         //     the theme's solid #E95420
-        let css = gtk4::CssProvider::new();
-        css.load_from_data(&format!(
-            "* {{ font-size: 13px; }} \
-             window, window:backdrop {{ border: 1px solid alpha(white, 0.15); border-radius: 12px; background-color: {bg}; }} \
-             scrolledwindow, viewport, list, \
-             scrolledwindow:backdrop, viewport:backdrop, list:backdrop {{ background-color: transparent; background-image: none; border-radius: 10px; }} \
-             row:not(:selected), row:not(:selected):backdrop {{ background-color: transparent; background-image: none; }} \
-             row:selected, row:selected:backdrop {{ background-color: {sel}; color: {fg}; }} \
-             .transcript {{ font-family: monospace; }} \
-             .dim {{ opacity: 0.55; }} \
+        crate::gtk_theme::load_css(&theme.base_css(&format!(
+            ".transcript {{ font-family: monospace; }} \
              .error {{ font-style: italic; color: alpha({err}, 0.8); }} \
-             .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }} \
-             row {{ border-radius: 8px; }}",
-            bg = view_bg_hex,
-            fg = fg_hex,
+             .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }}",
             err = error_hex,
-            sel = sel_hex,
-        ));
-        if let Some(display) = gtk4::gdk::Display::default() {
-            gtk4::style_context_add_provider_for_display(
-                &display,
-                &css,
-                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
-        }
+        )));
 
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         root.set_margin_top(6);
@@ -716,27 +694,7 @@ pub(super) async fn pick_with_streaming_gtk(
             });
         }
 
-        // Present invisible, then centre + reveal synchronously in
-        // the `map` signal.  The XID is obtained directly from GDK
-        // (no `_NET_CLIENT_LIST` race).
-        window.set_opacity(0.0);
-
-        {
-            let window_reveal = window.clone();
-            window.connect_map(move |w| {
-                let xid = w
-                    .surface()
-                    .and_then(|s| s.downcast_ref::<gdk4_x11::X11Surface>().map(|xs| xs.xid()));
-                if let Some(xid) = xid {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let xid32 = xid as u32;
-                    crate::x11::x11_centre_and_raise_xid(xid32);
-                }
-                window_reveal.set_opacity(1.0);
-            });
-        }
-
-        window.present();
+        crate::gtk_theme::present_centred(&window);
         list.grab_focus();
         main_loop.run();
         window.close();
