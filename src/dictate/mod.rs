@@ -792,7 +792,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Batch mode: overlay is still showing "Transcribing" badge —
     // it will be hidden after paste (below).
 
-    let text = crate::cli::action::transcribe::format_transcription_output(&result)
+    let text = crate::core::transcription::format_transcription_output(&result)
         .trim()
         .to_string();
     let metadata = result.metadata;
