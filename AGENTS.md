@@ -15,6 +15,7 @@
 
 ## Development Commands
 
+- **Prerequisite**: run `./autogen.sh` before any build, test, or lint command. It generates version metadata required by the build.
 - Format: `cargo fmt`
 - Lint: `cargo clippy --all-targets`
 - Test: `cargo test`
