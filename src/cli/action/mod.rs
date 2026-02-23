@@ -1,4 +1,3 @@
-pub(crate) mod paste;
 mod record;
 mod record_ui;
 pub(crate) mod transcribe;

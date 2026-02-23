@@ -8,9 +8,6 @@ mod picker;
 mod text;
 mod toggle;
 
-use crate::cli::action::paste::{
-    focus_window, get_active_window, paste_text_to_target, simulate_paste, PASTE_CHUNK_CHARS,
-};
 use crate::core::audio::file_source::WavFileSource;
 use crate::core::audio::indicator::SoundPlayer;
 use crate::core::audio::monitor_capture::MonitorCapture;
@@ -30,6 +27,9 @@ use crate::core::transcription::{
     TranscriptionMetadata, TranscriptionResult,
 };
 use crate::core::visualizer::VisualizerHandle;
+use crate::paste::{
+    focus_window, get_active_window, paste_text_to_target, simulate_paste, PASTE_CHUNK_CHARS,
+};
 use models::{build_retry_candidates, resolve_model, resolve_provider};
 use picker::{pick_with_streaming_gtk, x11_centre_and_raise, PICKER_TITLE};
 use std::path::PathBuf;
