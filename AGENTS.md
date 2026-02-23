@@ -1,34 +1,48 @@
-# talk-rs Agent Notes
+# talk-rs Agent Guide
 
-## Scope
+## Project Snapshot
 
-- Rust CLI scaffold for talk-rs.
-- Keep modules separated between CLI and core logic.
+- `talk-rs` is a production Rust CLI for Linux voice dictation.
+- Main flow: record audio, transcribe with provider backends, paste into the focused app.
+- Keep code modular: `src/cli/` for command parsing/dispatch, `src/core/` for runtime logic.
 
-## Commands
+## Architecture Boundaries
+
+- Keep `src/cli/` thin: argument parsing, command routing, and user-facing command wiring.
+- Keep `src/core/` as the source of truth for business logic (audio, transcription, overlay, daemon, cache, picker).
+- Do not leak CLI concerns into core modules.
+- Prefer focused modules and explicit `Result`-based error propagation.
+
+## Development Commands
 
 - Format: `cargo fmt`
 - Lint: `cargo clippy --all-targets`
-- Build: `cargo build`
 - Test: `cargo test`
+- Build: `cargo build`
+- Release build: `cargo build --release`
 
-## Conventions
+## Coding Rules
 
-- No `unwrap()` in project code.
-- Prefer explicit error handling with `Result`.
-- Keep `src/cli/` focused on argument parsing and dispatch.
-- No dead code pragmas without explanatory comments.
-- No trailing whitespace in any file.
+- No `unwrap()` or `expect()` in project code.
+- No dead-code pragmas without a short justification comment.
+- No trailing whitespace in tracked files.
+- Keep behavior changes covered by tests (unit and/or integration as appropriate).
+- Update docs/config examples when changing CLI flags, config schema, or user-visible behavior.
 
-## Review Checklist (Per Commit)
+## Verification Checklist
 
-Before each commit, verify:
-- [ ] `cargo fmt` - Code is formatted
-- [ ] `cargo clippy --all-targets` - No warnings
-- [ ] `cargo test` - All tests pass
-- [ ] `cargo build` - Builds successfully
-- [ ] No `unwrap()` or `expect()` in new code
-- [ ] No dead code pragmas (or commented explanation if necessary)
-- [ ] No trailing whitespace (check with `grep -r "[[:space:]]$" src/`)
-- [ ] All technical terms in commit message wrapped in double-backticks
-- [ ] Meta-goals reviewed (modularity, zero defaults, streaming, extensibility)
+Before finishing a change, run and validate:
+
+- [ ] `cargo fmt`
+- [ ] `cargo clippy --all-targets`
+- [ ] `cargo test`
+- [ ] `cargo build`
+- [ ] `cargo build --release` before asking for user approval
+- [ ] No new `unwrap()`/`expect()` in non-test code
+- [ ] No unexplained dead-code pragmas
+- [ ] No trailing whitespace (e.g. `grep -r "[[:space:]]$" src/ tests/`)
+
+## Agent File Convention
+
+- Keep this file as the project instruction source of truth.
+- Keep `CLAUDE.md` as a symlink to `AGENTS.md`.
