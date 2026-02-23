@@ -41,6 +41,7 @@ pub struct DictateOpts {
     pub realtime: bool,
     pub toggle: bool,
     pub no_sounds: bool,
+    pub no_boop: bool,
     pub monitor: bool,
     pub no_overlay: bool,
     pub amplitude: bool,
@@ -1827,6 +1828,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.diarize,
             opts.realtime,
             opts.no_sounds,
+            opts.no_boop,
             opts.monitor,
             opts.no_overlay,
             opts.amplitude,
@@ -2267,10 +2269,20 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         viz.show(182);
     }
 
-    // Start boop loop (every 5 seconds)
-    let boop_token = player
+    // Start boop loop (configurable interval, disabled by --no-boop or interval=0)
+    let boop_interval_ms = config
+        .indicators
         .as_ref()
-        .map(|p| p.start_boop_loop(std::time::Duration::from_secs(5)));
+        .map(|i| i.boop_interval_ms)
+        .unwrap_or(5000);
+    let boop_token = if opts.no_boop || boop_interval_ms == 0 {
+        log::debug!("boop sounds disabled");
+        None
+    } else {
+        player
+            .as_ref()
+            .map(|p| p.start_boop_loop(std::time::Duration::from_millis(boop_interval_ms)))
+    };
 
     // Set up the resample pipeline (common to both modes).  Audio has
     // been buffering in the capture channel since capture.start() above.
@@ -2626,6 +2638,7 @@ async fn toggle_dispatch(
     diarize: bool,
     realtime: bool,
     no_sounds: bool,
+    no_boop: bool,
     monitor: bool,
     no_overlay: bool,
     amplitude: bool,
@@ -2653,8 +2666,8 @@ async fn toggle_dispatch(
         match status {
             DaemonStatus::NotRunning => Some(
                 toggle_spawn(
-                    &pid_file, provider, model, diarize, realtime, no_sounds, monitor, no_overlay,
-                    amplitude, spectrum, save, verbose,
+                    &pid_file, provider, model, diarize, realtime, no_sounds, no_boop, monitor,
+                    no_overlay, amplitude, spectrum, save, verbose,
                 )
                 .await?,
             ),
@@ -2699,6 +2712,7 @@ async fn toggle_spawn(
     diarize: bool,
     realtime: bool,
     no_sounds: bool,
+    no_boop: bool,
     monitor: bool,
     no_overlay: bool,
     amplitude: bool,
@@ -2745,6 +2759,10 @@ async fn toggle_spawn(
 
     if no_sounds {
         cmd.arg("--no-sounds");
+    }
+
+    if no_boop {
+        cmd.arg("--no-boop");
     }
 
     if monitor {
