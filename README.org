@@ -84,7 +84,11 @@ An API key for at least one transcription provider is required:
 
 ** Installation
 
+If building from a git clone, run ~./autogen.sh~ first to resolve
+version placeholders in ~Cargo.toml~:
+
 #+begin_src sh
+./autogen.sh
 cargo build --release
 #+end_src
 
