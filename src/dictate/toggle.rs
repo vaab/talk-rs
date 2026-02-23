@@ -5,12 +5,12 @@
 //! validation after spawn.
 
 use super::models::resolve_provider;
-use crate::cli::action::paste::get_active_window;
 use crate::core::config::{Config, Provider};
 use crate::core::daemon::{self, DaemonStatus};
 use crate::core::error::TalkError;
 use crate::core::transcription;
 use crate::core::visualizer::VisualizerHandle;
+use crate::paste::get_active_window;
 use std::os::unix::process::CommandExt as _;
 
 /// Minimum time (ms) to keep a validation error visible in the target
