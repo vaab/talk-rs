@@ -1,12 +1,10 @@
-mod transcribe;
-
 use crate::cli::def::Commands;
 use std::path::PathBuf;
 
 pub use crate::dictate::{dictate, DictateOpts};
 pub use crate::record::record;
 pub use crate::record::ui::record_ui;
-pub use transcribe::transcribe;
+pub use crate::transcribe::transcribe;
 
 pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std::error::Error>> {
     match command {
