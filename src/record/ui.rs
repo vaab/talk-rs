@@ -586,9 +586,6 @@ fn show_recordings_window(
     gtk4::init().map_err(|e| TalkError::Config(format!("failed to initialize GTK: {}", e)))?;
 
     let theme = crate::gtk_theme::ThemeColors::resolve();
-    let view_bg_hex = &theme.view_bg;
-    let sel_hex = &theme.selection;
-    let fg_hex = &theme.foreground;
 
     let window = gtk4::Window::builder()
         .title(WINDOW_TITLE)
@@ -597,33 +594,14 @@ fn show_recordings_window(
         .decorated(false)
         .build();
 
-    let css = gtk4::CssProvider::new();
-    css.load_from_data(&format!(
-        "* {{ font-size: 13px; }} \
-         window, window:backdrop {{ border: 1px solid alpha(white, 0.15); border-radius: 12px; background-color: {bg}; }} \
-         scrolledwindow, viewport, list, \
-         scrolledwindow:backdrop, viewport:backdrop, list:backdrop {{ background-color: transparent; background-image: none; border-radius: 10px; }} \
-         row:not(:selected), row:not(:selected):backdrop {{ background-color: transparent; background-image: none; }} \
-         row:selected, row:selected:backdrop {{ background-color: {sel}; color: {fg}; }} \
-         .transcript {{ font-family: monospace; opacity: 0.7; }} \
-         .dim {{ opacity: 0.55; }} \
-         .meta {{ font-family: monospace; }} \
-         .play-btn, .folder-btn, .delete-btn {{ min-width: 28px; min-height: 28px; max-width: 28px; max-height: 28px; padding: 0; font-size: 14px; }} \
-         .folder-btn label, .delete-btn label {{ padding-top: 4px; }} \
-         row {{ border-radius: 8px; }} \
-         .section-expander {{ margin: 4px 2px; }} \
-         .section-expander > title {{ font-weight: bold; opacity: 0.85; padding: 4px 0; }}",
-        bg = view_bg_hex,
-        fg = fg_hex,
-        sel = sel_hex,
+    crate::gtk_theme::load_css(&theme.base_css(
+        ".transcript { font-family: monospace; opacity: 0.7; } \
+         .meta { font-family: monospace; } \
+         .play-btn, .folder-btn, .delete-btn { min-width: 28px; min-height: 28px; max-width: 28px; max-height: 28px; padding: 0; font-size: 14px; } \
+         .folder-btn label, .delete-btn label { padding-top: 4px; } \
+         .section-expander { margin: 4px 2px; } \
+         .section-expander > title { font-weight: bold; opacity: 0.85; padding: 4px 0; }",
     ));
-    if let Some(display) = gtk4::gdk::Display::default() {
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &css,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
 
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     root.set_margin_top(6);
@@ -1080,24 +1058,7 @@ fn show_recordings_window(
         });
     }
 
-    // Centre on monitor (same as picker)
-    window.set_opacity(0.0);
-    {
-        let window_reveal = window.clone();
-        window.connect_map(move |w| {
-            let xid = w
-                .surface()
-                .and_then(|s| s.downcast_ref::<gdk4_x11::X11Surface>().map(|xs| xs.xid()));
-            if let Some(xid) = xid {
-                #[allow(clippy::cast_possible_truncation)]
-                let xid32 = xid as u32;
-                crate::x11::x11_centre_and_raise_xid(xid32);
-            }
-            window_reveal.set_opacity(1.0);
-        });
-    }
-
-    window.present();
+    crate::gtk_theme::present_centred(&window);
     main_loop.run();
     window.close();
 
