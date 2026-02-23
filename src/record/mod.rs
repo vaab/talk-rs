@@ -3,6 +3,9 @@
 //! Captures audio from the system, encodes it with Opus, and writes to a file.
 //! Supports graceful shutdown via SIGINT (Ctrl+C).
 
+mod audio;
+mod entries;
+mod player;
 pub(crate) mod ui;
 
 use crate::core::audio::cpal_capture::CpalCapture;
