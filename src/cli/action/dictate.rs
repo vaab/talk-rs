@@ -42,6 +42,7 @@ pub struct DictateOpts {
     pub toggle: bool,
     pub no_sounds: bool,
     pub no_boop: bool,
+    pub no_chunk_paste: bool,
     pub monitor: bool,
     pub no_overlay: bool,
     pub amplitude: bool,
@@ -1720,6 +1721,7 @@ async fn paste_text_to_target(
     target_window: Option<&String>,
     text: &str,
     delete_chars_before_paste: usize,
+    chunk_chars: usize,
 ) -> Result<(), TalkError> {
     let clipboard = X11Clipboard::new();
 
@@ -1736,12 +1738,20 @@ async fn paste_text_to_target(
 
     let saved_clipboard = clipboard.get_text().await.ok();
 
-    let chunks = split_into_char_chunks(text, PASTE_CHUNK_CHARS);
-    for chunk in &chunks {
-        clipboard.set_text(chunk).await?;
+    if chunk_chars == 0 {
+        // No chunking: paste the entire text in one shot.
+        clipboard.set_text(text).await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         simulate_paste().await?;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    } else {
+        let chunks = split_into_char_chunks(text, chunk_chars);
+        for chunk in &chunks {
+            clipboard.set_text(chunk).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            simulate_paste().await?;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     // Extra settle time before restoring the clipboard so the last
@@ -1829,6 +1839,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.realtime,
             opts.no_sounds,
             opts.no_boop,
+            opts.no_chunk_paste,
             opts.monitor,
             opts.no_overlay,
             opts.amplitude,
@@ -1843,6 +1854,18 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     // Load configuration
     let config = Config::load(None)?;
+
+    // Effective paste chunk size: --no-chunk-paste disables chunking (0),
+    // otherwise use config value or the built-in default (150).
+    let paste_chunk_chars = if opts.no_chunk_paste {
+        0
+    } else {
+        config
+            .paste
+            .as_ref()
+            .map(|p| p.chunk_chars)
+            .unwrap_or(PASTE_CHUNK_CHARS)
+    };
 
     // Determine target window: use --target-window arg (from daemon mode)
     // or capture the currently active window.
@@ -2091,7 +2114,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             0
         };
 
-        paste_text_to_target(target_window.as_ref(), &selection.text, delete_chars).await?;
+        paste_text_to_target(
+            target_window.as_ref(),
+            &selection.text,
+            delete_chars,
+            paste_chunk_chars,
+        )
+        .await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &selection.text);
         println!("{}", selection.text);
         return Ok(());
@@ -2603,7 +2632,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         if let Some(ref o) = overlay {
             o.hide();
         }
-        paste_text_to_target(target_window.as_ref(), &text, 0).await?;
+        paste_text_to_target(target_window.as_ref(), &text, 0, paste_chunk_chars).await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
     }
 
@@ -2639,6 +2668,7 @@ async fn toggle_dispatch(
     realtime: bool,
     no_sounds: bool,
     no_boop: bool,
+    no_chunk_paste: bool,
     monitor: bool,
     no_overlay: bool,
     amplitude: bool,
@@ -2666,8 +2696,20 @@ async fn toggle_dispatch(
         match status {
             DaemonStatus::NotRunning => Some(
                 toggle_spawn(
-                    &pid_file, provider, model, diarize, realtime, no_sounds, no_boop, monitor,
-                    no_overlay, amplitude, spectrum, save, verbose,
+                    &pid_file,
+                    provider,
+                    model,
+                    diarize,
+                    realtime,
+                    no_sounds,
+                    no_boop,
+                    no_chunk_paste,
+                    monitor,
+                    no_overlay,
+                    amplitude,
+                    spectrum,
+                    save,
+                    verbose,
                 )
                 .await?,
             ),
@@ -2713,6 +2755,7 @@ async fn toggle_spawn(
     realtime: bool,
     no_sounds: bool,
     no_boop: bool,
+    no_chunk_paste: bool,
     monitor: bool,
     no_overlay: bool,
     amplitude: bool,
@@ -2763,6 +2806,10 @@ async fn toggle_spawn(
 
     if no_boop {
         cmd.arg("--no-boop");
+    }
+
+    if no_chunk_paste {
+        cmd.arg("--no-chunk-paste");
     }
 
     if monitor {

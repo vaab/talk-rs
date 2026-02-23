@@ -23,6 +23,10 @@ pub struct Config {
 
     /// Optional transcription defaults (provider selection, etc.).
     pub transcription: Option<TranscriptionConfig>,
+
+    /// Optional paste behaviour settings.
+    #[serde(default)]
+    pub paste: Option<PasteConfig>,
 }
 
 /// Transcription provider identifier.
@@ -171,6 +175,24 @@ pub struct IndicatorsConfig {
 
     /// Show visual indicator overlay.
     pub visual_overlay: bool,
+}
+
+/// Paste behaviour configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PasteConfig {
+    /// Maximum characters per clipboard paste chunk.
+    ///
+    /// Text longer than this is split on word boundaries into
+    /// consecutive Ctrl+Shift+V keystrokes.  Keeping chunks small
+    /// avoids terminal paste-summary behaviour that collapses large
+    /// pastes.  Set to `0` to disable chunking entirely (paste in one
+    /// shot).
+    #[serde(default = "default_paste_chunk_chars")]
+    pub chunk_chars: usize,
+}
+
+fn default_paste_chunk_chars() -> usize {
+    150
 }
 
 /// Get the config directory (~/.config/talk-rs/).
@@ -563,6 +585,78 @@ providers: {}
         let config = Config::load(Some(file.path()))?;
         assert!(config.providers.mistral.is_none());
         assert!(config.providers.openai.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_section_absent_gives_none() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert!(config.paste.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_chunk_chars_default() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste: {}
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        assert_eq!(paste.chunk_chars, 150);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_chunk_chars_custom() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste:
+  chunk_chars: 300
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        assert_eq!(paste.chunk_chars, 300);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_chunk_chars_zero_disables() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste:
+  chunk_chars: 0
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        assert_eq!(paste.chunk_chars, 0);
         Ok(())
     }
 }

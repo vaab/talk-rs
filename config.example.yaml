@@ -48,3 +48,13 @@ indicators:
   # Show visual indicator overlay during recording
   # Set to false to disable visual feedback
   visual_overlay: true
+
+# Optional: Paste Behaviour
+# Configure how transcribed text is pasted into the target application
+# paste:
+#   # Maximum characters per clipboard paste chunk (default: 150).
+#   # Text longer than this is split on word boundaries into consecutive
+#   # Ctrl+Shift+V keystrokes.  Keeping chunks small avoids terminal
+#   # paste-summary behaviour.  Set to 0 to disable chunking (paste in
+#   # one shot).  Also overridden by --no-chunk-paste (which forces 0).
+#   chunk_chars: 150

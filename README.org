@@ -136,6 +136,7 @@ providers:
 | ~transcription.default_provider~   | ~mistral~                 | Default provider when unspecified  |
 | ~indicators.boop_interval_ms~      | ~5000~                    | Periodic boop interval in ms (~0~ disables boops; also ~--no-boop~) |
 | ~indicators.visual_overlay~        | ~true~                    | Show X11 overlay badge             |
+| ~paste.chunk_chars~                | ~150~                     | Max chars per paste chunk (~0~ disables chunking; also ~--no-chunk-paste~) |
 
 *** Environment overrides
 
@@ -191,6 +192,7 @@ Options:
 | ~--monitor~                 | Mix system audio (monitor) with mic input       |
 | ~--no-sounds~               | Disable audio indicators                        |
 | ~--no-boop~                 | Disable periodic boop sounds (keep start/stop)  |
+| ~--no-chunk-paste~          | Paste all text in one shot (disable chunking)    |
 | ~--no-overlay~              | Disable visual overlay                          |
 | ~--amplitude~               | Show amplitude history visualizer               |
 | ~--spectrum~                | Show spectrum visualizer                        |
