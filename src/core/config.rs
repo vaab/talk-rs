@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Output directory for recordings, screenshots, and clipboard saves.
+    ///
+    /// The `record` command saves files here by default when no explicit
+    /// output path is given.
     pub output_dir: PathBuf,
 
     /// Transcription providers configuration.

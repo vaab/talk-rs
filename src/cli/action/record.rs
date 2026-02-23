@@ -6,32 +6,42 @@
 use crate::core::audio::cpal_capture::CpalCapture;
 use crate::core::audio::monitor_capture::MonitorCapture;
 use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
-use crate::core::config::AudioConfig;
+use crate::core::config::{AudioConfig, Config};
 use crate::core::error::TalkError;
 use chrono::Local;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-/// Parse command-line arguments for the record command.
+/// Generate a default timestamped filename for a recording.
+fn default_filename() -> String {
+    let now = Local::now();
+    now.format("memo-%Y-%m-%d-%H-%M-%S.ogg").to_string()
+}
+
+/// Resolve the output file path from CLI arguments and the configured
+/// `output_dir`.
 ///
-/// Returns the output file path. If not provided, generates a timestamp-based filename.
-pub fn parse_args(args: &[String]) -> Result<PathBuf, TalkError> {
+/// - No arguments → `<output_dir>/memo-YYYY-MM-DD-HH-MM-SS.ogg`
+/// - One argument → used as-is
+/// - More than one → error
+fn resolve_output_path(args: &[String], output_dir: &Path) -> Result<PathBuf, TalkError> {
     match args.len() {
-        0 => {
-            // Generate default filename with timestamp
-            let now = Local::now();
-            let filename = now.format("memo-%Y-%m-%d-%H-%M-%S.ogg").to_string();
-            Ok(PathBuf::from(filename))
-        }
-        1 => {
-            // Use provided filename
-            Ok(PathBuf::from(&args[0]))
-        }
+        0 => Ok(output_dir.join(default_filename())),
+        1 => Ok(PathBuf::from(&args[0])),
         _ => Err(TalkError::Audio(
             "record command takes at most one argument (output file path)".to_string(),
         )),
     }
+}
+
+/// Parse command-line arguments for the record command.
+///
+/// Returns the output file path. If not provided, generates a
+/// timestamp-based filename inside the configured `output_dir`.
+pub fn parse_args(args: &[String]) -> Result<PathBuf, TalkError> {
+    let config = Config::load(None)?;
+    resolve_output_path(args, &config.output_dir)
 }
 
 fn create_writer(path: &Path, config: AudioConfig) -> Result<Box<dyn AudioWriter>, TalkError> {
@@ -165,37 +175,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_args_no_args() {
-        let args = vec![];
-        let result = parse_args(&args).expect("parse should succeed");
+    fn test_resolve_output_path_no_args_uses_output_dir() {
+        let output_dir = PathBuf::from("/tmp/test-output");
+        let args: Vec<String> = vec![];
+        let result = resolve_output_path(&args, &output_dir).expect("resolve should succeed");
 
-        // Should generate a filename with memo- prefix and .ogg extension
-        let filename = result.file_name().expect("should have filename");
-        let filename_str = filename.to_string_lossy();
-        assert!(filename_str.starts_with("memo-"));
-        assert!(filename_str.ends_with(".ogg"));
+        // Path must live inside output_dir.
+        assert_eq!(
+            result.parent().expect("should have parent"),
+            output_dir,
+            "default recording should be placed in output_dir"
+        );
+
+        // Filename must follow the memo-YYYY-MM-DD-HH-MM-SS.ogg pattern.
+        let filename = result
+            .file_name()
+            .expect("should have filename")
+            .to_string_lossy();
+        assert!(
+            filename.starts_with("memo-"),
+            "filename should start with memo-"
+        );
+        assert!(filename.ends_with(".ogg"), "filename should end with .ogg");
     }
 
     #[test]
-    fn test_parse_args_with_filename() {
+    fn test_resolve_output_path_with_filename() {
+        let output_dir = PathBuf::from("/tmp/test-output");
         let args = vec!["my-recording.ogg".to_string()];
-        let result = parse_args(&args).expect("parse should succeed");
+        let result = resolve_output_path(&args, &output_dir).expect("resolve should succeed");
 
         assert_eq!(result, PathBuf::from("my-recording.ogg"));
     }
 
     #[test]
-    fn test_parse_args_with_path() {
+    fn test_resolve_output_path_with_absolute_path() {
+        let output_dir = PathBuf::from("/tmp/test-output");
         let args = vec!["/tmp/my-recording.ogg".to_string()];
-        let result = parse_args(&args).expect("parse should succeed");
+        let result = resolve_output_path(&args, &output_dir).expect("resolve should succeed");
 
         assert_eq!(result, PathBuf::from("/tmp/my-recording.ogg"));
     }
 
     #[test]
-    fn test_parse_args_too_many_args() {
+    fn test_resolve_output_path_too_many_args() {
+        let output_dir = PathBuf::from("/tmp/test-output");
         let args = vec!["file1.ogg".to_string(), "file2.ogg".to_string()];
-        let result = parse_args(&args);
+        let result = resolve_output_path(&args, &output_dir);
 
         assert!(result.is_err());
         assert!(result
