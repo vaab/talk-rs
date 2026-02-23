@@ -6,6 +6,7 @@
 mod models;
 mod pick;
 mod picker;
+mod picker_backend;
 mod realtime;
 mod streaming;
 mod text;
