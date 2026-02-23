@@ -1,6 +1,6 @@
 mod record;
 mod record_ui;
-pub(crate) mod transcribe;
+mod transcribe;
 
 use crate::cli::def::Commands;
 use std::path::PathBuf;
