@@ -64,14 +64,13 @@ A working Rust toolchain is required (1.70+). Install via
 The following tools must be available in ~$PATH~:
 
 - ~xclip~ -- clipboard access
-- ~xdotool~ -- window focus and key simulation
 
 #+begin_src sh
 # Debian / Ubuntu
-sudo apt install xclip xdotool
+sudo apt install xclip
 
 # Fedora
-sudo dnf install xclip xdotool
+sudo dnf install xclip
 #+end_src
 
 =PipeWire= must be running (used for audio capture). Most modern Linux
