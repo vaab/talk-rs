@@ -1,7 +1,7 @@
 //! Mock audio capture for testing.
 
 use super::{AudioCapture, CHANNEL_CAPACITY, CHUNK_DURATION_MS};
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

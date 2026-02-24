@@ -4,7 +4,7 @@
 //! to 16 kHz with a proper anti-aliasing filter before encoding and
 //! transcription.
 
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{
     Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,

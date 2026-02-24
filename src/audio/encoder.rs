@@ -1,7 +1,7 @@
 //! Audio encoding interfaces and implementations.
 
-use crate::core::config::AudioConfig;
-use crate::core::error::TalkError;
+use crate::config::AudioConfig;
+use crate::error::TalkError;
 
 /// Trait for audio encoding from PCM samples to compressed formats.
 pub trait AudioEncoder: Send {

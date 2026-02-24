@@ -10,9 +10,9 @@ use super::entries::{
     RecordingEntry,
 };
 use super::player::WavPlayer;
-use crate::core::config::Config;
-use crate::core::error::TalkError;
-use crate::core::recording_cache;
+use crate::config::Config;
+use crate::error::TalkError;
+use crate::recording_cache;
 
 /// Window title — also used for single-instance detection.
 const WINDOW_TITLE: &str = "talk-rs — Recordings";

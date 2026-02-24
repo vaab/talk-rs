@@ -3,8 +3,8 @@
 //! These tests verify OpusEncoder functionality using the actual opus library,
 //! not mocks. They test encoding, decoding roundtrips, flushing, and bitrate handling.
 
-use talk_rs::core::audio::encoder::{AudioEncoder, OpusEncoder};
-use talk_rs::core::config::AudioConfig;
+use talk_rs::audio::encoder::{AudioEncoder, OpusEncoder};
+use talk_rs::config::AudioConfig;
 
 fn test_audio_config() -> AudioConfig {
     AudioConfig {

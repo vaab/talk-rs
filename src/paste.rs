@@ -4,8 +4,8 @@
 //! blocks for pasting transcription text into a target application
 //! via xdotool and the X11 clipboard.
 
-use crate::core::clipboard::{Clipboard, X11Clipboard};
-use crate::core::error::TalkError;
+use crate::clipboard::{Clipboard, X11Clipboard};
+use crate::error::TalkError;
 
 /// Maximum number of attempts to focus the target window.
 const FOCUS_MAX_RETRIES: u32 = 5;

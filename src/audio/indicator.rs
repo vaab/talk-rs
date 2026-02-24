@@ -9,7 +9,7 @@
 //! - **Stop**: descending major third (458 Hz → 364 Hz)
 //! - **Boop**: soft double-pulse at 364 Hz (recording heartbeat)
 
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

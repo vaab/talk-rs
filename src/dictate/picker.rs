@@ -4,10 +4,10 @@
 //! X11 window centering/raising helpers, and WAV PCM reading used
 //! by the picker's realtime transcription support.
 
-use crate::core::config::{Config, Provider};
-use crate::core::error::TalkError;
-use crate::core::picker_cache;
-use crate::core::transcription::{self, BatchTranscriber, RealtimeTranscriber};
+use crate::config::{Config, Provider};
+use crate::error::TalkError;
+use crate::picker_cache;
+use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber};
 use std::path::PathBuf;
 
 use super::picker_backend::{

@@ -3,9 +3,9 @@
 //! Tests the record command end-to-end with both real audio hardware and mock capture.
 
 use std::fs;
-use talk_rs::core::audio::mock::MockAudioCapture;
-use talk_rs::core::audio::{AudioCapture, AudioEncoder, OpusEncoder};
-use talk_rs::core::config::AudioConfig;
+use talk_rs::audio::mock::MockAudioCapture;
+use talk_rs::audio::{AudioCapture, AudioEncoder, OpusEncoder};
+use talk_rs::config::AudioConfig;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 
@@ -165,7 +165,7 @@ fn test_record_default_filename_format() {
 #[tokio::test]
 #[ignore]
 async fn test_record_creates_output_file() {
-    use talk_rs::core::audio::cpal_capture::CpalCapture;
+    use talk_rs::audio::cpal_capture::CpalCapture;
 
     // Create temporary directory for test output
     let temp_dir = TempDir::new().expect("create temp dir");

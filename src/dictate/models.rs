@@ -1,6 +1,6 @@
 //! Model catalog: provider/model resolution and known model lists.
 
-use crate::core::config::{Config, Provider};
+use crate::config::{Config, Provider};
 
 /// Resolve the effective provider from CLI override or config default.
 pub(super) fn resolve_provider(cli_provider: Option<Provider>, config: &Config) -> Provider {

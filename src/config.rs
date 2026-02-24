@@ -2,7 +2,7 @@
 //!
 //! Config is stored in ~/.config/talk-rs/config.yaml
 
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 use directories::ProjectDirs;
 use serde::Deserialize;
 use std::env;

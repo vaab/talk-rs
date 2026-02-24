@@ -1,9 +1,9 @@
 //! Recording entry listing and file operations for the recordings browser.
 
 use super::audio::{ogg_duration_secs, wav_duration_secs};
-use crate::core::config::Config;
-use crate::core::error::TalkError;
-use crate::core::recording_cache;
+use crate::config::Config;
+use crate::error::TalkError;
+use crate::recording_cache;
 use std::path::PathBuf;
 
 /// Entry for one cached recording (WAV or OGG).

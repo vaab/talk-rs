@@ -4,13 +4,13 @@
 //! request.  Audio is also tee'd to a cache WAV for the recording cache.
 
 use super::realtime::audio_tee_to_wav;
-use crate::core::audio::indicator::SoundPlayer;
-use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
-use crate::core::config::AudioConfig;
-use crate::core::error::TalkError;
-use crate::core::overlay::{IndicatorKind, OverlayHandle};
-use crate::core::transcription::{BatchTranscriber, TranscriptionResult};
-use crate::core::visualizer::VisualizerHandle;
+use crate::audio::indicator::SoundPlayer;
+use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
+use crate::config::AudioConfig;
+use crate::error::TalkError;
+use crate::overlay::{IndicatorKind, OverlayHandle};
+use crate::transcription::{BatchTranscriber, TranscriptionResult};
+use crate::visualizer::VisualizerHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Batch dictation mode.

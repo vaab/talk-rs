@@ -8,11 +8,11 @@ mod entries;
 mod player;
 pub(crate) mod ui;
 
-use crate::core::audio::cpal_capture::CpalCapture;
-use crate::core::audio::monitor_capture::MonitorCapture;
-use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
-use crate::core::config::{AudioConfig, Config};
-use crate::core::error::TalkError;
+use crate::audio::cpal_capture::CpalCapture;
+use crate::audio::monitor_capture::MonitorCapture;
+use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
+use crate::config::{AudioConfig, Config};
+use crate::error::TalkError;
 use chrono::Local;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -237,10 +237,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_pipeline_with_mock_capture() {
-        use crate::core::audio::{
-            mock::MockAudioCapture, AudioCapture, AudioWriter, OggOpusWriter,
-        };
-        use crate::core::config::AudioConfig;
+        use crate::audio::{mock::MockAudioCapture, AudioCapture, AudioWriter, OggOpusWriter};
+        use crate::config::AudioConfig;
         use std::fs;
         use tempfile::TempDir;
 

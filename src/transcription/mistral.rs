@@ -3,9 +3,9 @@
 //! This module provides a [`BatchTranscriber`] implementation that uses the
 //! Mistral API to transcribe audio files.
 
-use crate::core::config::MistralConfig;
-use crate::core::error::TalkError;
-use crate::core::transcription::{
+use crate::config::MistralConfig;
+use crate::error::TalkError;
+use crate::transcription::{
     DiarizationSegment, MistralProviderMetadata, ProviderSpecificMetadata, TokenUsage,
     TranscriptionMetadata, TranscriptionResult,
 };

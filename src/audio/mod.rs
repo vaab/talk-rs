@@ -1,6 +1,6 @@
 //! Audio capture interfaces and implementations.
 
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 use tokio::sync::mpsc;
 
 pub mod cpal_capture;

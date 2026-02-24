@@ -12,7 +12,7 @@
 //! The visualizer opens its own CPAL capture stream so it is fully
 //! decoupled from the recording pipeline.
 
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
 use x11rb::connection::Connection;
@@ -683,7 +683,7 @@ impl VisualizerHandle {
     ///
     /// Returns `Err` if X11 or the audio device is unreachable.
     pub fn new(amplitude: bool, spectrum: bool, text: bool) -> Result<Self, TalkError> {
-        let geom = crate::core::monitor::primary_monitor_geometry()?;
+        let geom = crate::monitor::primary_monitor_geometry()?;
         let (tx, rx) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
@@ -741,7 +741,7 @@ fn visualizer_thread(
     enable_amplitude: bool,
     enable_spectrum: bool,
     enable_text: bool,
-    geom: crate::core::monitor::MonitorGeometry,
+    geom: crate::monitor::MonitorGeometry,
 ) -> Result<(), TalkError> {
     // ── Audio capture ────────────────────────────────────────────────
 

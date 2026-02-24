@@ -1,7 +1,7 @@
 //! Audio playback for the recordings browser via cpal.
 
 use super::audio::{read_ogg_as_f32, read_wav_as_f32};
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 
 /// Shared state between the GUI thread and the `cpal` output callback.
 struct WavPlaybackState {

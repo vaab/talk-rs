@@ -3,7 +3,7 @@
 //! Provides PID file management with kernel-level locking (flock)
 //! and process lifecycle control (start, stop, stale detection).
 
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 use directories::ProjectDirs;
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{kill, Signal};

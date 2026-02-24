@@ -1,6 +1,6 @@
 //! Audio decoding and resampling utilities for the recordings browser.
 
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 
 /// Opus always uses 48 kHz internally (RFC 7845).
 pub(super) const OPUS_SAMPLE_RATE: u32 = 48_000;
