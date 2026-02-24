@@ -683,7 +683,7 @@ impl VisualizerHandle {
     ///
     /// Returns `Err` if X11 or the audio device is unreachable.
     pub fn new(amplitude: bool, spectrum: bool, text: bool) -> Result<Self, TalkError> {
-        let geom = crate::monitor::primary_monitor_geometry()?;
+        let geom = super::monitor::primary_monitor_geometry()?;
         let (tx, rx) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
@@ -741,7 +741,7 @@ fn visualizer_thread(
     enable_amplitude: bool,
     enable_spectrum: bool,
     enable_text: bool,
-    geom: crate::monitor::MonitorGeometry,
+    geom: super::monitor::MonitorGeometry,
 ) -> Result<(), TalkError> {
     // ── Audio capture ────────────────────────────────────────────────
 

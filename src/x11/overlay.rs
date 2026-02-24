@@ -12,10 +12,10 @@ use x11rb::protocol::shape;
 // ── Embedded PNG assets ──────────────────────────────────────────────
 
 /// "recording" badge: 182×52, dark rounded rect with red dot + text.
-const RECORDING_PNG: &[u8] = include_bytes!("../assets/indicator.png");
+const RECORDING_PNG: &[u8] = include_bytes!("../../assets/indicator.png");
 
 /// "transcribing" badge: 210×52, dark rounded rect with blue dot + text.
-const TRANSCRIBING_PNG: &[u8] = include_bytes!("../assets/transcribing.png");
+const TRANSCRIBING_PNG: &[u8] = include_bytes!("../../assets/transcribing.png");
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ impl OverlayHandle {
     ///
     /// Returns `Err` if the X11 display cannot be opened.
     pub fn new() -> Result<Self, TalkError> {
-        let geom = crate::monitor::primary_monitor_geometry()?;
+        let geom = super::monitor::primary_monitor_geometry()?;
         let (tx, rx) = mpsc::channel();
 
         let thread = std::thread::Builder::new()
@@ -146,7 +146,7 @@ fn decode_png(bytes: &[u8]) -> Result<RgbaImage, TalkError> {
 /// Main loop for the overlay background thread.
 fn overlay_thread(
     rx: mpsc::Receiver<Command>,
-    geom: crate::monitor::MonitorGeometry,
+    geom: super::monitor::MonitorGeometry,
 ) -> Result<(), TalkError> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::*;
