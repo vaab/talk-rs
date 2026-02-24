@@ -2,7 +2,7 @@
 //!
 //! Extracted from `dictate.rs` — these are the low-level building
 //! blocks for pasting transcription text into a target application
-//! via xdotool and the X11 clipboard.
+//! via X11 and the clipboard.
 
 use crate::clipboard::{Clipboard, X11Clipboard};
 use crate::error::TalkError;
@@ -163,66 +163,67 @@ pub async fn paste_text_to_target(
     Ok(())
 }
 
-/// Get the currently focused window ID using xdotool.
+/// Get the currently focused window ID via `_NET_ACTIVE_WINDOW`.
 pub async fn get_active_window() -> Option<String> {
-    let output = tokio::process::Command::new("xdotool")
-        .arg("getactivewindow")
-        .output()
+    // The X11 call is blocking but fast; run on a blocking thread
+    // so we don't stall the async runtime.
+    tokio::task::spawn_blocking(|| crate::x11::x11_get_active_window().map(|wid| wid.to_string()))
         .await
-        .ok()?;
-
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
+        .ok()?
 }
 
-/// Focus a window by ID using xdotool.
+/// Focus a window by ID via `_NET_ACTIVE_WINDOW` ClientMessage.
 pub async fn focus_window(window_id: &str) -> bool {
-    let result = tokio::process::Command::new("xdotool")
-        .args(["windowactivate", "--sync", window_id])
-        .output()
-        .await;
+    let wid: u32 = match window_id.parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
-    matches!(result, Ok(output) if output.status.success())
+    tokio::task::spawn_blocking(move || crate::x11::x11_activate_window(wid))
+        .await
+        .unwrap_or(false)
 }
 
-/// Simulate a Ctrl+Shift+V paste keystroke using xdotool.
+/// Simulate a Ctrl+Shift+V paste keystroke via the XTest extension.
 pub async fn simulate_paste() -> Result<(), TalkError> {
-    let output = tokio::process::Command::new("xdotool")
-        .args(["key", "ctrl+shift+v"])
-        .output()
-        .await
-        .map_err(|e| TalkError::Clipboard(format!("failed to run xdotool: {e}")))?;
+    // X11 keysyms for Control_L, Shift_L, v
+    const CONTROL_L: u32 = 0xffe3;
+    const SHIFT_L: u32 = 0xffe1;
+    const KEY_V: u32 = 0x0076;
 
-    if !output.status.success() {
+    let ok = tokio::task::spawn_blocking(|| {
+        crate::x11::x11_send_key_combo(&[CONTROL_L, SHIFT_L, KEY_V])
+    })
+    .await
+    .unwrap_or(false);
+
+    if !ok {
         return Err(TalkError::Clipboard(
-            "xdotool key simulation failed".to_string(),
+            "XTest key simulation failed".to_string(),
         ));
     }
     Ok(())
 }
 
-/// Simulate deleting the previous text by sending repeated BackSpace.
+/// Simulate deleting the previous text by sending repeated BackSpace
+/// via the XTest extension.
 pub async fn simulate_backspace(count: usize) -> Result<(), TalkError> {
     if count == 0 {
         return Ok(());
     }
 
-    let repeat = count.to_string();
-    let output = tokio::process::Command::new("xdotool")
-        .args(["key", "--delay", "0", "--repeat", &repeat, "BackSpace"])
-        .output()
-        .await
-        .map_err(|e| TalkError::Clipboard(format!("failed to run xdotool: {e}")))?;
+    // X11 keysym for BackSpace.
+    const BACKSPACE: u32 = 0xff08;
 
-    if !output.status.success() {
+    let ok = tokio::task::spawn_blocking(move || crate::x11::x11_send_key_repeat(BACKSPACE, count))
+        .await
+        .unwrap_or(false);
+
+    if !ok {
         return Err(TalkError::Clipboard(
-            "xdotool backspace simulation failed".to_string(),
+            "XTest backspace simulation failed".to_string(),
         ));
     }
-
     Ok(())
 }
 
