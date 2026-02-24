@@ -9,7 +9,6 @@ pub mod gtk_theme;
 pub mod monitor;
 pub mod overlay;
 pub mod paste;
-pub mod picker_cache;
 pub mod record;
 pub mod recording_cache;
 pub mod transcribe;

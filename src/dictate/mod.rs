@@ -4,9 +4,7 @@
 //! into the focused application via clipboard.
 
 mod models;
-mod pick;
 mod picker;
-mod picker_backend;
 mod realtime;
 mod streaming;
 mod text;
@@ -30,7 +28,7 @@ use crate::recording_cache;
 use crate::transcription;
 use crate::visualizer::VisualizerHandle;
 use models::{resolve_model, resolve_provider};
-use pick::{run_pick, PickParams};
+use picker::{run_pick, PickParams};
 use realtime::dictate_realtime;
 use std::path::PathBuf;
 use streaming::dictate_streaming;

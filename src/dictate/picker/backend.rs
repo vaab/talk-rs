@@ -4,7 +4,7 @@
 //! GTK picker window: batch task spawning, realtime WebSocket
 //! streaming, and WAV PCM reading.
 
-use super::picker::{PickerCandidate, PickerMessage};
+use super::ui::{PickerCandidate, PickerMessage};
 use crate::config::Provider;
 use crate::error::TalkError;
 use crate::transcription::{BatchTranscriber, RealtimeTranscriber, TranscriptionEvent};

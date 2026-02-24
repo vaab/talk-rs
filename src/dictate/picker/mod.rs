@@ -4,17 +4,20 @@
 //! providers/models via a GTK picker window.  Cached results are reused
 //! when available.
 
+mod backend;
+pub(super) mod cache;
+mod ui;
+
 use crate::config::{Config, Provider};
 use crate::error::TalkError;
 use crate::paste::paste_text_to_target;
-use crate::picker_cache;
 use crate::recording_cache;
 use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber};
 use crate::x11::x11_centre_and_raise;
 use std::path::PathBuf;
 
 use super::models::build_retry_candidates;
-use super::picker::{pick_with_streaming_gtk, PICKER_TITLE};
+use ui::{pick_with_streaming_gtk, PICKER_TITLE};
 
 /// Parameters for the pick-mode path.
 pub(crate) struct PickParams {
@@ -51,7 +54,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
 
     // Load previously cached picker results for this audio file
     // so that reopening the picker skips API calls entirely.
-    let picker_cache_data = picker_cache::read(&audio_path);
+    let picker_cache_data = cache::read(&audio_path);
 
     // Determine the "already pasted" (provider, model, streaming) triple.
     // The picker cache's `selected` field takes precedence
@@ -216,7 +219,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
 
     // Record which entry the user selected so it appears
     // pre-selected the next time the picker opens.
-    if let Err(e) = picker_cache::write_selected(
+    if let Err(e) = cache::write_selected(
         &audio_path_for_selection,
         &selection.provider.to_string(),
         &selection.model,
