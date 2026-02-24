@@ -3,6 +3,7 @@
 //! Centre, raise, and activate windows using the `x11rb` crate.
 //! Shared by the dictate picker and recordings browser.
 
+pub mod clipboard;
 pub mod monitor;
 pub mod overlay;
 pub mod visualizer;
