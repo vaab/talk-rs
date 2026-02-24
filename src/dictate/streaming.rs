@@ -8,9 +8,9 @@ use crate::audio::indicator::SoundPlayer;
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::AudioConfig;
 use crate::error::TalkError;
-use crate::overlay::{IndicatorKind, OverlayHandle};
 use crate::transcription::{BatchTranscriber, TranscriptionResult};
-use crate::visualizer::VisualizerHandle;
+use crate::x11::overlay::{IndicatorKind, OverlayHandle};
+use crate::x11::visualizer::VisualizerHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Batch dictation mode.

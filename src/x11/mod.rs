@@ -3,6 +3,10 @@
 //! Centre, raise, and activate windows using the `x11rb` crate.
 //! Shared by the dictate picker and recordings browser.
 
+pub mod monitor;
+pub mod overlay;
+pub mod visualizer;
+
 /// Centre a known X11 window on the monitor containing the mouse
 /// pointer, set it always-on-top, and activate it.
 ///

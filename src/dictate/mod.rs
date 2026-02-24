@@ -20,13 +20,13 @@ use crate::clipboard::{Clipboard, X11Clipboard};
 use crate::config::{AudioConfig, Config, Provider};
 use crate::daemon;
 use crate::error::TalkError;
-use crate::overlay::{IndicatorKind, OverlayHandle};
 use crate::paste::{
     focus_window, get_active_window, paste_text_to_target, simulate_paste, PASTE_CHUNK_CHARS,
 };
 use crate::recording_cache;
 use crate::transcription;
-use crate::visualizer::VisualizerHandle;
+use crate::x11::overlay::{IndicatorKind, OverlayHandle};
+use crate::x11::visualizer::VisualizerHandle;
 use models::{resolve_model, resolve_provider};
 use picker::{run_pick, PickParams};
 use realtime::dictate_realtime;

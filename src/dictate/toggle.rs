@@ -10,7 +10,7 @@ use crate::daemon::{self, DaemonStatus};
 use crate::error::TalkError;
 use crate::paste::get_active_window;
 use crate::transcription;
-use crate::visualizer::VisualizerHandle;
+use crate::x11::visualizer::VisualizerHandle;
 use std::os::unix::process::CommandExt as _;
 
 /// Minimum time (ms) to keep a validation error visible in the target

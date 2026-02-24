@@ -12,7 +12,7 @@ use crate::transcription::{
     self, MistralProviderMetadata, OpenAIProviderMetadata, OpenAIRealtimeMetadata,
     ProviderSpecificMetadata, TranscriptionEvent, TranscriptionMetadata, TranscriptionResult,
 };
-use crate::visualizer::VisualizerHandle;
+use crate::x11::visualizer::VisualizerHandle;
 use std::path::PathBuf;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
