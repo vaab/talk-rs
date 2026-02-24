@@ -9,7 +9,7 @@
 //! **Must** be called from a thread where GTK4 has been initialised
 //! (or after `gtk4::init()`).
 
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 use gtk4::prelude::*;
 
 /// Primary monitor rectangle: `(x, y, width, height)` in physical pixels.

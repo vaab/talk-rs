@@ -4,15 +4,15 @@
 //! incremental transcription events.  Returns the accumulated text.
 
 use super::text::flush_sentences;
-use crate::core::audio::indicator::SoundPlayer;
-use crate::core::audio::{AudioCapture, AudioWriter, WavWriter};
-use crate::core::config::{AudioConfig, Config, Provider};
-use crate::core::error::TalkError;
-use crate::core::transcription::{
+use crate::audio::indicator::SoundPlayer;
+use crate::audio::{AudioCapture, AudioWriter, WavWriter};
+use crate::config::{AudioConfig, Config, Provider};
+use crate::error::TalkError;
+use crate::transcription::{
     self, MistralProviderMetadata, OpenAIProviderMetadata, OpenAIRealtimeMetadata,
     ProviderSpecificMetadata, TranscriptionEvent, TranscriptionMetadata, TranscriptionResult,
 };
-use crate::core::visualizer::VisualizerHandle;
+use crate::visualizer::VisualizerHandle;
 use std::path::PathBuf;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;

@@ -3,9 +3,9 @@
 //! This module provides a [`BatchTranscriber`] implementation that uses the
 //! OpenAI API to transcribe audio files (Whisper, GPT-4o-transcribe, etc.).
 
-use crate::core::config::OpenAIConfig;
-use crate::core::error::TalkError;
-use crate::core::transcription::{
+use crate::config::OpenAIConfig;
+use crate::error::TalkError;
+use crate::transcription::{
     OpenAIProviderMetadata, ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata,
     TranscriptionResult,
 };

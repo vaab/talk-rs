@@ -1,8 +1,8 @@
 //! CPAL-based audio capture implementation.
 
 use super::{AudioCapture, CHANNEL_CAPACITY, CHUNK_DURATION_MS};
-use crate::core::config::AudioConfig;
-use crate::core::error::TalkError;
+use crate::config::AudioConfig;
+use crate::error::TalkError;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use std::sync::atomic::{AtomicBool, Ordering};

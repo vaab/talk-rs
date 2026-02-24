@@ -5,9 +5,9 @@
 //! streaming, and WAV PCM reading.
 
 use super::picker::{PickerCandidate, PickerMessage};
-use crate::core::config::Provider;
-use crate::core::error::TalkError;
-use crate::core::transcription::{BatchTranscriber, RealtimeTranscriber, TranscriptionEvent};
+use crate::config::Provider;
+use crate::error::TalkError;
+use crate::transcription::{BatchTranscriber, RealtimeTranscriber, TranscriptionEvent};
 use std::path::PathBuf;
 
 /// PCM chunk size for realtime WAV feeding (480 samples = 30 ms at

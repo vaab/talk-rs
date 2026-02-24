@@ -5,8 +5,8 @@
 //! reproducible benchmarks across transcription providers.
 
 use super::{AudioCapture, CHANNEL_CAPACITY, CHUNK_DURATION_MS};
-use crate::core::config::AudioConfig;
-use crate::core::error::TalkError;
+use crate::config::AudioConfig;
+use crate::error::TalkError;
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -316,8 +316,8 @@ async fn read_wav_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::audio::AudioWriter;
-    use crate::core::audio::WavWriter;
+    use crate::audio::AudioWriter;
+    use crate::audio::WavWriter;
     use tempfile::NamedTempFile;
 
     /// Create a valid 16kHz mono 16-bit WAV file with synthetic PCM data.

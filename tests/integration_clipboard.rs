@@ -4,7 +4,7 @@
 //! Run ignored tests sequentially to avoid clipboard race conditions:
 //! `cargo test --test integration_clipboard -- --ignored --test-threads=1`
 
-use talk_rs::core::clipboard::{Clipboard, MockClipboard, X11Clipboard};
+use talk_rs::clipboard::{Clipboard, MockClipboard, X11Clipboard};
 
 /// Verify that xclip binary is available on the system.
 #[tokio::test]

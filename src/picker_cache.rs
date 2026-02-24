@@ -12,8 +12,8 @@
 //! named after the audio file stem (e.g.
 //! `20250219-081500.json` for `20250219-081500.wav`).
 
-use crate::core::daemon::cache_dir;
-use crate::core::error::TalkError;
+use crate::daemon::cache_dir;
+use crate::error::TalkError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

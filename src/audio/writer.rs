@@ -7,8 +7,8 @@
 use byteorder::{LittleEndian, WriteBytesExt};
 use ogg::{PacketWriteEndInfo, PacketWriter};
 
-use crate::core::config::AudioConfig;
-use crate::core::error::TalkError;
+use crate::config::AudioConfig;
+use crate::error::TalkError;
 
 /// Trait for audio container writers.
 ///
@@ -318,7 +318,7 @@ impl AudioWriter for WavWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::AudioConfig;
+    use crate::config::AudioConfig;
 
     fn test_config() -> AudioConfig {
         AudioConfig::new()

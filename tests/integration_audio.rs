@@ -5,9 +5,9 @@
 //!   cargo test -- --ignored
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use talk_rs::core::audio::cpal_capture::CpalCapture;
-use talk_rs::core::audio::AudioCapture;
-use talk_rs::core::config::AudioConfig;
+use talk_rs::audio::cpal_capture::CpalCapture;
+use talk_rs::audio::AudioCapture;
+use talk_rs::config::AudioConfig;
 
 fn test_audio_config() -> AudioConfig {
     AudioConfig {

@@ -6,8 +6,8 @@
 //! (including Bluetooth devices) with identical routing.
 
 use super::{AudioCapture, CHANNEL_CAPACITY, CHUNK_DURATION_MS};
-use crate::core::config::AudioConfig;
-use crate::core::error::TalkError;
+use crate::config::AudioConfig;
+use crate::error::TalkError;
 use tokio::sync::mpsc;
 
 use pipewire as pw;

@@ -4,12 +4,12 @@
 //! providers/models via a GTK picker window.  Cached results are reused
 //! when available.
 
-use crate::core::config::{Config, Provider};
-use crate::core::error::TalkError;
-use crate::core::picker_cache;
-use crate::core::recording_cache;
-use crate::core::transcription::{self, BatchTranscriber, RealtimeTranscriber};
+use crate::config::{Config, Provider};
+use crate::error::TalkError;
 use crate::paste::paste_text_to_target;
+use crate::picker_cache;
+use crate::recording_cache;
+use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber};
 use crate::x11::x11_centre_and_raise;
 use std::path::PathBuf;
 

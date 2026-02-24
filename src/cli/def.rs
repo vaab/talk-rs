@@ -1,4 +1,4 @@
-use crate::core::config::Provider;
+use crate::config::Provider;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]

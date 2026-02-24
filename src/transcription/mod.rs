@@ -8,8 +8,8 @@
 //! - [`BatchTranscriber`]: file or byte-stream in, full text out.
 //! - [`RealtimeTranscriber`]: raw PCM stream in, incremental event stream out.
 
-use crate::core::config::{Config, Provider};
-use crate::core::error::TalkError;
+use crate::config::{Config, Provider};
+use crate::error::TalkError;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::Path;

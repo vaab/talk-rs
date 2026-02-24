@@ -6,10 +6,10 @@
 //! model, and mode in its filename and contains the transcript plus
 //! recording metadata.
 
-use crate::core::config::Provider;
-use crate::core::daemon::cache_dir;
-use crate::core::error::TalkError;
-use crate::core::transcription::{
+use crate::config::Provider;
+use crate::daemon::cache_dir;
+use crate::error::TalkError;
+use crate::transcription::{
     MistralProviderMetadata, OpenAIProviderMetadata, OpenAIRealtimeMetadata,
     ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata,
 };

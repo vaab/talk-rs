@@ -7,10 +7,8 @@
 
 use std::fs;
 use std::path::Path;
-use talk_rs::core::config::MistralConfig;
-use talk_rs::core::transcription::{
-    BatchTranscriber, MistralBatchTranscriber, MockBatchTranscriber,
-};
+use talk_rs::config::MistralConfig;
+use talk_rs::transcription::{BatchTranscriber, MistralBatchTranscriber, MockBatchTranscriber};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 
@@ -145,7 +143,7 @@ async fn test_transcribe_nonexistent_file_errors() {
 #[tokio::test]
 #[ignore]
 async fn test_mistral_transcriber_real_api() {
-    use talk_rs::core::config::config_path;
+    use talk_rs::config::config_path;
 
     // Load config to get API key
     let config_path = config_path().expect("get config path");
@@ -157,7 +155,7 @@ async fn test_mistral_transcriber_real_api() {
     }
 
     let config_content = fs::read_to_string(&config_path).expect("read config file");
-    let config: talk_rs::core::config::Config =
+    let config: talk_rs::config::Config =
         serde_yaml::from_str(&config_content).expect("parse config YAML");
 
     // Create temporary directory for test audio

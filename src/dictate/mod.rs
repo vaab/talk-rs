@@ -12,23 +12,23 @@ mod streaming;
 mod text;
 mod toggle;
 
-use crate::core::audio::file_source::WavFileSource;
-use crate::core::audio::indicator::SoundPlayer;
-use crate::core::audio::monitor_capture::MonitorCapture;
-use crate::core::audio::pipewire_capture::PipeWireCapture;
-use crate::core::audio::resample;
-use crate::core::audio::{AudioCapture, CHUNK_DURATION_MS};
-use crate::core::clipboard::{Clipboard, X11Clipboard};
-use crate::core::config::{AudioConfig, Config, Provider};
-use crate::core::daemon;
-use crate::core::error::TalkError;
-use crate::core::overlay::{IndicatorKind, OverlayHandle};
-use crate::core::recording_cache;
-use crate::core::transcription;
-use crate::core::visualizer::VisualizerHandle;
+use crate::audio::file_source::WavFileSource;
+use crate::audio::indicator::SoundPlayer;
+use crate::audio::monitor_capture::MonitorCapture;
+use crate::audio::pipewire_capture::PipeWireCapture;
+use crate::audio::resample;
+use crate::audio::{AudioCapture, CHUNK_DURATION_MS};
+use crate::clipboard::{Clipboard, X11Clipboard};
+use crate::config::{AudioConfig, Config, Provider};
+use crate::daemon;
+use crate::error::TalkError;
+use crate::overlay::{IndicatorKind, OverlayHandle};
 use crate::paste::{
     focus_window, get_active_window, paste_text_to_target, simulate_paste, PASTE_CHUNK_CHARS,
 };
+use crate::recording_cache;
+use crate::transcription;
+use crate::visualizer::VisualizerHandle;
 use models::{resolve_model, resolve_provider};
 use pick::{run_pick, PickParams};
 use realtime::dictate_realtime;
@@ -582,7 +582,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Batch mode: overlay is still showing "Transcribing" badge —
     // it will be hidden after paste (below).
 
-    let text = crate::core::transcription::format_transcription_output(&result)
+    let text = crate::transcription::format_transcription_output(&result)
         .trim()
         .to_string();
     let metadata = result.metadata;
@@ -686,11 +686,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_dictate_pipeline_with_mocks() {
-        use crate::core::audio::mock::MockAudioCapture;
-        use crate::core::audio::{AudioCapture, AudioWriter, OggOpusWriter};
-        use crate::core::clipboard::MockClipboard;
-        use crate::core::config::AudioConfig;
-        use crate::core::transcription::{BatchTranscriber, MockBatchTranscriber};
+        use crate::audio::mock::MockAudioCapture;
+        use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
+        use crate::clipboard::MockClipboard;
+        use crate::config::AudioConfig;
+        use crate::transcription::{BatchTranscriber, MockBatchTranscriber};
 
         let audio_config = AudioConfig::new();
 

@@ -3,9 +3,9 @@
 //! Transcribes an audio file to text using the configured transcription backend.
 //! Supports writing output to stdout or to a file.
 
-use crate::core::config::{Config, Provider};
-use crate::core::error::TalkError;
-use crate::core::transcription::{self, format_transcription_output};
+use crate::config::{Config, Provider};
+use crate::error::TalkError;
+use crate::transcription::{self, format_transcription_output};
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -168,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transcribe_pipeline_with_mock_transcriber() {
-        use crate::core::transcription::{BatchTranscriber, MockBatchTranscriber};
+        use crate::transcription::{BatchTranscriber, MockBatchTranscriber};
         use std::fs;
         use tempfile::TempDir;
 

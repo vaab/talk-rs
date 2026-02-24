@@ -8,8 +8,8 @@
 
 use super::realtime::TranscriptionEvent;
 use super::RealtimeTranscriber;
-use crate::core::config::OpenAIConfig;
-use crate::core::error::TalkError;
+use crate::config::OpenAIConfig;
+use crate::error::TalkError;
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;

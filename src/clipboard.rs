@@ -3,7 +3,7 @@
 //! This module provides traits and implementations for clipboard operations
 //! using various backends (X11 via xclip, future: Wayland via wl-copy).
 
-use crate::core::error::TalkError;
+use crate::error::TalkError;
 use async_trait::async_trait;
 
 /// Trait for clipboard operations.

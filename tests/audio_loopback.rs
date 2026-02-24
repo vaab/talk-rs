@@ -17,7 +17,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use talk_rs::core::audio::indicator::SoundPlayer;
+use talk_rs::audio::indicator::SoundPlayer;
 
 // ── Shared null sink (lives for entire test binary) ──────────────────
 //
