@@ -1,9 +1,10 @@
 //! Clipboard interfaces and implementations.
 //!
 //! This module provides traits and implementations for clipboard operations
-//! using various backends (X11 via xclip, future: Wayland via wl-copy).
+//! using native X11 via `x11rb` (no external tools required).
 
 use crate::error::TalkError;
+use crate::x11::clipboard::{x11_clipboard_get, x11_clipboard_set, ClipboardServeHandle};
 use async_trait::async_trait;
 
 /// Trait for clipboard operations.
@@ -19,66 +20,60 @@ pub trait Clipboard: Send + Sync {
     async fn set_text(&self, text: &str) -> Result<(), TalkError>;
 }
 
-/// X11 clipboard implementation using the `xclip` command-line tool.
+/// X11 clipboard implementation using native `x11rb` calls.
 ///
-/// Requires `xclip` to be installed on the system.
-pub struct X11Clipboard;
+/// Each [`set_text`](Clipboard::set_text) call spawns a short-lived
+/// background thread that serves `SelectionRequest` events so the
+/// paste target can retrieve the data.  The thread is automatically
+/// replaced on the next `set_text` and cleaned up on drop.
+pub struct X11Clipboard {
+    serve_handle: std::sync::Mutex<Option<ClipboardServeHandle>>,
+}
 
 impl Default for X11Clipboard {
     fn default() -> Self {
-        Self
+        Self {
+            serve_handle: std::sync::Mutex::new(None),
+        }
     }
 }
 
 impl X11Clipboard {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
 #[async_trait]
 impl Clipboard for X11Clipboard {
     async fn get_text(&self) -> Result<String, TalkError> {
-        let output = tokio::process::Command::new("xclip")
-            .args(["-selection", "clipboard", "-o"])
-            .output()
+        let result = tokio::task::spawn_blocking(x11_clipboard_get)
             .await
-            .map_err(|e| TalkError::Clipboard(format!("failed to run xclip: {e}")))?;
+            .map_err(|e| TalkError::Clipboard(format!("clipboard task panicked: {e}")))?;
 
-        if !output.status.success() {
-            // Empty clipboard returns non-zero exit code
-            return Ok(String::new());
-        }
-
-        String::from_utf8(output.stdout)
-            .map_err(|e| TalkError::Clipboard(format!("clipboard content is not valid UTF-8: {e}")))
+        // Empty/missing clipboard is not an error — return empty string.
+        Ok(result.unwrap_or_default())
     }
 
     async fn set_text(&self, text: &str) -> Result<(), TalkError> {
-        use tokio::io::AsyncWriteExt;
-
-        let mut child = tokio::process::Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| TalkError::Clipboard(format!("failed to run xclip: {e}")))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes()).await.map_err(|e| {
-                TalkError::Clipboard(format!("failed to write to xclip stdin: {e}"))
-            })?;
-        }
-
-        let status = child
-            .wait()
+        // Claim ownership FIRST.  The X server sends SelectionClear to
+        // the previous owner, letting its serve thread finish any
+        // pending request before exiting — no aggressive kill needed.
+        let owned = text.to_string();
+        let handle = tokio::task::spawn_blocking(move || x11_clipboard_set(&owned))
             .await
-            .map_err(|e| TalkError::Clipboard(format!("failed to wait for xclip: {e}")))?;
+            .map_err(|e| TalkError::Clipboard(format!("clipboard task panicked: {e}")))?
+            .ok_or_else(|| {
+                TalkError::Clipboard("failed to claim clipboard ownership".to_string())
+            })?;
 
-        if !status.success() {
-            return Err(TalkError::Clipboard(
-                "xclip exited with non-zero status".to_string(),
-            ));
-        }
+        let mut guard = self
+            .serve_handle
+            .lock()
+            .map_err(|e| TalkError::Clipboard(format!("clipboard lock poisoned: {e}")))?;
+        // Old handle dropped here — its thread already received
+        // SelectionClear from the new owner and should exit fast.
+        *guard = Some(handle);
 
         Ok(())
     }
