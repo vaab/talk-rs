@@ -6,13 +6,11 @@
 
 use crate::config::{Config, Provider};
 use crate::error::TalkError;
-use crate::picker_cache;
 use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber};
 use std::path::PathBuf;
 
-use super::picker_backend::{
-    read_wav_pcm_samples, run_realtime_transcription, spawn_transcription,
-};
+use super::backend::{read_wav_pcm_samples, run_realtime_transcription, spawn_transcription};
+use super::cache;
 
 /// Window title used for the picker — also used for single-instance
 /// detection via `x11_centre_and_raise`.
@@ -792,17 +790,17 @@ pub(super) async fn pick_with_streaming_gtk(
         let items = results
             .lock()
             .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
-        let to_cache: Vec<picker_cache::CachedResult> = items
+        let to_cache: Vec<cache::CachedResult> = items
             .iter()
             .filter(|(_, _, text, _, is_error, _)| !text.is_empty() && !*is_error)
-            .map(|(p, m, t, _, _, s)| picker_cache::CachedResult {
+            .map(|(p, m, t, _, _, s)| cache::CachedResult {
                 provider: p.to_string(),
                 model: m.clone(),
                 text: t.clone(),
                 streaming: *s,
             })
             .collect();
-        if let Err(e) = picker_cache::write_results(&audio_path_for_cache, &to_cache) {
+        if let Err(e) = cache::write_results(&audio_path_for_cache, &to_cache) {
             log::warn!("failed to write picker cache: {}", e);
         }
     }
