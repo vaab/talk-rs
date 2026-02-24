@@ -61,18 +61,6 @@ A working Rust toolchain is required (1.70+). Install via
 
 *** Runtime dependencies
 
-The following tools must be available in ~$PATH~:
-
-- ~xclip~ -- clipboard access
-
-#+begin_src sh
-# Debian / Ubuntu
-sudo apt install xclip
-
-# Fedora
-sudo dnf install xclip
-#+end_src
-
 =PipeWire= must be running (used for audio capture). Most modern Linux
 desktops ship with PipeWire by default.
 
