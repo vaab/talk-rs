@@ -22,6 +22,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::BatchTranscriber;
 
+/// Default API base URL for the OpenAI API.
+const API_BASE: &str = "https://api.openai.com";
+
 /// OpenAI API transcription endpoint.
 const OPENAI_API_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
 
@@ -96,6 +99,54 @@ fn extract_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> BTreeMap<
         }
     }
     out
+}
+
+// ── Error detection ─────────────────────────────────────────────────
+
+/// Check if an error is a model-not-found error from the OpenAI API.
+///
+/// OpenAI returns `"code":"model_not_found"` or `"does not exist"`
+/// messages.
+pub(crate) fn is_model_error(error: &TalkError) -> bool {
+    let msg = error.to_string().to_lowercase();
+    msg.contains("model_not_found")
+        || (msg.contains("model") && (msg.contains("does not exist") || msg.contains("not found")))
+}
+
+/// Filter predicate for OpenAI transcription-relevant models.
+pub(crate) fn is_transcription_model(model_id: &str) -> bool {
+    model_id.contains("whisper") || model_id.contains("transcri")
+}
+
+/// Enrich a model error with available OpenAI transcription models.
+///
+/// Returns the error unchanged if it is not a model error or if
+/// suggestions cannot be fetched.
+pub(crate) async fn enrich_model_error(error: TalkError, api_key: &str, model: &str) -> TalkError {
+    if !is_model_error(&error) {
+        return error;
+    }
+    match super::model_suggestions::fetch_transcription_models(
+        api_key,
+        API_BASE,
+        is_transcription_model,
+    )
+    .await
+    {
+        Ok(models) if !models.is_empty() => TalkError::Transcription(format!(
+            "Model '{}' not found. Available transcription models: {}",
+            model,
+            models.join(", ")
+        )),
+        Ok(_) => TalkError::Transcription(format!(
+            "Model '{}' not found (no transcription models available in account)",
+            model
+        )),
+        Err(e) => {
+            log::warn!("could not fetch model suggestions: {}", e);
+            error
+        }
+    }
 }
 
 // ── Shared model validation ─────────────────────────────────────────
@@ -569,6 +620,51 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_is_model_error_openai_code() {
+        let err = TalkError::Transcription(
+            r#"OpenAI API error (404): {"error":{"message":"The model 'bad' does not exist","type":"invalid_request_error","param":"model","code":"model_not_found"}}"#.to_string(),
+        );
+        assert!(is_model_error(&err));
+    }
+
+    #[test]
+    fn test_is_model_error_does_not_exist() {
+        let err = TalkError::Transcription(
+            "The model 'xyz' does not exist or you do not have access".to_string(),
+        );
+        assert!(is_model_error(&err));
+    }
+
+    #[test]
+    fn test_is_model_error_negative_network() {
+        let err = TalkError::Transcription("connection timed out".to_string());
+        assert!(!is_model_error(&err));
+    }
+
+    #[test]
+    fn test_is_model_error_negative_auth() {
+        let err = TalkError::Transcription("OpenAI API error (401): Unauthorized".to_string());
+        assert!(!is_model_error(&err));
+    }
+
+    #[tokio::test]
+    async fn test_enrich_non_model_error_unchanged() {
+        let err = TalkError::Transcription("connection timed out".to_string());
+        let enriched = enrich_model_error(err, "key", "whisper-1").await;
+        assert_eq!(
+            enriched.to_string(),
+            "Transcription error: connection timed out"
+        );
+    }
+
+    #[test]
+    fn test_is_transcription_model_matches() {
+        assert!(is_transcription_model("whisper-1"));
+        assert!(is_transcription_model("gpt-4o-transcribe"));
+        assert!(!is_transcription_model("gpt-4o"));
     }
 
     #[tokio::test]

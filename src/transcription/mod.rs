@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub mod mistral;
+pub mod model_suggestions;
 pub mod openai;
 pub mod openai_realtime;
 pub mod realtime;
@@ -209,6 +210,47 @@ pub trait RealtimeTranscriber: Send + Sync {
         &self,
         audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     ) -> Result<tokio::sync::mpsc::Receiver<TranscriptionEvent>, TalkError>;
+}
+
+// ── Error detection / enrichment dispatchers ────────────────────────
+
+/// Check if an error is a model-not-found error for the given provider.
+///
+/// Dispatches to the provider module's own detection logic.
+pub fn is_model_error(provider: Provider, error: &TalkError) -> bool {
+    match provider {
+        Provider::Mistral => mistral::is_model_error(error),
+        Provider::OpenAI => openai::is_model_error(error),
+    }
+}
+
+/// Enrich a model error with available transcription model suggestions.
+///
+/// Dispatches to the provider module's own enrichment logic.  Returns
+/// the error unchanged if it is not a model error or if the provider
+/// section is not configured.
+pub async fn enrich_model_error(
+    config: &Config,
+    provider: Provider,
+    model: Option<&str>,
+    error: TalkError,
+) -> TalkError {
+    match provider {
+        Provider::Mistral => {
+            let Some(ref cfg) = config.providers.mistral else {
+                return error;
+            };
+            let model_name = model.unwrap_or(&cfg.model);
+            mistral::enrich_model_error(error, &cfg.api_key, model_name).await
+        }
+        Provider::OpenAI => {
+            let Some(ref cfg) = config.providers.openai else {
+                return error;
+            };
+            let model_name = model.unwrap_or(&cfg.model);
+            openai::enrich_model_error(error, &cfg.api_key, model_name).await
+        }
+    }
 }
 
 // ── Factory ──────────────────────────────────────────────────────────
