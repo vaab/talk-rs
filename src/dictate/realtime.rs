@@ -46,11 +46,7 @@ pub(crate) async fn dictate_realtime(
     visualizer: Option<&VisualizerHandle>,
     shutdown: &CancellationToken,
 ) -> Result<TranscriptionResult, TalkError> {
-    // Create and validate the transcriber before starting audio capture
-    // so the user gets immediate feedback on misconfiguration.
     let transcriber = transcription::create_realtime_transcriber(&config, provider, model)?;
-    log::info!("validating {} provider configuration", provider);
-    transcriber.validate().await?;
 
     // Always tee audio to the cache WAV for recording cache.
     log::info!("caching audio to: {}", cache_wav_path.display());

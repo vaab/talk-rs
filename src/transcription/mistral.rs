@@ -21,6 +21,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::BatchTranscriber;
 
+/// Default API base URL for the Mistral API.
+const API_BASE: &str = "https://api.mistral.ai";
+
 /// Mistral API transcription endpoint.
 const MISTRAL_API_ENDPOINT: &str = "https://api.mistral.ai/v1/audio/transcriptions";
 
@@ -108,6 +111,53 @@ fn parse_diarization_segments(segments: &[serde_json::Value]) -> Option<Vec<Diar
         None
     } else {
         Some(result)
+    }
+}
+
+// ── Error detection ─────────────────────────────────────────────────
+
+/// Check if an error is a model-not-found error from the Mistral API.
+///
+/// Mistral returns `"Unknown model: xyz"` or similar messages.
+pub(crate) fn is_model_error(error: &TalkError) -> bool {
+    let msg = error.to_string().to_lowercase();
+    msg.contains("unknown model")
+        || (msg.contains("model") && (msg.contains("not found") || msg.contains("invalid model")))
+}
+
+/// Filter predicate for Mistral transcription-relevant models.
+pub(crate) fn is_transcription_model(model_id: &str) -> bool {
+    model_id.contains("voxtral") || model_id.contains("transcri")
+}
+
+/// Enrich a model error with available Mistral transcription models.
+///
+/// Returns the error unchanged if it is not a model error or if
+/// suggestions cannot be fetched.
+pub(crate) async fn enrich_model_error(error: TalkError, api_key: &str, model: &str) -> TalkError {
+    if !is_model_error(&error) {
+        return error;
+    }
+    match super::model_suggestions::fetch_transcription_models(
+        api_key,
+        API_BASE,
+        is_transcription_model,
+    )
+    .await
+    {
+        Ok(models) if !models.is_empty() => TalkError::Transcription(format!(
+            "Model '{}' not found. Available transcription models: {}",
+            model,
+            models.join(", ")
+        )),
+        Ok(_) => TalkError::Transcription(format!(
+            "Model '{}' not found (no transcription models available in account)",
+            model
+        )),
+        Err(e) => {
+            log::warn!("could not fetch model suggestions: {}", e);
+            error
+        }
     }
 }
 
@@ -712,6 +762,53 @@ mod tests {
         assert_eq!(segments[0].end, 1.5);
         assert_eq!(segments[1].speaker, "SPEAKER_01");
         assert_eq!(segments[1].text, "I am fine.");
+    }
+
+    #[test]
+    fn test_is_model_error_unknown_model() {
+        let err = TalkError::Transcription(
+            r#"Mistral API error (422): {"object":"error","message":"Unknown model: bad-model","type":"invalid_request_error"}"#.to_string(),
+        );
+        assert!(is_model_error(&err));
+    }
+
+    #[test]
+    fn test_is_model_error_not_found() {
+        let err = TalkError::Transcription(
+            "Model 'voxtral-mini-9999' not found. Available transcription models: voxtral-mini-2507"
+                .to_string(),
+        );
+        assert!(is_model_error(&err));
+    }
+
+    #[test]
+    fn test_is_model_error_negative_network() {
+        let err = TalkError::Transcription("connection timed out".to_string());
+        assert!(!is_model_error(&err));
+    }
+
+    #[test]
+    fn test_is_model_error_negative_auth() {
+        let err = TalkError::Transcription("Mistral API error (401): Unauthorized".to_string());
+        assert!(!is_model_error(&err));
+    }
+
+    #[tokio::test]
+    async fn test_enrich_non_model_error_unchanged() {
+        let err = TalkError::Transcription("connection timed out".to_string());
+        let enriched = enrich_model_error(err, "key", "voxtral-mini-2507").await;
+        assert_eq!(
+            enriched.to_string(),
+            "Transcription error: connection timed out"
+        );
+    }
+
+    #[test]
+    fn test_is_transcription_model_matches() {
+        assert!(is_transcription_model("voxtral-mini-2507"));
+        assert!(is_transcription_model("voxtral-mini-2602"));
+        assert!(is_transcription_model("some-transcription-model"));
+        assert!(!is_transcription_model("mistral-large-latest"));
     }
 
     #[tokio::test]

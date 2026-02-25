@@ -396,8 +396,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             }
         });
 
-        let result = dictate_realtime(
-            config,
+        let result = match dictate_realtime(
+            config.clone(),
             provider,
             opts.model.as_deref(),
             &cache_wav_path,
@@ -410,7 +410,17 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             visualizer.as_ref(),
             &shutdown,
         )
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Enrich model-not-found errors with available models.
+                let enriched =
+                    transcription::enrich_model_error(&config, provider, opts.model.as_deref(), e)
+                        .await;
+                return Err(enriched);
+            }
+        };
 
         // Wait for all pending pastes to complete
         if let Err(e) = paste_task.await {
@@ -427,8 +437,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         result
     } else {
         // Batch mode (default): capture audio, encode, then transcribe.
-        // Provider validation is handled by toggle_validate() in the
-        // caller — no network round-trip here.
         let transcriber = transcription::create_batch_transcriber(
             &config,
             provider,
@@ -462,6 +470,32 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             Ok(r) => r,
             Err(first_err) => {
                 log::warn!("initial transcription failed: {}", first_err);
+
+                // Model-not-found is a permanent error — retrying will
+                // not help.  Enrich with available models and bail.
+                if transcription::is_model_error(provider, &first_err) {
+                    let enriched = transcription::enrich_model_error(
+                        &config,
+                        provider,
+                        opts.model.as_deref(),
+                        first_err,
+                    )
+                    .await;
+                    let final_msg = format!("{}", enriched);
+                    log::error!("{}", final_msg);
+                    if let Some(ref viz) = visualizer {
+                        viz.set_text(&format!("Error: {}", final_msg));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    if let Some(ref viz) = visualizer {
+                        viz.hide();
+                    }
+                    if let Some(ref o) = overlay {
+                        o.hide();
+                    }
+                    return Ok(());
+                }
+
                 let mut last_err = first_err;
                 let mut succeeded = None;
 
