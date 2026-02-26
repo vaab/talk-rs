@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use super::backend::{read_wav_pcm_samples, run_realtime_transcription, spawn_transcription};
 use super::cache;
+use crate::record::player::WavPlayer;
 
 /// Window title used for the picker — also used for single-instance
 /// detection via `x11_centre_and_raise`.
@@ -166,6 +167,9 @@ pub(super) async fn pick_with_streaming_gtk(
     )>::new()));
     let results_for_gtk = results.clone();
 
+    // Clone audio path for the GTK play button before moving into closures.
+    let audio_path_for_player = audio_path.clone();
+
     // ── GTK window ──────────────────────────────────────────────
     let gtk_handle = tokio::task::spawn_blocking(move || -> Result<(), TalkError> {
         use gtk4::glib;
@@ -194,7 +198,8 @@ pub(super) async fn pick_with_streaming_gtk(
         crate::gtk_theme::load_css(&theme.base_css(&format!(
             ".transcript {{ font-family: monospace; }} \
              .error {{ font-style: italic; color: alpha({err}, 0.8); }} \
-             .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }}",
+             .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }} \
+             .play-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }}",
             err = error_hex,
         )));
 
@@ -203,6 +208,75 @@ pub(super) async fn pick_with_streaming_gtk(
         root.set_margin_bottom(6);
         root.set_margin_start(6);
         root.set_margin_end(6);
+
+        // ── Audio player for playback button ─────────────────────
+        let player: Rc<Option<WavPlayer>> = Rc::new(match WavPlayer::new() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::warn!("audio output unavailable, play button disabled: {}", e);
+                None
+            }
+        });
+
+        // Play-button bar above the transcription list.
+        let play_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        play_bar.set_margin_start(4);
+        play_bar.set_margin_end(4);
+        play_bar.set_margin_bottom(4);
+
+        let play_btn = gtk4::Button::with_label("\u{25b6}");
+        play_btn.set_tooltip_text(Some("Play recorded audio"));
+        play_btn.add_css_class("play-btn");
+        if player.is_none() {
+            play_btn.set_sensitive(false);
+        }
+
+        {
+            let player_ref = Rc::clone(&player);
+            let audio = audio_path_for_player;
+            play_btn.connect_clicked(move |btn| {
+                let is_playing = btn.label().is_some_and(|l| l == "\u{25a0}");
+                if is_playing {
+                    if let Some(ref p) = *player_ref {
+                        p.stop();
+                    }
+                    btn.set_label("\u{25b6}");
+                    btn.set_tooltip_text(Some("Play recorded audio"));
+                } else {
+                    if let Some(ref p) = *player_ref {
+                        if let Err(e) = p.play(&audio) {
+                            log::warn!("failed to play audio: {}", e);
+                            return;
+                        }
+                    }
+                    btn.set_label("\u{25a0}");
+                    btn.set_tooltip_text(Some("Stop playback"));
+                }
+            });
+        }
+
+        // Poll for playback completion to auto-reset the button.
+        {
+            let player_poll = Rc::clone(&player);
+            let btn_poll = play_btn.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                let is_playing = btn_poll.label().is_some_and(|l| l == "\u{25a0}");
+                if is_playing {
+                    let finished = player_poll
+                        .as_ref()
+                        .as_ref()
+                        .is_none_or(|p| p.is_finished());
+                    if finished {
+                        btn_poll.set_label("\u{25b6}");
+                        btn_poll.set_tooltip_text(Some("Play recorded audio"));
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+
+        play_bar.append(&play_btn);
+        root.append(&play_bar);
 
         let scrolled = gtk4::ScrolledWindow::builder()
             .vexpand(true)
@@ -403,9 +477,13 @@ pub(super) async fn pick_with_streaming_gtk(
             let sel = Rc::clone(&sel_sender);
             let ml = main_loop.clone();
             let win = window.clone();
+            let player_ref = Rc::clone(&player);
             let key_ctl = gtk4::EventControllerKey::new();
             key_ctl.connect_key_pressed(move |_, key, _, _| {
                 if key == gtk4::gdk::Key::Escape {
+                    if let Some(ref p) = *player_ref {
+                        p.stop();
+                    }
                     win.set_visible(false);
                     if let Some(tx) = sel.borrow_mut().take() {
                         let _ = tx.send(None);
@@ -423,7 +501,11 @@ pub(super) async fn pick_with_streaming_gtk(
         {
             let sel = Rc::clone(&sel_sender);
             let ml = main_loop.clone();
+            let player_ref = Rc::clone(&player);
             window.connect_close_request(move |win| {
+                if let Some(ref p) = *player_ref {
+                    p.stop();
+                }
                 win.set_visible(false);
                 if let Some(tx) = sel.borrow_mut().take() {
                     let _ = tx.send(None);

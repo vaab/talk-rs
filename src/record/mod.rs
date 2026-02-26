@@ -5,7 +5,7 @@
 
 mod audio;
 mod entries;
-mod player;
+pub(crate) mod player;
 pub(crate) mod ui;
 
 use crate::audio::cpal_capture::CpalCapture;
