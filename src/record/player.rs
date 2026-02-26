@@ -16,7 +16,7 @@ struct WavPlaybackState {
 /// [`play`](WavPlayer::play) loads an audio file and starts from the
 /// beginning; [`stop`](WavPlayer::stop) clears the buffer.
 // Named WavPlayer for backwards compatibility; handles both WAV and OGG.
-pub(super) struct WavPlayer {
+pub(crate) struct WavPlayer {
     state: std::sync::Arc<std::sync::Mutex<WavPlaybackState>>,
     device_sample_rate: u32,
     // Dropping this stops the stream.
@@ -25,7 +25,7 @@ pub(super) struct WavPlayer {
 
 impl WavPlayer {
     /// Open the default output device and start a silent stream.
-    pub(super) fn new() -> Result<Self, TalkError> {
+    pub(crate) fn new() -> Result<Self, TalkError> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         let host = cpal::default_host();
@@ -90,7 +90,7 @@ impl WavPlayer {
     }
 
     /// Load an audio file (WAV or OGG) and start playing it from the beginning.
-    pub(super) fn play(&self, audio_path: &std::path::Path) -> Result<(), TalkError> {
+    pub(crate) fn play(&self, audio_path: &std::path::Path) -> Result<(), TalkError> {
         let ext = audio_path
             .extension()
             .and_then(|e| e.to_str())
@@ -107,7 +107,7 @@ impl WavPlayer {
     }
 
     /// Stop playback immediately.
-    pub(super) fn stop(&self) {
+    pub(crate) fn stop(&self) {
         if let Ok(mut guard) = self.state.lock() {
             guard.samples.clear();
             guard.position = 0;
@@ -115,7 +115,7 @@ impl WavPlayer {
     }
 
     /// `true` when all samples have been consumed (or nothing loaded).
-    pub(super) fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         self.state
             .lock()
             .map(|g| g.samples.is_empty() || g.position >= g.samples.len())
