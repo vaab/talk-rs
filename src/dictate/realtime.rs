@@ -355,7 +355,14 @@ pub(crate) async fn dictate_realtime(
                     }
                     Some(TranscriptionEvent::Error { message }) => {
                         bump("error", &mut event_counts);
-                        log::warn!("realtime transcription error: {} — attempting reconnect", message);
+                        let msg = format!(
+                            "Transcription error: {} — reconnecting",
+                            message
+                        );
+                        log::warn!("{}", msg);
+                        if let Some(viz) = visualizer {
+                            viz.set_text(&msg);
+                        }
 
                         // Try to reconnect with a fresh transcriber and
                         // replay all audio from the beginning.
@@ -373,17 +380,34 @@ pub(crate) async fn dictate_realtime(
                                 match new_transcriber.transcribe_realtime(new_fwd_rx).await {
                                     Ok(new_rx) => {
                                         log::info!("realtime transcription reconnected");
+                                        if let Some(viz) = visualizer {
+                                            viz.set_text("");
+                                        }
                                         event_rx = new_rx;
                                         continue;
                                     }
                                     Err(e) => {
-                                        log::warn!("reconnect failed: {}", e);
+                                        let msg = format!(
+                                            "Reconnect failed: {}",
+                                            e
+                                        );
+                                        log::warn!("{}", msg);
+                                        if let Some(viz) = visualizer {
+                                            viz.set_text(&msg);
+                                        }
                                         break;
                                     }
                                 }
                             }
                             Err(e) => {
-                                log::warn!("could not create replacement transcriber: {}", e);
+                                let msg = format!(
+                                    "Reconnect failed: {}",
+                                    e
+                                );
+                                log::warn!("{}", msg);
+                                if let Some(viz) = visualizer {
+                                    viz.set_text(&msg);
+                                }
                                 break;
                             }
                         }
@@ -429,6 +453,9 @@ pub(crate) async fn dictate_realtime(
                         // reconnect and replay from the beginning.
                         bump("channel_closed", &mut event_counts);
                         log::warn!("realtime event channel closed — attempting reconnect");
+                        if let Some(viz) = visualizer {
+                            viz.set_text("Connection lost — reconnecting");
+                        }
 
                         feeder_handle.abort();
                         match transcription::create_realtime_transcriber(&config, provider, model)
@@ -444,16 +471,27 @@ pub(crate) async fn dictate_realtime(
                                 match new_transcriber.transcribe_realtime(new_fwd_rx).await {
                                     Ok(new_rx) => {
                                         log::info!("realtime transcription reconnected");
+                                        if let Some(viz) = visualizer {
+                                            viz.set_text("");
+                                        }
                                         event_rx = new_rx;
                                         continue;
                                     }
                                     Err(e) => {
-                                        log::warn!("reconnect failed: {}", e);
+                                        let msg = format!("Reconnect failed: {}", e);
+                                        log::warn!("{}", msg);
+                                        if let Some(viz) = visualizer {
+                                            viz.set_text(&msg);
+                                        }
                                     }
                                 }
                             }
                             Err(e) => {
-                                log::warn!("could not create replacement transcriber: {}", e);
+                                let msg = format!("Reconnect failed: {}", e);
+                                log::warn!("{}", msg);
+                                if let Some(viz) = visualizer {
+                                    viz.set_text(&msg);
+                                }
                             }
                         }
                         // Reconnect failed — flush trailing text and exit.

@@ -193,25 +193,27 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     };
 
-    // Initialize visualizer (amplitude / spectrum panels)
-    let visualizer = if opts.amplitude || opts.spectrum {
-        match VisualizerHandle::new(opts.amplitude, opts.spectrum, opts.realtime) {
-            Ok(h) => {
-                log::debug!(
-                    "visualizer initialized (amplitude={}, spectrum={}, text={})",
-                    opts.amplitude,
-                    opts.spectrum,
-                    opts.realtime,
-                );
-                Some(h)
-            }
-            Err(e) => {
-                log::warn!("visualizer unavailable: {}", e);
-                None
-            }
+    // Initialize visualizer.
+    //
+    // Always created so that error/retry messages can be shown in the
+    // text panel below the recording badge even without --amplitude or
+    // --spectrum.  When neither audio visualizer is enabled, the
+    // visualizer thread skips CPAL audio capture and only handles text
+    // rendering — very lightweight.
+    let visualizer = match VisualizerHandle::new(opts.amplitude, opts.spectrum, opts.realtime) {
+        Ok(h) => {
+            log::debug!(
+                "visualizer initialized (amplitude={}, spectrum={}, text={})",
+                opts.amplitude,
+                opts.spectrum,
+                opts.realtime,
+            );
+            Some(h)
         }
-    } else {
-        None
+        Err(e) => {
+            log::warn!("visualizer unavailable: {}", e);
+            None
+        }
     };
 
     // Generate cache recording path (always, even without --save)

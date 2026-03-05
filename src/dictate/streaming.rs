@@ -195,10 +195,15 @@ pub(crate) async fn dictate_streaming(
 
                     live_retries += 1;
                     if live_retries > MAX_LIVE_RETRIES {
-                        log::warn!(
-                            "exceeded {} live retries, deferring to post-recording retry",
+                        let msg = format!(
+                            "Transcription failed ({} retries exhausted) — \
+                             will retry after recording",
                             MAX_LIVE_RETRIES
                         );
+                        log::warn!("{}", msg);
+                        if let Some(viz) = visualizer {
+                            viz.set_text(&msg);
+                        }
                         // Continue recording — will retry from WAV
                         // after recording stops.
                         shutdown.cancelled().await;
@@ -211,11 +216,14 @@ pub(crate) async fn dictate_streaming(
                         break;
                     }
 
-                    log::info!(
-                        "retrying transcription pipeline (attempt {}/{})",
-                        live_retries,
-                        MAX_LIVE_RETRIES
+                    let msg = format!(
+                        "Transcription failed: {} — retrying ({}/{})",
+                        reason, live_retries, MAX_LIVE_RETRIES
                     );
+                    log::info!("{}", msg);
+                    if let Some(viz) = visualizer {
+                        viz.set_text(&msg);
+                    }
                     match transcription::create_batch_transcriber(
                         config, provider, model, diarize,
                     ) {
@@ -232,9 +240,20 @@ pub(crate) async fn dictate_streaming(
                             // from-file branch; keep the receiver
                             // alive so the sender side does not error.
                             _ = std::mem::replace(&mut encode_done_rx, pipeline.3);
+                            if let Some(viz) = visualizer {
+                                viz.set_text("");
+                            }
                         }
                         Err(e) => {
-                            log::warn!("could not create replacement transcriber: {}", e);
+                            let msg = format!(
+                                "Transcription reconnect failed: {} — \
+                                 will retry after recording",
+                                e
+                            );
+                            log::warn!("{}", msg);
+                            if let Some(viz) = visualizer {
+                                viz.set_text(&msg);
+                            }
                             // Fall through — will retry from WAV after
                             // recording stops.
                             shutdown.cancelled().await;
