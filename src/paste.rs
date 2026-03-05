@@ -139,22 +139,22 @@ pub async fn paste_text_to_target(
     if chunk_chars == 0 {
         // No chunking: paste the entire text in one shot.
         clipboard.set_text(text).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         simulate_paste().await?;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     } else {
         let chunks = split_into_char_chunks(text, chunk_chars);
         for chunk in &chunks {
             clipboard.set_text(chunk).await?;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             simulate_paste().await?;
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         }
     }
 
     // Extra settle time before restoring the clipboard so the last
     // paste has time to be consumed by the target application.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     if let Some(saved) = saved_clipboard {
         let _ = clipboard.set_text(&saved).await;

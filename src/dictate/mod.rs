@@ -387,11 +387,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     log::warn!("per-segment clipboard set failed: {}", e);
                     continue;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 if let Err(e) = simulate_paste().await {
                     log::warn!("per-segment paste failed: {}", e);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             }
         });
 
