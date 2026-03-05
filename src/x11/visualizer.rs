@@ -743,51 +743,68 @@ fn visualizer_thread(
     enable_text: bool,
     geom: super::monitor::MonitorGeometry,
 ) -> Result<(), TalkError> {
-    // ── Audio capture ────────────────────────────────────────────────
+    let need_audio = enable_amplitude || enable_spectrum;
 
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| TalkError::Audio("no default input device for visualizer".into()))?;
+    // ── Audio capture (only when amplitude/spectrum panels are used) ──
 
-    let supported = device
-        .default_input_config()
-        .map_err(|e| TalkError::Audio(format!("visualizer input config: {}", e)))?;
+    // Hold the CPAL stream and ring buffer in options so that
+    // text-only mode skips audio device initialisation entirely.
+    let mut _stream_guard: Option<cpal::Stream> = None;
+    let ring: Option<Arc<Mutex<RingBuffer>>>;
+    let rms_chunk: usize;
 
-    let channels = supported.channels() as usize;
+    if need_audio {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| TalkError::Audio("no default input device for visualizer".into()))?;
 
-    let ring = Arc::new(Mutex::new(RingBuffer::new(
-        supported.sample_rate().0 as usize / 2,
-    )));
-    let ring_w = Arc::clone(&ring);
+        let supported = device
+            .default_input_config()
+            .map_err(|e| TalkError::Audio(format!("visualizer input config: {}", e)))?;
 
-    let stream = device
-        .build_input_stream(
-            &cpal::StreamConfig {
-                channels: supported.channels(),
-                sample_rate: supported.sample_rate(),
-                buffer_size: cpal::BufferSize::Default,
-            },
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mono: Vec<f32> = if channels == 1 {
-                    data.to_vec()
-                } else {
-                    data.chunks_exact(channels)
-                        .map(|f| f.iter().sum::<f32>() / channels as f32)
-                        .collect()
-                };
-                if let Ok(mut g) = ring_w.lock() {
-                    g.push(&mono);
-                }
-            },
-            |e| log::error!("visualizer audio error: {}", e),
-            None,
-        )
-        .map_err(|e| TalkError::Audio(format!("visualizer stream: {}", e)))?;
+        let channels = supported.channels() as usize;
 
-    stream
-        .play()
-        .map_err(|e| TalkError::Audio(format!("visualizer stream play: {}", e)))?;
+        let r = Arc::new(Mutex::new(RingBuffer::new(
+            supported.sample_rate().0 as usize / 2,
+        )));
+        let ring_w = Arc::clone(&r);
+
+        let stream = device
+            .build_input_stream(
+                &cpal::StreamConfig {
+                    channels: supported.channels(),
+                    sample_rate: supported.sample_rate(),
+                    buffer_size: cpal::BufferSize::Default,
+                },
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mono: Vec<f32> = if channels == 1 {
+                        data.to_vec()
+                    } else {
+                        data.chunks_exact(channels)
+                            .map(|f| f.iter().sum::<f32>() / channels as f32)
+                            .collect()
+                    };
+                    if let Ok(mut g) = ring_w.lock() {
+                        g.push(&mono);
+                    }
+                },
+                |e| log::error!("visualizer audio error: {}", e),
+                None,
+            )
+            .map_err(|e| TalkError::Audio(format!("visualizer stream: {}", e)))?;
+
+        stream
+            .play()
+            .map_err(|e| TalkError::Audio(format!("visualizer stream play: {}", e)))?;
+
+        rms_chunk = supported.sample_rate().0 as usize / FPS as usize;
+        ring = Some(r);
+        _stream_guard = Some(stream);
+    } else {
+        ring = None;
+        rms_chunk = 0;
+    }
 
     // ── X11 connection ───────────────────────────────────────────────
 
@@ -823,7 +840,6 @@ fn visualizer_thread(
     // ── State ────────────────────────────────────────────────────────
 
     let frame_dur = std::time::Duration::from_micros(1_000_000 / FPS as u64);
-    let rms_chunk = supported.sample_rate().0 as usize / FPS as usize;
 
     let mut wins = WindowState {
         amplitude_win: None,
@@ -835,6 +851,7 @@ fn visualizer_thread(
     };
     let mut is_showing = false;
     let mut current_text = String::new();
+    let mut text_is_mapped = false;
     let mut frame_counter: u64 = 0;
 
     // Amplitude history: one RMS value per frame, capped to a
@@ -871,6 +888,7 @@ fn visualizer_thread(
                         enable_text,
                         &mut wins,
                     )?;
+                    text_is_mapped = enable_text;
                     is_showing = true;
                 }
                 Ok(VizCommand::Hide) => {}
@@ -888,6 +906,7 @@ fn visualizer_thread(
                 Ok(VizCommand::Hide) => {
                     destroy_windows(&conn, &mut wins);
                     is_showing = false;
+                    text_is_mapped = false;
                 }
                 Ok(VizCommand::Text { text }) => {
                     current_text = text;
@@ -910,6 +929,7 @@ fn visualizer_thread(
                         enable_text,
                         &mut wins,
                     )?;
+                    text_is_mapped = enable_text;
                 }
                 Ok(VizCommand::Quit) => {
                     destroy_windows(&conn, &mut wins);
@@ -938,71 +958,89 @@ fn visualizer_thread(
 
         let frame_start = std::time::Instant::now();
 
-        let samples = ring
-            .lock()
-            .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
-            .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)]);
+        let samples = if let Some(ref r) = ring {
+            r.lock()
+                .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
+                .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)])
+        } else {
+            Vec::new()
+        };
 
         // Compute RMS for this frame, update all-time peak, and
         // append to the rolling history window.
-        let frame_rms = rms(&samples[samples.len().saturating_sub(rms_chunk)..]);
-        if frame_rms > amp_peak {
-            amp_peak = frame_rms;
-        }
-        amp_history.push(frame_rms);
-        if amp_history.len() > amp_max_frames {
-            amp_history.drain(..amp_history.len() - amp_max_frames);
-        }
-
-        // Amplitude panel
-        if let (Some(win), Some(gc)) = (wins.amplitude_win, wins.amplitude_gc) {
-            amp_pb.clear(BG);
-            render_amplitude(&mut amp_pb, &amp_history, amp_peak);
-
-            let _ = conn.put_image(
-                ImageFormat::Z_PIXMAP,
-                win,
-                gc,
-                VIS_W,
-                VIS_H,
-                0,
-                0,
-                0,
-                depth,
-                &amp_pb.data,
-            );
-        }
-
-        // Spectrum panel
-        if let (Some(win), Some(gc)) = (wins.spectrum_win, wins.spectrum_gc) {
-            let magnitudes = compute_spectrum(&samples);
-
-            // Update spectrum peak: fast attack, slow decay.
-            spectrum_peak *= PEAK_DECAY;
-            let frame_peak = magnitudes.iter().copied().fold(0.0f32, f32::max);
-            if frame_peak > spectrum_peak {
-                spectrum_peak = frame_peak;
+        if !samples.is_empty() {
+            let frame_rms = rms(&samples[samples.len().saturating_sub(rms_chunk)..]);
+            if frame_rms > amp_peak {
+                amp_peak = frame_rms;
             }
-            spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
+            amp_history.push(frame_rms);
+            if amp_history.len() > amp_max_frames {
+                amp_history.drain(..amp_history.len() - amp_max_frames);
+            }
 
-            sp_pb.clear(BG);
-            render_spectrum(&mut sp_pb, &magnitudes, spectrum_peak);
+            // Amplitude panel
+            if let (Some(win), Some(gc)) = (wins.amplitude_win, wins.amplitude_gc) {
+                amp_pb.clear(BG);
+                render_amplitude(&mut amp_pb, &amp_history, amp_peak);
 
-            let _ = conn.put_image(
-                ImageFormat::Z_PIXMAP,
-                win,
-                gc,
-                VIS_W,
-                VIS_H,
-                0,
-                0,
-                0,
-                depth,
-                &sp_pb.data,
-            );
+                let _ = conn.put_image(
+                    ImageFormat::Z_PIXMAP,
+                    win,
+                    gc,
+                    VIS_W,
+                    VIS_H,
+                    0,
+                    0,
+                    0,
+                    depth,
+                    &amp_pb.data,
+                );
+            }
+
+            // Spectrum panel
+            if let (Some(win), Some(gc)) = (wins.spectrum_win, wins.spectrum_gc) {
+                let magnitudes = compute_spectrum(&samples);
+
+                // Update spectrum peak: fast attack, slow decay.
+                spectrum_peak *= PEAK_DECAY;
+                let frame_peak = magnitudes.iter().copied().fold(0.0f32, f32::max);
+                if frame_peak > spectrum_peak {
+                    spectrum_peak = frame_peak;
+                }
+                spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
+
+                sp_pb.clear(BG);
+                render_spectrum(&mut sp_pb, &magnitudes, spectrum_peak);
+
+                let _ = conn.put_image(
+                    ImageFormat::Z_PIXMAP,
+                    win,
+                    gc,
+                    VIS_W,
+                    VIS_H,
+                    0,
+                    0,
+                    0,
+                    depth,
+                    &sp_pb.data,
+                );
+            }
         }
 
-        // Text panel — always re-render for smooth dot wave animation.
+        // On-demand text panel visibility: map when text appears,
+        // unmap when cleared (unless enable_text keeps it always visible).
+        if let Some(win) = wins.text_win {
+            let want_visible = enable_text || !current_text.is_empty();
+            if want_visible && !text_is_mapped {
+                let _ = conn.map_window(win);
+                text_is_mapped = true;
+            } else if !want_visible && text_is_mapped {
+                let _ = conn.unmap_window(win);
+                text_is_mapped = false;
+            }
+        }
+
+        // Text panel — re-render for smooth dot wave animation.
         if let (Some(win), Some(gc), Some(ref f)) = (wins.text_win, wins.text_gc, &font) {
             let dot_br = dot_wave(frame_counter);
             text_pb.clear_rounded(BG, TEXT_CORNER_RADIUS);
@@ -1138,8 +1176,13 @@ fn create_windows(
         state.spectrum_gc = Some(gc);
     }
 
-    // Text window — centred below the badge (only in realtime mode).
-    if enable_text {
+    // Text window — centred below the badge.
+    // Always created so error/status messages can be shown on demand.
+    // Only mapped immediately if `enable_text` is true (realtime mode
+    // where live transcription text is expected).  Otherwise the
+    // render loop maps/unmaps it when `current_text` becomes
+    // non-empty/empty.
+    {
         let text_x = mon_x + (mon_w as i16 / 2) - (TEXT_W as i16 / 2);
         let text_y = badge_y + VIS_H as i16 + TEXT_GAP;
 
@@ -1162,8 +1205,10 @@ fn create_windows(
         )
         .map_err(|e| TalkError::Config(format!("X11 create text win: {}", e)))?;
 
-        conn.map_window(win)
-            .map_err(|e| TalkError::Config(format!("X11 map text win: {}", e)))?;
+        if enable_text {
+            conn.map_window(win)
+                .map_err(|e| TalkError::Config(format!("X11 map text win: {}", e)))?;
+        }
 
         let gc = conn
             .generate_id()
