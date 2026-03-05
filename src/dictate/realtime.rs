@@ -2,6 +2,11 @@
 //!
 //! Streams raw PCM audio to the transcription API and receives
 //! incremental transcription events.  Returns the accumulated text.
+//!
+//! Also provides [`AudioBuffer`], [`wav_recording_task`], and
+//! [`buffer_feeder`] — the shared infrastructure that decouples WAV
+//! recording from transcription so that a transcription failure never
+//! truncates the cached recording.
 
 use super::text::flush_sentences;
 use crate::audio::indicator::SoundPlayer;
@@ -14,8 +19,167 @@ use crate::transcription::{
 };
 use crate::x11::visualizer::VisualizerHandle;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+
+// ── Shared audio buffer ─────────────────────────────────────────────
+
+/// Append-only buffer of PCM audio chunks.
+///
+/// The WAV recording task pushes every chunk here.  Feeder tasks read
+/// from any position and wait for new data.  When the recording stops,
+/// [`close`](AudioBuffer::close) is called to unblock waiting feeders.
+///
+/// This decouples the WAV recording from transcription: the WAV task
+/// writes chunks to the file and the buffer unconditionally, while
+/// feeder tasks can fail and be restarted from cursor 0 without
+/// affecting the recording.
+pub(super) struct AudioBuffer {
+    chunks: tokio::sync::Mutex<Vec<Vec<i16>>>,
+    notify: tokio::sync::Notify,
+    closed: AtomicBool,
+}
+
+impl AudioBuffer {
+    pub(super) fn new() -> Self {
+        Self {
+            chunks: tokio::sync::Mutex::new(Vec::new()),
+            notify: tokio::sync::Notify::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Append a chunk and wake any waiting feeders.
+    pub(super) async fn push(&self, chunk: Vec<i16>) {
+        self.chunks.lock().await.push(chunk);
+        self.notify.notify_waiters();
+    }
+
+    /// Mark the buffer as complete — no more chunks will arrive.
+    pub(super) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Read new chunks starting at `cursor`.
+    ///
+    /// Returns `(chunks, new_cursor)`.  Blocks until data is available
+    /// or the buffer is closed.  Returns an empty vec when closed and
+    /// fully drained.
+    pub(super) async fn read_from(&self, cursor: usize) -> (Vec<Vec<i16>>, usize) {
+        loop {
+            {
+                let buf = self.chunks.lock().await;
+                if buf.len() > cursor {
+                    let new_chunks = buf[cursor..].to_vec();
+                    return (new_chunks, buf.len());
+                }
+                if self.closed.load(Ordering::Acquire) {
+                    return (Vec::new(), cursor);
+                }
+            }
+            // No new data — wait for a push() or close().
+            // Tiny race window (notification between lock release and
+            // here) is harmless: the next push() wakes us within ≤20 ms.
+            self.notify.notified().await;
+        }
+    }
+}
+
+// ── WAV recording task ──────────────────────────────────────────────
+
+/// Record every PCM chunk to a WAV file and into the shared buffer.
+///
+/// This task is completely independent of the transcription pipeline.
+/// It runs until the `source` channel closes (capture stopped), then
+/// patches the WAV header with the final data size and syncs to disk.
+pub(super) async fn wav_recording_task(
+    mut source: tokio::sync::mpsc::Receiver<Vec<i16>>,
+    wav_path: PathBuf,
+    audio_config: AudioConfig,
+    buffer: Arc<AudioBuffer>,
+) -> Result<(), TalkError> {
+    let mut writer = WavWriter::new(audio_config);
+    let header = writer.header()?;
+
+    let mut file = tokio::fs::File::create(&wav_path)
+        .await
+        .map_err(TalkError::Io)?;
+    file.write_all(&header).await.map_err(TalkError::Io)?;
+
+    let mut total_samples: u64 = 0;
+
+    while let Some(pcm_chunk) = source.recv().await {
+        // Write PCM bytes to the WAV file.
+        total_samples += pcm_chunk.len() as u64;
+        let pcm_bytes = writer.write_pcm(&pcm_chunk)?;
+        file.write_all(&pcm_bytes).await.map_err(TalkError::Io)?;
+
+        // Append to the shared buffer (feeders read from here).
+        buffer.push(pcm_chunk).await;
+    }
+
+    // No more audio — tell feeders there is nothing left to wait for.
+    buffer.close();
+
+    // Patch WAV header with actual data size.
+    let final_header = writer.finalize()?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(TalkError::Io)?;
+    file.write_all(&final_header).await.map_err(TalkError::Io)?;
+    file.sync_all().await.map_err(TalkError::Io)?;
+
+    log::info!(
+        "cache WAV: {} samples ({:.1}s) saved to {}",
+        total_samples,
+        total_samples as f64 / 16000.0,
+        wav_path.display()
+    );
+
+    Ok(())
+}
+
+// ── Buffer feeder ───────────────────────────────────────────────────
+
+/// Feed chunks from the shared [`AudioBuffer`] into a channel.
+///
+/// Starts reading at `cursor` (0 for a fresh pipeline, >0 when
+/// resuming a partially-replayed buffer).  Returns when:
+///
+/// - The buffer is closed and fully drained (normal completion), or
+/// - The receiving end of `fwd_tx` is dropped (pipeline failure).
+///
+/// The caller should monitor the returned `JoinHandle` to detect
+/// pipeline failures and spawn a replacement feeder at cursor 0.
+pub(super) async fn buffer_feeder(
+    buffer: Arc<AudioBuffer>,
+    fwd_tx: tokio::sync::mpsc::Sender<Vec<i16>>,
+    start_cursor: usize,
+) {
+    let mut cursor = start_cursor;
+    loop {
+        let (chunks, new_cursor) = buffer.read_from(cursor).await;
+        if chunks.is_empty() {
+            // Buffer closed and fully drained.
+            break;
+        }
+        for chunk in chunks {
+            if fwd_tx.send(chunk).await.is_err() {
+                log::warn!(
+                    "transcriber channel closed at chunk {} — feeder stopping",
+                    cursor
+                );
+                return;
+            }
+            cursor += 1;
+        }
+        cursor = new_cursor;
+    }
+    // fwd_tx dropped here → signals end-of-audio downstream.
+}
 
 /// Realtime dictation mode via WebSocket.
 ///
@@ -46,20 +210,21 @@ pub(crate) async fn dictate_realtime(
     visualizer: Option<&VisualizerHandle>,
     shutdown: &CancellationToken,
 ) -> Result<TranscriptionResult, TalkError> {
-    let transcriber = transcription::create_realtime_transcriber(&config, provider, model)?;
-
-    // Always tee audio to the cache WAV for recording cache.
+    // Always record audio to the cache WAV independently of transcription.
     log::info!("caching audio to: {}", cache_wav_path.display());
-    let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
-    let wav_task = tokio::spawn(audio_tee_to_wav(
+    let buffer = Arc::new(AudioBuffer::new());
+    let wav_task = tokio::spawn(wav_recording_task(
         audio_rx,
-        fwd_tx,
         cache_wav_path.to_path_buf(),
         AudioConfig::new(),
+        Arc::clone(&buffer),
     ));
-    let audio_rx = fwd_rx;
 
-    let mut event_rx = transcriber.transcribe_realtime(audio_rx).await?;
+    // Create initial transcription pipeline: buffer → feeder → transcriber.
+    let transcriber = transcription::create_realtime_transcriber(&config, provider, model)?;
+    let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
+    let mut feeder_handle = tokio::spawn(buffer_feeder(Arc::clone(&buffer), fwd_tx, 0));
+    let mut event_rx = transcriber.transcribe_realtime(fwd_rx).await?;
     let started = std::time::Instant::now();
 
     if from_file {
@@ -190,10 +355,38 @@ pub(crate) async fn dictate_realtime(
                     }
                     Some(TranscriptionEvent::Error { message }) => {
                         bump("error", &mut event_counts);
-                        return Err(TalkError::Transcription(format!(
-                            "Realtime transcription error: {}",
-                            message
-                        )));
+                        log::warn!("realtime transcription error: {} — attempting reconnect", message);
+
+                        // Try to reconnect with a fresh transcriber and
+                        // replay all audio from the beginning.
+                        feeder_handle.abort();
+                        match transcription::create_realtime_transcriber(&config, provider, model)
+                        {
+                            Ok(new_transcriber) => {
+                                let (new_fwd_tx, new_fwd_rx) =
+                                    tokio::sync::mpsc::channel::<Vec<i16>>(100);
+                                feeder_handle = tokio::spawn(buffer_feeder(
+                                    Arc::clone(&buffer),
+                                    new_fwd_tx,
+                                    0,
+                                ));
+                                match new_transcriber.transcribe_realtime(new_fwd_rx).await {
+                                    Ok(new_rx) => {
+                                        log::info!("realtime transcription reconnected");
+                                        event_rx = new_rx;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("reconnect failed: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("could not create replacement transcriber: {}", e);
+                                break;
+                            }
+                        }
                     }
                     Some(TranscriptionEvent::SessionCreated) => {
                         bump("session_created", &mut event_counts);
@@ -231,7 +424,39 @@ pub(crate) async fn dictate_realtime(
                         }
                     }
                     None => {
-                        // Channel closed without Done event
+                        // Channel closed without Done event — the
+                        // WebSocket may have disconnected.  Try to
+                        // reconnect and replay from the beginning.
+                        bump("channel_closed", &mut event_counts);
+                        log::warn!("realtime event channel closed — attempting reconnect");
+
+                        feeder_handle.abort();
+                        match transcription::create_realtime_transcriber(&config, provider, model)
+                        {
+                            Ok(new_transcriber) => {
+                                let (new_fwd_tx, new_fwd_rx) =
+                                    tokio::sync::mpsc::channel::<Vec<i16>>(100);
+                                feeder_handle = tokio::spawn(buffer_feeder(
+                                    Arc::clone(&buffer),
+                                    new_fwd_tx,
+                                    0,
+                                ));
+                                match new_transcriber.transcribe_realtime(new_fwd_rx).await {
+                                    Ok(new_rx) => {
+                                        log::info!("realtime transcription reconnected");
+                                        event_rx = new_rx;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("reconnect failed: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("could not create replacement transcriber: {}", e);
+                            }
+                        }
+                        // Reconnect failed — flush trailing text and exit.
                         let trailing = current_line.trim().to_string();
                         if !trailing.is_empty() {
                             println!("{}", trailing);
@@ -252,8 +477,11 @@ pub(crate) async fn dictate_realtime(
     }
 
     ctrlc_task.abort();
+    feeder_handle.abort();
 
-    // Wait for WAV tee task to finish writing
+    // Wait for WAV recording task to finish (no timeout — it
+    // completes as soon as the source channel closes and the header
+    // is patched, which is fast).
     match wav_task.await {
         Ok(Ok(())) => log::debug!("cache WAV saved"),
         Ok(Err(e)) => log::warn!("cache WAV write error: {}", e),
@@ -305,62 +533,235 @@ pub(crate) async fn dictate_realtime(
     })
 }
 
-/// Tee audio from `source` into both a WAV file and a forwarding channel.
-///
-/// Each `Vec<i16>` chunk is forwarded to `fwd_tx` for the transcriber
-/// and then written as raw PCM s16le to the WAV file.  The WAV is an
-/// exact mirror of what the API received — not more, not less.  When the
-/// source channel closes, the WAV header is patched with the final size.
-pub(super) async fn audio_tee_to_wav(
-    mut source: tokio::sync::mpsc::Receiver<Vec<i16>>,
-    fwd_tx: tokio::sync::mpsc::Sender<Vec<i16>>,
-    wav_path: PathBuf,
-    audio_config: AudioConfig,
-) -> Result<(), TalkError> {
-    let mut writer = WavWriter::new(audio_config);
-    let header = writer.header()?;
+// Old `audio_tee_to_wav` removed — replaced by `wav_recording_task`
+// + `buffer_feeder` above.  The WAV recording is now fully decoupled
+// from the transcription pipeline.
 
-    let mut file = tokio::fs::File::create(&wav_path)
-        .await
-        .map_err(TalkError::Io)?;
-    file.write_all(&header).await.map_err(TalkError::Io)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AudioConfig;
 
-    let mut total_samples: u64 = 0;
+    // ── AudioBuffer tests ───────────────────────────────────────────
 
-    while let Some(pcm_chunk) = source.recv().await {
-        // Forward to transcriber first.  Only write to the debug WAV
-        // what was successfully forwarded, so the capture is an exact
-        // mirror of what the API received.
-        let wav_chunk = pcm_chunk.clone();
-        if fwd_tx.send(pcm_chunk).await.is_err() {
-            log::debug!("transcriber channel closed, stopping debug WAV");
-            break;
-        }
+    #[tokio::test]
+    async fn audio_buffer_push_then_read_returns_chunks() {
+        let buf = AudioBuffer::new();
+        buf.push(vec![1, 2, 3]).await;
+        buf.push(vec![4, 5, 6]).await;
 
-        total_samples += wav_chunk.len() as u64;
-        let pcm_bytes = writer.write_pcm(&wav_chunk)?;
-        file.write_all(&pcm_bytes).await.map_err(TalkError::Io)?;
+        let (chunks, cursor) = buf.read_from(0).await;
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], vec![1, 2, 3]);
+        assert_eq!(chunks[1], vec![4, 5, 6]);
+        assert_eq!(cursor, 2);
     }
 
-    // No drain loop — the WAV contains exactly what was forwarded.
+    #[tokio::test]
+    async fn audio_buffer_read_from_cursor_skips_earlier() {
+        let buf = AudioBuffer::new();
+        buf.push(vec![10]).await;
+        buf.push(vec![20]).await;
+        buf.push(vec![30]).await;
 
-    // Signal end-of-audio to transcriber before WAV finalisation.
-    drop(fwd_tx);
+        let (chunks, cursor) = buf.read_from(2).await;
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], vec![30]);
+        assert_eq!(cursor, 3);
+    }
 
-    // Patch WAV header with actual data size
-    let final_header = writer.finalize()?;
-    file.seek(std::io::SeekFrom::Start(0))
-        .await
-        .map_err(TalkError::Io)?;
-    file.write_all(&final_header).await.map_err(TalkError::Io)?;
-    file.sync_all().await.map_err(TalkError::Io)?;
+    #[tokio::test]
+    async fn audio_buffer_close_unblocks_empty_read() {
+        let buf = Arc::new(AudioBuffer::new());
+        buf.push(vec![1]).await;
 
-    log::info!(
-        "debug WAV: {} samples ({:.1}s) saved to {}",
-        total_samples,
-        total_samples as f64 / 16000.0,
-        wav_path.display()
-    );
+        // Drain all data.
+        let (_chunks, cursor) = buf.read_from(0).await;
+        assert_eq!(cursor, 1);
 
-    Ok(())
+        // Close from another task.
+        let buf2 = Arc::clone(&buf);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            buf2.close();
+        });
+
+        // read_from should return empty once closed.
+        let (chunks, cursor) = buf.read_from(1).await;
+        assert!(chunks.is_empty());
+        assert_eq!(cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn audio_buffer_push_after_close_still_accessible() {
+        // close() only sets a flag — pre-existing data is readable.
+        let buf = AudioBuffer::new();
+        buf.push(vec![42]).await;
+        buf.close();
+
+        let (chunks, _) = buf.read_from(0).await;
+        assert_eq!(chunks, vec![vec![42]]);
+    }
+
+    // ── buffer_feeder tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn buffer_feeder_replays_from_cursor_zero() {
+        let buf = Arc::new(AudioBuffer::new());
+        buf.push(vec![1, 2]).await;
+        buf.push(vec![3, 4]).await;
+        buf.close();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        buffer_feeder(buf, tx, 0).await;
+
+        let c1 = rx.recv().await;
+        let c2 = rx.recv().await;
+        let c3 = rx.recv().await;
+        assert_eq!(c1, Some(vec![1, 2]));
+        assert_eq!(c2, Some(vec![3, 4]));
+        assert!(c3.is_none()); // channel closed
+    }
+
+    #[tokio::test]
+    async fn buffer_feeder_stops_when_receiver_dropped() {
+        let buf = Arc::new(AudioBuffer::new());
+        buf.push(vec![10]).await;
+        buf.push(vec![20]).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx); // drop receiver immediately
+
+        // feeder should exit quickly without hanging.
+        let handle = tokio::spawn(buffer_feeder(buf, tx, 0));
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("feeder should finish promptly")
+            .expect("feeder should not panic");
+    }
+
+    #[tokio::test]
+    async fn buffer_feeder_starts_from_nonzero_cursor() {
+        let buf = Arc::new(AudioBuffer::new());
+        buf.push(vec![100]).await;
+        buf.push(vec![200]).await;
+        buf.push(vec![300]).await;
+        buf.close();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        buffer_feeder(buf, tx, 2).await;
+
+        let c1 = rx.recv().await;
+        let c2 = rx.recv().await;
+        assert_eq!(c1, Some(vec![300]));
+        assert!(c2.is_none());
+    }
+
+    // ── wav_recording_task tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn wav_recording_task_writes_complete_wav() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let wav_path = dir.path().join("test.wav");
+        let audio_config = AudioConfig::new();
+        let buffer = Arc::new(AudioBuffer::new());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        let buf_clone = Arc::clone(&buffer);
+        let path_clone = wav_path.clone();
+        let handle = tokio::spawn(wav_recording_task(rx, path_clone, audio_config, buf_clone));
+
+        // Send 5 chunks of 320 samples (20ms at 16kHz mono).
+        for i in 0..5u16 {
+            let chunk: Vec<i16> = (0..320)
+                .map(|s| (s as i16).wrapping_mul(i as i16))
+                .collect();
+            tx.send(chunk).await.expect("send chunk");
+        }
+        drop(tx); // close channel → task finishes
+
+        handle.await.expect("task join").expect("wav write");
+
+        // Verify WAV file.
+        let data = std::fs::read(&wav_path).expect("read wav");
+        assert_eq!(&data[0..4], b"RIFF");
+        assert_eq!(&data[8..12], b"WAVE");
+
+        // Total PCM data: 5 chunks × 320 samples × 2 bytes = 3200 bytes.
+        // WAV header is 44 bytes.
+        assert_eq!(data.len(), 44 + 5 * 320 * 2);
+    }
+
+    #[tokio::test]
+    async fn wav_recording_task_populates_buffer() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let wav_path = dir.path().join("test.wav");
+        let audio_config = AudioConfig::new();
+        let buffer = Arc::new(AudioBuffer::new());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let buf_clone = Arc::clone(&buffer);
+        let handle = tokio::spawn(wav_recording_task(rx, wav_path, audio_config, buf_clone));
+
+        tx.send(vec![1, 2, 3]).await.expect("send");
+        tx.send(vec![4, 5, 6]).await.expect("send");
+        drop(tx);
+
+        handle.await.expect("join").expect("wav");
+
+        // Buffer should have both chunks and be closed.
+        let (chunks, _) = buffer.read_from(0).await;
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], vec![1, 2, 3]);
+        assert_eq!(chunks[1], vec![4, 5, 6]);
+
+        // Confirm closed: read_from at end returns empty.
+        let (empty, _) = buffer.read_from(2).await;
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wav_recording_independent_of_feeder_failure() {
+        // Verify that the WAV file is complete even when the feeder
+        // (downstream transcription pipeline) fails.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let wav_path = dir.path().join("test.wav");
+        let audio_config = AudioConfig::new();
+        let buffer = Arc::new(AudioBuffer::new());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let buf_clone = Arc::clone(&buffer);
+        let path_clone = wav_path.clone();
+        let wav_handle = tokio::spawn(wav_recording_task(rx, path_clone, audio_config, buf_clone));
+
+        // Start a feeder that will be killed.
+        let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(10);
+        let feeder = tokio::spawn(buffer_feeder(Arc::clone(&buffer), fwd_tx, 0));
+
+        // Send some audio.
+        tx.send(vec![10; 320]).await.expect("send");
+        tx.send(vec![20; 320]).await.expect("send");
+
+        // Kill the feeder by dropping the receiver.
+        drop(fwd_rx);
+        // Wait for feeder to notice and exit.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), feeder).await;
+
+        // Send more audio AFTER the feeder died — WAV must still record.
+        tx.send(vec![30; 320])
+            .await
+            .expect("send after feeder death");
+        drop(tx);
+
+        wav_handle.await.expect("join").expect("wav");
+
+        // All 3 chunks must be in the WAV.
+        let data = std::fs::read(&wav_path).expect("read wav");
+        assert_eq!(data.len(), 44 + 3 * 320 * 2);
+
+        // All 3 chunks must be in the buffer.
+        let (chunks, _) = buffer.read_from(0).await;
+        assert_eq!(chunks.len(), 3);
+    }
 }

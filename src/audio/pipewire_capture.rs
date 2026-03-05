@@ -131,36 +131,48 @@ fn run_capture_loop(
     // PipeWire delivers buffers at the graph quantum (typically ~1024
     // frames ≈ 21.3 ms at 48 kHz), which may not match our 20 ms
     // chunk size exactly.
-    let mut buffer: Vec<i16> = Vec::with_capacity(samples_per_chunk * 2);
+    //
+    // Shared with the main scope so we can flush remaining samples
+    // after `mainloop.run()` returns.
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let buffer: Rc<RefCell<Vec<i16>>> =
+        Rc::new(RefCell::new(Vec::with_capacity(samples_per_chunk * 2)));
 
     let _listener = stream
         .add_local_listener()
-        .process(move |stream_ref, _: &mut ()| {
-            let Some(mut pw_buf) = stream_ref.dequeue_buffer() else {
-                return;
-            };
-            let datas = pw_buf.datas_mut();
-            if datas.is_empty() {
-                return;
-            }
+        .process({
+            let buf = Rc::clone(&buffer);
+            let audio_tx = audio_tx.clone();
+            move |stream_ref, _: &mut ()| {
+                let Some(mut pw_buf) = stream_ref.dequeue_buffer() else {
+                    return;
+                };
+                let datas = pw_buf.datas_mut();
+                if datas.is_empty() {
+                    return;
+                }
 
-            let size = datas[0].chunk().size() as usize;
-            let Some(raw) = datas[0].data() else {
-                return;
-            };
-            let pcm = &raw[..size];
+                let size = datas[0].chunk().size() as usize;
+                let Some(raw) = datas[0].data() else {
+                    return;
+                };
+                let pcm = &raw[..size];
 
-            // Convert s16le bytes to i16 samples.
-            buffer.extend(
-                pcm.chunks_exact(2)
-                    .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
-            );
+                let mut buffer = buf.borrow_mut();
 
-            // Emit fixed-size chunks.
-            while buffer.len() >= samples_per_chunk {
-                let chunk: Vec<i16> = buffer.drain(..samples_per_chunk).collect();
-                if audio_tx.try_send(chunk).is_err() {
-                    log::warn!("audio channel full, dropped {} samples", samples_per_chunk);
+                // Convert s16le bytes to i16 samples.
+                buffer.extend(
+                    pcm.chunks_exact(2)
+                        .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+                );
+
+                // Emit fixed-size chunks.
+                while buffer.len() >= samples_per_chunk {
+                    let chunk: Vec<i16> = buffer.drain(..samples_per_chunk).collect();
+                    if audio_tx.try_send(chunk).is_err() {
+                        log::warn!("audio channel full, dropped {} samples", samples_per_chunk);
+                    }
                 }
             }
         })
@@ -194,6 +206,28 @@ fn run_capture_loop(
 
     // Run the main loop — blocks until quit signal.
     mainloop.run();
+
+    // Flush any remaining samples in the accumulation buffer.
+    // Full chunks are sent as-is; a trailing partial chunk (< one
+    // full chunk) is also emitted so the last fraction of audio is
+    // never silently lost.
+    let remaining = buffer.borrow_mut().split_off(0);
+    if !remaining.is_empty() {
+        log::debug!(
+            "flushing {} residual samples ({} full chunks + {} trailing)",
+            remaining.len(),
+            remaining.len() / samples_per_chunk,
+            remaining.len() % samples_per_chunk,
+        );
+        for chunk in remaining.chunks(samples_per_chunk) {
+            if audio_tx.try_send(chunk.to_vec()).is_err() {
+                log::warn!(
+                    "audio channel full while flushing, dropped {} samples",
+                    chunk.len()
+                );
+            }
+        }
+    }
 
     log::debug!("PipeWire capture mainloop exited");
     Ok(())

@@ -290,24 +290,21 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         shutdown_clone.cancel();
     });
 
-    // Start capture BEFORE the start sound so that audio is already
-    // being buffered while the sound plays.  The channel holds ~500 ms
-    // of data (25 × 20 ms chunks), which is more than enough for the
-    // setup that follows before the resample task drains it.
-    let raw_audio_rx = capture.start()?;
-
     log::info!(
         "starting {} transcription{}",
         if opts.realtime { "realtime" } else { "batch" },
         if from_file { " (from file)" } else { "" }
     );
 
-    // Play start sound — recording is already active so the user can
-    // start speaking as soon as they hear the tone.
+    // Play start sound BEFORE starting capture so that the tone is
+    // never captured in the recording.
     if let Some(ref p) = player {
         log::debug!("playing start sound");
         p.play_start().await;
     }
+
+    // Start capture AFTER the start sound so the tone is not recorded.
+    let raw_audio_rx = capture.start()?;
 
     // Show recording indicator
     if let Some(ref o) = overlay {
@@ -456,6 +453,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             boop_token.as_ref(),
             overlay.as_ref(),
             visualizer.as_ref(),
+            &config,
+            provider,
+            opts.model.as_deref(),
+            opts.diarize,
         )
         .await;
 
