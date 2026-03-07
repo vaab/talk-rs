@@ -487,7 +487,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     let final_msg = format!("{}", enriched);
                     log::error!("{}", final_msg);
                     if let Some(ref viz) = visualizer {
-                        viz.set_text(&format!("Error: {}", final_msg));
+                        viz.push_message(&format!("Error: {}", final_msg));
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     if let Some(ref viz) = visualizer {
@@ -510,7 +510,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     );
                     log::warn!("{}", msg);
                     if let Some(ref viz) = visualizer {
-                        viz.set_text(&msg);
+                        viz.push_message(&msg);
                     }
 
                     let retry_transcriber = match transcription::create_batch_transcriber(
@@ -574,7 +574,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         );
                         log::error!("{}", final_msg);
                         if let Some(ref viz) = visualizer {
-                            viz.set_text(&format!("Error: {}", final_msg));
+                            viz.push_message(&format!("Error: {}", final_msg));
                         }
                         // Brief pause so the user can read the error.
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -674,10 +674,14 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             std::process::id()
         );
         log::warn!("empty transcription — nothing to paste");
-        // Hide transcribing overlay (batch mode keeps it visible until now).
+        // Hide transcribing overlay and visualizer (batch mode keeps
+        // them visible until now).
         if !opts.realtime {
             if let Some(ref o) = overlay {
                 o.hide();
+            }
+            if let Some(ref viz) = visualizer {
+                viz.hide();
             }
         }
         return Ok(());
@@ -688,9 +692,12 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Paste into focused application (batch mode only;
     // realtime mode pastes per-segment during recording)
     if !opts.realtime {
-        // Hide transcribing overlay just before pasting.
+        // Hide transcribing overlay and visualizer just before pasting.
         if let Some(ref o) = overlay {
             o.hide();
+        }
+        if let Some(ref viz) = visualizer {
+            viz.hide();
         }
         paste_text_to_target(target_window.as_ref(), &text, 0, paste_chunk_chars).await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);

@@ -51,8 +51,10 @@ const PEAK_FLOOR: f32 = 0.0001;
 
 /// Width of the text overlay in pixels.
 const TEXT_W: u16 = 1200;
-/// Height of the text overlay in pixels.
-const TEXT_H: u16 = 44;
+/// Height of a single text line in pixels.
+const TEXT_LINE_H: u16 = 44;
+/// Maximum number of text lines (TTL messages + live text).
+const MAX_TEXT_LINES: u16 = 5;
 /// Vertical gap between badge bottom and text overlay top.
 const TEXT_GAP: i16 = 4;
 /// Font size for transcription text in pixels.
@@ -64,6 +66,8 @@ const TEXT_CORNER_RADIUS: usize = 10;
 
 const BG: [u8; 4] = [0x00, 0x00, 0x00, 0xFF]; // #000000 black
 const TEXT_COLOR: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF]; // #ffffff white
+/// Reddish colour for error/status messages (BGRA).
+const ERROR_COLOR: [u8; 4] = [0x55, 0x55, 0xFF, 0xFF]; // #ff5555 reddish
 /// Brightest dot colour (BGRA).
 const DOT_HI: [u8; 4] = [0xCC, 0xCC, 0xCC, 0xFF]; // #cccccc
 /// Dimmest dot colour (BGRA).
@@ -364,12 +368,14 @@ fn rasterise_glyphs(text: &str, font: &fontdue::Font) -> (Vec<(fontdue::Metrics,
 }
 
 /// Blit pre-rasterised glyphs into the pixel buffer at `start_x`,
-/// vertically centred, clipped to buffer bounds.
+/// vertically centred, clipped to buffer bounds.  `opacity` (0.0–1.0)
+/// scales the per-glyph coverage alpha for smooth fade-out.
 fn blit_glyphs(
     pb: &mut PixelBuffer,
     glyphs: &[(fontdue::Metrics, Vec<u8>)],
     start_x: i32,
     color: [u8; 4],
+    opacity: f32,
 ) {
     let h = pb.height;
     let w = pb.width;
@@ -377,12 +383,15 @@ fn blit_glyphs(
     let mut cursor_x = start_x;
 
     for (metrics, bitmap) in glyphs {
-        blit_glyph_at(pb, metrics, bitmap, cursor_x, baseline, w, h, color);
+        blit_glyph_at(
+            pb, metrics, bitmap, cursor_x, baseline, w, h, color, opacity,
+        );
         cursor_x += metrics.advance_width as i32;
     }
 }
 
 /// Blit a single rasterised glyph at `cursor_x` with the given colour.
+/// `opacity` (0.0–1.0) is multiplied into the glyph coverage alpha.
 #[allow(clippy::too_many_arguments)]
 fn blit_glyph_at(
     pb: &mut PixelBuffer,
@@ -393,6 +402,7 @@ fn blit_glyph_at(
     buf_w: usize,
     buf_h: usize,
     color: [u8; 4],
+    opacity: f32,
 ) {
     let gx = cursor_x + metrics.xmin;
     let gy = baseline - metrics.height as i32 - metrics.ymin;
@@ -407,7 +417,7 @@ fn blit_glyph_at(
             let py = gy + row as i32;
             if px >= 0 && (px as usize) < buf_w && py >= 0 && (py as usize) < buf_h {
                 let off = (py as usize * buf_w + px as usize) * 4;
-                let a = alpha as f32 / 255.0;
+                let a = alpha as f32 / 255.0 * opacity;
                 for (c, &fg_val) in color.iter().enumerate().take(3) {
                     let bg_val = pb.data[off + c] as f32;
                     pb.data[off + c] = (bg_val + (fg_val as f32 - bg_val) * a) as u8;
@@ -500,7 +510,7 @@ fn render_text(pb: &mut PixelBuffer, text: &str, font: &fontdue::Font, dot_brigh
     // ── Blit text ────────────────────────────────────────────────────
 
     let visible_glyphs = &text_glyphs[first_visible_glyph..];
-    blit_glyphs(pb, visible_glyphs, text_start_x, TEXT_COLOR);
+    blit_glyphs(pb, visible_glyphs, text_start_x, TEXT_COLOR, 1.0);
 
     let visible_text_w: usize = visible_glyphs
         .iter()
@@ -522,12 +532,55 @@ fn render_text(pb: &mut PixelBuffer, text: &str, font: &fontdue::Font, dot_brigh
             w,
             h,
             color,
+            1.0,
         );
         cursor_x += dot_adv as i32;
         if i < 2 {
             cursor_x += space_adv as i32;
         }
     }
+}
+
+/// Render centred text in a given colour **without** trailing dots.
+///
+/// Used for TTL status / error messages that should remain static and
+/// visually distinct from the live transcription line.
+fn render_text_status(
+    pb: &mut PixelBuffer,
+    text: &str,
+    font: &fontdue::Font,
+    color: [u8; 4],
+    opacity: f32,
+) {
+    let w = pb.width;
+
+    let (glyphs, text_w) = if text.is_empty() {
+        return;
+    } else {
+        rasterise_glyphs(text, font)
+    };
+
+    // Centre horizontally; clip leading chars on overflow.
+    let (start_x, first_visible) = if text_w <= w {
+        ((w - text_w) as i32 / 2, 0usize)
+    } else {
+        let skip_px = text_w - w;
+        let mut skipped = 0usize;
+        let mut first = 0usize;
+        for (i, (m, _)) in glyphs.iter().enumerate() {
+            let adv = m.advance_width as usize;
+            if skipped + adv > skip_px {
+                first = i;
+                break;
+            }
+            skipped += adv;
+            first = i + 1;
+        }
+        let partial = skip_px.saturating_sub(skipped) as i32;
+        (-(partial), first)
+    };
+
+    blit_glyphs(pb, &glyphs[first_visible..], start_x, color, opacity);
 }
 
 // ── Rendering helpers ────────────────────────────────────────────────
@@ -652,13 +705,24 @@ fn render_spectrum(pb: &mut PixelBuffer, magnitudes: &[f32], peak: f32) {
 // ── Public API ───────────────────────────────────────────────────────
 
 /// Commands from the main thread to the visualizer thread.
+/// Default time-to-live for pushed status messages (seconds).
+const MESSAGE_TTL_SECS: f32 = 3.0;
+/// Seconds a TTL message stays fully opaque before starting to fade.
+const MESSAGE_FADE_DELAY_SECS: f32 = 1.0;
+
 enum VizCommand {
     /// Show the visualizer panels (badge width needed for positioning).
     Show { badge_width: u16 },
     /// Hide visualizer panels.
     Hide,
+    /// Hide only the amplitude/spectrum panels (keep the text panel
+    /// and render loop alive so status messages remain visible).
+    HideAudio,
     /// Update the live transcription text displayed below the badge.
     Text { text: String },
+    /// Push a status message with its own TTL.  Messages stack
+    /// vertically and disappear individually when their TTL expires.
+    PushMessage { text: String },
     /// Shut down the thread.
     Quit,
 }
@@ -712,9 +776,23 @@ impl VisualizerHandle {
         let _ = self.tx.send(VizCommand::Hide);
     }
 
+    /// Hide only the amplitude/spectrum panels.  The text panel and
+    /// render loop stay alive so pushed status messages remain visible.
+    pub fn hide_audio(&self) {
+        let _ = self.tx.send(VizCommand::HideAudio);
+    }
+
     /// Update the live transcription text shown below the badge.
     pub fn set_text(&self, text: &str) {
         let _ = self.tx.send(VizCommand::Text {
+            text: text.to_string(),
+        });
+    }
+
+    /// Push a status message that stays visible for ~2 s then fades.
+    /// Multiple messages stack vertically; each has its own TTL.
+    pub fn push_message(&self, text: &str) {
+        let _ = self.tx.send(VizCommand::PushMessage {
             text: text.to_string(),
         });
     }
@@ -821,7 +899,7 @@ fn visualizer_thread(
 
     let mut amp_pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
     let mut sp_pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
-    let mut text_pb = PixelBuffer::new(TEXT_W as usize, TEXT_H as usize);
+    let mut text_pb = PixelBuffer::new(TEXT_W as usize, TEXT_LINE_H as usize);
 
     // ── Font (loaded in background to avoid blocking panel startup) ──
 
@@ -852,6 +930,10 @@ fn visualizer_thread(
     let mut is_showing = false;
     let mut current_text = String::new();
     let mut text_is_mapped = false;
+    // TTL status messages: each entry is (text, expiry instant).
+    let mut ttl_messages: Vec<(String, std::time::Instant)> = Vec::new();
+    // Last rendered line count — used to avoid redundant window resizes.
+    let mut prev_text_lines: u16 = 0;
     let mut frame_counter: u64 = 0;
 
     // Amplitude history: one RMS value per frame, capped to a
@@ -891,9 +973,14 @@ fn visualizer_thread(
                     text_is_mapped = enable_text;
                     is_showing = true;
                 }
-                Ok(VizCommand::Hide) => {}
+                Ok(VizCommand::Hide) | Ok(VizCommand::HideAudio) => {}
                 Ok(VizCommand::Text { text }) => {
                     current_text = text;
+                }
+                Ok(VizCommand::PushMessage { text }) => {
+                    let expires = std::time::Instant::now()
+                        + std::time::Duration::from_secs_f32(MESSAGE_TTL_SECS);
+                    ttl_messages.push((text, expires));
                 }
                 Ok(VizCommand::Quit) | Err(_) => break,
             }
@@ -908,8 +995,16 @@ fn visualizer_thread(
                     is_showing = false;
                     text_is_mapped = false;
                 }
+                Ok(VizCommand::HideAudio) => {
+                    destroy_audio_windows(&conn, &mut wins);
+                }
                 Ok(VizCommand::Text { text }) => {
                     current_text = text;
+                }
+                Ok(VizCommand::PushMessage { text }) => {
+                    let expires = std::time::Instant::now()
+                        + std::time::Duration::from_secs_f32(MESSAGE_TTL_SECS);
+                    ttl_messages.push((text, expires));
                 }
                 Ok(VizCommand::Show { badge_width }) => {
                     destroy_windows(&conn, &mut wins);
@@ -1027,37 +1122,87 @@ fn visualizer_thread(
             }
         }
 
-        // On-demand text panel visibility: map when text appears,
-        // unmap when cleared (unless enable_text keeps it always visible).
+        // Prune expired TTL messages.
+        let now_ttl = std::time::Instant::now();
+        ttl_messages.retain(|(_, expires)| *expires > now_ttl);
+
+        // Collect all lines to render: TTL messages (newest first), then live text.
+        // Each entry carries a fade alpha (1.0 = fully visible).
+        let fade_duration = MESSAGE_TTL_SECS - MESSAGE_FADE_DELAY_SECS;
+        let mut text_lines: Vec<(&str, f32)> = ttl_messages
+            .iter()
+            .rev()
+            .map(|(t, expires)| {
+                let remaining = expires.duration_since(now_ttl).as_secs_f32();
+                let elapsed = MESSAGE_TTL_SECS - remaining;
+                let alpha = if elapsed < MESSAGE_FADE_DELAY_SECS {
+                    1.0
+                } else {
+                    ((MESSAGE_TTL_SECS - elapsed) / fade_duration).clamp(0.0, 1.0)
+                };
+                (t.as_str(), alpha)
+            })
+            .collect();
+        let mut n_ttl = text_lines.len();
+        if !current_text.is_empty() {
+            text_lines.push((&current_text, 1.0));
+        }
+        // Cap to max lines (keep most recent).
+        if text_lines.len() > MAX_TEXT_LINES as usize {
+            let drop = text_lines.len() - MAX_TEXT_LINES as usize;
+            text_lines = text_lines.split_off(drop);
+            n_ttl = n_ttl.saturating_sub(drop);
+        }
+        let n_lines = text_lines.len() as u16;
+
+        // On-demand text panel visibility + dynamic height.
         if let Some(win) = wins.text_win {
-            let want_visible = enable_text || !current_text.is_empty();
+            let want_visible = enable_text || n_lines > 0;
+            if want_visible && n_lines > 0 && n_lines != prev_text_lines {
+                let new_h = n_lines.max(1) * TEXT_LINE_H;
+                let _ = conn.configure_window(
+                    win,
+                    &x11rb::protocol::xproto::ConfigureWindowAux::new().height(u32::from(new_h)),
+                );
+                let _ = apply_rounded_shape(&conn, win, TEXT_W, new_h, TEXT_CORNER_RADIUS);
+                prev_text_lines = n_lines;
+            }
             if want_visible && !text_is_mapped {
                 let _ = conn.map_window(win);
                 text_is_mapped = true;
             } else if !want_visible && text_is_mapped {
                 let _ = conn.unmap_window(win);
                 text_is_mapped = false;
+                prev_text_lines = 0;
             }
         }
 
-        // Text panel — re-render for smooth dot wave animation.
+        // Text panel — render each line into its own row.
+        // TTL status lines use reddish colour without dots; the live
+        // transcription line (if any) uses white with animated dots.
         if let (Some(win), Some(gc), Some(ref f)) = (wins.text_win, wins.text_gc, &font) {
             let dot_br = dot_wave(frame_counter);
-            text_pb.clear_rounded(BG, TEXT_CORNER_RADIUS);
-            render_text(&mut text_pb, &current_text, f, dot_br);
+            for (i, (line, alpha)) in text_lines.iter().enumerate() {
+                text_pb.clear_rounded(BG, TEXT_CORNER_RADIUS);
+                if i < n_ttl {
+                    render_text_status(&mut text_pb, line, f, ERROR_COLOR, *alpha);
+                } else {
+                    render_text(&mut text_pb, line, f, dot_br);
+                }
 
-            let _ = conn.put_image(
-                ImageFormat::Z_PIXMAP,
-                win,
-                gc,
-                TEXT_W,
-                TEXT_H,
-                0,
-                0,
-                0,
-                depth,
-                &text_pb.data,
-            );
+                let _ = conn.put_image(
+                    ImageFormat::Z_PIXMAP,
+                    win,
+                    gc,
+                    TEXT_W,
+                    TEXT_LINE_H,
+                    0,
+                    i as i16 * TEXT_LINE_H as i16,
+                    0,
+                    depth,
+                    &text_pb.data,
+                );
+            }
         }
         frame_counter += 1;
 
@@ -1197,7 +1342,7 @@ fn create_windows(
             text_x,
             text_y,
             TEXT_W,
-            TEXT_H,
+            TEXT_LINE_H * MAX_TEXT_LINES,
             0,
             WindowClass::INPUT_OUTPUT,
             0,
@@ -1217,7 +1362,7 @@ fn create_windows(
             .map_err(|e| TalkError::Config(format!("X11 gc: {}", e)))?;
 
         // Apply rounded-corner shape mask via the XShape extension.
-        apply_rounded_shape(conn, win, TEXT_W, TEXT_H, TEXT_CORNER_RADIUS)?;
+        apply_rounded_shape(conn, win, TEXT_W, TEXT_LINE_H, TEXT_CORNER_RADIUS)?;
 
         state.text_win = Some(win);
         state.text_gc = Some(gc);
@@ -1360,7 +1505,8 @@ fn apply_rounded_shape(
     Ok(())
 }
 
-fn destroy_windows(conn: &impl Connection, state: &mut WindowState) {
+/// Destroy only the amplitude and spectrum windows (keep text alive).
+fn destroy_audio_windows(conn: &impl Connection, state: &mut WindowState) {
     if let Some(gc) = state.amplitude_gc.take() {
         let _ = conn.free_gc(gc);
     }
@@ -1373,6 +1519,11 @@ fn destroy_windows(conn: &impl Connection, state: &mut WindowState) {
     if let Some(win) = state.spectrum_win.take() {
         let _ = conn.destroy_window(win);
     }
+    let _ = conn.flush();
+}
+
+fn destroy_windows(conn: &impl Connection, state: &mut WindowState) {
+    destroy_audio_windows(conn, state);
     if let Some(gc) = state.text_gc.take() {
         let _ = conn.free_gc(gc);
     }
