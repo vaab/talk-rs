@@ -202,7 +202,7 @@ pub(crate) async fn dictate_streaming(
                         );
                         log::warn!("{}", msg);
                         if let Some(viz) = visualizer {
-                            viz.set_text(&msg);
+                            viz.push_message(&msg);
                         }
                         // Continue recording — will retry from WAV
                         // after recording stops.
@@ -222,7 +222,7 @@ pub(crate) async fn dictate_streaming(
                     );
                     log::info!("{}", msg);
                     if let Some(viz) = visualizer {
-                        viz.set_text(&msg);
+                        viz.push_message(&msg);
                     }
                     match transcription::create_batch_transcriber(
                         config, provider, model, diarize,
@@ -240,9 +240,6 @@ pub(crate) async fn dictate_streaming(
                             // from-file branch; keep the receiver
                             // alive so the sender side does not error.
                             _ = std::mem::replace(&mut encode_done_rx, pipeline.3);
-                            if let Some(viz) = visualizer {
-                                viz.set_text("");
-                            }
                         }
                         Err(e) => {
                             let msg = format!(
@@ -252,7 +249,7 @@ pub(crate) async fn dictate_streaming(
                             );
                             log::warn!("{}", msg);
                             if let Some(viz) = visualizer {
-                                viz.set_text(&msg);
+                                viz.push_message(&msg);
                             }
                             // Fall through — will retry from WAV after
                             // recording stops.
@@ -279,7 +276,7 @@ pub(crate) async fn dictate_streaming(
             p.play_stop().await;
         }
         if let Some(viz) = visualizer {
-            viz.hide();
+            viz.hide_audio();
         }
         if let Some(o) = overlay {
             o.show(IndicatorKind::Transcribing);

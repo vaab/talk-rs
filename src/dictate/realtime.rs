@@ -361,7 +361,7 @@ pub(crate) async fn dictate_realtime(
                         );
                         log::warn!("{}", msg);
                         if let Some(viz) = visualizer {
-                            viz.set_text(&msg);
+                            viz.push_message(&msg);
                         }
 
                         // Try to reconnect with a fresh transcriber and
@@ -380,9 +380,6 @@ pub(crate) async fn dictate_realtime(
                                 match new_transcriber.transcribe_realtime(new_fwd_rx).await {
                                     Ok(new_rx) => {
                                         log::info!("realtime transcription reconnected");
-                                        if let Some(viz) = visualizer {
-                                            viz.set_text("");
-                                        }
                                         event_rx = new_rx;
                                         continue;
                                     }
@@ -393,7 +390,7 @@ pub(crate) async fn dictate_realtime(
                                         );
                                         log::warn!("{}", msg);
                                         if let Some(viz) = visualizer {
-                                            viz.set_text(&msg);
+                                            viz.push_message(&msg);
                                         }
                                         break;
                                     }
@@ -406,7 +403,7 @@ pub(crate) async fn dictate_realtime(
                                 );
                                 log::warn!("{}", msg);
                                 if let Some(viz) = visualizer {
-                                    viz.set_text(&msg);
+                                    viz.push_message(&msg);
                                 }
                                 break;
                             }
@@ -454,7 +451,7 @@ pub(crate) async fn dictate_realtime(
                         bump("channel_closed", &mut event_counts);
                         log::warn!("realtime event channel closed — attempting reconnect");
                         if let Some(viz) = visualizer {
-                            viz.set_text("Connection lost — reconnecting");
+                            viz.push_message("Connection lost — reconnecting");
                         }
 
                         feeder_handle.abort();
@@ -471,9 +468,6 @@ pub(crate) async fn dictate_realtime(
                                 match new_transcriber.transcribe_realtime(new_fwd_rx).await {
                                     Ok(new_rx) => {
                                         log::info!("realtime transcription reconnected");
-                                        if let Some(viz) = visualizer {
-                                            viz.set_text("");
-                                        }
                                         event_rx = new_rx;
                                         continue;
                                     }
@@ -481,7 +475,7 @@ pub(crate) async fn dictate_realtime(
                                         let msg = format!("Reconnect failed: {}", e);
                                         log::warn!("{}", msg);
                                         if let Some(viz) = visualizer {
-                                            viz.set_text(&msg);
+                                            viz.push_message(&msg);
                                         }
                                     }
                                 }
@@ -490,7 +484,7 @@ pub(crate) async fn dictate_realtime(
                                 let msg = format!("Reconnect failed: {}", e);
                                 log::warn!("{}", msg);
                                 if let Some(viz) = visualizer {
-                                    viz.set_text(&msg);
+                                    viz.push_message(&msg);
                                 }
                             }
                         }
