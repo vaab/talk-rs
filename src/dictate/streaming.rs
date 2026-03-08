@@ -276,7 +276,7 @@ pub(crate) async fn dictate_streaming(
             p.play_stop().await;
         }
         if let Some(viz) = visualizer {
-            viz.hide_audio();
+            viz.hide();
         }
         if let Some(o) = overlay {
             o.show(IndicatorKind::Transcribing);
