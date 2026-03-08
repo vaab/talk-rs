@@ -489,12 +489,18 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     if let Some(ref viz) = visualizer {
                         viz.push_message(&format!("Error: {}", final_msg));
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    if let Some(ref viz) = visualizer {
-                        viz.hide();
-                    }
                     if let Some(ref o) = overlay {
                         o.hide();
+                    }
+                    // Clean up PID before returning so a new daemon can
+                    // start while the visualizer drains its messages.
+                    if opts.daemon {
+                        if let Ok(pid_file) = daemon::pid_path() {
+                            let _ = daemon::remove_pid_file_if_owner(
+                                std::process::id(),
+                                &pid_file,
+                            );
+                        }
                     }
                     return Ok(());
                 }
@@ -576,13 +582,19 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         if let Some(ref viz) = visualizer {
                             viz.push_message(&format!("Error: {}", final_msg));
                         }
-                        // Brief pause so the user can read the error.
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        if let Some(ref viz) = visualizer {
-                            viz.hide();
-                        }
                         if let Some(ref o) = overlay {
                             o.hide();
+                        }
+                        // Clean up PID before returning so a new daemon
+                        // can start while the visualizer drains its
+                        // messages.
+                        if opts.daemon {
+                            if let Ok(pid_file) = daemon::pid_path() {
+                                let _ = daemon::remove_pid_file_if_owner(
+                                    std::process::id(),
+                                    &pid_file,
+                                );
+                            }
                         }
                         return Ok(());
                     }
@@ -680,9 +692,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             if let Some(ref o) = overlay {
                 o.hide();
             }
-            if let Some(ref viz) = visualizer {
-                viz.hide();
-            }
         }
         return Ok(());
     }
@@ -692,12 +701,9 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Paste into focused application (batch mode only;
     // realtime mode pastes per-segment during recording)
     if !opts.realtime {
-        // Hide transcribing overlay and visualizer just before pasting.
+        // Hide transcribing overlay just before pasting.
         if let Some(ref o) = overlay {
             o.hide();
-        }
-        if let Some(ref viz) = visualizer {
-            viz.hide();
         }
         paste_text_to_target(target_window.as_ref(), &text, 0, paste_chunk_chars).await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);

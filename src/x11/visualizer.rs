@@ -713,11 +713,9 @@ const MESSAGE_FADE_DELAY_SECS: f32 = 1.0;
 enum VizCommand {
     /// Show the visualizer panels (badge width needed for positioning).
     Show { badge_width: u16 },
-    /// Hide visualizer panels.
+    /// Hide the amplitude/spectrum panels.  The text panel stays alive
+    /// (it is managed independently by the render loop).
     Hide,
-    /// Hide only the amplitude/spectrum panels (keep the text panel
-    /// and render loop alive so status messages remain visible).
-    HideAudio,
     /// Update the live transcription text displayed below the badge.
     Text { text: String },
     /// Push a status message with its own TTL.  Messages stack
@@ -746,14 +744,14 @@ impl VisualizerHandle {
     /// * `text` — enable the live transcription text panel (below badge).
     ///
     /// Returns `Err` if X11 or the audio device is unreachable.
-    pub fn new(amplitude: bool, spectrum: bool, text: bool) -> Result<Self, TalkError> {
+    pub fn new(amplitude: bool, spectrum: bool, _text: bool) -> Result<Self, TalkError> {
         let geom = super::monitor::primary_monitor_geometry()?;
         let (tx, rx) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("visualizer".into())
             .spawn(move || {
-                if let Err(e) = visualizer_thread(rx, amplitude, spectrum, text, geom) {
+                if let Err(e) = visualizer_thread(rx, amplitude, spectrum, geom) {
                     log::error!("visualizer thread error: {}", e);
                 }
             })
@@ -771,15 +769,10 @@ impl VisualizerHandle {
         let _ = self.tx.send(VizCommand::Show { badge_width });
     }
 
-    /// Hide visualizer panels.
+    /// Hide the amplitude/spectrum audio panels.  The text panel
+    /// stays alive — it self-manages based on pending messages.
     pub fn hide(&self) {
         let _ = self.tx.send(VizCommand::Hide);
-    }
-
-    /// Hide only the amplitude/spectrum panels.  The text panel and
-    /// render loop stay alive so pushed status messages remain visible.
-    pub fn hide_audio(&self) {
-        let _ = self.tx.send(VizCommand::HideAudio);
     }
 
     /// Update the live transcription text shown below the badge.
@@ -818,7 +811,6 @@ fn visualizer_thread(
     rx: std::sync::mpsc::Receiver<VizCommand>,
     enable_amplitude: bool,
     enable_spectrum: bool,
-    enable_text: bool,
     geom: super::monitor::MonitorGeometry,
 ) -> Result<(), TalkError> {
     let need_audio = enable_amplitude || enable_spectrum;
@@ -895,6 +887,55 @@ fn visualizer_thread(
 
     let (mon_x, mon_y, mon_w, _mon_h) = geom;
 
+    // ── Persistent text window (lives for the entire thread) ────────
+    //
+    // Created once here and never destroyed until the thread exits.
+    // The render loop maps/unmaps it on demand based on whether there
+    // are messages to display.
+
+    let text_x = mon_x + (mon_w as i16 / 2) - (TEXT_W as i16 / 2);
+    let text_y = mon_y + TOP_OFFSET + VIS_H as i16 + TEXT_GAP;
+
+    let text_win = {
+        let values = CreateWindowAux::new()
+            .background_pixel(screen.black_pixel)
+            .border_pixel(0)
+            .override_redirect(1u32)
+            .event_mask(EventMask::EXPOSURE);
+
+        let win = conn
+            .generate_id()
+            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
+
+        conn.create_window(
+            COPY_DEPTH_FROM_PARENT,
+            win,
+            root,
+            text_x,
+            text_y,
+            TEXT_W,
+            TEXT_LINE_H * MAX_TEXT_LINES,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &values,
+        )
+        .map_err(|e| TalkError::Config(format!("X11 create text win: {}", e)))?;
+
+        apply_rounded_shape(&conn, win, TEXT_W, TEXT_LINE_H, TEXT_CORNER_RADIUS)?;
+
+        win
+    };
+    let text_gc = {
+        let gc = conn
+            .generate_id()
+            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
+        conn.create_gc(gc, text_win, &CreateGCAux::new())
+            .map_err(|e| TalkError::Config(format!("X11 gc: {}", e)))?;
+        gc
+    };
+    let _ = conn.flush();
+
     // ── Pixel buffers ────────────────────────────────────────────────
 
     let mut amp_pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
@@ -924,8 +965,6 @@ fn visualizer_thread(
         spectrum_win: None,
         amplitude_gc: None,
         spectrum_gc: None,
-        text_win: None,
-        text_gc: None,
     };
     let mut is_showing = false;
     let mut current_text = String::new();
@@ -946,12 +985,22 @@ fn visualizer_thread(
 
     // Spectrum peak: fast attack, slow decay.
     let mut spectrum_peak: f32 = 0.001;
+    let mut should_quit = false;
 
     // ── Event loop ───────────────────────────────────────────────────
+    //
+    // Three states:
+    //   1. Audio active (`is_showing`): render audio panels + text at 60 fps.
+    //   2. Text only (`!is_showing`, TTL messages pending): render text at
+    //      60 fps so fade animation stays smooth.
+    //   3. Idle (`!is_showing`, no TTL messages): block on `rx.recv()`.
 
     loop {
-        // When hidden, block on commands (no rendering needed).
-        if !is_showing {
+        // Idle: no audio panels, no pending messages → block.
+        if !is_showing && ttl_messages.is_empty() {
+            if should_quit {
+                break;
+            }
             match rx.recv() {
                 Ok(VizCommand::Show { badge_width }) => {
                     amp_history.clear();
@@ -967,13 +1016,11 @@ fn visualizer_thread(
                         badge_width,
                         enable_amplitude,
                         enable_spectrum,
-                        enable_text,
                         &mut wins,
                     )?;
-                    text_is_mapped = enable_text;
                     is_showing = true;
                 }
-                Ok(VizCommand::Hide) | Ok(VizCommand::HideAudio) => {}
+                Ok(VizCommand::Hide) => {}
                 Ok(VizCommand::Text { text }) => {
                     current_text = text;
                 }
@@ -981,64 +1028,69 @@ fn visualizer_thread(
                     let expires = std::time::Instant::now()
                         + std::time::Duration::from_secs_f32(MESSAGE_TTL_SECS);
                     ttl_messages.push((text, expires));
+                    // Fall through to render loop on next iteration.
                 }
-                Ok(VizCommand::Quit) | Err(_) => break,
+                Ok(VizCommand::Quit) | Err(_) => {
+                    should_quit = true;
+                }
             }
             continue;
         }
 
-        // When shown, drain commands without blocking.
-        loop {
-            match rx.try_recv() {
-                Ok(VizCommand::Hide) => {
-                    destroy_windows(&conn, &mut wins);
-                    is_showing = false;
-                    text_is_mapped = false;
-                }
-                Ok(VizCommand::HideAudio) => {
-                    destroy_audio_windows(&conn, &mut wins);
-                }
-                Ok(VizCommand::Text { text }) => {
-                    current_text = text;
-                }
-                Ok(VizCommand::PushMessage { text }) => {
-                    let expires = std::time::Instant::now()
-                        + std::time::Duration::from_secs_f32(MESSAGE_TTL_SECS);
-                    ttl_messages.push((text, expires));
-                }
-                Ok(VizCommand::Show { badge_width }) => {
-                    destroy_windows(&conn, &mut wins);
-                    amp_history.clear();
-                    amp_history.resize(amp_max_frames, 0.0);
-                    create_windows(
-                        &conn,
-                        screen,
-                        root,
-                        depth,
-                        mon_x,
-                        mon_y,
-                        mon_w,
-                        badge_width,
-                        enable_amplitude,
-                        enable_spectrum,
-                        enable_text,
-                        &mut wins,
-                    )?;
-                    text_is_mapped = enable_text;
-                }
-                Ok(VizCommand::Quit) => {
-                    destroy_windows(&conn, &mut wins);
-                    return Ok(());
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    destroy_windows(&conn, &mut wins);
-                    return Ok(());
+        // Active: drain commands without blocking.
+        // Skip when quit is already requested — the channel is
+        // disconnected and every try_recv would return Disconnected.
+        if !should_quit {
+            loop {
+                match rx.try_recv() {
+                    Ok(VizCommand::Hide) => {
+                        destroy_audio_windows(&conn, &mut wins);
+                        is_showing = false;
+                    }
+                    Ok(VizCommand::Text { text }) => {
+                        current_text = text;
+                    }
+                    Ok(VizCommand::PushMessage { text }) => {
+                        let expires = std::time::Instant::now()
+                            + std::time::Duration::from_secs_f32(MESSAGE_TTL_SECS);
+                        ttl_messages.push((text, expires));
+                    }
+                    Ok(VizCommand::Show { badge_width }) => {
+                        destroy_audio_windows(&conn, &mut wins);
+                        amp_history.clear();
+                        amp_history.resize(amp_max_frames, 0.0);
+                        create_windows(
+                            &conn,
+                            screen,
+                            root,
+                            depth,
+                            mon_x,
+                            mon_y,
+                            mon_w,
+                            badge_width,
+                            enable_amplitude,
+                            enable_spectrum,
+                            &mut wins,
+                        )?;
+                        is_showing = true;
+                    }
+                    Ok(VizCommand::Quit) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        destroy_audio_windows(&conn, &mut wins);
+                        is_showing = false;
+                        should_quit = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 }
             }
         }
 
-        if !is_showing {
+        if should_quit && ttl_messages.is_empty() {
+            break;
+        }
+
+        if !is_showing && ttl_messages.is_empty() {
+            // No audio panels, no pending messages — go idle.
             continue;
         }
 
@@ -1156,22 +1208,22 @@ fn visualizer_thread(
         let n_lines = text_lines.len() as u16;
 
         // On-demand text panel visibility + dynamic height.
-        if let Some(win) = wins.text_win {
-            let want_visible = enable_text || n_lines > 0;
-            if want_visible && n_lines > 0 && n_lines != prev_text_lines {
+        {
+            let want_visible = n_lines > 0;
+            if want_visible && n_lines != prev_text_lines {
                 let new_h = n_lines.max(1) * TEXT_LINE_H;
                 let _ = conn.configure_window(
-                    win,
+                    text_win,
                     &x11rb::protocol::xproto::ConfigureWindowAux::new().height(u32::from(new_h)),
                 );
-                let _ = apply_rounded_shape(&conn, win, TEXT_W, new_h, TEXT_CORNER_RADIUS);
+                let _ = apply_rounded_shape(&conn, text_win, TEXT_W, new_h, TEXT_CORNER_RADIUS);
                 prev_text_lines = n_lines;
             }
             if want_visible && !text_is_mapped {
-                let _ = conn.map_window(win);
+                let _ = conn.map_window(text_win);
                 text_is_mapped = true;
             } else if !want_visible && text_is_mapped {
-                let _ = conn.unmap_window(win);
+                let _ = conn.unmap_window(text_win);
                 text_is_mapped = false;
                 prev_text_lines = 0;
             }
@@ -1180,7 +1232,7 @@ fn visualizer_thread(
         // Text panel — render each line into its own row.
         // TTL status lines use reddish colour without dots; the live
         // transcription line (if any) uses white with animated dots.
-        if let (Some(win), Some(gc), Some(ref f)) = (wins.text_win, wins.text_gc, &font) {
+        if let Some(ref f) = font {
             let dot_br = dot_wave(frame_counter);
             for (i, (line, alpha)) in text_lines.iter().enumerate() {
                 text_pb.clear_rounded(BG, TEXT_CORNER_RADIUS);
@@ -1192,8 +1244,8 @@ fn visualizer_thread(
 
                 let _ = conn.put_image(
                     ImageFormat::Z_PIXMAP,
-                    win,
-                    gc,
+                    text_win,
+                    text_gc,
                     TEXT_W,
                     TEXT_LINE_H,
                     0,
@@ -1214,6 +1266,12 @@ fn visualizer_thread(
         }
     }
 
+    // Clean up the persistent text window.
+    let _ = conn.free_gc(text_gc);
+    let _ = conn.destroy_window(text_win);
+    destroy_audio_windows(&conn, &mut wins);
+    let _ = conn.flush();
+
     Ok(())
 }
 
@@ -1224,8 +1282,6 @@ struct WindowState {
     spectrum_win: Option<Window>,
     amplitude_gc: Option<Gcontext>,
     spectrum_gc: Option<Gcontext>,
-    text_win: Option<Window>,
-    text_gc: Option<Gcontext>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1240,7 +1296,6 @@ fn create_windows(
     badge_width: u16,
     enable_amplitude: bool,
     enable_spectrum: bool,
-    enable_text: bool,
     state: &mut WindowState,
 ) -> Result<(), TalkError> {
     // Badge position (must match overlay.rs logic)
@@ -1321,52 +1376,8 @@ fn create_windows(
         state.spectrum_gc = Some(gc);
     }
 
-    // Text window — centred below the badge.
-    // Always created so error/status messages can be shown on demand.
-    // Only mapped immediately if `enable_text` is true (realtime mode
-    // where live transcription text is expected).  Otherwise the
-    // render loop maps/unmaps it when `current_text` becomes
-    // non-empty/empty.
-    {
-        let text_x = mon_x + (mon_w as i16 / 2) - (TEXT_W as i16 / 2);
-        let text_y = badge_y + VIS_H as i16 + TEXT_GAP;
-
-        let win = conn
-            .generate_id()
-            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
-
-        conn.create_window(
-            COPY_DEPTH_FROM_PARENT,
-            win,
-            root,
-            text_x,
-            text_y,
-            TEXT_W,
-            TEXT_LINE_H * MAX_TEXT_LINES,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            0,
-            &values,
-        )
-        .map_err(|e| TalkError::Config(format!("X11 create text win: {}", e)))?;
-
-        if enable_text {
-            conn.map_window(win)
-                .map_err(|e| TalkError::Config(format!("X11 map text win: {}", e)))?;
-        }
-
-        let gc = conn
-            .generate_id()
-            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
-        conn.create_gc(gc, win, &CreateGCAux::new())
-            .map_err(|e| TalkError::Config(format!("X11 gc: {}", e)))?;
-
-        // Apply rounded-corner shape mask via the XShape extension.
-        apply_rounded_shape(conn, win, TEXT_W, TEXT_LINE_H, TEXT_CORNER_RADIUS)?;
-
-        state.text_win = Some(win);
-        state.text_gc = Some(gc);
-    }
+    // NOTE: text window is created once at thread start and lives for
+    // the entire thread lifetime — it is not part of WindowState.
 
     conn.flush()
         .map_err(|e| TalkError::Config(format!("X11 flush: {}", e)))?;
@@ -1517,17 +1528,6 @@ fn destroy_audio_windows(conn: &impl Connection, state: &mut WindowState) {
         let _ = conn.free_gc(gc);
     }
     if let Some(win) = state.spectrum_win.take() {
-        let _ = conn.destroy_window(win);
-    }
-    let _ = conn.flush();
-}
-
-fn destroy_windows(conn: &impl Connection, state: &mut WindowState) {
-    destroy_audio_windows(conn, state);
-    if let Some(gc) = state.text_gc.take() {
-        let _ = conn.free_gc(gc);
-    }
-    if let Some(win) = state.text_win.take() {
         let _ = conn.destroy_window(win);
     }
     let _ = conn.flush();
