@@ -465,9 +465,9 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // If the initial streaming transcription failed (timeout,
         // API error, network issue), retry up to 5 times using the
         // saved WAV file.  Each retry creates a fresh transcriber
-        // and applies the same 2-second timeout.
+        // and applies the same 5-second timeout.
         const MAX_RETRIES: u32 = 5;
-        const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
         match stream_result {
             Ok(r) => r,

@@ -27,6 +27,9 @@ const MAX_RETRIES: u32 = 5;
 /// Delay between retry attempts.
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// TCP connect timeout — fail fast when the server is unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 // ── Cache ───────────────────────────────────────────────────────────
 
 struct CachedModels {
@@ -68,7 +71,10 @@ pub(crate) async fn fetch_transcription_models(
     }
 
     // Fetch with retries.
-    let client = Client::new();
+    let client = Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| TalkError::Config(format!("failed to build HTTP client: {}", e)))?;
     let models_url = format!("{}/v1/models", api_base);
     let mut last_err: Option<TalkError> = None;
 

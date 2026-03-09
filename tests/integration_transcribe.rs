@@ -112,7 +112,7 @@ async fn test_transcribe_nonexistent_file_errors() {
         model: "voxtral-mini-latest".to_string(),
         context_bias: None,
     };
-    let transcriber = MistralBatchTranscriber::new(config, false);
+    let transcriber = MistralBatchTranscriber::new(config, false).expect("build client");
 
     let result = transcriber
         .transcribe_file(Path::new("/nonexistent/path/to/audio.wav"))
@@ -175,7 +175,7 @@ async fn test_mistral_transcriber_real_api() {
         .providers
         .mistral
         .expect("mistral provider must be configured for this test");
-    let transcriber = MistralBatchTranscriber::new(mistral_config, false);
+    let transcriber = MistralBatchTranscriber::new(mistral_config, false).expect("build client");
 
     // Transcribe the file
     let result = transcriber.transcribe_file(&audio_path).await;

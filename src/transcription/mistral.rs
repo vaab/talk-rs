@@ -33,6 +33,17 @@ const BATCH_FILE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Timeout for the lightweight model-listing preflight check.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// TCP connect timeout — fail fast when the server is unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Build an HTTP client with a TCP connect timeout.
+fn build_client() -> Result<Client, TalkError> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| TalkError::Config(format!("failed to build HTTP client: {}", e)))
+}
+
 /// Response from Mistral API transcription endpoint.
 #[derive(Debug, Deserialize)]
 struct MistralResponse {
@@ -187,7 +198,7 @@ pub(crate) async fn validate_mistral_model(
 ) -> Result<(), TalkError> {
     let models_url = format!("{}/v1/models", api_base);
 
-    let client = Client::new();
+    let client = build_client()?;
     let response = client
         .get(&models_url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -259,13 +270,13 @@ impl MistralBatchTranscriber {
     ///
     /// * `config` - Mistral API configuration containing the API key
     /// * `diarize` - Request speaker diarization (requires V2 model)
-    pub fn new(config: MistralConfig, diarize: bool) -> Self {
-        Self {
-            client: Client::new(),
+    pub fn new(config: MistralConfig, diarize: bool) -> Result<Self, TalkError> {
+        Ok(Self {
+            client: build_client()?,
             config,
             endpoint: MISTRAL_API_ENDPOINT.to_string(),
             diarize,
-        }
+        })
     }
 
     /// Create a new Mistral transcriber with a custom endpoint (for testing).
@@ -276,13 +287,17 @@ impl MistralBatchTranscriber {
     /// * `endpoint` - Custom API endpoint URL
     /// * `diarize` - Request speaker diarization
     #[cfg(test)]
-    pub fn with_endpoint(config: MistralConfig, endpoint: String, diarize: bool) -> Self {
-        Self {
-            client: Client::new(),
+    pub fn with_endpoint(
+        config: MistralConfig,
+        endpoint: String,
+        diarize: bool,
+    ) -> Result<Self, TalkError> {
+        Ok(Self {
+            client: build_client()?,
             config,
             endpoint,
             diarize,
-        }
+        })
     }
 }
 
@@ -566,7 +581,8 @@ mod tests {
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
-        );
+        )
+        .expect("build client");
 
         // Transcribe the file
         let result = transcriber.transcribe_file(temp_file.path()).await;
@@ -600,7 +616,8 @@ mod tests {
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
-        );
+        )
+        .expect("build client");
 
         // Create a channel and send fake audio data
         let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -644,7 +661,8 @@ mod tests {
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
-        );
+        )
+        .expect("build client");
 
         // Transcribe the file
         let result = transcriber.transcribe_file(temp_file.path()).await;
@@ -660,7 +678,7 @@ mod tests {
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::new(config, false);
+        let transcriber = MistralBatchTranscriber::new(config, false).expect("build client");
 
         let result = transcriber
             .transcribe_file(Path::new("/nonexistent/file.wav"))
@@ -697,7 +715,8 @@ mod tests {
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
-        );
+        )
+        .expect("build client");
 
         // Transcribe the file
         let result = transcriber.transcribe_file(temp_file.path()).await;
@@ -746,7 +765,8 @@ mod tests {
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             true,
-        );
+        )
+        .expect("build client");
 
         let result = transcriber.transcribe_file(temp_file.path()).await;
 
@@ -843,7 +863,8 @@ mod tests {
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
-        );
+        )
+        .expect("build client");
 
         let result = transcriber.transcribe_file(temp_file.path()).await;
 

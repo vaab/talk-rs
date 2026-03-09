@@ -282,7 +282,7 @@ pub fn create_batch_transcriber(
             if let Some(m) = model {
                 cfg.model = m.to_string();
             }
-            Ok(Box::new(MistralBatchTranscriber::new(cfg, diarize)))
+            Ok(Box::new(MistralBatchTranscriber::new(cfg, diarize)?))
         }
         Provider::OpenAI => {
             let mut cfg = config.providers.openai.clone().ok_or_else(|| {
@@ -298,7 +298,7 @@ pub fn create_batch_transcriber(
             if let Some(m) = model {
                 cfg.model = m.to_string();
             }
-            Ok(Box::new(OpenAIBatchTranscriber::new(cfg)))
+            Ok(Box::new(OpenAIBatchTranscriber::new(cfg)?))
         }
     }
 }

@@ -34,6 +34,17 @@ const BATCH_FILE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Timeout for the lightweight model-listing preflight check.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// TCP connect timeout — fail fast when the server is unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Build an HTTP client with a TCP connect timeout.
+fn build_client() -> Result<Client, TalkError> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| TalkError::Config(format!("failed to build HTTP client: {}", e)))
+}
+
 /// Response from OpenAI API transcription endpoint.
 #[derive(Debug, Deserialize)]
 struct OpenAIResponse {
@@ -179,7 +190,7 @@ pub(crate) async fn validate_openai_model(
 ) -> Result<(), TalkError> {
     let models_url = format!("{}/v1/models", api_base);
 
-    let client = Client::new();
+    let client = build_client()?;
     let response = client
         .get(&models_url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -249,12 +260,12 @@ impl OpenAIBatchTranscriber {
     /// # Arguments
     ///
     /// * `config` - OpenAI API configuration containing the API key
-    pub fn new(config: OpenAIConfig) -> Self {
-        Self {
-            client: Client::new(),
+    pub fn new(config: OpenAIConfig) -> Result<Self, TalkError> {
+        Ok(Self {
+            client: build_client()?,
             config,
             endpoint: OPENAI_API_ENDPOINT.to_string(),
-        }
+        })
     }
 
     /// Create a new OpenAI transcriber with a custom endpoint (for testing).
@@ -264,12 +275,12 @@ impl OpenAIBatchTranscriber {
     /// * `config` - OpenAI API configuration containing the API key
     /// * `endpoint` - Custom API endpoint URL
     #[cfg(test)]
-    pub fn with_endpoint(config: OpenAIConfig, endpoint: String) -> Self {
-        Self {
-            client: Client::new(),
+    pub fn with_endpoint(config: OpenAIConfig, endpoint: String) -> Result<Self, TalkError> {
+        Ok(Self {
+            client: build_client()?,
             config,
             endpoint,
-        }
+        })
     }
 }
 
@@ -532,7 +543,8 @@ mod tests {
         let transcriber = OpenAIBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
-        );
+        )
+        .expect("build client");
 
         let result = transcriber.transcribe_file(temp_file.path()).await;
 
@@ -561,7 +573,8 @@ mod tests {
         let transcriber = OpenAIBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
-        );
+        )
+        .expect("build client");
 
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
@@ -597,7 +610,8 @@ mod tests {
         let transcriber = OpenAIBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
-        );
+        )
+        .expect("build client");
 
         let result = transcriber.transcribe_file(temp_file.path()).await;
 
@@ -612,7 +626,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::new(config);
+        let transcriber = OpenAIBatchTranscriber::new(config).expect("build client");
 
         let result = transcriber
             .transcribe_file(Path::new("/nonexistent/file.ogg"))
@@ -689,7 +703,8 @@ mod tests {
         let transcriber = OpenAIBatchTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
-        );
+        )
+        .expect("build client");
 
         let result = transcriber.transcribe_file(temp_file.path()).await;
 
