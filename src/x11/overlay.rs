@@ -79,8 +79,13 @@ const FREQ_NOISE_FLOOR: f32 = 0.01;
 
 // ── Colors (BGRA for little-endian ZPixmap, depth 24/32) ────────────
 
-/// Badge background: dark charcoal.
-const BG_COLOR: [u8; 4] = [0x2D, 0x2D, 0x2D, 0xFF];
+/// Badge background: fully transparent (compositor alpha).
+const BG_COLOR: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+
+/// Border colour: medium gray, fully opaque (BGRA).
+const BORDER_COLOR: [u8; 4] = [0x88, 0x88, 0x88, 0xFF];
+/// Border width in pixels.
+const BORDER_WIDTH: f32 = 2.0;
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -297,13 +302,10 @@ fn render_spectrogram(
                 0.0
             };
 
-            // Alpha-blend white onto the badge background.
-            // brightness acts as opacity: 0 = pure background, 1 = pure white.
-            let a = brightness;
-            let b = (BG_COLOR[0] as f32 + (0xFF as f32 - BG_COLOR[0] as f32) * a) as u8;
-            let g = (BG_COLOR[1] as f32 + (0xFF as f32 - BG_COLOR[1] as f32) * a) as u8;
-            let r = (BG_COLOR[2] as f32 + (0xFF as f32 - BG_COLOR[2] as f32) * a) as u8;
-            let color = [b, g, r, 0xFF];
+            // Premultiplied alpha: white × brightness.
+            // Compositors expect color channels ≤ alpha.
+            let alpha = (brightness * 255.0) as u8;
+            let color = [alpha, alpha, alpha, alpha];
             pb.set_pixel(x, y, color);
         }
     }
@@ -324,11 +326,11 @@ fn draw_pulsing_dot(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32, bri
 
             // Anti-aliasing at the edge: smooth falloff over 1px.
             let edge_dist = radius - dist_sq.sqrt();
-            let alpha = edge_dist.clamp(0.0, 1.0);
+            let edge_alpha = edge_dist.clamp(0.0, 1.0);
 
-            // Red colour in BGRA with brightness and edge alpha.
-            let r_val = (255.0 * brightness * alpha) as u8;
-            let color = [0x00, 0x00, r_val, 0xFF];
+            // BGRA with true alpha for compositor transparency.
+            let val = (255.0 * brightness * edge_alpha) as u8;
+            let color = [0x00, 0x00, val, val];
 
             // Draw in all four quadrants.
             let coords: [(usize, usize); 4] = [
@@ -341,6 +343,57 @@ fn draw_pulsing_dot(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32, bri
                 if px < pb.width && py < pb.height {
                     pb.set_pixel(px, py, color);
                 }
+            }
+        }
+    }
+}
+
+/// Signed distance from a point to the border of a rounded rectangle.
+///
+/// Negative values are inside, positive outside.
+fn rounded_rect_sdf(px: f32, py: f32, w: f32, h: f32, r: f32) -> f32 {
+    let cx = px - w / 2.0;
+    let cy = py - h / 2.0;
+    let hw = w / 2.0 - r;
+    let hh = h / 2.0 - r;
+    let dx = cx.abs() - hw;
+    let dy = cy.abs() - hh;
+    let outside = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt();
+    let inside = dx.max(dy).min(0.0);
+    outside + inside - r
+}
+
+/// Draw a rounded rectangle border (outline only) into the pixel buffer.
+///
+/// Uses an SDF for anti-aliased edges.  Only the border ring is drawn;
+/// the interior is left untouched (transparent).
+fn draw_rounded_border(pb: &mut PixelBuffer, color: [u8; 4], radius: f32, border_width: f32) {
+    let w = pb.width as f32;
+    let h = pb.height as f32;
+
+    for y in 0..pb.height {
+        for x in 0..pb.width {
+            let d = rounded_rect_sdf(x as f32 + 0.5, y as f32 + 0.5, w, h, radius);
+
+            // Outside the shape: d > 0 → skip (transparent).
+            // Inside the border ring: -border_width < d <= 0.
+            // Deep inside: d <= -border_width → skip (interior).
+
+            // Outer edge anti-aliasing (smooth over 1px).
+            let outer_alpha = (-d).clamp(0.0, 1.0);
+            // Inner edge anti-aliasing (smooth over 1px).
+            let inner_alpha = (d + border_width).clamp(0.0, 1.0);
+
+            let alpha = outer_alpha * inner_alpha;
+
+            if alpha > 0.0 {
+                let a = (color[3] as f32 * alpha) as u8;
+                // Premultiplied: color channels scaled by effective alpha.
+                let b = (color[0] as f32 * alpha) as u8;
+                let g = (color[1] as f32 * alpha) as u8;
+                let r = (color[2] as f32 * alpha) as u8;
+                let pixel = [b, g, r, a];
+                pb.set_pixel(x, y, pixel);
             }
         }
     }
@@ -498,7 +551,27 @@ fn overlay_thread(
 
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
-    let depth = screen.root_depth;
+
+    // Try to find a 32-bit ARGB visual for compositor transparency.
+    // Falls back to the root depth if unavailable.
+    let argb_ctx = if let Some(visual) = find_argb_visual(screen) {
+        let colormap = conn
+            .generate_id()
+            .map_err(|e| TalkError::Config(format!("X11 generate_id failed: {}", e)))?;
+        conn.create_colormap(ColormapAlloc::NONE, colormap, root, visual)
+            .map_err(|e| TalkError::Config(format!("X11 create_colormap failed: {}", e)))?;
+        log::info!("using 32-bit ARGB visual for recording badge transparency");
+        Some(ArgbContext {
+            visual,
+            colormap,
+            depth: 32,
+        })
+    } else {
+        log::warn!("no 32-bit ARGB visual found; recording badge will have opaque background");
+        None
+    };
+
+    let depth = argb_ctx.as_ref().map_or(screen.root_depth, |c| c.depth);
 
     // Pre-decode the transcribing indicator image.
     let transcribing_img = decode_png(TRANSCRIBING_PNG)?;
@@ -606,10 +679,19 @@ fn overlay_thread(
                     let badge_x = mon_x + (mon_w as i16 / 2) - (BADGE_W as i16 / 2);
                     let badge_y = mon_y + 4;
 
-                    let win = create_overlay_window(
-                        &conn, screen, root, badge_x, badge_y, BADGE_W, BADGE_H,
-                    )?;
-                    apply_rounded_shape(&conn, win, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+                    let win = if let Some(ref ctx) = argb_ctx {
+                        // 32-bit ARGB window — compositor handles transparency.
+                        create_argb_overlay_window(
+                            &conn, root, ctx, badge_x, badge_y, BADGE_W, BADGE_H,
+                        )?
+                    } else {
+                        // Fallback: opaque window with shape mask.
+                        let w = create_overlay_window(
+                            &conn, screen, root, badge_x, badge_y, BADGE_W, BADGE_H,
+                        )?;
+                        apply_rounded_shape(&conn, w, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+                        w
+                    };
 
                     conn.map_window(win)
                         .map_err(|e| TalkError::Config(format!("X11 map_window failed: {}", e)))?;
@@ -762,7 +844,8 @@ fn overlay_thread(
 
         // ── Render badge ─────────────────────────────────────
 
-        pb.clear_rounded(BG_COLOR, CORNER_RADIUS);
+        pb.clear(BG_COLOR);
+        draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
 
         let vol_norm = if rms_peak > PEAK_FLOOR {
             (frame_rms / rms_peak).clamp(0.0, 1.0)
@@ -813,6 +896,67 @@ fn overlay_thread(
 }
 
 // ── Window helpers ───────────────────────────────────────────────────
+
+/// Find a 32-bit TrueColor visual suitable for compositor alpha transparency.
+///
+/// Returns `Some(visual_id)` if one is available, `None` otherwise.
+fn find_argb_visual(screen: &Screen) -> Option<Visualid> {
+    screen
+        .allowed_depths
+        .iter()
+        .filter(|d| d.depth == 32)
+        .flat_map(|d| &d.visuals)
+        .find(|v| v.class == VisualClass::TRUE_COLOR)
+        .map(|v| v.visual_id)
+}
+
+/// ARGB window context: visual, colormap, and depth for 32-bit transparency.
+struct ArgbContext {
+    visual: Visualid,
+    colormap: Colormap,
+    depth: u8,
+}
+
+/// Create an override-redirect window with 32-bit ARGB visual.
+///
+/// The caller must free the colormap when the window is destroyed.
+fn create_argb_overlay_window(
+    conn: &impl Connection,
+    root: u32,
+    ctx: &ArgbContext,
+    x: i16,
+    y: i16,
+    w: u16,
+    h: u16,
+) -> Result<u32, TalkError> {
+    let win = conn
+        .generate_id()
+        .map_err(|e| TalkError::Config(format!("X11 generate_id failed: {}", e)))?;
+
+    let values = CreateWindowAux::new()
+        .background_pixel(0) // transparent
+        .border_pixel(0) // required for non-default visual
+        .override_redirect(1u32)
+        .event_mask(EventMask::EXPOSURE)
+        .colormap(ctx.colormap);
+
+    conn.create_window(
+        ctx.depth,
+        win,
+        root,
+        x,
+        y,
+        w,
+        h,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        ctx.visual,
+        &values,
+    )
+    .map_err(|e| TalkError::Config(format!("X11 create_window failed: {}", e)))?;
+
+    Ok(win)
+}
 
 /// Create an override-redirect X11 window at the given position.
 fn create_overlay_window(
@@ -991,29 +1135,28 @@ mod tests {
     #[test]
     fn render_spectrogram_right_aligned() {
         let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
-        pb.clear_rounded(BG_COLOR, CORNER_RADIUS);
+        pb.clear(BG_COLOR);
 
         // Only 5 columns of history — should right-align.
         let history: Vec<Vec<f32>> = (0..5).map(|_| vec![1.0; SPEC_H]).collect();
         render_spectrogram(&mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
 
-        // Leftmost columns of spectrogram area should still be BG.
+        // Leftmost columns of spectrogram area should still be BG (alpha=0).
         let check_col = SPEC_LEFT;
         let mid_y = SPEC_TOP + SPEC_H / 2;
         let off = (mid_y * pb.width + check_col) * 4;
         assert_eq!(
-            &pb.data[off..off + 4],
-            &BG_COLOR,
-            "leftmost spectrogram column should be bg when history is short"
+            pb.data[off + 3],
+            0,
+            "leftmost spectrogram column should be transparent when history is short"
         );
 
-        // Rightmost columns should have content (right-aligned).
+        // Rightmost columns should have content (non-zero alpha).
         let right_col = SPEC_LEFT + SPEC_W - 1; // last column of spectrogram area
         let off2 = (mid_y * pb.width + right_col) * 4;
-        assert_ne!(
-            &pb.data[off2..off2 + 4],
-            &BG_COLOR,
-            "rightmost spectrogram column should have content"
+        assert!(
+            pb.data[off2 + 3] > 0,
+            "rightmost spectrogram column should have non-zero alpha"
         );
     }
 
@@ -1092,12 +1235,65 @@ mod tests {
         assert_ne!(IndicatorKind::Recording, IndicatorKind::Transcribing);
     }
 
+    // ── Border rendering ───────────────────────────────────────────────
+
+    #[test]
+    fn rounded_rect_sdf_centre_is_negative() {
+        let w = BADGE_W as f32;
+        let h = BADGE_H as f32;
+        let d = rounded_rect_sdf(w / 2.0, h / 2.0, w, h, CORNER_RADIUS as f32);
+        assert!(
+            d < 0.0,
+            "centre of badge should be inside (negative SDF), got {}",
+            d
+        );
+    }
+
+    #[test]
+    fn rounded_rect_sdf_outside_is_positive() {
+        let w = BADGE_W as f32;
+        let h = BADGE_H as f32;
+        // Well outside the badge.
+        let d = rounded_rect_sdf(w + 10.0, h + 10.0, w, h, CORNER_RADIUS as f32);
+        assert!(
+            d > 0.0,
+            "point outside badge should have positive SDF, got {}",
+            d
+        );
+    }
+
+    #[test]
+    fn draw_rounded_border_produces_border_pixels() {
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear(BG_COLOR);
+        draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
+
+        // The top edge centre should have border pixels.
+        let mid_x = BADGE_W as usize / 2;
+        let off = mid_x * 4;
+        assert!(
+            pb.data[off + 3] > 0,
+            "top edge centre should have non-zero alpha from border"
+        );
+
+        // Interior centre should be transparent (no border there).
+        let cx = BADGE_W as usize / 2;
+        let cy = BADGE_H as usize / 2;
+        let off_centre = (cy * pb.width + cx) * 4;
+        assert_eq!(
+            pb.data[off_centre + 3],
+            0,
+            "badge interior should remain transparent"
+        );
+    }
+
     // ── Full badge render (integration) ──────────────────────────────
 
     #[test]
     fn full_badge_render_produces_content() {
         let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
-        pb.clear_rounded(BG_COLOR, CORNER_RADIUS);
+        pb.clear(BG_COLOR);
+        draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
         draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX, 0.7);
 
         let history: Vec<Vec<f32>> = (0..SPEC_W)
@@ -1105,12 +1301,13 @@ mod tests {
             .collect();
         render_spectrogram(&mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
 
-        let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG_COLOR).count();
+        // Count pixels with non-zero alpha (visible content).
+        let visible = pb.data.chunks_exact(4).filter(|p| p[3] > 0).count();
 
         assert!(
-            non_bg > 500,
-            "full badge render should produce significant content, got {} non-bg pixels",
-            non_bg
+            visible > 500,
+            "full badge render should produce significant visible content, got {} pixels with alpha > 0",
+            visible
         );
     }
 }
