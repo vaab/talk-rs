@@ -6,6 +6,7 @@
 pub mod clipboard;
 pub mod monitor;
 pub mod overlay;
+pub mod render_util;
 pub mod visualizer;
 
 /// Centre a known X11 window on the monitor containing the mouse

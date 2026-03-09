@@ -3,28 +3,93 @@
 //! Displays a small badge at the top-center of the primary monitor using X11.
 //! Uses the Shape extension for binary transparency (works without a compositor).
 //! The overlay runs on a dedicated background thread with a command channel.
+//!
+//! During **recording**, the badge is rendered dynamically at 60 fps:
+//! a pulsing red dot (brightness driven by volume) plus a real-time
+//! spectrogram waterfall that scrolls right-to-left, replacing the
+//! former static "recording" text.
+//!
+//! During **transcribing**, the badge is a static PNG (unchanged).
 
+use super::render_util::{
+    apply_rounded_shape, compute_spectrum, rms, PixelBuffer, RingBuffer, PEAK_DECAY, PEAK_FLOOR,
+};
 use crate::error::TalkError;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::HashMap;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use x11rb::connection::Connection;
 use x11rb::protocol::shape;
+use x11rb::protocol::xproto::*;
+use x11rb::wrapper::ConnectionExt as _;
+use x11rb::COPY_DEPTH_FROM_PARENT;
 
 // ── Embedded PNG assets ──────────────────────────────────────────────
 
-/// "recording" badge: 182×52, dark rounded rect with red dot + text.
-const RECORDING_PNG: &[u8] = include_bytes!("../../assets/indicator.png");
-
 /// "transcribing" badge: 210×52, dark rounded rect with blue dot + text.
 const TRANSCRIBING_PNG: &[u8] = include_bytes!("../../assets/transcribing.png");
+
+// ── Badge layout constants ───────────────────────────────────────────
+
+/// Badge width in pixels (matches the original recording indicator).
+const BADGE_W: u16 = 182;
+/// Badge height in pixels.
+const BADGE_H: u16 = 52;
+/// Corner radius for the rounded rectangle background.
+const CORNER_RADIUS: usize = 13;
+
+/// X coordinate of the red dot centre.
+const DOT_CX: usize = 28;
+/// Y coordinate of the red dot centre (vertically centred).
+const DOT_CY: usize = 26;
+/// Minimum red dot radius (quiet).
+const DOT_RADIUS_MIN: f32 = 3.0;
+/// Maximum red dot radius (loud).
+const DOT_RADIUS_MAX: f32 = 10.0;
+/// Minimum dot brightness — always visible.
+const DOT_MIN_BRIGHTNESS: f32 = 0.5;
+
+/// Left edge of the spectrogram area (right of the dot + gap).
+const SPEC_LEFT: usize = 44;
+/// Top edge of the spectrogram area (padding from badge top).
+const SPEC_TOP: usize = 4;
+/// Right edge of the spectrogram area (padding from badge right).
+const SPEC_RIGHT: usize = 174;
+/// Bottom edge of the spectrogram area (padding from badge bottom).
+const SPEC_BOTTOM: usize = 48;
+/// Spectrogram width in pixels (time columns).
+const SPEC_W: usize = SPEC_RIGHT - SPEC_LEFT;
+/// Spectrogram height in pixels (frequency rows).
+const SPEC_H: usize = SPEC_BOTTOM - SPEC_TOP;
+
+/// Target frames per second for the recording render loop.
+const FPS: u32 = 60;
+/// Number of audio samples fed into the FFT (must be power of two).
+const FFT_SIZE: usize = 1024;
+
+/// Lowest frequency shown in the spectrogram (Hz).
+const FREQ_MIN: f32 = 80.0;
+/// Hard upper limit for dynamic frequency scaling (Hz).
+const FREQ_MAX: f32 = 8000.0;
+/// Initial effective frequency ceiling; grows as higher harmonics appear.
+const FREQ_INITIAL_MAX: f32 = 320.0;
+/// Minimum FFT magnitude to count a bin as "active" for frequency scaling.
+const FREQ_NOISE_FLOOR: f32 = 0.01;
+
+// ── Colors (BGRA for little-endian ZPixmap, depth 24/32) ────────────
+
+/// Badge background: dark charcoal.
+const BG_COLOR: [u8; 4] = [0x2D, 0x2D, 0x2D, 0xFF];
 
 // ── Public types ─────────────────────────────────────────────────────
 
 /// Which indicator to display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndicatorKind {
-    /// Red badge shown during audio recording.
+    /// Red badge shown during audio recording (dynamic spectrogram).
     Recording,
-    /// Blue badge shown during transcription.
+    /// Blue badge shown during transcription (static PNG).
     Transcribing,
 }
 
@@ -113,11 +178,9 @@ fn decode_png(bytes: &[u8]) -> Result<RgbaImage, TalkError> {
         .next_frame(&mut buf)
         .map_err(|e| TalkError::Config(format!("failed to decode PNG frame: {}", e)))?;
 
-    // Ensure RGBA output
     let data = match info.color_type {
         png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
         png::ColorType::Rgb => {
-            // Add opaque alpha channel
             let rgb = &buf[..info.buffer_size()];
             let mut rgba = Vec::with_capacity(info.width as usize * info.height as usize * 4);
             for chunk in rgb.chunks_exact(3) {
@@ -141,134 +204,160 @@ fn decode_png(bytes: &[u8]) -> Result<RgbaImage, TalkError> {
     })
 }
 
-// ── X11 overlay thread ──────────────────────────────────────────────
+// ── Spectrogram helpers ──────────────────────────────────────────────
 
-/// Main loop for the overlay background thread.
-fn overlay_thread(
-    rx: mpsc::Receiver<Command>,
-    geom: super::monitor::MonitorGeometry,
-) -> Result<(), TalkError> {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::*;
-    use x11rb::wrapper::ConnectionExt as _;
-    use x11rb::COPY_DEPTH_FROM_PARENT;
+/// Map FFT magnitude bins to a fixed-height spectrogram column using
+/// logarithmic frequency spacing.
+///
+/// Returns a `Vec<f32>` of length `num_rows`, where index 0 is the
+/// lowest frequency (bottom of spectrogram) and the last index is
+/// the highest (top).
+fn map_spectrum_to_column(
+    magnitudes: &[f32],
+    num_rows: usize,
+    sample_rate: u32,
+    freq_max: f32,
+) -> Vec<f32> {
+    let n_bins = magnitudes.len();
+    if n_bins == 0 || num_rows == 0 {
+        return vec![0.0; num_rows];
+    }
 
-    let (conn, screen_num) = x11rb::connect(None)
-        .map_err(|e| TalkError::Config(format!("failed to connect to X11: {}", e)))?;
+    let nyquist = sample_rate as f32 / 2.0;
+    let f_max = freq_max.min(nyquist);
+    let log_min = FREQ_MIN.ln();
+    let log_max = f_max.ln();
 
-    let screen = &conn.setup().roots[screen_num];
-    let root = screen.root;
+    let mut column = Vec::with_capacity(num_rows);
 
-    // Pre-decode both indicator images
-    let recording_img = decode_png(RECORDING_PNG)?;
-    let transcribing_img = decode_png(TRANSCRIBING_PNG)?;
+    for row in 0..num_rows {
+        let t = if num_rows > 1 {
+            row as f32 / (num_rows - 1) as f32
+        } else {
+            0.5
+        };
+        let log_f = log_min + t * (log_max - log_min);
+        let freq = log_f.exp();
 
-    let (mon_x, mon_y, mon_w, _mon_h) = geom;
+        // Map frequency to FFT bin index.
+        let bin_f = freq / nyquist * n_bins as f32;
+        let bin = (bin_f as usize).min(n_bins - 1);
 
-    let mut current_window: Option<Window> = None;
+        // Average a few neighbouring bins for smoothness.
+        let bin_start = bin.saturating_sub(1);
+        let bin_end = (bin + 2).min(n_bins);
+        let avg: f32 =
+            magnitudes[bin_start..bin_end].iter().sum::<f32>() / (bin_end - bin_start) as f32;
 
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Command::Show(kind) => {
-                // Destroy previous window if any
-                if let Some(win) = current_window.take() {
-                    let _ = conn.destroy_window(win);
-                    let _ = conn.flush();
-                }
+        column.push(avg);
+    }
 
-                let img = match kind {
-                    IndicatorKind::Recording => &recording_img,
-                    IndicatorKind::Transcribing => &transcribing_img,
-                };
+    column
+}
 
-                let w = img.width as u16;
-                let h = img.height as u16;
+/// Render the spectrogram waterfall into the pixel buffer.
+///
+/// `history` holds the most recent columns of spectral data (each a
+/// `Vec<f32>` of length `SPEC_H`).  Newer columns are at the end.
+/// The spectrogram is right-aligned: the newest column draws at the
+/// right edge of the area, oldest on the left.
+fn render_spectrogram(
+    pb: &mut PixelBuffer,
+    history: &[Vec<f32>],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    peak: f32,
+) {
+    if history.is_empty() || peak < PEAK_FLOOR {
+        return;
+    }
 
-                // Center horizontally on primary monitor, 4px from top
-                let x = mon_x + (mon_w as i16 / 2) - (w as i16 / 2);
-                let y = mon_y + 4;
+    let n = history.len();
+    let start = n.saturating_sub(w);
+    let num_cols = n - start;
 
-                // Create override_redirect window
-                let win = conn
-                    .generate_id()
-                    .map_err(|e| TalkError::Config(format!("X11 generate_id failed: {}", e)))?;
+    for (col_idx, column) in history[start..].iter().enumerate() {
+        // Right-aligned: newest column at the right edge.
+        let x = x0 + w - num_cols + col_idx;
 
-                let values = CreateWindowAux::new()
-                    .background_pixel(screen.black_pixel)
-                    .border_pixel(0)
-                    .override_redirect(1u32)
-                    .event_mask(EventMask::EXPOSURE);
-
-                conn.create_window(
-                    COPY_DEPTH_FROM_PARENT,
-                    win,
-                    root,
-                    x,
-                    y,
-                    w,
-                    h,
-                    0,
-                    WindowClass::INPUT_OUTPUT,
-                    0, // CopyFromParent visual
-                    &values,
-                )
-                .map_err(|e| TalkError::Config(format!("X11 create_window failed: {}", e)))?;
-
-                // Build shape mask (1-bit pixmap): alpha > 128 → opaque
-                apply_shape_mask(&conn, win, img, w, h)?;
-
-                // Map the window first — X11 clears content on map, so we
-                // must draw AFTER the window is visible.
-                conn.map_window(win)
-                    .map_err(|e| TalkError::Config(format!("X11 map_window failed: {}", e)))?;
-
-                // Sync with X server: ensures the map request is fully
-                // processed and the Expose event generated before we draw.
-                conn.sync()
-                    .map_err(|e| TalkError::Config(format!("X11 sync failed: {}", e)))?;
-
-                // Now draw visible pixels grouped by color
-                draw_image(&conn, win, screen, img)?;
-
-                conn.flush()
-                    .map_err(|e| TalkError::Config(format!("X11 flush failed: {}", e)))?;
-
-                current_window = Some(win);
-            }
-
-            Command::Hide => {
-                if let Some(win) = current_window.take() {
-                    let _ = conn.destroy_window(win);
-                    let _ = conn.flush();
-                }
-            }
-
-            Command::Quit => {
-                if let Some(win) = current_window.take() {
-                    let _ = conn.destroy_window(win);
-                    let _ = conn.flush();
-                }
+        for (row_idx, &magnitude) in column.iter().enumerate() {
+            // row 0 = low freq = bottom of area
+            if row_idx >= h {
                 break;
+            }
+            let y = y0 + h - 1 - row_idx;
+
+            let norm = (magnitude / peak).clamp(0.0, 1.0);
+            // Log scale for better visual contrast.
+            let brightness = if norm > 0.0 {
+                (1.0 + norm * 9.0).log10() // maps 0..1 → 0..1
+            } else {
+                0.0
+            };
+
+            // Alpha-blend white onto the badge background.
+            // brightness acts as opacity: 0 = pure background, 1 = pure white.
+            let a = brightness;
+            let b = (BG_COLOR[0] as f32 + (0xFF as f32 - BG_COLOR[0] as f32) * a) as u8;
+            let g = (BG_COLOR[1] as f32 + (0xFF as f32 - BG_COLOR[1] as f32) * a) as u8;
+            let r = (BG_COLOR[2] as f32 + (0xFF as f32 - BG_COLOR[2] as f32) * a) as u8;
+            let color = [b, g, r, 0xFF];
+            pb.set_pixel(x, y, color);
+        }
+    }
+}
+
+/// Draw the red dot with brightness driven by current volume level.
+fn draw_pulsing_dot(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32, brightness: f32) {
+    let r_sq = radius * radius;
+    let r_int = radius.ceil() as usize;
+    let brightness = brightness.clamp(DOT_MIN_BRIGHTNESS, 1.0);
+
+    for dy in 0..=r_int {
+        for dx in 0..=r_int {
+            let dist_sq = (dx * dx + dy * dy) as f32;
+            if dist_sq > r_sq {
+                continue;
+            }
+
+            // Anti-aliasing at the edge: smooth falloff over 1px.
+            let edge_dist = radius - dist_sq.sqrt();
+            let alpha = edge_dist.clamp(0.0, 1.0);
+
+            // Red colour in BGRA with brightness and edge alpha.
+            let r_val = (255.0 * brightness * alpha) as u8;
+            let color = [0x00, 0x00, r_val, 0xFF];
+
+            // Draw in all four quadrants.
+            let coords: [(usize, usize); 4] = [
+                (cx + dx, cy + dy),
+                (cx.wrapping_sub(dx), cy + dy),
+                (cx + dx, cy.wrapping_sub(dy)),
+                (cx.wrapping_sub(dx), cy.wrapping_sub(dy)),
+            ];
+            for (px, py) in coords {
+                if px < pb.width && py < pb.height {
+                    pb.set_pixel(px, py, color);
+                }
             }
         }
     }
-
-    Ok(())
 }
+
+// ── Static PNG window (transcribing) ─────────────────────────────────
 
 /// Apply a 1-bit shape mask based on the image alpha channel.
 ///
 /// Pixels with alpha > 128 are visible; all others are transparent.
-fn apply_shape_mask(
-    conn: &impl x11rb::connection::Connection,
+fn apply_alpha_shape_mask(
+    conn: &impl Connection,
     win: u32,
     img: &RgbaImage,
     w: u16,
     h: u16,
 ) -> Result<(), TalkError> {
-    use x11rb::protocol::xproto::*;
-
-    // Create a 1-bit depth pixmap for the shape mask
     let mask = conn
         .generate_id()
         .map_err(|e| TalkError::Config(format!("X11 generate_id failed: {}", e)))?;
@@ -276,7 +365,6 @@ fn apply_shape_mask(
     conn.create_pixmap(1, mask, win, w, h)
         .map_err(|e| TalkError::Config(format!("X11 create_pixmap failed: {}", e)))?;
 
-    // Create GC for the mask pixmap
     let gc = conn
         .generate_id()
         .map_err(|e| TalkError::Config(format!("X11 generate_id failed: {}", e)))?;
@@ -284,7 +372,6 @@ fn apply_shape_mask(
     conn.create_gc(gc, mask, &CreateGCAux::new().foreground(0))
         .map_err(|e| TalkError::Config(format!("X11 create_gc failed: {}", e)))?;
 
-    // Fill mask with 0 (fully transparent)
     conn.poly_fill_rectangle(
         mask,
         gc,
@@ -297,11 +384,9 @@ fn apply_shape_mask(
     )
     .map_err(|e| TalkError::Config(format!("X11 poly_fill_rectangle failed: {}", e)))?;
 
-    // Set foreground to 1 (opaque) and draw visible pixels
     conn.change_gc(gc, &ChangeGCAux::new().foreground(1))
         .map_err(|e| TalkError::Config(format!("X11 change_gc failed: {}", e)))?;
 
-    // Collect all opaque pixel coordinates
     let mut opaque_points: Vec<Point> = Vec::new();
     for py in 0..img.height {
         for px in 0..img.width {
@@ -316,17 +401,14 @@ fn apply_shape_mask(
         }
     }
 
-    // Draw in batches (X11 has a request size limit)
     for chunk in opaque_points.chunks(4096) {
         conn.poly_point(CoordMode::ORIGIN, mask, gc, chunk)
             .map_err(|e| TalkError::Config(format!("X11 poly_point failed: {}", e)))?;
     }
 
-    // Apply shape mask to window
     shape::mask(conn, shape::SO::SET, shape::SK::BOUNDING, win, 0, 0, mask)
         .map_err(|e| TalkError::Config(format!("X11 shape_mask failed: {}", e)))?;
 
-    // Cleanup
     conn.free_gc(gc)
         .map_err(|e| TalkError::Config(format!("X11 free_gc failed: {}", e)))?;
     conn.free_pixmap(mask)
@@ -337,16 +419,13 @@ fn apply_shape_mask(
 
 /// Draw visible pixels onto the window, grouped by color for efficiency.
 fn draw_image(
-    conn: &impl x11rb::connection::Connection,
+    conn: &impl Connection,
     win: u32,
-    screen: &x11rb::protocol::xproto::Screen,
+    screen: &Screen,
     img: &RgbaImage,
 ) -> Result<(), TalkError> {
-    use x11rb::protocol::xproto::*;
-
     let cmap = screen.default_colormap;
 
-    // Group visible pixels by RGB color
     let mut color_groups: HashMap<(u8, u8, u8), Vec<Point>> = HashMap::new();
 
     for py in 0..img.height {
@@ -374,7 +453,6 @@ fn draw_image(
         .map_err(|e| TalkError::Config(format!("X11 create_gc failed: {}", e)))?;
 
     for ((r, g, b), points) in &color_groups {
-        // Allocate color (X11 uses 16-bit channels)
         let reply = conn
             .alloc_color(
                 cmap,
@@ -389,7 +467,6 @@ fn draw_image(
         conn.change_gc(gc, &ChangeGCAux::new().foreground(reply.pixel))
             .map_err(|e| TalkError::Config(format!("X11 change_gc failed: {}", e)))?;
 
-        // Draw in batches
         for chunk in points.chunks(4096) {
             conn.poly_point(CoordMode::ORIGIN, win, gc, chunk)
                 .map_err(|e| TalkError::Config(format!("X11 poly_point failed: {}", e)))?;
@@ -402,17 +479,429 @@ fn draw_image(
     Ok(())
 }
 
+// ── X11 overlay thread ──────────────────────────────────────────────
+
+/// Main loop for the overlay background thread.
+///
+/// Has two modes:
+///
+/// * **Transcribing** — static PNG badge; blocks on commands.
+/// * **Recording** — dynamic spectrogram badge at 60 fps with its own
+///   CPAL audio capture; drains commands non-blocking each frame.
+#[allow(clippy::too_many_lines)]
+fn overlay_thread(
+    rx: mpsc::Receiver<Command>,
+    geom: super::monitor::MonitorGeometry,
+) -> Result<(), TalkError> {
+    let (conn, screen_num) = x11rb::connect(None)
+        .map_err(|e| TalkError::Config(format!("failed to connect to X11: {}", e)))?;
+
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+    let depth = screen.root_depth;
+
+    // Pre-decode the transcribing indicator image.
+    let transcribing_img = decode_png(TRANSCRIBING_PNG)?;
+
+    let (mon_x, mon_y, mon_w, _mon_h) = geom;
+
+    // ── CPAL audio capture (for recording spectrogram) ───────────
+    //
+    // Opened once at thread start and kept alive for the thread's
+    // lifetime.  Data is only read when in Recording state.
+
+    let host = cpal::default_host();
+    let cpal_ok = host.default_input_device().is_some();
+
+    let ring: Option<Arc<Mutex<RingBuffer>>>;
+    let sample_rate: u32;
+    let rms_chunk: usize;
+
+    // Hold the stream so it stays alive.
+    let _stream_guard: Option<cpal::Stream>;
+
+    if cpal_ok {
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| TalkError::Audio("no default input device for overlay".into()))?;
+
+        let supported = device
+            .default_input_config()
+            .map_err(|e| TalkError::Audio(format!("overlay input config: {}", e)))?;
+
+        let channels = supported.channels() as usize;
+        sample_rate = supported.sample_rate().0;
+
+        let r = Arc::new(Mutex::new(RingBuffer::new(sample_rate as usize / 2)));
+        let ring_w = Arc::clone(&r);
+
+        let stream = device
+            .build_input_stream(
+                &cpal::StreamConfig {
+                    channels: supported.channels(),
+                    sample_rate: supported.sample_rate(),
+                    buffer_size: cpal::BufferSize::Default,
+                },
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mono: Vec<f32> = if channels == 1 {
+                        data.to_vec()
+                    } else {
+                        data.chunks_exact(channels)
+                            .map(|f| f.iter().sum::<f32>() / channels as f32)
+                            .collect()
+                    };
+                    if let Ok(mut g) = ring_w.lock() {
+                        g.push(&mono);
+                    }
+                },
+                |e| log::error!("overlay audio error: {}", e),
+                None,
+            )
+            .map_err(|e| TalkError::Audio(format!("overlay stream: {}", e)))?;
+
+        stream
+            .play()
+            .map_err(|e| TalkError::Audio(format!("overlay stream play: {}", e)))?;
+
+        rms_chunk = sample_rate as usize / FPS as usize;
+        ring = Some(r);
+        _stream_guard = Some(stream);
+    } else {
+        log::warn!("no audio device for overlay spectrogram; recording badge will be static");
+        ring = None;
+        sample_rate = 48000;
+        rms_chunk = 0;
+        _stream_guard = None;
+    }
+
+    // ── State ────────────────────────────────────────────────────────
+
+    let frame_dur = std::time::Duration::from_micros(1_000_000 / FPS as u64);
+
+    let mut current_window: Option<Window> = None;
+    let mut current_gc: Option<Gcontext> = None;
+    let mut is_recording = false;
+
+    let mut spectrogram_history: Vec<Vec<f32>> = Vec::new();
+    let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+    let mut rms_peak: f32 = PEAK_FLOOR;
+    let mut spec_peak: f32 = PEAK_FLOOR;
+    // Dynamic frequency ceiling — grows as higher harmonics appear.
+    let mut effective_freq_max: f32 = FREQ_INITIAL_MAX;
+
+    // ── Event loop ───────────────────────────────────────────────────
+
+    loop {
+        // ── Idle / transcribing: block on commands ───────────────
+        if !is_recording {
+            let cmd = match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            };
+
+            match cmd {
+                Command::Show(IndicatorKind::Recording) => {
+                    destroy_current(&conn, &mut current_window, &mut current_gc);
+
+                    let badge_x = mon_x + (mon_w as i16 / 2) - (BADGE_W as i16 / 2);
+                    let badge_y = mon_y + 4;
+
+                    let win = create_overlay_window(
+                        &conn, screen, root, badge_x, badge_y, BADGE_W, BADGE_H,
+                    )?;
+                    apply_rounded_shape(&conn, win, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+
+                    conn.map_window(win)
+                        .map_err(|e| TalkError::Config(format!("X11 map_window failed: {}", e)))?;
+                    conn.sync()
+                        .map_err(|e| TalkError::Config(format!("X11 sync failed: {}", e)))?;
+
+                    let gc = conn
+                        .generate_id()
+                        .map_err(|e| TalkError::Config(format!("X11 generate_id: {}", e)))?;
+                    conn.create_gc(gc, win, &CreateGCAux::new())
+                        .map_err(|e| TalkError::Config(format!("X11 create_gc: {}", e)))?;
+
+                    conn.flush()
+                        .map_err(|e| TalkError::Config(format!("X11 flush: {}", e)))?;
+
+                    current_window = Some(win);
+                    current_gc = Some(gc);
+                    is_recording = true;
+                    spectrogram_history.clear();
+                    rms_peak = PEAK_FLOOR;
+                    spec_peak = PEAK_FLOOR;
+                    effective_freq_max = FREQ_INITIAL_MAX;
+                }
+
+                Command::Show(IndicatorKind::Transcribing) => {
+                    destroy_current(&conn, &mut current_window, &mut current_gc);
+                    show_transcribing(
+                        &conn,
+                        screen,
+                        root,
+                        &transcribing_img,
+                        mon_x,
+                        mon_y,
+                        mon_w,
+                        &mut current_window,
+                    )?;
+                }
+
+                Command::Hide => {
+                    destroy_current(&conn, &mut current_window, &mut current_gc);
+                }
+
+                Command::Quit => {
+                    destroy_current(&conn, &mut current_window, &mut current_gc);
+                    break;
+                }
+            }
+
+            continue;
+        }
+
+        // ── Recording state: 60 fps render loop ─────────────────
+
+        let frame_start = std::time::Instant::now();
+
+        // Non-blocking command drain.
+        let mut quit = false;
+        loop {
+            match rx.try_recv() {
+                Ok(Command::Show(IndicatorKind::Recording)) => {
+                    spectrogram_history.clear();
+                    rms_peak = PEAK_FLOOR;
+                    spec_peak = PEAK_FLOOR;
+                    effective_freq_max = FREQ_INITIAL_MAX;
+                }
+                Ok(Command::Show(IndicatorKind::Transcribing)) => {
+                    destroy_current(&conn, &mut current_window, &mut current_gc);
+                    is_recording = false;
+                    show_transcribing(
+                        &conn,
+                        screen,
+                        root,
+                        &transcribing_img,
+                        mon_x,
+                        mon_y,
+                        mon_w,
+                        &mut current_window,
+                    )?;
+                    break;
+                }
+                Ok(Command::Hide) => {
+                    destroy_current(&conn, &mut current_window, &mut current_gc);
+                    is_recording = false;
+                    break;
+                }
+                Ok(Command::Quit) | Err(mpsc::TryRecvError::Disconnected) => {
+                    destroy_current(&conn, &mut current_window, &mut current_gc);
+                    is_recording = false;
+                    quit = true;
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        if quit {
+            break;
+        }
+        if !is_recording {
+            continue;
+        }
+
+        // ── Read audio and compute spectrogram frame ─────────
+
+        let samples = if let Some(ref r) = ring {
+            r.lock()
+                .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
+                .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)])
+        } else {
+            vec![0.0; FFT_SIZE]
+        };
+
+        let magnitudes = compute_spectrum(&samples);
+        let frame_rms = rms(&samples[samples.len().saturating_sub(rms_chunk.max(1))..]);
+
+        // Dynamic frequency scaling: expand the ceiling when higher
+        // harmonics appear (all-time max, never shrinks).
+        let nyquist = sample_rate as f32 / 2.0;
+        let n_mag = magnitudes.len();
+        for (i, &mag) in magnitudes.iter().enumerate().rev() {
+            if mag > FREQ_NOISE_FLOOR {
+                let freq = (i as f32 / n_mag as f32) * nyquist;
+                if freq > effective_freq_max {
+                    effective_freq_max = freq.min(FREQ_MAX);
+                }
+                break;
+            }
+        }
+
+        // Map FFT bins to spectrogram column.
+        let column = map_spectrum_to_column(&magnitudes, SPEC_H, sample_rate, effective_freq_max);
+        spectrogram_history.push(column);
+        if spectrogram_history.len() > SPEC_W {
+            spectrogram_history.drain(..spectrogram_history.len() - SPEC_W);
+        }
+
+        // Update peaks (fast attack, slow decay).
+        rms_peak *= PEAK_DECAY;
+        if frame_rms > rms_peak {
+            rms_peak = frame_rms;
+        }
+        rms_peak = rms_peak.max(PEAK_FLOOR);
+
+        // All-time peak: only grows, never decays.  This gives a stable
+        // opacity scale where the loudest moment seen so far is full white.
+        let frame_spec_max = magnitudes.iter().copied().fold(0.0f32, f32::max);
+        if frame_spec_max > spec_peak {
+            spec_peak = frame_spec_max;
+        }
+
+        // ── Render badge ─────────────────────────────────────
+
+        pb.clear_rounded(BG_COLOR, CORNER_RADIUS);
+
+        let vol_norm = if rms_peak > PEAK_FLOOR {
+            (frame_rms / rms_peak).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let dot_radius = DOT_RADIUS_MIN + (DOT_RADIUS_MAX - DOT_RADIUS_MIN) * vol_norm;
+        let dot_brightness = DOT_MIN_BRIGHTNESS + (1.0 - DOT_MIN_BRIGHTNESS) * vol_norm;
+        draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, dot_radius, dot_brightness);
+
+        render_spectrogram(
+            &mut pb,
+            &spectrogram_history,
+            SPEC_LEFT,
+            SPEC_TOP,
+            SPEC_W,
+            SPEC_H,
+            spec_peak,
+        );
+
+        // ── Blit to X11 window ───────────────────────────────
+
+        if let (Some(win), Some(gc)) = (current_window, current_gc) {
+            let _ = conn.put_image(
+                ImageFormat::Z_PIXMAP,
+                win,
+                gc,
+                BADGE_W,
+                BADGE_H,
+                0,
+                0,
+                0,
+                depth,
+                &pb.data,
+            );
+            let _ = conn.flush();
+        }
+
+        // ── Frame timing ─────────────────────────────────────
+
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_dur {
+            std::thread::sleep(frame_dur - elapsed);
+        }
+    }
+
+    Ok(())
+}
+
+// ── Window helpers ───────────────────────────────────────────────────
+
+/// Create an override-redirect X11 window at the given position.
+fn create_overlay_window(
+    conn: &impl Connection,
+    screen: &Screen,
+    root: u32,
+    x: i16,
+    y: i16,
+    w: u16,
+    h: u16,
+) -> Result<u32, TalkError> {
+    let win = conn
+        .generate_id()
+        .map_err(|e| TalkError::Config(format!("X11 generate_id failed: {}", e)))?;
+
+    let values = CreateWindowAux::new()
+        .background_pixel(screen.black_pixel)
+        .border_pixel(0)
+        .override_redirect(1u32)
+        .event_mask(EventMask::EXPOSURE);
+
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        win,
+        root,
+        x,
+        y,
+        w,
+        h,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &values,
+    )
+    .map_err(|e| TalkError::Config(format!("X11 create_window failed: {}", e)))?;
+
+    Ok(win)
+}
+
+/// Show the static transcribing badge.
+#[allow(clippy::too_many_arguments)]
+fn show_transcribing(
+    conn: &impl Connection,
+    screen: &Screen,
+    root: u32,
+    img: &RgbaImage,
+    mon_x: i16,
+    mon_y: i16,
+    mon_w: u16,
+    current_window: &mut Option<u32>,
+) -> Result<(), TalkError> {
+    let w = img.width as u16;
+    let h = img.height as u16;
+    let x = mon_x + (mon_w as i16 / 2) - (w as i16 / 2);
+    let y = mon_y + 4;
+
+    let win = create_overlay_window(conn, screen, root, x, y, w, h)?;
+    apply_alpha_shape_mask(conn, win, img, w, h)?;
+
+    conn.map_window(win)
+        .map_err(|e| TalkError::Config(format!("X11 map_window failed: {}", e)))?;
+    conn.sync()
+        .map_err(|e| TalkError::Config(format!("X11 sync failed: {}", e)))?;
+
+    draw_image(conn, win, screen, img)?;
+
+    conn.flush()
+        .map_err(|e| TalkError::Config(format!("X11 flush failed: {}", e)))?;
+
+    *current_window = Some(win);
+    Ok(())
+}
+
+/// Destroy the current overlay window and free its GC if present.
+fn destroy_current(conn: &impl Connection, window: &mut Option<u32>, gc: &mut Option<u32>) {
+    if let Some(g) = gc.take() {
+        let _ = conn.free_gc(g);
+    }
+    if let Some(win) = window.take() {
+        let _ = conn.destroy_window(win);
+        let _ = conn.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_decode_recording_png() {
-        let img = decode_png(RECORDING_PNG).expect("decode recording PNG");
-        assert_eq!(img.width, 182);
-        assert_eq!(img.height, 52);
-        assert_eq!(img.data.len(), 182 * 52 * 4);
-    }
+    // ── PNG decoding ─────────────────────────────────────────────────
 
     #[test]
     fn test_decode_transcribing_png() {
@@ -423,12 +912,11 @@ mod tests {
     }
 
     #[test]
-    fn test_recording_png_has_opaque_pixels() {
-        let img = decode_png(RECORDING_PNG).expect("decode");
+    fn test_transcribing_png_has_opaque_pixels() {
+        let img = decode_png(TRANSCRIBING_PNG).expect("decode");
         let opaque_count = (0..img.width * img.height)
             .filter(|&i| img.data[(i * 4 + 3) as usize] > 128)
             .count();
-        // The badge has a significant number of opaque pixels
         assert!(
             opaque_count > 1000,
             "expected >1000 opaque pixels, got {}",
@@ -436,25 +924,193 @@ mod tests {
         );
     }
 
+    // ── Spectrogram mapping ──────────────────────────────────────────
+
     #[test]
-    fn test_recording_png_has_transparent_pixels() {
-        let img = decode_png(RECORDING_PNG).expect("decode");
-        let transparent_count = (0..img.width * img.height)
-            .filter(|&i| img.data[(i * 4 + 3) as usize] <= 128)
-            .count();
-        // Rounded corners create transparent pixels
+    fn map_spectrum_column_length() {
+        let magnitudes = vec![1.0f32; 512];
+        let column = map_spectrum_to_column(&magnitudes, SPEC_H, 48000, FREQ_MAX);
+        assert_eq!(column.len(), SPEC_H);
+    }
+
+    #[test]
+    fn map_spectrum_empty_magnitudes() {
+        let column = map_spectrum_to_column(&[], SPEC_H, 48000, FREQ_MAX);
+        assert_eq!(column.len(), SPEC_H);
+        assert!(column.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn map_spectrum_low_freq_comes_first() {
+        // Create magnitudes that are loud at low bins and quiet at high.
+        let mut magnitudes = vec![0.0f32; 512];
+        for m in magnitudes.iter_mut().take(10) {
+            *m = 10.0;
+        }
+        let column = map_spectrum_to_column(&magnitudes, SPEC_H, 48000, FREQ_MAX);
+        // First row (low freq) should be louder than last (high freq).
         assert!(
-            transparent_count > 10,
-            "expected transparent pixels for rounded corners, got {}",
-            transparent_count
+            column[0] > column[SPEC_H - 1],
+            "low freq row ({}) should be louder than high freq row ({})",
+            column[0],
+            column[SPEC_H - 1]
+        );
+    }
+
+    // ── Spectrogram rendering ────────────────────────────────────────
+
+    #[test]
+    fn render_spectrogram_no_panic() {
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear(BG_COLOR);
+
+        let history: Vec<Vec<f32>> = (0..SPEC_W)
+            .map(|i| vec![(i as f32 * 0.01).sin().abs(); SPEC_H])
+            .collect();
+        render_spectrogram(&mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
+
+        let mut non_bg = 0;
+        for y in SPEC_TOP..SPEC_BOTTOM {
+            for x in SPEC_LEFT..SPEC_RIGHT {
+                let off = (y * pb.width + x) * 4;
+                if pb.data[off..off + 4] != BG_COLOR {
+                    non_bg += 1;
+                }
+            }
+        }
+        assert!(non_bg > 0, "spectrogram should produce non-bg pixels");
+    }
+
+    #[test]
+    fn render_spectrogram_empty_history_no_panic() {
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear(BG_COLOR);
+        render_spectrogram(&mut pb, &[], SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
+    }
+
+    #[test]
+    fn render_spectrogram_right_aligned() {
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear_rounded(BG_COLOR, CORNER_RADIUS);
+
+        // Only 5 columns of history — should right-align.
+        let history: Vec<Vec<f32>> = (0..5).map(|_| vec![1.0; SPEC_H]).collect();
+        render_spectrogram(&mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
+
+        // Leftmost columns of spectrogram area should still be BG.
+        let check_col = SPEC_LEFT;
+        let mid_y = SPEC_TOP + SPEC_H / 2;
+        let off = (mid_y * pb.width + check_col) * 4;
+        assert_eq!(
+            &pb.data[off..off + 4],
+            &BG_COLOR,
+            "leftmost spectrogram column should be bg when history is short"
+        );
+
+        // Rightmost columns should have content (right-aligned).
+        let right_col = SPEC_LEFT + SPEC_W - 1; // last column of spectrogram area
+        let off2 = (mid_y * pb.width + right_col) * 4;
+        assert_ne!(
+            &pb.data[off2..off2 + 4],
+            &BG_COLOR,
+            "rightmost spectrogram column should have content"
+        );
+    }
+
+    // ── Red dot rendering ────────────────────────────────────────────
+
+    #[test]
+    fn draw_pulsing_dot_no_panic() {
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear(BG_COLOR);
+        draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX, 0.8);
+
+        let off = (DOT_CY * pb.width + DOT_CX) * 4;
+        assert!(
+            pb.data[off + 2] > 0,
+            "dot centre red channel should be non-zero"
         );
     }
 
     #[test]
-    fn test_indicator_kind_clone_eq() {
+    fn draw_pulsing_dot_dim_vs_bright() {
+        let mut pb_dim = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb_dim.clear(BG_COLOR);
+        draw_pulsing_dot(
+            &mut pb_dim,
+            DOT_CX,
+            DOT_CY,
+            DOT_RADIUS_MAX,
+            DOT_MIN_BRIGHTNESS,
+        );
+        let off = (DOT_CY * pb_dim.width + DOT_CX) * 4;
+        let dim_r = pb_dim.data[off + 2];
+
+        let mut pb_bright = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb_bright.clear(BG_COLOR);
+        draw_pulsing_dot(&mut pb_bright, DOT_CX, DOT_CY, DOT_RADIUS_MAX, 1.0);
+        let bright_r = pb_bright.data[off + 2];
+
+        assert!(
+            bright_r > dim_r,
+            "bright dot ({}) should have higher red than dim ({})",
+            bright_r,
+            dim_r
+        );
+    }
+
+    // ── Badge constants coherence ────────────────────────────────────
+
+    #[test]
+    fn spectrogram_area_fits_in_badge() {
+        let bw = BADGE_W as usize;
+        let bh = BADGE_H as usize;
+        assert!(
+            SPEC_RIGHT <= bw,
+            "spectrogram right edge exceeds badge width"
+        );
+        assert!(
+            SPEC_BOTTOM <= bh,
+            "spectrogram bottom edge exceeds badge height"
+        );
+    }
+
+    #[test]
+    fn dot_fits_in_badge() {
+        let r = DOT_RADIUS_MAX.ceil() as usize;
+        assert!(DOT_CX >= r);
+        assert!(DOT_CY >= r);
+        assert!(DOT_CX + r < BADGE_W as usize);
+        assert!(DOT_CY + r < BADGE_H as usize);
+    }
+
+    #[test]
+    fn indicator_kind_clone_eq() {
         let a = IndicatorKind::Recording;
         let b = a;
         assert_eq!(a, b);
         assert_ne!(IndicatorKind::Recording, IndicatorKind::Transcribing);
+    }
+
+    // ── Full badge render (integration) ──────────────────────────────
+
+    #[test]
+    fn full_badge_render_produces_content() {
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear_rounded(BG_COLOR, CORNER_RADIUS);
+        draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX, 0.7);
+
+        let history: Vec<Vec<f32>> = (0..SPEC_W)
+            .map(|i| vec![(i as f32 * 0.05).sin().abs(); SPEC_H])
+            .collect();
+        render_spectrogram(&mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
+
+        let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG_COLOR).count();
+
+        assert!(
+            non_bg > 500,
+            "full badge render should produce significant content, got {} non-bg pixels",
+            non_bg
+        );
     }
 }
