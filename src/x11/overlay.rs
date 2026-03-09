@@ -282,6 +282,7 @@ fn map_spectrum_to_column(
 /// `Vec<f32>` of length `SPEC_H`).  Newer columns are at the end.
 /// The spectrogram is right-aligned: the newest column draws at the
 /// right edge of the area, oldest on the left.
+#[allow(clippy::too_many_arguments)]
 fn render_spectrogram(
     pb: &mut PixelBuffer,
     history: &[Vec<f32>],
@@ -290,6 +291,7 @@ fn render_spectrogram(
     w: usize,
     h: usize,
     peak: f32,
+    mono: Option<([u8; 4], [u8; 4])>,
 ) {
     if history.is_empty() || peak < PEAK_FLOOR {
         return;
@@ -318,10 +320,13 @@ fn render_spectrogram(
                 0.0
             };
 
-            // Premultiplied alpha: white × brightness.
-            // Compositors expect color channels ≤ alpha.
-            let alpha = (brightness * 255.0) as u8;
-            let color = [alpha, alpha, alpha, alpha];
+            let color = if mono.is_some() {
+                // Premultiplied alpha: white × brightness.
+                let alpha = (brightness * 255.0) as u8;
+                [alpha, alpha, alpha, alpha]
+            } else {
+                super::render_util::heat_map_color(norm, brightness)
+            };
             pb.set_pixel(x, y, color);
         }
     }
@@ -366,12 +371,10 @@ fn render_amplitude_badge(
         let norm = (avg_rms / max_rms).clamp(0.0, 1.0);
         let half_height = (norm * max_half as f32) as usize;
 
-        // Premultiplied alpha white (like waterfall) or monochrome.
         let color = if let Some((fg, bg)) = mono {
             super::render_util::lerp_color(bg, fg, norm)
         } else {
-            let alpha = (norm * 255.0) as u8;
-            [alpha, alpha, alpha, alpha]
+            super::render_util::level_color(norm)
         };
 
         let top = center_y.saturating_sub(half_height);
@@ -430,12 +433,10 @@ fn render_spectrum_badge(
         let bar_x = x0 + bar * 3;
         let bar_y = y0 + h - 2 - bar_height;
 
-        // Premultiplied alpha white (like waterfall) or monochrome.
         let color = if let Some((fg, bg)) = mono {
             super::render_util::lerp_color(bg, fg, log_norm)
         } else {
-            let alpha = (log_norm * 255.0) as u8;
-            [alpha, alpha, alpha, alpha]
+            super::render_util::level_color(log_norm)
         };
 
         for dy in 0..bar_height {
@@ -1082,6 +1083,7 @@ fn overlay_thread(
                         SPEC_W,
                         SPEC_H,
                         spec_peak,
+                        mono_palette,
                     );
                 }
                 VizMode::Amplitude => {
@@ -1366,7 +1368,9 @@ mod tests {
         let history: Vec<Vec<f32>> = (0..SPEC_W)
             .map(|i| vec![(i as f32 * 0.01).sin().abs(); SPEC_H])
             .collect();
-        render_spectrogram(&mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
+        render_spectrogram(
+            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None,
+        );
 
         let mut non_bg = 0;
         for y in SPEC_TOP..SPEC_BOTTOM {
@@ -1384,7 +1388,7 @@ mod tests {
     fn render_spectrogram_empty_history_no_panic() {
         let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
         pb.clear(BG_COLOR);
-        render_spectrogram(&mut pb, &[], SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
+        render_spectrogram(&mut pb, &[], SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None);
     }
 
     #[test]
@@ -1394,7 +1398,9 @@ mod tests {
 
         // Only 5 columns of history — should right-align.
         let history: Vec<Vec<f32>> = (0..5).map(|_| vec![1.0; SPEC_H]).collect();
-        render_spectrogram(&mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
+        render_spectrogram(
+            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None,
+        );
 
         // Leftmost columns of spectrogram area should still be BG (alpha=0).
         let check_col = SPEC_LEFT;
@@ -1554,7 +1560,9 @@ mod tests {
         let history: Vec<Vec<f32>> = (0..SPEC_W)
             .map(|i| vec![(i as f32 * 0.05).sin().abs(); SPEC_H])
             .collect();
-        render_spectrogram(&mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0);
+        render_spectrogram(
+            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None,
+        );
 
         // Count pixels with non-zero alpha (visible content).
         let visible = pb.data.chunks_exact(4).filter(|p| p[3] > 0).count();

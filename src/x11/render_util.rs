@@ -254,6 +254,64 @@ pub fn rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt()
 }
 
+/// Map a 0–1 normalized value to a heat-map BGRA colour (premultiplied
+/// alpha).
+///
+/// The gradient goes: transparent → blue → cyan → green → yellow → red.
+/// Alpha tracks `brightness` so quiet areas fade to transparent
+/// (suitable for waterfall overlays on a dark badge).
+pub fn heat_map_color(norm: f32, brightness: f32) -> [u8; 4] {
+    let norm = norm.clamp(0.0, 1.0);
+    let alpha = (brightness * 255.0).clamp(0.0, 255.0) as u8;
+    if alpha == 0 {
+        return [0, 0, 0, 0];
+    }
+
+    // Piecewise-linear RGB gradient (0.0–1.0 range).
+    let (r, g, b) = if norm < 0.2 {
+        let t = norm / 0.2;
+        (0.0, 0.0, t)
+    } else if norm < 0.4 {
+        let t = (norm - 0.2) / 0.2;
+        (0.0, t, 1.0)
+    } else if norm < 0.6 {
+        let t = (norm - 0.4) / 0.2;
+        (0.0, 1.0, 1.0 - t)
+    } else if norm < 0.8 {
+        let t = (norm - 0.6) / 0.2;
+        (t, 1.0, 0.0)
+    } else {
+        let t = (norm - 0.8) / 0.2;
+        (1.0, 1.0 - t, 0.0)
+    };
+
+    // Premultiply by alpha (= brightness).
+    let af = brightness;
+    [
+        (b * af * 255.0) as u8,
+        (g * af * 255.0) as u8,
+        (r * af * 255.0) as u8,
+        alpha,
+    ]
+}
+
+/// Map a 0–1 normalized level to an opaque BGRA bar colour.
+///
+/// The gradient goes: green (low) → yellow (mid) → red (high).
+/// Returns fully opaque pixels suitable for amplitude / spectrum bars.
+pub fn level_color(norm: f32) -> [u8; 4] {
+    let norm = norm.clamp(0.0, 1.0);
+    let (r, g) = if norm < 0.5 {
+        let t = norm / 0.5;
+        (t, 1.0)
+    } else {
+        let t = (norm - 0.5) / 0.5;
+        (1.0, 1.0 - t)
+    };
+    // BGRA, fully opaque, blue channel is always 0.
+    [0, (g * 255.0) as u8, (r * 255.0) as u8, 0xFF]
+}
+
 /// Linearly interpolate between two BGRA colours by factor `t` (0–1).
 pub fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     let t = t.clamp(0.0, 1.0);
