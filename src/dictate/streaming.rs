@@ -294,7 +294,7 @@ pub(crate) async fn dictate_streaming(
     }
 
     // ── Wait for transcription result ───────────────────────────────
-    const TRANSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const TRANSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     let t0 = std::time::Instant::now();
     log::info!(
         "waiting for transcription (timeout: {:?})",
