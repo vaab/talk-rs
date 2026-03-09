@@ -32,15 +32,15 @@ const TRANSCRIBING_PNG: &[u8] = include_bytes!("../../assets/transcribing.png");
 
 // ── Badge layout constants ───────────────────────────────────────────
 
-/// Badge width in pixels (matches the original recording indicator).
-const BADGE_W: u16 = 182;
+/// Badge width in pixels (~50% wider than original for full-width spectrogram).
+const BADGE_W: u16 = 273;
 /// Badge height in pixels.
 const BADGE_H: u16 = 52;
 /// Corner radius for the rounded rectangle background.
 const CORNER_RADIUS: usize = 13;
 
-/// X coordinate of the red dot centre.
-const DOT_CX: usize = 28;
+/// X coordinate of the red dot centre (near left edge, over spectrogram).
+const DOT_CX: usize = 20;
 /// Y coordinate of the red dot centre (vertically centred).
 const DOT_CY: usize = 26;
 /// Minimum red dot radius (quiet).
@@ -50,12 +50,12 @@ const DOT_RADIUS_MAX: f32 = 10.0;
 /// Minimum dot brightness — always visible.
 const DOT_MIN_BRIGHTNESS: f32 = 0.5;
 
-/// Left edge of the spectrogram area (right of the dot + gap).
-const SPEC_LEFT: usize = 44;
+/// Left edge of the spectrogram area (inside border margin).
+const SPEC_LEFT: usize = 4;
 /// Top edge of the spectrogram area (padding from badge top).
 const SPEC_TOP: usize = 4;
-/// Right edge of the spectrogram area (padding from badge right).
-const SPEC_RIGHT: usize = 174;
+/// Right edge of the spectrogram area (inside border margin).
+const SPEC_RIGHT: usize = 269;
 /// Bottom edge of the spectrogram area (padding from badge bottom).
 const SPEC_BOTTOM: usize = 48;
 /// Spectrogram width in pixels (time columns).
@@ -847,15 +847,7 @@ fn overlay_thread(
         pb.clear(BG_COLOR);
         draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
 
-        let vol_norm = if rms_peak > PEAK_FLOOR {
-            (frame_rms / rms_peak).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let dot_radius = DOT_RADIUS_MIN + (DOT_RADIUS_MAX - DOT_RADIUS_MIN) * vol_norm;
-        let dot_brightness = DOT_MIN_BRIGHTNESS + (1.0 - DOT_MIN_BRIGHTNESS) * vol_norm;
-        draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, dot_radius, dot_brightness);
-
+        // Spectrogram first (full width), then dot on top.
         render_spectrogram(
             &mut pb,
             &spectrogram_history,
@@ -865,6 +857,15 @@ fn overlay_thread(
             SPEC_H,
             spec_peak,
         );
+
+        let vol_norm = if rms_peak > PEAK_FLOOR {
+            (frame_rms / rms_peak).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let dot_radius = DOT_RADIUS_MIN + (DOT_RADIUS_MAX - DOT_RADIUS_MIN) * vol_norm;
+        let dot_brightness = DOT_MIN_BRIGHTNESS + (1.0 - DOT_MIN_BRIGHTNESS) * vol_norm;
+        draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, dot_radius, dot_brightness);
 
         // ── Blit to X11 window ───────────────────────────────
 
