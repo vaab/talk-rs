@@ -49,6 +49,8 @@ const DOT_RADIUS_MIN: f32 = 3.0;
 const DOT_RADIUS_MAX: f32 = 10.0;
 /// Minimum dot brightness — always visible.
 const DOT_MIN_BRIGHTNESS: f32 = 0.5;
+/// Transparent gap (pixels) between red dot edge and spectrogram.
+const DOT_GAP: f32 = 2.0;
 
 /// Left edge of the spectrogram area (inside border margin).
 const SPEC_LEFT: usize = 4;
@@ -312,6 +314,47 @@ fn render_spectrogram(
 }
 
 /// Draw the red dot with brightness driven by current volume level.
+/// Clear a circle to `BG_COLOR` (transparent), creating a gap between
+/// the red dot and the spectrogram underneath.
+fn clear_dot_gap(pb: &mut PixelBuffer, cx: usize, cy: usize, outer_radius: f32) {
+    let r_sq = outer_radius * outer_radius;
+    let r_int = outer_radius.ceil() as usize;
+
+    for dy in 0..=r_int {
+        for dx in 0..=r_int {
+            let dist_sq = (dx * dx + dy * dy) as f32;
+            if dist_sq > r_sq {
+                continue;
+            }
+            // Anti-aliased edge: fade to transparent over 1 px.
+            let edge_dist = outer_radius - dist_sq.sqrt();
+            let edge_alpha = edge_dist.clamp(0.0, 1.0);
+
+            let coords: [(usize, usize); 4] = [
+                (cx + dx, cy + dy),
+                (cx.wrapping_sub(dx), cy + dy),
+                (cx + dx, cy.wrapping_sub(dy)),
+                (cx.wrapping_sub(dx), cy.wrapping_sub(dy)),
+            ];
+            for (px, py) in coords {
+                if px < pb.width && py < pb.height {
+                    if edge_alpha >= 1.0 {
+                        pb.set_pixel(px, py, BG_COLOR);
+                    } else {
+                        // Blend existing pixel towards transparent.
+                        let off = (py * pb.width + px) * 4;
+                        let keep = 1.0 - edge_alpha;
+                        pb.data[off] = (pb.data[off] as f32 * keep) as u8;
+                        pb.data[off + 1] = (pb.data[off + 1] as f32 * keep) as u8;
+                        pb.data[off + 2] = (pb.data[off + 2] as f32 * keep) as u8;
+                        pb.data[off + 3] = (pb.data[off + 3] as f32 * keep) as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn draw_pulsing_dot(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32, brightness: f32) {
     let r_sq = radius * radius;
     let r_int = radius.ceil() as usize;
@@ -865,6 +908,7 @@ fn overlay_thread(
         };
         let dot_radius = DOT_RADIUS_MIN + (DOT_RADIUS_MAX - DOT_RADIUS_MIN) * vol_norm;
         let dot_brightness = DOT_MIN_BRIGHTNESS + (1.0 - DOT_MIN_BRIGHTNESS) * vol_norm;
+        clear_dot_gap(&mut pb, DOT_CX, DOT_CY, dot_radius + DOT_GAP);
         draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, dot_radius, dot_brightness);
 
         // ── Blit to X11 window ───────────────────────────────
