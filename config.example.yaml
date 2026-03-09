@@ -50,6 +50,15 @@ indicators:
   # Set to false to disable visual feedback
   visual_overlay: true
 
+  # In-badge audio visualizer during recording (disabled by default).
+  # Available modes: waterfall, amplitude, spectrum
+  # Also settable via --viz <MODE> or TALK_RS_INDICATORS_VIZ env var.
+  # viz: waterfall
+
+  # Monochrome visualizer (theme-aware: white on dark, black on light).
+  # Also settable via --bw or TALK_RS_INDICATORS_BW env var.
+  # bw: false
+
 # Optional: Paste Behaviour
 # Configure how transcribed text is pasted into the target application
 # paste:
