@@ -94,13 +94,10 @@ pub enum Commands {
         /// Disable visual overlay indicator
         #[arg(long)]
         no_overlay: bool,
-        /// Show amplitude history visualizer (left of badge)
-        #[arg(long)]
-        amplitude: bool,
-        /// Show spectrum visualizer (right of badge)
-        #[arg(long)]
-        spectrum: bool,
-        /// Use monochrome (black/white) colors for audio visualizers
+        /// Visualizer inside the recording badge (waterfall, amplitude, spectrum)
+        #[arg(long, value_parser = clap::value_parser!(crate::config::VizMode))]
+        viz: Option<crate::config::VizMode>,
+        /// Use monochrome (black/white) colors for the visualizer
         #[arg(long)]
         bw: bool,
         /// Run as daemon process (internal, used by --toggle)

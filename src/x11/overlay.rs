@@ -120,18 +120,32 @@ pub struct OverlayHandle {
 impl OverlayHandle {
     /// Spawn the overlay thread and open an X11 connection.
     ///
+    /// * `viz` — visualizer mode to render inside the badge (or `None`
+    ///   for a plain badge with only the red dot).
+    /// * `bw` — use monochrome colours (theme-aware).
+    ///
     /// Monitor geometry is queried via GDK4 **before** spawning the
     /// thread (GDK must be called from the main thread) and passed in.
     ///
     /// Returns `Err` if the X11 display cannot be opened.
-    pub fn new() -> Result<Self, TalkError> {
+    pub fn new(viz: Option<crate::config::VizMode>, bw: bool) -> Result<Self, TalkError> {
         let geom = super::monitor::primary_monitor_geometry()?;
+
+        // Resolve monochrome palette up front (D-Bus on main thread).
+        let mono_palette = if bw {
+            let (fg, bg) = super::render_util::monochrome_palette();
+            log::info!("monochrome overlay: fg={:?} bg={:?}", fg, bg);
+            Some((fg, bg))
+        } else {
+            None
+        };
+
         let (tx, rx) = mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("overlay".into())
             .spawn(move || {
-                if let Err(e) = overlay_thread(rx, geom) {
+                if let Err(e) = overlay_thread(rx, geom, viz, mono_palette) {
                     log::error!("overlay thread error: {}", e);
                 }
             })
@@ -309,6 +323,125 @@ fn render_spectrogram(
             let alpha = (brightness * 255.0) as u8;
             let color = [alpha, alpha, alpha, alpha];
             pb.set_pixel(x, y, color);
+        }
+    }
+}
+
+/// Render amplitude history inside a sub-region of the badge.
+///
+/// Draws symmetric bars around the vertical centre, scrolling left
+/// (newest at right edge).  Uses premultiplied alpha white (like the
+/// waterfall), or monochrome palette if provided.
+#[allow(clippy::too_many_arguments)]
+fn render_amplitude_badge(
+    pb: &mut PixelBuffer,
+    history: &[f32],
+    max_rms: f32,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    mono: Option<([u8; 4], [u8; 4])>,
+) {
+    if history.is_empty() || max_rms < PEAK_FLOOR {
+        return;
+    }
+
+    let n = history.len();
+    let center_y = y0 + h / 2;
+    let max_half = (h / 2).saturating_sub(1);
+
+    for col in 0..w {
+        let start = col * n / w;
+        let end = ((col + 1) * n / w).max(start + 1).min(n);
+
+        let avg_rms = if end > start {
+            history[start..end].iter().sum::<f32>() / (end - start) as f32
+        } else if start < n {
+            history[start]
+        } else {
+            0.0
+        };
+
+        let norm = (avg_rms / max_rms).clamp(0.0, 1.0);
+        let half_height = (norm * max_half as f32) as usize;
+
+        // Premultiplied alpha white (like waterfall) or monochrome.
+        let color = if let Some((fg, bg)) = mono {
+            super::render_util::lerp_color(bg, fg, norm)
+        } else {
+            let alpha = (norm * 255.0) as u8;
+            [alpha, alpha, alpha, alpha]
+        };
+
+        let top = center_y.saturating_sub(half_height);
+        let bottom = center_y + half_height;
+        for y in top..=bottom.min(y0 + h - 1) {
+            pb.set_pixel(x0 + col, y, color);
+        }
+    }
+}
+
+/// Render spectrum bars inside a sub-region of the badge.
+///
+/// Bars grow upward from the bottom edge.  Uses premultiplied alpha
+/// white (like the waterfall), or monochrome palette if provided.
+#[allow(clippy::too_many_arguments)]
+fn render_spectrum_badge(
+    pb: &mut PixelBuffer,
+    magnitudes: &[f32],
+    peak: f32,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    mono: Option<([u8; 4], [u8; 4])>,
+) {
+    if magnitudes.is_empty() || peak < PEAK_FLOOR {
+        return;
+    }
+
+    // Use lower quarter of spectrum (voice content).
+    let useful = &magnitudes[..magnitudes.len() / 4];
+
+    let num_bars = w / 3; // 2px bar + 1px gap
+    if num_bars == 0 {
+        return;
+    }
+    let bins_per_bar = useful.len() / num_bars;
+    if bins_per_bar == 0 {
+        return;
+    }
+
+    for bar in 0..num_bars {
+        let start = bar * bins_per_bar;
+        let end = (start + bins_per_bar).min(useful.len());
+
+        let avg = if end > start {
+            useful[start..end].iter().sum::<f32>() / (end - start) as f32
+        } else {
+            0.0
+        };
+
+        let norm = (avg / peak).clamp(0.0, 1.0);
+        let log_norm = (1.0 + norm * 9.0).log10();
+
+        let bar_height = (log_norm * (h.saturating_sub(4)) as f32) as usize;
+        let bar_x = x0 + bar * 3;
+        let bar_y = y0 + h - 2 - bar_height;
+
+        // Premultiplied alpha white (like waterfall) or monochrome.
+        let color = if let Some((fg, bg)) = mono {
+            super::render_util::lerp_color(bg, fg, log_norm)
+        } else {
+            let alpha = (log_norm * 255.0) as u8;
+            [alpha, alpha, alpha, alpha]
+        };
+
+        for dy in 0..bar_height {
+            for dx in 0..2 {
+                pb.set_pixel(bar_x + dx, bar_y + dy, color);
+            }
         }
     }
 }
@@ -588,6 +721,8 @@ fn draw_image(
 fn overlay_thread(
     rx: mpsc::Receiver<Command>,
     geom: super::monitor::MonitorGeometry,
+    viz: Option<crate::config::VizMode>,
+    mono_palette: Option<([u8; 4], [u8; 4])>,
 ) -> Result<(), TalkError> {
     let (conn, screen_num) = x11rb::connect(None)
         .map_err(|e| TalkError::Config(format!("failed to connect to X11: {}", e)))?;
@@ -621,13 +756,15 @@ fn overlay_thread(
 
     let (mon_x, mon_y, mon_w, _mon_h) = geom;
 
-    // ── CPAL audio capture (for recording spectrogram) ───────────
+    // ── CPAL audio capture (for recording visualization) ──────────
     //
-    // Opened once at thread start and kept alive for the thread's
-    // lifetime.  Data is only read when in Recording state.
+    // Only opened when a visualizer mode is active.  Without a viz
+    // mode the badge shows a static red dot and no audio capture is
+    // needed.
 
+    let need_audio = viz.is_some();
     let host = cpal::default_host();
-    let cpal_ok = host.default_input_device().is_some();
+    let cpal_ok = need_audio && host.default_input_device().is_some();
 
     let ring: Option<Arc<Mutex<RingBuffer>>>;
     let sample_rate: u32;
@@ -701,6 +838,14 @@ fn overlay_thread(
     let mut spectrogram_history: Vec<Vec<f32>> = Vec::new();
     let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
     let mut rms_peak: f32 = PEAK_FLOOR;
+
+    // Amplitude history for amplitude viz mode: one RMS value per frame.
+    let amp_window_secs: f32 = 5.0;
+    let amp_max_frames = (FPS as f32 * amp_window_secs) as usize;
+    let mut amp_history: Vec<f32> = vec![0.0; amp_max_frames];
+    let mut amp_peak: f32 = PEAK_FLOOR;
+    // Spectrum peak for spectrum viz mode.
+    let mut spectrum_peak: f32 = PEAK_FLOOR;
     let mut spec_peak: f32 = PEAK_FLOOR;
     // Dynamic frequency ceiling — grows as higher harmonics appear.
     let mut effective_freq_max: f32 = FREQ_INITIAL_MAX;
@@ -756,6 +901,10 @@ fn overlay_thread(
                     spectrogram_history.clear();
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
+                    spectrum_peak = PEAK_FLOOR;
+                    amp_peak = PEAK_FLOOR;
+                    amp_history.clear();
+                    amp_history.resize(amp_max_frames, 0.0);
                     effective_freq_max = FREQ_INITIAL_MAX;
                 }
 
@@ -798,6 +947,10 @@ fn overlay_thread(
                     spectrogram_history.clear();
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
+                    spectrum_peak = PEAK_FLOOR;
+                    amp_peak = PEAK_FLOOR;
+                    amp_history.clear();
+                    amp_history.resize(amp_max_frames, 0.0);
                     effective_freq_max = FREQ_INITIAL_MAX;
                 }
                 Ok(Command::Show(IndicatorKind::Transcribing)) => {
@@ -837,52 +990,78 @@ fn overlay_thread(
             continue;
         }
 
-        // ── Read audio and compute spectrogram frame ─────────
+        // ── Read audio and compute visualization frame ──────
 
-        let samples = if let Some(ref r) = ring {
-            r.lock()
+        let (frame_rms, magnitudes) = if let Some(ref r) = ring {
+            let samples = r
+                .lock()
                 .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
-                .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)])
+                .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)]);
+            let fr = rms(&samples[samples.len().saturating_sub(rms_chunk.max(1))..]);
+            let mags = compute_spectrum(&samples);
+            (fr, mags)
         } else {
-            vec![0.0; FFT_SIZE]
+            (0.0, Vec::new())
         };
 
-        let magnitudes = compute_spectrum(&samples);
-        let frame_rms = rms(&samples[samples.len().saturating_sub(rms_chunk.max(1))..]);
-
-        // Dynamic frequency scaling: expand the ceiling when higher
-        // harmonics appear (all-time max, never shrinks).
-        let nyquist = sample_rate as f32 / 2.0;
-        let n_mag = magnitudes.len();
-        for (i, &mag) in magnitudes.iter().enumerate().rev() {
-            if mag > FREQ_NOISE_FLOOR {
-                let freq = (i as f32 / n_mag as f32) * nyquist;
-                if freq > effective_freq_max {
-                    effective_freq_max = freq.min(FREQ_MAX);
-                }
-                break;
-            }
-        }
-
-        // Map FFT bins to spectrogram column.
-        let column = map_spectrum_to_column(&magnitudes, SPEC_H, sample_rate, effective_freq_max);
-        spectrogram_history.push(column);
-        if spectrogram_history.len() > SPEC_W {
-            spectrogram_history.drain(..spectrogram_history.len() - SPEC_W);
-        }
-
-        // Update peaks (fast attack, slow decay).
+        // Update RMS peak (fast attack, slow decay).
         rms_peak *= PEAK_DECAY;
         if frame_rms > rms_peak {
             rms_peak = frame_rms;
         }
         rms_peak = rms_peak.max(PEAK_FLOOR);
 
-        // All-time peak: only grows, never decays.  This gives a stable
-        // opacity scale where the loudest moment seen so far is full white.
-        let frame_spec_max = magnitudes.iter().copied().fold(0.0f32, f32::max);
-        if frame_spec_max > spec_peak {
-            spec_peak = frame_spec_max;
+        // Per-viz-mode data updates.
+        if let Some(mode) = viz {
+            use crate::config::VizMode;
+            match mode {
+                VizMode::Waterfall => {
+                    // Dynamic frequency scaling.
+                    let nyquist = sample_rate as f32 / 2.0;
+                    let n_mag = magnitudes.len();
+                    for (i, &mag) in magnitudes.iter().enumerate().rev() {
+                        if mag > FREQ_NOISE_FLOOR {
+                            let freq = (i as f32 / n_mag as f32) * nyquist;
+                            if freq > effective_freq_max {
+                                effective_freq_max = freq.min(FREQ_MAX);
+                            }
+                            break;
+                        }
+                    }
+                    let column = map_spectrum_to_column(
+                        &magnitudes,
+                        SPEC_H,
+                        sample_rate,
+                        effective_freq_max,
+                    );
+                    spectrogram_history.push(column);
+                    if spectrogram_history.len() > SPEC_W {
+                        spectrogram_history.drain(..spectrogram_history.len() - SPEC_W);
+                    }
+                    // All-time peak for opacity normalization.
+                    let frame_spec_max = magnitudes.iter().copied().fold(0.0f32, f32::max);
+                    if frame_spec_max > spec_peak {
+                        spec_peak = frame_spec_max;
+                    }
+                }
+                VizMode::Amplitude => {
+                    if frame_rms > amp_peak {
+                        amp_peak = frame_rms;
+                    }
+                    amp_history.push(frame_rms);
+                    if amp_history.len() > amp_max_frames {
+                        amp_history.drain(..amp_history.len() - amp_max_frames);
+                    }
+                }
+                VizMode::Spectrum => {
+                    spectrum_peak *= PEAK_DECAY;
+                    let frame_peak = magnitudes.iter().copied().fold(0.0f32, f32::max);
+                    if frame_peak > spectrum_peak {
+                        spectrum_peak = frame_peak;
+                    }
+                    spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
+                }
+            }
         }
 
         // ── Render badge ─────────────────────────────────────
@@ -890,16 +1069,47 @@ fn overlay_thread(
         pb.clear(BG_COLOR);
         draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
 
-        // Spectrogram first (full width), then dot on top.
-        render_spectrogram(
-            &mut pb,
-            &spectrogram_history,
-            SPEC_LEFT,
-            SPEC_TOP,
-            SPEC_W,
-            SPEC_H,
-            spec_peak,
-        );
+        // Render visualization inside the badge area.
+        if let Some(mode) = viz {
+            use crate::config::VizMode;
+            match mode {
+                VizMode::Waterfall => {
+                    render_spectrogram(
+                        &mut pb,
+                        &spectrogram_history,
+                        SPEC_LEFT,
+                        SPEC_TOP,
+                        SPEC_W,
+                        SPEC_H,
+                        spec_peak,
+                    );
+                }
+                VizMode::Amplitude => {
+                    render_amplitude_badge(
+                        &mut pb,
+                        &amp_history,
+                        amp_peak,
+                        SPEC_LEFT,
+                        SPEC_TOP,
+                        SPEC_W,
+                        SPEC_H,
+                        mono_palette,
+                    );
+                }
+                VizMode::Spectrum => {
+                    render_spectrum_badge(
+                        &mut pb,
+                        &magnitudes,
+                        spectrum_peak,
+                        SPEC_LEFT,
+                        SPEC_TOP,
+                        SPEC_W,
+                        SPEC_H,
+                        mono_palette,
+                    );
+                }
+            }
+        }
 
         let vol_norm = if rms_peak > PEAK_FLOOR {
             (frame_rms / rms_peak).clamp(0.0, 1.0)

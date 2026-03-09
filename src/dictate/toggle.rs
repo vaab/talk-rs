@@ -3,7 +3,7 @@
 //! Extracted from `dictate.rs` — handles the `--toggle` flag logic:
 //! spawn a new daemon process or stop a running one.
 
-use crate::config::Provider;
+use crate::config::{Provider, VizMode};
 use crate::daemon::{self, DaemonStatus};
 use crate::error::TalkError;
 use crate::paste::get_active_window;
@@ -21,8 +21,7 @@ pub async fn toggle_dispatch(
     no_chunk_paste: bool,
     monitor: bool,
     no_overlay: bool,
-    amplitude: bool,
-    spectrum: bool,
+    viz: Option<VizMode>,
     bw: bool,
     save: Option<&std::path::Path>,
     verbose: u8,
@@ -48,8 +47,7 @@ pub async fn toggle_dispatch(
                 no_chunk_paste,
                 monitor,
                 no_overlay,
-                amplitude,
-                spectrum,
+                viz,
                 bw,
                 save,
                 verbose,
@@ -77,8 +75,7 @@ async fn toggle_spawn(
     no_chunk_paste: bool,
     monitor: bool,
     no_overlay: bool,
-    amplitude: bool,
-    spectrum: bool,
+    viz: Option<VizMode>,
     bw: bool,
     save: Option<&std::path::Path>,
     verbose: u8,
@@ -136,12 +133,8 @@ async fn toggle_spawn(
         cmd.arg("--no-overlay");
     }
 
-    if amplitude {
-        cmd.arg("--amplitude");
-    }
-
-    if spectrum {
-        cmd.arg("--spectrum");
+    if let Some(mode) = viz {
+        cmd.arg("--viz").arg(mode.to_string());
     }
 
     if bw {

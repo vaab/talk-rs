@@ -1,45 +1,29 @@
-//! Real-time audio visualizer overlays (amplitude history + FFT spectrum)
-//! and live transcription text display.
+//! Live transcription text display overlay.
 //!
-//! Displays small panels on either side of the recording badge using X11
-//! `put_image` for efficient rendering at 60 fps.  Each panel is
-//! independently toggleable:
+//! Displays a text panel below the recording badge using X11
+//! `put_image` for efficient rendering at 60 fps.
 //!
-//! - **Amplitude** (left of badge): RMS volume history over time.
-//! - **Spectrum** (right of badge): FFT frequency-domain bar chart.
-//! - **Text** (below badge): live transcription text as words arrive.
+//! - **Text** (below badge): live transcription text as words arrive,
+//!   plus TTL status/error messages.
 //!
-//! The visualizer opens its own CPAL capture stream so it is fully
-//! decoupled from the recording pipeline.
+//! Audio visualization (amplitude, spectrum, waterfall) has moved into
+//! the recording badge itself (see `overlay.rs`).
 
-use super::render_util::{
-    apply_rounded_shape, compute_spectrum, lerp_color, rms, PixelBuffer, RingBuffer, PEAK_DECAY,
-    PEAK_FLOOR,
-};
+use super::render_util::{apply_rounded_shape, lerp_color, PixelBuffer};
 use crate::error::TalkError;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::{Arc, Mutex};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
 // ── Layout constants ─────────────────────────────────────────────────
 
-/// Width of each visualizer panel in pixels.
-const VIS_W: u16 = 200;
-/// Height matches the recording badge (52 px).
-const VIS_H: u16 = 52;
-/// Horizontal gap between badge edge and visualizer panel.
-const GAP: i16 = 4;
 /// Vertical offset from the monitor top edge (matches badge placement).
 const TOP_OFFSET: i16 = 4;
 /// Target frames per second for the render loop.
 const FPS: u32 = 60;
-/// Amplitude history window in seconds.  Only the most recent
-/// `AMP_WINDOW_SECS` of RMS values are kept; older data scrolls off.
-const AMP_WINDOW_SECS: f32 = 5.0;
-/// Number of audio samples fed into the FFT (must be power of two).
-const FFT_SIZE: usize = 1024;
+
+/// Height of the recording badge (must match overlay.rs BADGE_H).
+const BADGE_H: u16 = 52;
 
 /// Width of the text overlay in pixels.
 const TEXT_W: u16 = 1200;
@@ -66,17 +50,6 @@ const DOT_HI: [u8; 4] = [0xCC, 0xCC, 0xCC, 0xFF]; // #cccccc
 const DOT_LO: [u8; 4] = [0x33, 0x33, 0x33, 0xFF]; // #333333
 /// Full wave-cycle length in frames (90 frames ≈ 1.5 s at 60 fps).
 const DOT_CYCLE_FRAMES: f32 = 90.0;
-const AMP_COLOR: [u8; 4] = [0x88, 0xFF, 0x00, 0xFF]; // #00ff88 bright green
-const AMP_DIM: [u8; 4] = [0x44, 0x88, 0x00, 0xFF]; // #008844 dim green
-
-/// Gradient stops for spectrum bars (low → high frequency).
-const SPEC_COLORS: [[u8; 4]; 5] = [
-    [0xFF, 0xCC, 0x00, 0xFF], // #00ccff cyan
-    [0xFF, 0xFF, 0x00, 0xFF], // #00ffff aqua
-    [0x44, 0xFF, 0x00, 0xFF], // #00ff44 green
-    [0x00, 0xCC, 0xFF, 0xFF], // #ffcc00 amber
-    [0x44, 0x44, 0xFF, 0xFF], // #ff4444 red
-];
 
 // ── Font loading ─────────────────────────────────────────────────────
 
@@ -339,151 +312,17 @@ fn render_text_status(
     blit_glyphs(pb, &glyphs[first_visible..], start_x, color, opacity);
 }
 
-// ── Rendering helpers ────────────────────────────────────────────────
-
-/// Render amplitude history as a symmetrical waveform.
-///
-/// Maps `history` (one RMS value per frame) onto the panel width.
-/// Each column draws a bar centred on the vertical midline, extending
-/// equally upward and downward — producing a mirror-image waveform.
-/// Normalised against `max_rms` so speech fills the panel height and
-/// silence stays thin.
-fn render_amplitude(
-    pb: &mut PixelBuffer,
-    history: &[f32],
-    max_rms: f32,
-    mono: Option<([u8; 4], [u8; 4])>,
-) {
-    if history.is_empty() || max_rms < PEAK_FLOOR {
-        return;
-    }
-
-    let h = pb.height;
-    let w = pb.width;
-    let n = history.len();
-    let center = h / 2;
-    // Maximum half-height leaves 1 px margin top and bottom.
-    let max_half = center.saturating_sub(1);
-
-    for col in 0..w {
-        let start = col * n / w;
-        let end = ((col + 1) * n / w).max(start + 1).min(n);
-
-        let avg_rms = if end > start {
-            history[start..end].iter().sum::<f32>() / (end - start) as f32
-        } else if start < n {
-            history[start]
-        } else {
-            0.0
-        };
-
-        let norm = (avg_rms / max_rms).clamp(0.0, 1.0);
-        let half_height = (norm * max_half as f32) as usize;
-
-        let color = if let Some((fg, bg)) = mono {
-            // Monochrome: interpolate from bg to fg based on amplitude.
-            lerp_color(bg, fg, norm)
-        } else if norm > 0.5 {
-            AMP_COLOR
-        } else {
-            AMP_DIM
-        };
-        let top = center - half_height;
-        let bottom = center + half_height;
-        for y in top..=bottom {
-            pb.set_pixel(col, y, color);
-        }
-    }
-}
-
-fn spectrum_color(t: f32) -> [u8; 4] {
-    let t = t.clamp(0.0, 1.0);
-    let n = SPEC_COLORS.len() - 1;
-    let idx = (t * n as f32).min(n as f32 - 0.001);
-    let i = idx as usize;
-    let frac = idx - i as f32;
-
-    let a = SPEC_COLORS[i];
-    let b = SPEC_COLORS[i + 1];
-
-    [
-        (a[0] as f32 + (b[0] as f32 - a[0] as f32) * frac) as u8,
-        (a[1] as f32 + (b[1] as f32 - a[1] as f32) * frac) as u8,
-        (a[2] as f32 + (b[2] as f32 - a[2] as f32) * frac) as u8,
-        0xFF,
-    ]
-}
-
-/// Render spectrum bars normalised against `peak` (the all-time maximum
-/// magnitude).  When the user is silent, bars stay tiny because `peak`
-/// retains the loudest value ever seen.
-fn render_spectrum(
-    pb: &mut PixelBuffer,
-    magnitudes: &[f32],
-    peak: f32,
-    mono: Option<([u8; 4], [u8; 4])>,
-) {
-    if magnitudes.is_empty() {
-        return;
-    }
-
-    let h = pb.height;
-    let w = pb.width;
-
-    // Use lower quarter of spectrum (voice content).
-    let useful = &magnitudes[..magnitudes.len() / 4];
-
-    let num_bars = w / 3; // 2px bar + 1px gap
-    if num_bars == 0 {
-        return;
-    }
-    let bins_per_bar = useful.len() / num_bars;
-    if bins_per_bar == 0 {
-        return;
-    }
-
-    for bar in 0..num_bars {
-        let start = bar * bins_per_bar;
-        let end = (start + bins_per_bar).min(useful.len());
-
-        let avg = if end > start {
-            useful[start..end].iter().sum::<f32>() / (end - start) as f32
-        } else {
-            0.0
-        };
-
-        // Normalise against all-time peak → noise stays small once
-        // the user has spoken.
-        let norm = (avg / peak).clamp(0.0, 1.0);
-        let log_norm = (1.0 + norm * 9.0).log10(); // log10(1..10) → 0..1
-
-        let bar_height = (log_norm * (h - 4) as f32) as usize;
-        let bar_x = bar * 3;
-        let bar_y = h - 2 - bar_height;
-
-        let color = if let Some((fg, bg)) = mono {
-            // Monochrome: interpolate from bg to fg based on magnitude.
-            lerp_color(bg, fg, log_norm)
-        } else {
-            spectrum_color(bar as f32 / num_bars as f32)
-        };
-        pb.fill_rect(bar_x, bar_y, 2, bar_height, color);
-    }
-}
-
 // ── Public API ───────────────────────────────────────────────────────
 
-/// Commands from the main thread to the visualizer thread.
 /// Default time-to-live for pushed status messages (seconds).
 const MESSAGE_TTL_SECS: f32 = 3.0;
 /// Seconds a TTL message stays fully opaque before starting to fade.
 const MESSAGE_FADE_DELAY_SECS: f32 = 1.0;
 
 enum VizCommand {
-    /// Show the visualizer panels (badge width needed for positioning).
-    Show { badge_width: u16 },
-    /// Hide the amplitude/spectrum panels.  The text panel stays alive
-    /// (it is managed independently by the render loop).
+    /// Show the text panel.
+    Show,
+    /// Hide (no-op — text panel self-manages based on pending messages).
     Hide,
     /// Update the live transcription text displayed below the badge.
     Text { text: String },
@@ -496,43 +335,35 @@ enum VizCommand {
 
 /// Handle to the visualizer background thread.
 ///
-/// The thread owns its own CPAL capture and X11 connection.  Sending
-/// [`show`](VisualizerHandle::show) positions the panels relative to
-/// the recording badge; [`hide`](VisualizerHandle::hide) tears them
-/// down.  Dropping the handle stops the thread.
+/// The thread owns its own X11 connection.  Sending
+/// [`show`](VisualizerHandle::show) positions the text panel relative
+/// to the recording badge; [`hide`](VisualizerHandle::hide) is a
+/// no-op (the text panel self-manages).  Dropping the handle stops
+/// the thread.
 pub struct VisualizerHandle {
     tx: std::sync::mpsc::Sender<VizCommand>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl VisualizerHandle {
-    /// Spawn the visualizer thread.
+    /// Spawn the visualizer thread (text panel only).
     ///
-    /// * `amplitude` — enable the amplitude history panel (left of badge).
-    /// * `spectrum` — enable the spectrum panel (right of badge).
-    /// * `text` — enable the live transcription text panel (below badge).
-    /// * `bw` — use monochrome (theme-aware) colours for audio panels.
+    /// Audio visualization has moved into the overlay badge.  The
+    /// visualizer thread now only handles the text panel (status
+    /// messages and live transcription text below the badge).
     ///
-    /// Returns `Err` if X11 or the audio device is unreachable.
-    pub fn new(amplitude: bool, spectrum: bool, _text: bool, bw: bool) -> Result<Self, TalkError> {
+    /// * `_text` — reserved for future use; text panel is always active.
+    ///
+    /// Returns `Err` if X11 is unreachable.
+    pub fn new(_text: bool) -> Result<Self, TalkError> {
         let geom = super::monitor::primary_monitor_geometry()?;
-
-        // Resolve monochrome palette up front (before spawning the
-        // thread) so D-Bus calls happen on the main thread.
-        let mono_palette = if bw {
-            let (fg, bg) = super::render_util::monochrome_palette();
-            log::info!("monochrome visualizer: fg={:?} bg={:?}", fg, bg);
-            Some((fg, bg))
-        } else {
-            None
-        };
 
         let (tx, rx) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("visualizer".into())
             .spawn(move || {
-                if let Err(e) = visualizer_thread(rx, amplitude, spectrum, geom, mono_palette) {
+                if let Err(e) = visualizer_thread(rx, geom) {
                     log::error!("visualizer thread error: {}", e);
                 }
             })
@@ -544,14 +375,12 @@ impl VisualizerHandle {
         })
     }
 
-    /// Show visualizer panels positioned relative to a badge of the
-    /// given pixel width.
-    pub fn show(&self, badge_width: u16) {
-        let _ = self.tx.send(VizCommand::Show { badge_width });
+    /// Show the text panel.
+    pub fn show(&self, _badge_width: u16) {
+        let _ = self.tx.send(VizCommand::Show);
     }
 
-    /// Hide the amplitude/spectrum audio panels.  The text panel
-    /// stays alive — it self-manages based on pending messages.
+    /// Hide the text panel (no-op — text panel self-manages visibility).
     pub fn hide(&self) {
         let _ = self.tx.send(VizCommand::Hide);
     }
@@ -583,81 +412,15 @@ impl Drop for VisualizerHandle {
 
 // ── Thread implementation ────────────────────────────────────────────
 
-/// Main visualizer thread.
+/// Main visualizer thread (text panel only).
 ///
-/// Owns both a CPAL input stream (for audio data) and an X11
-/// connection (for rendering).  Blocks on commands when hidden;
-/// renders at [`FPS`] when shown.
+/// Owns an X11 connection for rendering the text panel below the
+/// recording badge.  Blocks on commands when idle; renders at [`FPS`]
+/// when there are messages to display.
 fn visualizer_thread(
     rx: std::sync::mpsc::Receiver<VizCommand>,
-    enable_amplitude: bool,
-    enable_spectrum: bool,
     geom: super::monitor::MonitorGeometry,
-    mono_palette: Option<([u8; 4], [u8; 4])>,
 ) -> Result<(), TalkError> {
-    let need_audio = enable_amplitude || enable_spectrum;
-
-    // ── Audio capture (only when amplitude/spectrum panels are used) ──
-
-    // Hold the CPAL stream and ring buffer in options so that
-    // text-only mode skips audio device initialisation entirely.
-    let mut _stream_guard: Option<cpal::Stream> = None;
-    let ring: Option<Arc<Mutex<RingBuffer>>>;
-    let rms_chunk: usize;
-
-    if need_audio {
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| TalkError::Audio("no default input device for visualizer".into()))?;
-
-        let supported = device
-            .default_input_config()
-            .map_err(|e| TalkError::Audio(format!("visualizer input config: {}", e)))?;
-
-        let channels = supported.channels() as usize;
-
-        let r = Arc::new(Mutex::new(RingBuffer::new(
-            supported.sample_rate().0 as usize / 2,
-        )));
-        let ring_w = Arc::clone(&r);
-
-        let stream = device
-            .build_input_stream(
-                &cpal::StreamConfig {
-                    channels: supported.channels(),
-                    sample_rate: supported.sample_rate(),
-                    buffer_size: cpal::BufferSize::Default,
-                },
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mono: Vec<f32> = if channels == 1 {
-                        data.to_vec()
-                    } else {
-                        data.chunks_exact(channels)
-                            .map(|f| f.iter().sum::<f32>() / channels as f32)
-                            .collect()
-                    };
-                    if let Ok(mut g) = ring_w.lock() {
-                        g.push(&mono);
-                    }
-                },
-                |e| log::error!("visualizer audio error: {}", e),
-                None,
-            )
-            .map_err(|e| TalkError::Audio(format!("visualizer stream: {}", e)))?;
-
-        stream
-            .play()
-            .map_err(|e| TalkError::Audio(format!("visualizer stream play: {}", e)))?;
-
-        rms_chunk = supported.sample_rate().0 as usize / FPS as usize;
-        ring = Some(r);
-        _stream_guard = Some(stream);
-    } else {
-        ring = None;
-        rms_chunk = 0;
-    }
-
     // ── X11 connection ───────────────────────────────────────────────
 
     let (conn, screen_num) = x11rb::connect(None)
@@ -676,7 +439,7 @@ fn visualizer_thread(
     // are messages to display.
 
     let text_x = mon_x + (mon_w as i16 / 2) - (TEXT_W as i16 / 2);
-    let text_y = mon_y + TOP_OFFSET + VIS_H as i16 + TEXT_GAP;
+    let text_y = mon_y + TOP_OFFSET + BADGE_H as i16 + TEXT_GAP;
 
     let text_win = {
         let values = CreateWindowAux::new()
@@ -718,13 +481,11 @@ fn visualizer_thread(
     };
     let _ = conn.flush();
 
-    // ── Pixel buffers ────────────────────────────────────────────────
+    // ── Pixel buffer ─────────────────────────────────────────────────
 
-    let mut amp_pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
-    let mut sp_pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
     let mut text_pb = PixelBuffer::new(TEXT_W as usize, TEXT_LINE_H as usize);
 
-    // ── Font (loaded in background to avoid blocking panel startup) ──
+    // ── Font (loaded in background to avoid blocking startup) ────────
 
     let font_rx = {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -742,12 +503,6 @@ fn visualizer_thread(
 
     let frame_dur = std::time::Duration::from_micros(1_000_000 / FPS as u64);
 
-    let mut wins = WindowState {
-        amplitude_win: None,
-        spectrum_win: None,
-        amplitude_gc: None,
-        spectrum_gc: None,
-    };
     let mut is_showing = false;
     let mut current_text = String::new();
     let mut text_is_mapped = false;
@@ -756,50 +511,23 @@ fn visualizer_thread(
     // Last rendered line count — used to avoid redundant window resizes.
     let mut prev_text_lines: u16 = 0;
     let mut frame_counter: u64 = 0;
-
-    // Amplitude history: one RMS value per frame, capped to a
-    // rolling window of `AMP_WINDOW_SECS` seconds.
-    let amp_max_frames = (FPS as f32 * AMP_WINDOW_SECS) as usize;
-    let mut amp_history: Vec<f32> = vec![0.0; amp_max_frames];
-    // All-time peak RMS — only grows, never shrinks.  Gives a stable
-    // Y-axis scale: once the user has spoken, silence stays small.
-    let mut amp_peak: f32 = PEAK_FLOOR;
-
-    // Spectrum peak: fast attack, slow decay.
-    let mut spectrum_peak: f32 = 0.001;
     let mut should_quit = false;
 
     // ── Event loop ───────────────────────────────────────────────────
     //
-    // Three states:
-    //   1. Audio active (`is_showing`): render audio panels + text at 60 fps.
-    //   2. Text only (`!is_showing`, TTL messages pending): render text at
+    // Two states:
+    //   1. Text active (`is_showing` or TTL messages pending): render at
     //      60 fps so fade animation stays smooth.
-    //   3. Idle (`!is_showing`, no TTL messages): block on `rx.recv()`.
+    //   2. Idle (`!is_showing`, no TTL messages): block on `rx.recv()`.
 
     loop {
-        // Idle: no audio panels, no pending messages → block.
+        // Idle: no pending messages → block.
         if !is_showing && ttl_messages.is_empty() {
             if should_quit {
                 break;
             }
             match rx.recv() {
-                Ok(VizCommand::Show { badge_width }) => {
-                    amp_history.clear();
-                    amp_history.resize(amp_max_frames, 0.0);
-                    create_windows(
-                        &conn,
-                        screen,
-                        root,
-                        depth,
-                        mon_x,
-                        mon_y,
-                        mon_w,
-                        badge_width,
-                        enable_amplitude,
-                        enable_spectrum,
-                        &mut wins,
-                    )?;
+                Ok(VizCommand::Show) => {
                     is_showing = true;
                 }
                 Ok(VizCommand::Hide) => {}
@@ -826,7 +554,6 @@ fn visualizer_thread(
             loop {
                 match rx.try_recv() {
                     Ok(VizCommand::Hide) => {
-                        destroy_audio_windows(&conn, &mut wins);
                         is_showing = false;
                     }
                     Ok(VizCommand::Text { text }) => {
@@ -837,27 +564,10 @@ fn visualizer_thread(
                             + std::time::Duration::from_secs_f32(MESSAGE_TTL_SECS);
                         ttl_messages.push((text, expires));
                     }
-                    Ok(VizCommand::Show { badge_width }) => {
-                        destroy_audio_windows(&conn, &mut wins);
-                        amp_history.clear();
-                        amp_history.resize(amp_max_frames, 0.0);
-                        create_windows(
-                            &conn,
-                            screen,
-                            root,
-                            depth,
-                            mon_x,
-                            mon_y,
-                            mon_w,
-                            badge_width,
-                            enable_amplitude,
-                            enable_spectrum,
-                            &mut wins,
-                        )?;
+                    Ok(VizCommand::Show) => {
                         is_showing = true;
                     }
                     Ok(VizCommand::Quit) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        destroy_audio_windows(&conn, &mut wins);
                         is_showing = false;
                         should_quit = true;
                         break;
@@ -872,7 +582,7 @@ fn visualizer_thread(
         }
 
         if !is_showing && ttl_messages.is_empty() {
-            // No audio panels, no pending messages — go idle.
+            // No pending messages — go idle.
             continue;
         }
 
@@ -886,78 +596,6 @@ fn visualizer_thread(
         // ── Render frame ─────────────────────────────────────────────
 
         let frame_start = std::time::Instant::now();
-
-        let samples = if let Some(ref r) = ring {
-            r.lock()
-                .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
-                .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)])
-        } else {
-            Vec::new()
-        };
-
-        // Compute RMS for this frame, update all-time peak, and
-        // append to the rolling history window.
-        if !samples.is_empty() {
-            let frame_rms = rms(&samples[samples.len().saturating_sub(rms_chunk)..]);
-            if frame_rms > amp_peak {
-                amp_peak = frame_rms;
-            }
-            amp_history.push(frame_rms);
-            if amp_history.len() > amp_max_frames {
-                amp_history.drain(..amp_history.len() - amp_max_frames);
-            }
-
-            // Resolve background colour (monochrome overrides default).
-            let panel_bg = mono_palette.map_or(BG, |(_, bg)| bg);
-
-            // Amplitude panel
-            if let (Some(win), Some(gc)) = (wins.amplitude_win, wins.amplitude_gc) {
-                amp_pb.clear(panel_bg);
-                render_amplitude(&mut amp_pb, &amp_history, amp_peak, mono_palette);
-
-                let _ = conn.put_image(
-                    ImageFormat::Z_PIXMAP,
-                    win,
-                    gc,
-                    VIS_W,
-                    VIS_H,
-                    0,
-                    0,
-                    0,
-                    depth,
-                    &amp_pb.data,
-                );
-            }
-
-            // Spectrum panel
-            if let (Some(win), Some(gc)) = (wins.spectrum_win, wins.spectrum_gc) {
-                let magnitudes = compute_spectrum(&samples);
-
-                // Update spectrum peak: fast attack, slow decay.
-                spectrum_peak *= PEAK_DECAY;
-                let frame_peak = magnitudes.iter().copied().fold(0.0f32, f32::max);
-                if frame_peak > spectrum_peak {
-                    spectrum_peak = frame_peak;
-                }
-                spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
-
-                sp_pb.clear(panel_bg);
-                render_spectrum(&mut sp_pb, &magnitudes, spectrum_peak, mono_palette);
-
-                let _ = conn.put_image(
-                    ImageFormat::Z_PIXMAP,
-                    win,
-                    gc,
-                    VIS_W,
-                    VIS_H,
-                    0,
-                    0,
-                    0,
-                    depth,
-                    &sp_pb.data,
-                );
-            }
-        }
 
         // Prune expired TTL messages.
         let now_ttl = std::time::Instant::now();
@@ -1054,182 +692,14 @@ fn visualizer_thread(
     // Clean up the persistent text window.
     let _ = conn.free_gc(text_gc);
     let _ = conn.destroy_window(text_win);
-    destroy_audio_windows(&conn, &mut wins);
     let _ = conn.flush();
 
     Ok(())
-}
-
-// ── Window helpers ───────────────────────────────────────────────────
-
-struct WindowState {
-    amplitude_win: Option<Window>,
-    spectrum_win: Option<Window>,
-    amplitude_gc: Option<Gcontext>,
-    spectrum_gc: Option<Gcontext>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn create_windows(
-    conn: &impl Connection,
-    screen: &Screen,
-    root: Window,
-    _depth: u8,
-    mon_x: i16,
-    mon_y: i16,
-    mon_w: u16,
-    badge_width: u16,
-    enable_amplitude: bool,
-    enable_spectrum: bool,
-    state: &mut WindowState,
-) -> Result<(), TalkError> {
-    // Badge position (must match overlay.rs logic)
-    let badge_x = mon_x + (mon_w as i16 / 2) - (badge_width as i16 / 2);
-    let badge_y = mon_y + TOP_OFFSET;
-
-    let values = CreateWindowAux::new()
-        .background_pixel(screen.black_pixel)
-        .border_pixel(0)
-        .override_redirect(1u32)
-        .event_mask(EventMask::EXPOSURE);
-
-    if enable_amplitude {
-        let x = badge_x - GAP - VIS_W as i16;
-        let win = conn
-            .generate_id()
-            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
-
-        conn.create_window(
-            COPY_DEPTH_FROM_PARENT,
-            win,
-            root,
-            x,
-            badge_y,
-            VIS_W,
-            VIS_H,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            0,
-            &values,
-        )
-        .map_err(|e| TalkError::Config(format!("X11 create amplitude win: {}", e)))?;
-
-        conn.map_window(win)
-            .map_err(|e| TalkError::Config(format!("X11 map amplitude win: {}", e)))?;
-
-        let gc = conn
-            .generate_id()
-            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
-        conn.create_gc(gc, win, &CreateGCAux::new())
-            .map_err(|e| TalkError::Config(format!("X11 gc: {}", e)))?;
-
-        state.amplitude_win = Some(win);
-        state.amplitude_gc = Some(gc);
-    }
-
-    if enable_spectrum {
-        let x = badge_x + badge_width as i16 + GAP;
-        let win = conn
-            .generate_id()
-            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
-
-        conn.create_window(
-            COPY_DEPTH_FROM_PARENT,
-            win,
-            root,
-            x,
-            badge_y,
-            VIS_W,
-            VIS_H,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            0,
-            &values,
-        )
-        .map_err(|e| TalkError::Config(format!("X11 create spectrum win: {}", e)))?;
-
-        conn.map_window(win)
-            .map_err(|e| TalkError::Config(format!("X11 map spectrum win: {}", e)))?;
-
-        let gc = conn
-            .generate_id()
-            .map_err(|e| TalkError::Config(format!("X11 id: {}", e)))?;
-        conn.create_gc(gc, win, &CreateGCAux::new())
-            .map_err(|e| TalkError::Config(format!("X11 gc: {}", e)))?;
-
-        state.spectrum_win = Some(win);
-        state.spectrum_gc = Some(gc);
-    }
-
-    // NOTE: text window is created once at thread start and lives for
-    // the entire thread lifetime — it is not part of WindowState.
-
-    conn.flush()
-        .map_err(|e| TalkError::Config(format!("X11 flush: {}", e)))?;
-
-    Ok(())
-}
-
-/// Destroy only the amplitude and spectrum windows (keep text alive).
-fn destroy_audio_windows(conn: &impl Connection, state: &mut WindowState) {
-    if let Some(gc) = state.amplitude_gc.take() {
-        let _ = conn.free_gc(gc);
-    }
-    if let Some(win) = state.amplitude_win.take() {
-        let _ = conn.destroy_window(win);
-    }
-    if let Some(gc) = state.spectrum_gc.take() {
-        let _ = conn.free_gc(gc);
-    }
-    if let Some(win) = state.spectrum_win.take() {
-        let _ = conn.destroy_window(win);
-    }
-    let _ = conn.flush();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Spectrum peak tracking ───────────────────────────────────────
-
-    #[test]
-    fn peak_fast_attack_slow_decay() {
-        let mut peak: f32 = PEAK_FLOOR;
-
-        // Loud frame — peak jumps instantly
-        peak *= PEAK_DECAY;
-        let loud = 5.0;
-        if loud > peak {
-            peak = loud;
-        }
-        peak = peak.max(PEAK_FLOOR);
-        assert!((peak - 5.0).abs() < f32::EPSILON);
-
-        // Quiet frame — peak decays slightly
-        peak *= PEAK_DECAY;
-        let quiet = 0.001;
-        if quiet > peak {
-            peak = quiet;
-        }
-        peak = peak.max(PEAK_FLOOR);
-        assert!(
-            peak < 5.0 && peak > 4.9,
-            "peak should have decayed slightly: {}",
-            peak
-        );
-
-        // After many quiet frames, peak shrinks substantially
-        for _ in 0..600 {
-            peak *= PEAK_DECAY;
-            peak = peak.max(PEAK_FLOOR);
-        }
-        assert!(
-            peak < 2.0,
-            "peak should have decayed after 600 frames: {}",
-            peak
-        );
-    }
 
     // ── Text rendering ────────────────────────────────────────────────
 
@@ -1299,161 +769,5 @@ mod tests {
                 [0.8, 0.5, 0.2],
             );
         }
-    }
-
-    // ── Rendering (smoke tests — no panic) ───────────────────────────
-
-    #[test]
-    fn render_amplitude_no_panic() {
-        let mut pb = PixelBuffer::new(200, 52);
-        pb.clear(BG);
-        // Simulate 60 frames of varying amplitude
-        let history: Vec<f32> = (0..60).map(|i| (i as f32 * 0.1).sin().abs()).collect();
-        let max_rms = history.iter().copied().fold(0.0f32, f32::max);
-        render_amplitude(&mut pb, &history, max_rms, None);
-
-        // Should have non-background pixels
-        let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
-        assert!(non_bg > 0);
-    }
-
-    #[test]
-    fn render_amplitude_silent_stays_tiny() {
-        let mut pb = PixelBuffer::new(200, 52);
-        pb.clear(BG);
-        // Very quiet history with a high max
-        let history = vec![0.0001f32; 60];
-        render_amplitude(&mut pb, &history, 1.0, None);
-
-        // Almost everything should still be background
-        let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
-        let total = pb.width * pb.height;
-        assert!(
-            non_bg < total / 4,
-            "silent amplitude should be mostly empty, got {}/{} non-bg",
-            non_bg,
-            total
-        );
-    }
-
-    #[test]
-    fn render_amplitude_prepadded_leaves_left_empty() {
-        // Simulates the fixed behavior: a full-length history where
-        // only the rightmost entries have data (the rest are zero).
-        // The left portion of the panel must stay empty (all BG).
-        let window_frames = (FPS as f32 * AMP_WINDOW_SECS) as usize; // 300
-        let active_frames = 10;
-        let mut history = vec![0.0f32; window_frames];
-        for val in &mut history[window_frames - active_frames..] {
-            *val = 0.8;
-        }
-
-        let mut pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
-        pb.clear(BG);
-        render_amplitude(&mut pb, &history, 1.0, None);
-
-        // The leftmost 80% of columns should have at most a 1-pixel
-        // centre line per column (render_amplitude draws a min-height
-        // bar at the midline even for zero RMS).  The right side
-        // should have real symmetric bars.
-        let check_cols = pb.width * 80 / 100;
-        let mut left_non_bg = 0usize;
-        for x in 0..check_cols {
-            for y in 0..pb.height {
-                let off = (y * pb.width + x) * 4;
-                if pb.data[off..off + 4] != BG {
-                    left_non_bg += 1;
-                }
-            }
-        }
-        // At most 1 pixel per column (the baseline).
-        assert!(
-            left_non_bg <= check_cols,
-            "left 80% should only have baseline pixels, got {} non-bg for {} cols",
-            left_non_bg,
-            check_cols
-        );
-
-        // The rightmost columns must have substantially taller bars
-        // (more than just the 1-pixel baseline).
-        let right_cols = 5;
-        let mut right_non_bg = 0usize;
-        for x in (pb.width - right_cols)..pb.width {
-            for y in 0..pb.height {
-                let off = (y * pb.width + x) * 4;
-                if pb.data[off..off + 4] != BG {
-                    right_non_bg += 1;
-                }
-            }
-        }
-        assert!(
-            right_non_bg > right_cols * 2,
-            "rightmost columns should have amplitude bars taller than baseline, got {} pixels for {} cols",
-            right_non_bg,
-            right_cols
-        );
-    }
-
-    #[test]
-    fn render_amplitude_symmetric_around_center() {
-        let mut pb = PixelBuffer::new(200, 52);
-        pb.clear(BG);
-        let history = vec![0.8f32; 60];
-        render_amplitude(&mut pb, &history, 1.0, None);
-
-        let center = pb.height / 2;
-        // For each column, count non-bg pixels above and below centre.
-        for col in 0..pb.width {
-            let mut above = 0usize;
-            let mut below = 0usize;
-            for y in 0..center {
-                let off = (y * pb.width + col) * 4;
-                if pb.data[off..off + 4] != BG {
-                    above += 1;
-                }
-            }
-            // Skip the centre pixel itself (shared), count below.
-            for y in (center + 1)..pb.height {
-                let off = (y * pb.width + col) * 4;
-                if pb.data[off..off + 4] != BG {
-                    below += 1;
-                }
-            }
-            assert_eq!(
-                above, below,
-                "column {} should be symmetric: {} above vs {} below centre",
-                col, above, below
-            );
-        }
-    }
-
-    #[test]
-    fn render_spectrum_no_panic() {
-        let mut pb = PixelBuffer::new(200, 52);
-        pb.clear(BG);
-        let mags: Vec<f32> = (0..512).map(|i| i as f32 * 0.01).collect();
-        render_spectrum(&mut pb, &mags, 5.0, None);
-
-        let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
-        assert!(non_bg > 0);
-    }
-
-    #[test]
-    fn render_spectrum_silent_stays_tiny() {
-        let mut pb = PixelBuffer::new(200, 52);
-        pb.clear(BG);
-        // Very quiet signal with a high all-time peak
-        let mags: Vec<f32> = vec![0.001; 512];
-        render_spectrum(&mut pb, &mags, 100.0, None);
-
-        // Almost everything should still be background
-        let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
-        let total = pb.width * pb.height;
-        assert!(
-            non_bg < total / 10,
-            "silent spectrum should be mostly empty, got {}/{} non-bg",
-            non_bg,
-            total
-        );
     }
 }

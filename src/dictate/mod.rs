@@ -53,8 +53,7 @@ pub struct DictateOpts {
     pub no_chunk_paste: bool,
     pub monitor: bool,
     pub no_overlay: bool,
-    pub amplitude: bool,
-    pub spectrum: bool,
+    pub viz: Option<crate::config::VizMode>,
     pub bw: bool,
     pub daemon: bool,
     pub target_window: Option<String>,
@@ -75,8 +74,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.no_chunk_paste,
             opts.monitor,
             opts.no_overlay,
-            opts.amplitude,
-            opts.spectrum,
+            opts.viz,
             opts.bw,
             opts.save.as_deref(),
             opts.verbose,
@@ -178,14 +176,22 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         );
     }
 
+    // Resolve visualizer mode: CLI flag overrides config.
+    let viz_mode = opts
+        .viz
+        .or_else(|| config.indicators.as_ref().and_then(|ind| ind.viz));
+    if let Some(mode) = viz_mode {
+        log::info!("visualizer mode: {}", mode);
+    }
+
     // Initialize overlay (visual indicator on X11)
     let overlay = if opts.no_overlay {
         log::debug!("visual overlay disabled");
         None
     } else {
-        match OverlayHandle::new() {
+        match OverlayHandle::new(viz_mode, opts.bw) {
             Ok(h) => {
-                log::debug!("overlay initialized");
+                log::debug!("overlay initialized (viz={:?}, bw={})", viz_mode, opts.bw);
                 Some(h)
             }
             Err(e) => {
@@ -195,29 +201,19 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     };
 
-    // Initialize visualizer.
-    //
-    // Always created so that error/retry messages can be shown in the
-    // text panel below the recording badge even without --amplitude or
-    // --spectrum.  When neither audio visualizer is enabled, the
-    // visualizer thread skips CPAL audio capture and only handles text
-    // rendering — very lightweight.
-    let visualizer =
-        match VisualizerHandle::new(opts.amplitude, opts.spectrum, opts.realtime, opts.bw) {
-            Ok(h) => {
-                log::debug!(
-                    "visualizer initialized (amplitude={}, spectrum={}, text={})",
-                    opts.amplitude,
-                    opts.spectrum,
-                    opts.realtime,
-                );
-                Some(h)
-            }
-            Err(e) => {
-                log::warn!("visualizer unavailable: {}", e);
-                None
-            }
-        };
+    // Initialize visualizer (text panel for status messages / live
+    // transcription text).  Audio visualization has moved into the
+    // overlay badge itself — the visualizer thread only handles text.
+    let visualizer = match VisualizerHandle::new(opts.realtime) {
+        Ok(h) => {
+            log::debug!("visualizer text panel initialized");
+            Some(h)
+        }
+        Err(e) => {
+            log::warn!("visualizer unavailable: {}", e);
+            None
+        }
+    };
 
     // Generate cache recording path (always, even without --save)
     let (cache_wav_path, cache_timestamp) = recording_cache::generate_recording_path()?;
@@ -317,9 +313,9 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         o.show(IndicatorKind::Recording);
     }
 
-    // Show visualizer panels (positioned relative to recording badge)
+    // Show visualizer text panel (positioned relative to recording badge)
     if let Some(ref viz) = visualizer {
-        log::debug!("showing visualizer");
+        log::debug!("showing visualizer text panel");
         viz.show(crate::x11::overlay::BADGE_W);
     }
 

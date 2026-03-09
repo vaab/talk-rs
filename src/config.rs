@@ -170,6 +170,44 @@ impl AudioConfig {
     }
 }
 
+/// Visualizer mode for the recording badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VizMode {
+    /// FFT spectrogram waterfall (time × frequency, opacity = magnitude).
+    Waterfall,
+    /// RMS amplitude history (symmetric bars, scrolling left).
+    Amplitude,
+    /// FFT frequency-domain bar chart.
+    Spectrum,
+}
+
+impl std::fmt::Display for VizMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VizMode::Waterfall => write!(f, "waterfall"),
+            VizMode::Amplitude => write!(f, "amplitude"),
+            VizMode::Spectrum => write!(f, "spectrum"),
+        }
+    }
+}
+
+impl std::str::FromStr for VizMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "waterfall" => Ok(VizMode::Waterfall),
+            "amplitude" => Ok(VizMode::Amplitude),
+            "spectrum" => Ok(VizMode::Spectrum),
+            other => Err(format!(
+                "unknown visualizer mode '{}' (expected: waterfall, amplitude, spectrum)",
+                other
+            )),
+        }
+    }
+}
+
 /// Indicator configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndicatorsConfig {
@@ -178,6 +216,11 @@ pub struct IndicatorsConfig {
 
     /// Show visual indicator overlay.
     pub visual_overlay: bool,
+
+    /// Visualizer mode rendered inside the recording badge.
+    ///
+    /// When absent, the badge shows only the red dot (no visualization).
+    pub viz: Option<VizMode>,
 }
 
 /// Paste behaviour configuration.
@@ -248,6 +291,14 @@ impl Config {
 
         if let Some(value) = env_var_string("TALK_RS_OUTPUT_DIR")? {
             config.output_dir = PathBuf::from(value);
+        }
+
+        // Indicators env var overrides.
+        if let Some(value) = env_var_string("TALK_RS_INDICATORS_VIZ")? {
+            let mode: VizMode = value.parse().map_err(TalkError::Config)?;
+            if let Some(ref mut ind) = config.indicators {
+                ind.viz = Some(mode);
+            }
         }
 
         // Mistral env var overrides (only when the section exists).
