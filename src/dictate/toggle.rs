@@ -22,7 +22,7 @@ pub async fn toggle_dispatch(
     monitor: bool,
     no_overlay: bool,
     viz: Option<VizMode>,
-    bw: bool,
+    mono: bool,
     save: Option<&std::path::Path>,
     verbose: u8,
 ) -> Result<(), TalkError> {
@@ -48,7 +48,7 @@ pub async fn toggle_dispatch(
                 monitor,
                 no_overlay,
                 viz,
-                bw,
+                mono,
                 save,
                 verbose,
             )
@@ -76,7 +76,7 @@ async fn toggle_spawn(
     monitor: bool,
     no_overlay: bool,
     viz: Option<VizMode>,
-    bw: bool,
+    mono: bool,
     save: Option<&std::path::Path>,
     verbose: u8,
 ) -> Result<(), TalkError> {
@@ -137,8 +137,8 @@ async fn toggle_spawn(
         cmd.arg("--viz").arg(mode.to_string());
     }
 
-    if bw {
-        cmd.arg("--bw");
+    if mono {
+        cmd.arg("--mono");
     }
 
     if let Some(path) = save {

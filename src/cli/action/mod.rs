@@ -47,7 +47,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             monitor,
             no_overlay,
             viz,
-            bw,
+            mono,
             daemon,
             target_window,
         } => {
@@ -69,7 +69,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
                 monitor,
                 no_overlay,
                 viz,
-                bw,
+                mono,
                 daemon,
                 target_window,
                 verbose,

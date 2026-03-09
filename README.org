@@ -25,7 +25,7 @@ happening.
   (works without a compositor).
 - *Audio visualizers* -- optional in-badge visualization during
   recording (~--viz waterfall~, ~--viz amplitude~, ~--viz spectrum~);
-  monochrome mode with ~--bw~.
+  monochrome mode with ~--mono~.
 - *Audio feedback* -- start/stop tones and periodic boop during
   recording; fully configurable or disabled.
 - *Context bias* -- supply domain-specific vocabulary to improve
@@ -129,7 +129,7 @@ providers:
 | ~indicators.boop_interval_ms~      | ~5000~                    | Periodic boop interval in ms (~0~ disables boops; also ~--no-boop~) |
 | ~indicators.visual_overlay~        | ~true~                    | Show X11 overlay badge             |
 | ~indicators.viz~                   | /none/                    | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ (also ~--viz~; env ~TALK_RS_INDICATORS_VIZ~) |
-| ~indicators.bw~                    | ~false~                   | Monochrome visualizer (also ~--bw~) |
+| ~indicators.mono~                  | ~false~                   | Monochrome visualizer (also ~--mono~) |
 | ~paste.chunk_chars~                | ~150~                     | Max chars per paste chunk (~0~ disables chunking; also ~--no-chunk-paste~) |
 
 *** Environment overrides
@@ -189,7 +189,7 @@ Options:
 | ~--no-chunk-paste~          | Paste all text in one shot (disable chunking)    |
 | ~--no-overlay~              | Disable visual overlay                          |
 | ~--viz <MODE>~              | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ |
-| ~--bw~                      | Monochrome visualizer (theme-aware)             |
+| ~--mono~                    | Monochrome visualizer (theme-aware)             |
 
 *** Record
 

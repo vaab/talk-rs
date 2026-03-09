@@ -97,9 +97,9 @@ pub enum Commands {
         /// Visualizer inside the recording badge (waterfall, amplitude, spectrum)
         #[arg(long, value_parser = clap::value_parser!(crate::config::VizMode))]
         viz: Option<crate::config::VizMode>,
-        /// Use monochrome (black/white) colors for the visualizer
+        /// Use monochrome colors for the visualizer (theme-aware)
         #[arg(long)]
-        bw: bool,
+        mono: bool,
         /// Run as daemon process (internal, used by --toggle)
         #[arg(long, hide = true)]
         daemon: bool,

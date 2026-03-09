@@ -122,17 +122,17 @@ impl OverlayHandle {
     ///
     /// * `viz` — visualizer mode to render inside the badge (or `None`
     ///   for a plain badge with only the red dot).
-    /// * `bw` — use monochrome colours (theme-aware).
+    /// * `mono` — use monochrome colours (theme-aware).
     ///
     /// Monitor geometry is queried via GDK4 **before** spawning the
     /// thread (GDK must be called from the main thread) and passed in.
     ///
     /// Returns `Err` if the X11 display cannot be opened.
-    pub fn new(viz: Option<crate::config::VizMode>, bw: bool) -> Result<Self, TalkError> {
+    pub fn new(viz: Option<crate::config::VizMode>, mono: bool) -> Result<Self, TalkError> {
         let geom = super::monitor::primary_monitor_geometry()?;
 
         // Resolve monochrome palette up front (D-Bus on main thread).
-        let mono_palette = if bw {
+        let mono_palette = if mono {
             let (fg, bg) = super::render_util::monochrome_palette();
             log::info!("monochrome overlay: fg={:?} bg={:?}", fg, bg);
             Some((fg, bg))

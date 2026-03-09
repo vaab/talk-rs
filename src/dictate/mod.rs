@@ -54,7 +54,7 @@ pub struct DictateOpts {
     pub monitor: bool,
     pub no_overlay: bool,
     pub viz: Option<crate::config::VizMode>,
-    pub bw: bool,
+    pub mono: bool,
     pub daemon: bool,
     pub target_window: Option<String>,
     pub verbose: u8,
@@ -75,7 +75,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.monitor,
             opts.no_overlay,
             opts.viz,
-            opts.bw,
+            opts.mono,
             opts.save.as_deref(),
             opts.verbose,
         )
@@ -189,9 +189,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         log::debug!("visual overlay disabled");
         None
     } else {
-        match OverlayHandle::new(viz_mode, opts.bw) {
+        match OverlayHandle::new(viz_mode, opts.mono) {
             Ok(h) => {
-                log::debug!("overlay initialized (viz={:?}, bw={})", viz_mode, opts.bw);
+                log::debug!(
+                    "overlay initialized (viz={:?}, mono={})",
+                    viz_mode,
+                    opts.mono
+                );
                 Some(h)
             }
             Err(e) => {

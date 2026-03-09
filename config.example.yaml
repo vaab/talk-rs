@@ -56,8 +56,8 @@ indicators:
   # viz: waterfall
 
   # Monochrome visualizer (theme-aware: white on dark, black on light).
-  # Also settable via --bw or TALK_RS_INDICATORS_BW env var.
-  # bw: false
+  # Also settable via --mono or TALK_RS_INDICATORS_MONO env var.
+  # mono: false
 
 # Optional: Paste Behaviour
 # Configure how transcribed text is pasted into the target application
