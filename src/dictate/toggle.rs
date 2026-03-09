@@ -23,6 +23,7 @@ pub async fn toggle_dispatch(
     no_overlay: bool,
     amplitude: bool,
     spectrum: bool,
+    bw: bool,
     save: Option<&std::path::Path>,
     verbose: u8,
 ) -> Result<(), TalkError> {
@@ -49,6 +50,7 @@ pub async fn toggle_dispatch(
                 no_overlay,
                 amplitude,
                 spectrum,
+                bw,
                 save,
                 verbose,
             )
@@ -77,6 +79,7 @@ async fn toggle_spawn(
     no_overlay: bool,
     amplitude: bool,
     spectrum: bool,
+    bw: bool,
     save: Option<&std::path::Path>,
     verbose: u8,
 ) -> Result<(), TalkError> {
@@ -139,6 +142,10 @@ async fn toggle_spawn(
 
     if spectrum {
         cmd.arg("--spectrum");
+    }
+
+    if bw {
+        cmd.arg("--bw");
     }
 
     if let Some(path) = save {

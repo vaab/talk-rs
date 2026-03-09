@@ -33,7 +33,7 @@ const TRANSCRIBING_PNG: &[u8] = include_bytes!("../../assets/transcribing.png");
 // ── Badge layout constants ───────────────────────────────────────────
 
 /// Badge width in pixels (~50% wider than original for full-width spectrogram).
-const BADGE_W: u16 = 273;
+pub(crate) const BADGE_W: u16 = 273;
 /// Badge height in pixels.
 const BADGE_H: u16 = 52;
 /// Corner radius for the rounded rectangle background.

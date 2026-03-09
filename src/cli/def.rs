@@ -100,6 +100,9 @@ pub enum Commands {
         /// Show spectrum visualizer (right of badge)
         #[arg(long)]
         spectrum: bool,
+        /// Use monochrome (black/white) colors for audio visualizers
+        #[arg(long)]
+        bw: bool,
         /// Run as daemon process (internal, used by --toggle)
         #[arg(long, hide = true)]
         daemon: bool,

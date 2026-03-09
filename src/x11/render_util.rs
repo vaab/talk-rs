@@ -265,6 +265,58 @@ pub fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     ]
 }
 
+// ── Theme detection ──────────────────────────────────────────────────
+
+/// Detect whether the desktop theme is dark.
+///
+/// Uses the `dark-light` crate (freedesktop portal via D-Bus) with a
+/// fallback to the `GTK_THEME` environment variable.  Returns `true`
+/// for dark themes (use white foreground), `false` for light themes
+/// (use black foreground).  Defaults to dark when detection fails.
+pub fn detect_is_dark_theme() -> bool {
+    match dark_light::detect() {
+        Ok(dark_light::Mode::Light) => {
+            log::debug!("theme detection: light (via dark-light)");
+            false
+        }
+        Ok(dark_light::Mode::Dark) => {
+            log::debug!("theme detection: dark (via dark-light)");
+            true
+        }
+        _ => {
+            // Fallback: check GTK_THEME for "dark" substring.
+            if let Ok(theme) = std::env::var("GTK_THEME") {
+                let lower = theme.to_ascii_lowercase();
+                if lower.contains("dark") {
+                    log::debug!("theme detection: dark (GTK_THEME={:?})", theme);
+                    return true;
+                }
+                if lower.contains("light") {
+                    log::debug!("theme detection: light (GTK_THEME={:?})", theme);
+                    return false;
+                }
+            }
+            log::debug!("theme detection: defaulting to dark");
+            true
+        }
+    }
+}
+
+/// Return the BGRA foreground and background colours for monochrome
+/// visualiser mode based on theme detection.
+///
+/// - Dark theme → white foreground on black background.
+/// - Light theme → black foreground on white background.
+pub fn monochrome_palette() -> ([u8; 4], [u8; 4]) {
+    if detect_is_dark_theme() {
+        // fg = white, bg = black
+        ([0xFF, 0xFF, 0xFF, 0xFF], [0x00, 0x00, 0x00, 0xFF])
+    } else {
+        // fg = black, bg = white
+        ([0x00, 0x00, 0x00, 0xFF], [0xFF, 0xFF, 0xFF, 0xFF])
+    }
+}
+
 // ── X11 shape helpers ────────────────────────────────────────────────
 
 /// Create a 1-bit pixmap with a rounded rectangle and apply it as the

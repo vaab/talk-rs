@@ -55,6 +55,7 @@ pub struct DictateOpts {
     pub no_overlay: bool,
     pub amplitude: bool,
     pub spectrum: bool,
+    pub bw: bool,
     pub daemon: bool,
     pub target_window: Option<String>,
     pub verbose: u8,
@@ -76,6 +77,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.no_overlay,
             opts.amplitude,
             opts.spectrum,
+            opts.bw,
             opts.save.as_deref(),
             opts.verbose,
         )
@@ -200,21 +202,22 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // --spectrum.  When neither audio visualizer is enabled, the
     // visualizer thread skips CPAL audio capture and only handles text
     // rendering — very lightweight.
-    let visualizer = match VisualizerHandle::new(opts.amplitude, opts.spectrum, opts.realtime) {
-        Ok(h) => {
-            log::debug!(
-                "visualizer initialized (amplitude={}, spectrum={}, text={})",
-                opts.amplitude,
-                opts.spectrum,
-                opts.realtime,
-            );
-            Some(h)
-        }
-        Err(e) => {
-            log::warn!("visualizer unavailable: {}", e);
-            None
-        }
-    };
+    let visualizer =
+        match VisualizerHandle::new(opts.amplitude, opts.spectrum, opts.realtime, opts.bw) {
+            Ok(h) => {
+                log::debug!(
+                    "visualizer initialized (amplitude={}, spectrum={}, text={})",
+                    opts.amplitude,
+                    opts.spectrum,
+                    opts.realtime,
+                );
+                Some(h)
+            }
+            Err(e) => {
+                log::warn!("visualizer unavailable: {}", e);
+                None
+            }
+        };
 
     // Generate cache recording path (always, even without --save)
     let (cache_wav_path, cache_timestamp) = recording_cache::generate_recording_path()?;
@@ -314,10 +317,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         o.show(IndicatorKind::Recording);
     }
 
-    // Show visualizer panels (positioned relative to 182px recording badge)
+    // Show visualizer panels (positioned relative to recording badge)
     if let Some(ref viz) = visualizer {
         log::debug!("showing visualizer");
-        viz.show(182);
+        viz.show(crate::x11::overlay::BADGE_W);
     }
 
     // Start boop loop (configurable interval, disabled by --no-boop or interval=0)

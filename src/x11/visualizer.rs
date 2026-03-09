@@ -348,7 +348,12 @@ fn render_text_status(
 /// equally upward and downward — producing a mirror-image waveform.
 /// Normalised against `max_rms` so speech fills the panel height and
 /// silence stays thin.
-fn render_amplitude(pb: &mut PixelBuffer, history: &[f32], max_rms: f32) {
+fn render_amplitude(
+    pb: &mut PixelBuffer,
+    history: &[f32],
+    max_rms: f32,
+    mono: Option<([u8; 4], [u8; 4])>,
+) {
     if history.is_empty() || max_rms < PEAK_FLOOR {
         return;
     }
@@ -375,7 +380,14 @@ fn render_amplitude(pb: &mut PixelBuffer, history: &[f32], max_rms: f32) {
         let norm = (avg_rms / max_rms).clamp(0.0, 1.0);
         let half_height = (norm * max_half as f32) as usize;
 
-        let color = if norm > 0.5 { AMP_COLOR } else { AMP_DIM };
+        let color = if let Some((fg, bg)) = mono {
+            // Monochrome: interpolate from bg to fg based on amplitude.
+            lerp_color(bg, fg, norm)
+        } else if norm > 0.5 {
+            AMP_COLOR
+        } else {
+            AMP_DIM
+        };
         let top = center - half_height;
         let bottom = center + half_height;
         for y in top..=bottom {
@@ -405,7 +417,12 @@ fn spectrum_color(t: f32) -> [u8; 4] {
 /// Render spectrum bars normalised against `peak` (the all-time maximum
 /// magnitude).  When the user is silent, bars stay tiny because `peak`
 /// retains the loudest value ever seen.
-fn render_spectrum(pb: &mut PixelBuffer, magnitudes: &[f32], peak: f32) {
+fn render_spectrum(
+    pb: &mut PixelBuffer,
+    magnitudes: &[f32],
+    peak: f32,
+    mono: Option<([u8; 4], [u8; 4])>,
+) {
     if magnitudes.is_empty() {
         return;
     }
@@ -444,7 +461,12 @@ fn render_spectrum(pb: &mut PixelBuffer, magnitudes: &[f32], peak: f32) {
         let bar_x = bar * 3;
         let bar_y = h - 2 - bar_height;
 
-        let color = spectrum_color(bar as f32 / num_bars as f32);
+        let color = if let Some((fg, bg)) = mono {
+            // Monochrome: interpolate from bg to fg based on magnitude.
+            lerp_color(bg, fg, log_norm)
+        } else {
+            spectrum_color(bar as f32 / num_bars as f32)
+        };
         pb.fill_rect(bar_x, bar_y, 2, bar_height, color);
     }
 }
@@ -489,16 +511,28 @@ impl VisualizerHandle {
     /// * `amplitude` — enable the amplitude history panel (left of badge).
     /// * `spectrum` — enable the spectrum panel (right of badge).
     /// * `text` — enable the live transcription text panel (below badge).
+    /// * `bw` — use monochrome (theme-aware) colours for audio panels.
     ///
     /// Returns `Err` if X11 or the audio device is unreachable.
-    pub fn new(amplitude: bool, spectrum: bool, _text: bool) -> Result<Self, TalkError> {
+    pub fn new(amplitude: bool, spectrum: bool, _text: bool, bw: bool) -> Result<Self, TalkError> {
         let geom = super::monitor::primary_monitor_geometry()?;
+
+        // Resolve monochrome palette up front (before spawning the
+        // thread) so D-Bus calls happen on the main thread.
+        let mono_palette = if bw {
+            let (fg, bg) = super::render_util::monochrome_palette();
+            log::info!("monochrome visualizer: fg={:?} bg={:?}", fg, bg);
+            Some((fg, bg))
+        } else {
+            None
+        };
+
         let (tx, rx) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("visualizer".into())
             .spawn(move || {
-                if let Err(e) = visualizer_thread(rx, amplitude, spectrum, geom) {
+                if let Err(e) = visualizer_thread(rx, amplitude, spectrum, geom, mono_palette) {
                     log::error!("visualizer thread error: {}", e);
                 }
             })
@@ -559,6 +593,7 @@ fn visualizer_thread(
     enable_amplitude: bool,
     enable_spectrum: bool,
     geom: super::monitor::MonitorGeometry,
+    mono_palette: Option<([u8; 4], [u8; 4])>,
 ) -> Result<(), TalkError> {
     let need_audio = enable_amplitude || enable_spectrum;
 
@@ -872,10 +907,13 @@ fn visualizer_thread(
                 amp_history.drain(..amp_history.len() - amp_max_frames);
             }
 
+            // Resolve background colour (monochrome overrides default).
+            let panel_bg = mono_palette.map_or(BG, |(_, bg)| bg);
+
             // Amplitude panel
             if let (Some(win), Some(gc)) = (wins.amplitude_win, wins.amplitude_gc) {
-                amp_pb.clear(BG);
-                render_amplitude(&mut amp_pb, &amp_history, amp_peak);
+                amp_pb.clear(panel_bg);
+                render_amplitude(&mut amp_pb, &amp_history, amp_peak, mono_palette);
 
                 let _ = conn.put_image(
                     ImageFormat::Z_PIXMAP,
@@ -903,8 +941,8 @@ fn visualizer_thread(
                 }
                 spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
 
-                sp_pb.clear(BG);
-                render_spectrum(&mut sp_pb, &magnitudes, spectrum_peak);
+                sp_pb.clear(panel_bg);
+                render_spectrum(&mut sp_pb, &magnitudes, spectrum_peak, mono_palette);
 
                 let _ = conn.put_image(
                     ImageFormat::Z_PIXMAP,
@@ -1272,7 +1310,7 @@ mod tests {
         // Simulate 60 frames of varying amplitude
         let history: Vec<f32> = (0..60).map(|i| (i as f32 * 0.1).sin().abs()).collect();
         let max_rms = history.iter().copied().fold(0.0f32, f32::max);
-        render_amplitude(&mut pb, &history, max_rms);
+        render_amplitude(&mut pb, &history, max_rms, None);
 
         // Should have non-background pixels
         let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
@@ -1285,7 +1323,7 @@ mod tests {
         pb.clear(BG);
         // Very quiet history with a high max
         let history = vec![0.0001f32; 60];
-        render_amplitude(&mut pb, &history, 1.0);
+        render_amplitude(&mut pb, &history, 1.0, None);
 
         // Almost everything should still be background
         let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
@@ -1312,7 +1350,7 @@ mod tests {
 
         let mut pb = PixelBuffer::new(VIS_W as usize, VIS_H as usize);
         pb.clear(BG);
-        render_amplitude(&mut pb, &history, 1.0);
+        render_amplitude(&mut pb, &history, 1.0, None);
 
         // The leftmost 80% of columns should have at most a 1-pixel
         // centre line per column (render_amplitude draws a min-height
@@ -1361,7 +1399,7 @@ mod tests {
         let mut pb = PixelBuffer::new(200, 52);
         pb.clear(BG);
         let history = vec![0.8f32; 60];
-        render_amplitude(&mut pb, &history, 1.0);
+        render_amplitude(&mut pb, &history, 1.0, None);
 
         let center = pb.height / 2;
         // For each column, count non-bg pixels above and below centre.
@@ -1394,7 +1432,7 @@ mod tests {
         let mut pb = PixelBuffer::new(200, 52);
         pb.clear(BG);
         let mags: Vec<f32> = (0..512).map(|i| i as f32 * 0.01).collect();
-        render_spectrum(&mut pb, &mags, 5.0);
+        render_spectrum(&mut pb, &mags, 5.0, None);
 
         let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
         assert!(non_bg > 0);
@@ -1406,7 +1444,7 @@ mod tests {
         pb.clear(BG);
         // Very quiet signal with a high all-time peak
         let mags: Vec<f32> = vec![0.001; 512];
-        render_spectrum(&mut pb, &mags, 100.0);
+        render_spectrum(&mut pb, &mags, 100.0, None);
 
         // Almost everything should still be background
         let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();

@@ -54,6 +54,7 @@ png = "0.17"
 fontdue = "0.9"
 gtk4 = { version = "0.8", features = ["v4_10"] }
 gdk4-x11 = "0.8"
+dark-light = "2.0"
 
 [dev-dependencies]
 assert_cmd = "2"
