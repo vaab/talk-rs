@@ -68,7 +68,7 @@ const SPEC_H: usize = SPEC_BOTTOM - SPEC_TOP;
 /// Target frames per second for the recording render loop.
 const FPS: u32 = 60;
 /// Number of audio samples fed into the FFT (must be power of two).
-const FFT_SIZE: usize = 1024;
+const FFT_SIZE: usize = 2048;
 
 /// Lowest frequency shown in the spectrogram (Hz).
 const FREQ_MIN: f32 = 80.0;
@@ -249,28 +249,48 @@ fn map_spectrum_to_column(
     let log_min = FREQ_MIN.ln();
     let log_max = f_max.ln();
 
+    // Pre-compute the fractional bin index for each row centre.
+    let bin_centers: Vec<f32> = (0..num_rows)
+        .map(|row| {
+            let t = if num_rows > 1 {
+                row as f32 / (num_rows - 1) as f32
+            } else {
+                0.5
+            };
+            let freq = (log_min + t * (log_max - log_min)).exp();
+            (freq / nyquist * n_bins as f32).clamp(0.0, (n_bins - 1) as f32)
+        })
+        .collect();
+
     let mut column = Vec::with_capacity(num_rows);
 
     for row in 0..num_rows {
-        let t = if num_rows > 1 {
-            row as f32 / (num_rows - 1) as f32
+        // Each row covers the band from the midpoint to its previous
+        // neighbour up to the midpoint to its next neighbour.
+        let lo = if row == 0 {
+            bin_centers[0]
         } else {
-            0.5
+            (bin_centers[row - 1] + bin_centers[row]) * 0.5
         };
-        let log_f = log_min + t * (log_max - log_min);
-        let freq = log_f.exp();
+        let hi = if row + 1 >= num_rows {
+            bin_centers[num_rows - 1]
+        } else {
+            (bin_centers[row] + bin_centers[row + 1]) * 0.5
+        };
 
-        // Map frequency to FFT bin index.
-        let bin_f = freq / nyquist * n_bins as f32;
-        let bin = (bin_f as usize).min(n_bins - 1);
+        let bin_start = (lo.floor() as usize).min(n_bins - 1);
+        let bin_end = ((hi.ceil() as usize) + 1).min(n_bins);
+        // Guarantee at least one bin.
+        let bin_end = bin_end.max(bin_start + 1);
 
-        // Average a few neighbouring bins for smoothness.
-        let bin_start = bin.saturating_sub(1);
-        let bin_end = (bin + 2).min(n_bins);
-        let avg: f32 =
-            magnitudes[bin_start..bin_end].iter().sum::<f32>() / (bin_end - bin_start) as f32;
+        // Use peak (max) within the bin range — matches how real-time
+        // spectrum analysers work and avoids visual holes between harmonics.
+        let peak_val: f32 = magnitudes[bin_start..bin_end]
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
 
-        column.push(avg);
+        column.push(peak_val);
     }
 
     column
@@ -407,18 +427,15 @@ fn render_spectrum_badge(
     // Use lower quarter of spectrum (voice content).
     let useful = &magnitudes[..magnitudes.len() / 4];
 
-    let num_bars = w / 3; // 2px bar + 1px gap
-    if num_bars == 0 {
-        return;
-    }
-    let bins_per_bar = useful.len() / num_bars;
-    if bins_per_bar == 0 {
+    let num_bars = w; // one bar per pixel column — no gaps
+    if num_bars == 0 || useful.is_empty() {
         return;
     }
 
     for bar in 0..num_bars {
-        let start = bar * bins_per_bar;
-        let end = (start + bins_per_bar).min(useful.len());
+        // Proportional mapping: distribute ALL bins across bars evenly.
+        let start = bar * useful.len() / num_bars;
+        let end = ((bar + 1) * useful.len() / num_bars).max(start + 1);
 
         let avg = if end > start {
             useful[start..end].iter().sum::<f32>() / (end - start) as f32
@@ -430,7 +447,7 @@ fn render_spectrum_badge(
         let log_norm = (1.0 + norm * 9.0).log10();
 
         let bar_height = (log_norm * (h.saturating_sub(4)) as f32) as usize;
-        let bar_x = x0 + bar * 3;
+        let bar_x = x0 + bar;
         let bar_y = y0 + h - 2 - bar_height;
 
         let color = if let Some((fg, bg)) = mono {
@@ -440,9 +457,7 @@ fn render_spectrum_badge(
         };
 
         for dy in 0..bar_height {
-            for dx in 0..2 {
-                pb.set_pixel(bar_x + dx, bar_y + dy, color);
-            }
+            pb.set_pixel(bar_x, bar_y + dy, color);
         }
     }
 }
