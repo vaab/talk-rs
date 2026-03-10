@@ -9,7 +9,10 @@
 //! Audio visualization (amplitude, spectrum, waterfall) has moved into
 //! the recording badge itself (see `overlay.rs`).
 
-use super::render_util::{apply_rounded_shape, lerp_color, PixelBuffer};
+use super::render_util::{
+    apply_rounded_shape, blit_glyph_at, blit_glyphs, lerp_color, load_system_font,
+    rasterise_glyphs, PixelBuffer,
+};
 use crate::error::TalkError;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
@@ -51,120 +54,21 @@ const DOT_LO: [u8; 4] = [0x33, 0x33, 0x33, 0xFF]; // #333333
 /// Full wave-cycle length in frames (90 frames ≈ 1.5 s at 60 fps).
 const DOT_CYCLE_FRAMES: f32 = 90.0;
 
-// ── Font loading ─────────────────────────────────────────────────────
+// Font loading and glyph rendering are shared via render_util.
+// Local wrappers pass the visualizer's TEXT_FONT_SIZE to the
+// parameterised render_util functions.
 
-/// Well-known system font paths, tried in order.  CJK-capable fonts
-/// come first so Chinese / Japanese / Korean text renders correctly.
-const FONT_SEARCH_PATHS: &[&str] = &[
-    // CJK-capable (Noto Sans CJK covers Latin + CJK + most scripts)
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-    // Droid fallback (broad Unicode coverage including CJK)
-    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-    // Latin-only fallbacks
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-];
-
-/// Load a system TrueType font for text rendering.
-///
-/// Searches well-known paths; returns `None` if no font is found.
-fn load_system_font() -> Option<fontdue::Font> {
-    for path in FONT_SEARCH_PATHS {
-        if let Ok(data) = std::fs::read(path) {
-            let settings = fontdue::FontSettings {
-                collection_index: 0,
-                scale: TEXT_FONT_SIZE,
-                load_substitutions: true,
-            };
-            match fontdue::Font::from_bytes(data, settings) {
-                Ok(font) => {
-                    log::debug!("loaded font from {}", path);
-                    return Some(font);
-                }
-                Err(e) => {
-                    log::warn!("failed to parse font {}: {}", path, e);
-                }
-            }
-        }
-    }
-    log::warn!("no system font found, text overlay disabled");
-    None
+/// Load a font at the visualizer's text size.
+fn load_viz_font() -> Option<fontdue::Font> {
+    load_system_font(TEXT_FONT_SIZE)
 }
 
-/// Rasterise glyphs and return `(glyph_data, total_advance_width)`.
-fn rasterise_glyphs(text: &str, font: &fontdue::Font) -> (Vec<(fontdue::Metrics, Vec<u8>)>, usize) {
-    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::new();
-    let mut total_w: usize = 0;
-    for ch in text.chars() {
-        let (metrics, bitmap) = font.rasterize(ch, TEXT_FONT_SIZE);
-        total_w += metrics.advance_width as usize;
-        glyphs.push((metrics, bitmap));
-    }
-    (glyphs, total_w)
-}
-
-/// Blit pre-rasterised glyphs into the pixel buffer at `start_x`,
-/// vertically centred, clipped to buffer bounds.  `opacity` (0.0–1.0)
-/// scales the per-glyph coverage alpha for smooth fade-out.
-fn blit_glyphs(
-    pb: &mut PixelBuffer,
-    glyphs: &[(fontdue::Metrics, Vec<u8>)],
-    start_x: i32,
-    color: [u8; 4],
-    opacity: f32,
-) {
-    let h = pb.height;
-    let w = pb.width;
-    let baseline = (h as i32 * 3) / 4;
-    let mut cursor_x = start_x;
-
-    for (metrics, bitmap) in glyphs {
-        blit_glyph_at(
-            pb, metrics, bitmap, cursor_x, baseline, w, h, color, opacity,
-        );
-        cursor_x += metrics.advance_width as i32;
-    }
-}
-
-/// Blit a single rasterised glyph at `cursor_x` with the given colour.
-/// `opacity` (0.0–1.0) is multiplied into the glyph coverage alpha.
-#[allow(clippy::too_many_arguments)]
-fn blit_glyph_at(
-    pb: &mut PixelBuffer,
-    metrics: &fontdue::Metrics,
-    bitmap: &[u8],
-    cursor_x: i32,
-    baseline: i32,
-    buf_w: usize,
-    buf_h: usize,
-    color: [u8; 4],
-    opacity: f32,
-) {
-    let gx = cursor_x + metrics.xmin;
-    let gy = baseline - metrics.height as i32 - metrics.ymin;
-
-    for row in 0..metrics.height {
-        for col in 0..metrics.width {
-            let alpha = bitmap[row * metrics.width + col];
-            if alpha == 0 {
-                continue;
-            }
-            let px = gx + col as i32;
-            let py = gy + row as i32;
-            if px >= 0 && (px as usize) < buf_w && py >= 0 && (py as usize) < buf_h {
-                let off = (py as usize * buf_w + px as usize) * 4;
-                let a = alpha as f32 / 255.0 * opacity;
-                for (c, &fg_val) in color.iter().enumerate().take(3) {
-                    let bg_val = pb.data[off + c] as f32;
-                    pb.data[off + c] = (bg_val + (fg_val as f32 - bg_val) * a) as u8;
-                }
-            }
-        }
-    }
+/// Rasterise glyphs at the visualizer's text size.
+fn viz_rasterise_glyphs(
+    text: &str,
+    font: &fontdue::Font,
+) -> (Vec<(fontdue::Metrics, Vec<u8>)>, usize) {
+    rasterise_glyphs(text, font, TEXT_FONT_SIZE)
 }
 
 /// Compute per-dot brightness for a pulsing wave animation.
@@ -199,7 +103,7 @@ fn render_text(pb: &mut PixelBuffer, text: &str, font: &fontdue::Font, dot_brigh
     let (text_glyphs, text_w) = if text.is_empty() {
         (Vec::new(), 0)
     } else {
-        rasterise_glyphs(text, font)
+        viz_rasterise_glyphs(text, font)
     };
 
     // ── Compute fixed dot area width ─────────────────────────────────
@@ -286,7 +190,7 @@ fn render_text_status(
     let (glyphs, text_w) = if text.is_empty() {
         return;
     } else {
-        rasterise_glyphs(text, font)
+        viz_rasterise_glyphs(text, font)
     };
 
     // Centre horizontally; clip leading chars on overflow.
@@ -399,6 +303,15 @@ impl VisualizerHandle {
             text: text.to_string(),
         });
     }
+
+    /// Create a standalone message sender that can push status messages
+    /// from any thread without holding a reference to the handle.
+    pub fn message_pusher(&self) -> impl Fn(String) + Send + 'static {
+        let tx = self.tx.clone();
+        move |text: String| {
+            let _ = tx.send(VizCommand::PushMessage { text });
+        }
+    }
 }
 
 impl Drop for VisualizerHandle {
@@ -492,7 +405,7 @@ fn visualizer_thread(
         std::thread::Builder::new()
             .name("viz-font-loader".into())
             .spawn(move || {
-                let _ = tx.send(load_system_font());
+                let _ = tx.send(load_viz_font());
             })
             .map_err(|e| TalkError::Config(format!("font loader thread: {}", e)))?;
         rx
@@ -705,7 +618,7 @@ mod tests {
 
     #[test]
     fn render_text_no_panic_with_font() {
-        if let Some(font) = load_system_font() {
+        if let Some(font) = load_viz_font() {
             let mut pb = PixelBuffer::new(600, 36);
             pb.clear(BG);
             render_text(&mut pb, "Hello world", &font, [0.5, 0.5, 0.5]);
@@ -718,7 +631,7 @@ mod tests {
 
     #[test]
     fn render_text_dots_always_present() {
-        if let Some(font) = load_system_font() {
+        if let Some(font) = load_viz_font() {
             let mut pb = PixelBuffer::new(600, 36);
             pb.clear(BG);
             render_text(&mut pb, "", &font, [1.0, 1.0, 1.0]);
@@ -730,7 +643,7 @@ mod tests {
 
     #[test]
     fn render_text_dots_dim_still_visible() {
-        if let Some(font) = load_system_font() {
+        if let Some(font) = load_viz_font() {
             let mut pb = PixelBuffer::new(600, 36);
             pb.clear(BG);
             render_text(&mut pb, "", &font, [0.0, 0.0, 0.0]);
@@ -758,7 +671,7 @@ mod tests {
 
     #[test]
     fn render_text_overflow_clips_left() {
-        if let Some(font) = load_system_font() {
+        if let Some(font) = load_viz_font() {
             // Narrow buffer — long text + dots should clip from the left.
             let mut pb = PixelBuffer::new(80, 36);
             pb.clear(BG);

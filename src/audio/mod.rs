@@ -11,6 +11,7 @@ pub mod mock;
 pub mod monitor_capture;
 pub mod pipewire_capture;
 pub mod resample;
+pub mod tee;
 pub mod writer;
 
 pub use encoder::{AudioEncoder, MockEncoder, OpusEncoder};

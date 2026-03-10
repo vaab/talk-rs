@@ -12,10 +12,10 @@
 //! During **transcribing**, the badge is a static PNG (unchanged).
 
 use super::render_util::{
-    apply_rounded_shape, compute_spectrum, rms, PixelBuffer, RingBuffer, PEAK_DECAY, PEAK_FLOOR,
+    apply_rounded_shape, blit_glyph_at, compute_spectrum, rasterise_glyphs, rms, PixelBuffer,
+    RingBuffer, PEAK_DECAY, PEAK_FLOOR,
 };
 use crate::error::TalkError;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -123,12 +123,22 @@ impl OverlayHandle {
     /// * `viz` — visualizer mode to render inside the badge (or `None`
     ///   for a plain badge with only the red dot).
     /// * `mono` — use monochrome colours (theme-aware).
+    /// * `audio_ring` — shared ring buffer fed by the audio tee task.
+    /// * `sample_rate` — capture sample rate (for FFT/RMS sizing).
+    /// * `silence_tx` — optional channel to notify when silence is
+    ///   detected (`true`) or audio returns (`false`).
     ///
     /// Monitor geometry is queried via GDK4 **before** spawning the
     /// thread (GDK must be called from the main thread) and passed in.
     ///
     /// Returns `Err` if the X11 display cannot be opened.
-    pub fn new(viz: Option<crate::config::VizMode>, mono: bool) -> Result<Self, TalkError> {
+    pub fn new(
+        viz: Option<crate::config::VizMode>,
+        mono: bool,
+        audio_ring: Arc<Mutex<RingBuffer>>,
+        sample_rate: u32,
+        silence_tx: Option<std::sync::mpsc::Sender<bool>>,
+    ) -> Result<Self, TalkError> {
         let geom = super::monitor::primary_monitor_geometry()?;
 
         // Resolve monochrome palette up front (D-Bus on main thread).
@@ -145,7 +155,15 @@ impl OverlayHandle {
         let thread = std::thread::Builder::new()
             .name("overlay".into())
             .spawn(move || {
-                if let Err(e) = overlay_thread(rx, geom, viz, mono_palette) {
+                if let Err(e) = overlay_thread(
+                    rx,
+                    geom,
+                    viz,
+                    mono_palette,
+                    audio_ring,
+                    sample_rate,
+                    silence_tx,
+                ) {
                     log::error!("overlay thread error: {}", e);
                 }
             })
@@ -591,6 +609,114 @@ fn draw_rounded_border(pb: &mut PixelBuffer, color: [u8; 4], radius: f32, border
     }
 }
 
+// ── Silence warning rendering ────────────────────────────────────────
+
+/// Draw a prohibit icon (circle outline + diagonal bar) in bright red.
+///
+/// Replaces the pulsing red dot when silence is detected.  Anti-aliased
+/// like `draw_pulsing_dot()`, placed at the same centre coordinates.
+fn draw_prohibit_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32) {
+    // Bright red, BGRA
+    let color: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
+    let stroke = 2.0f32;
+    let r_outer = radius;
+    let r_inner = radius - stroke;
+    let r_outer_sq = r_outer * r_outer;
+    let r_inner_sq = r_inner * r_inner;
+    let r_int = r_outer.ceil() as i32;
+
+    // Draw circle outline
+    for dy in -r_int..=r_int {
+        for dx in -r_int..=r_int {
+            let dist_sq = (dx * dx + dy * dy) as f32;
+            if dist_sq > r_outer_sq {
+                continue;
+            }
+            // Anti-aliased outer edge
+            let outer_edge = r_outer - dist_sq.sqrt();
+            let outer_alpha = outer_edge.clamp(0.0, 1.0);
+            // Anti-aliased inner edge (hollow centre)
+            let inner_edge = dist_sq.sqrt() - r_inner;
+            let inner_alpha = inner_edge.clamp(0.0, 1.0);
+
+            let alpha = outer_alpha * inner_alpha;
+            if alpha <= 0.0 {
+                continue;
+            }
+
+            let px = cx as i32 + dx;
+            let py = cy as i32 + dy;
+            if px >= 0 && (px as usize) < pb.width && py >= 0 && (py as usize) < pb.height {
+                let off = (py as usize * pb.width + px as usize) * 4;
+                for (c, &fg_val) in color.iter().enumerate().take(4) {
+                    let bg_val = pb.data[off + c] as f32;
+                    pb.data[off + c] = (bg_val + (fg_val as f32 - bg_val) * alpha) as u8;
+                }
+            }
+        }
+    }
+
+    // Draw diagonal bar (top-left to bottom-right at 45°)
+    let half_stroke = stroke / 2.0;
+    for dy in -r_int..=r_int {
+        for dx in -r_int..=r_int {
+            let dist_sq = (dx * dx + dy * dy) as f32;
+            // Only draw inside the circle
+            if dist_sq > r_inner_sq {
+                continue;
+            }
+            // Distance from the line y = x (45° diagonal)
+            let line_dist = ((dx as f32) - (dy as f32)).abs() / std::f32::consts::SQRT_2;
+            if line_dist > half_stroke + 1.0 {
+                continue;
+            }
+            let alpha = (half_stroke + 1.0 - line_dist).clamp(0.0, 1.0);
+            if alpha <= 0.0 {
+                continue;
+            }
+
+            let px = cx as i32 + dx;
+            let py = cy as i32 + dy;
+            if px >= 0 && (px as usize) < pb.width && py >= 0 && (py as usize) < pb.height {
+                let off = (py as usize * pb.width + px as usize) * 4;
+                for (c, &fg_val) in color.iter().enumerate().take(4) {
+                    let bg_val = pb.data[off + c] as f32;
+                    pb.data[off + c] = (bg_val + (fg_val as f32 - bg_val) * alpha) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Render "NO SOUND" text in bright red, centred in the SPEC area.
+fn render_no_sound_text(
+    pb: &mut PixelBuffer,
+    font: &fontdue::Font,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) {
+    let font_size = 24.0f32;
+    let color: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF]; // bright red BGRA
+    let (glyphs, text_w) = rasterise_glyphs("NO SOUND", font, font_size);
+
+    // Centre horizontally in the spec area
+    let start_x = x0 as i32 + (w as i32 - text_w as i32) / 2;
+    // Centre vertically in the spec area
+    let baseline = y0 as i32 + (h as i32 * 3) / 4;
+
+    let buf_w = pb.width;
+    let buf_h = pb.height;
+    let mut cursor_x = start_x;
+    for (metrics, bitmap) in &glyphs {
+        blit_glyph_at(
+            pb, metrics, bitmap, cursor_x, baseline, buf_w, buf_h, color, 1.0,
+        );
+        cursor_x += metrics.advance_width as i32;
+    }
+}
+
 // ── Static PNG window (transcribing) ─────────────────────────────────
 
 /// Apply a 1-bit shape mask based on the image alpha channel.
@@ -731,14 +857,18 @@ fn draw_image(
 /// Has two modes:
 ///
 /// * **Transcribing** — static PNG badge; blocks on commands.
-/// * **Recording** — dynamic spectrogram badge at 60 fps with its own
-///   CPAL audio capture; drains commands non-blocking each frame.
+/// * **Recording** — dynamic spectrogram badge at 60 fps reading from
+///   the shared `audio_ring` buffer (fed by the audio tee); drains
+///   commands non-blocking each frame.
 #[allow(clippy::too_many_lines)]
 fn overlay_thread(
     rx: mpsc::Receiver<Command>,
     geom: super::monitor::MonitorGeometry,
     viz: Option<crate::config::VizMode>,
     mono_palette: Option<([u8; 4], [u8; 4])>,
+    ring: Arc<Mutex<RingBuffer>>,
+    sample_rate: u32,
+    silence_tx: Option<std::sync::mpsc::Sender<bool>>,
 ) -> Result<(), TalkError> {
     let (conn, screen_num) = x11rb::connect(None)
         .map_err(|e| TalkError::Config(format!("failed to connect to X11: {}", e)))?;
@@ -772,76 +902,28 @@ fn overlay_thread(
 
     let (mon_x, mon_y, mon_w, _mon_h) = geom;
 
-    // ── CPAL audio capture (for recording visualization) ──────────
-    //
-    // Only opened when a visualizer mode is active.  Without a viz
-    // mode the badge shows a static red dot and no audio capture is
-    // needed.
+    // Audio ring buffer and sample rate are now provided externally
+    // via the audio tee task (no independent CPAL capture).
+    let rms_chunk: usize = sample_rate as usize / FPS as usize;
 
-    let need_audio = viz.is_some();
-    let host = cpal::default_host();
-    let cpal_ok = need_audio && host.default_input_device().is_some();
+    // Load a system font for rendering "NO SOUND" text on the badge.
+    let badge_font = super::render_util::load_system_font(24.0);
 
-    let ring: Option<Arc<Mutex<RingBuffer>>>;
-    let sample_rate: u32;
-    let rms_chunk: usize;
+    // ── Dead-signal detection state ─────────────────────────────────
+    // Detect a dead/missing audio device by checking sample variance.
+    // A real microphone always produces nonzero variance (thermal and
+    // quantization noise), even in a silent room (~6e-10 measured).
+    // A dead device produces perfectly uniform samples (variance = 0):
+    // e.g. constant i16::MIN (-32768 → -1.0f32) or all zeros.
+    let mut dead_signal_frames: u32 = 0;
+    let mut no_sound_active: bool = false;
+    let mut silence_notified: bool = false;
+    const DEAD_SIGNAL_VARIANCE_CEIL: f32 = 1e-10; // ~6× below real mic noise floor
+    const DEAD_SIGNAL_TRIGGER_FRAMES: u32 = 1; // trigger immediately — variance is unambiguous
 
-    // Hold the stream so it stays alive.
-    let _stream_guard: Option<cpal::Stream>;
-
-    if cpal_ok {
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| TalkError::Audio("no default input device for overlay".into()))?;
-
-        let supported = device
-            .default_input_config()
-            .map_err(|e| TalkError::Audio(format!("overlay input config: {}", e)))?;
-
-        let channels = supported.channels() as usize;
-        sample_rate = supported.sample_rate().0;
-
-        let r = Arc::new(Mutex::new(RingBuffer::new(sample_rate as usize / 2)));
-        let ring_w = Arc::clone(&r);
-
-        let stream = device
-            .build_input_stream(
-                &cpal::StreamConfig {
-                    channels: supported.channels(),
-                    sample_rate: supported.sample_rate(),
-                    buffer_size: cpal::BufferSize::Default,
-                },
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mono: Vec<f32> = if channels == 1 {
-                        data.to_vec()
-                    } else {
-                        data.chunks_exact(channels)
-                            .map(|f| f.iter().sum::<f32>() / channels as f32)
-                            .collect()
-                    };
-                    if let Ok(mut g) = ring_w.lock() {
-                        g.push(&mono);
-                    }
-                },
-                |e| log::error!("overlay audio error: {}", e),
-                None,
-            )
-            .map_err(|e| TalkError::Audio(format!("overlay stream: {}", e)))?;
-
-        stream
-            .play()
-            .map_err(|e| TalkError::Audio(format!("overlay stream play: {}", e)))?;
-
-        rms_chunk = sample_rate as usize / FPS as usize;
-        ring = Some(r);
-        _stream_guard = Some(stream);
-    } else {
-        log::warn!("no audio device for overlay spectrogram; recording badge will be static");
-        ring = None;
-        sample_rate = 48000;
-        rms_chunk = 0;
-        _stream_guard = None;
-    }
+    // Diagnostic logging counter (logs every ~1 second = 60 frames).
+    let mut diag_frame_counter: u32 = 0;
+    const DIAG_LOG_INTERVAL: u32 = 60;
 
     // ── State ────────────────────────────────────────────────────────
 
@@ -922,6 +1004,9 @@ fn overlay_thread(
                     amp_history.clear();
                     amp_history.resize(amp_max_frames, 0.0);
                     effective_freq_max = FREQ_INITIAL_MAX;
+                    dead_signal_frames = 0;
+                    no_sound_active = false;
+                    silence_notified = false;
                 }
 
                 Command::Show(IndicatorKind::Transcribing) => {
@@ -968,6 +1053,9 @@ fn overlay_thread(
                     amp_history.clear();
                     amp_history.resize(amp_max_frames, 0.0);
                     effective_freq_max = FREQ_INITIAL_MAX;
+                    dead_signal_frames = 0;
+                    no_sound_active = false;
+                    silence_notified = false;
                 }
                 Ok(Command::Show(IndicatorKind::Transcribing)) => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
@@ -1008,16 +1096,21 @@ fn overlay_thread(
 
         // ── Read audio and compute visualization frame ──────
 
-        let (frame_rms, magnitudes) = if let Some(ref r) = ring {
-            let samples = r
+        let (frame_rms, magnitudes, frame_variance) = {
+            let samples = ring
                 .lock()
                 .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
                 .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)]);
-            let fr = rms(&samples[samples.len().saturating_sub(rms_chunk.max(1))..]);
+            let rms_slice = &samples[samples.len().saturating_sub(rms_chunk.max(1))..];
+            let fr = rms(rms_slice);
+            // Compute sample variance to distinguish a dead device
+            // (constant signal, variance ≈ 0) from a real microphone
+            // (random noise, variance > 0 even when quiet).
+            let n = rms_slice.len().max(1) as f32;
+            let mean = rms_slice.iter().sum::<f32>() / n;
+            let var = rms_slice.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / n;
             let mags = compute_spectrum(&samples);
-            (fr, mags)
-        } else {
-            (0.0, Vec::new())
+            (fr, mags, var)
         };
 
         // Update RMS peak (fast attack, slow decay).
@@ -1026,6 +1119,43 @@ fn overlay_thread(
             rms_peak = frame_rms;
         }
         rms_peak = rms_peak.max(PEAK_FLOOR);
+
+        // ── Diagnostic logging (once per second) ─────────────
+        diag_frame_counter += 1;
+        if diag_frame_counter >= DIAG_LOG_INTERVAL {
+            diag_frame_counter = 0;
+            log::debug!(
+                "[audio-diag] rms={:.6} variance={:.10}",
+                frame_rms,
+                frame_variance,
+            );
+        }
+
+        // ── Dead-signal detection ────────────────────────────
+        // A dead or missing audio device produces perfectly uniform
+        // samples (e.g. constant -1.0 or all zeros) with variance ≈ 0.
+        // A real microphone always has random noise (variance > 1e-10).
+        if frame_variance < DEAD_SIGNAL_VARIANCE_CEIL {
+            dead_signal_frames = dead_signal_frames.saturating_add(1);
+        } else {
+            if no_sound_active {
+                if let Some(ref tx) = silence_tx {
+                    let _ = tx.send(false);
+                }
+            }
+            dead_signal_frames = 0;
+            no_sound_active = false;
+            silence_notified = false;
+        }
+        if dead_signal_frames >= DEAD_SIGNAL_TRIGGER_FRAMES {
+            no_sound_active = true;
+            if !silence_notified {
+                if let Some(ref tx) = silence_tx {
+                    let _ = tx.send(true);
+                }
+                silence_notified = true;
+            }
+        }
 
         // Per-viz-mode data updates.
         if let Some(mode) = viz {
@@ -1085,58 +1215,68 @@ fn overlay_thread(
         pb.clear(BG_COLOR);
         draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
 
-        // Render visualization inside the badge area.
-        if let Some(mode) = viz {
-            use crate::config::VizMode;
-            match mode {
-                VizMode::Waterfall => {
-                    render_spectrogram(
-                        &mut pb,
-                        &spectrogram_history,
-                        SPEC_LEFT,
-                        SPEC_TOP,
-                        SPEC_W,
-                        SPEC_H,
-                        spec_peak,
-                        mono_palette,
-                    );
-                }
-                VizMode::Amplitude => {
-                    render_amplitude_badge(
-                        &mut pb,
-                        &amp_history,
-                        amp_peak,
-                        SPEC_LEFT,
-                        SPEC_TOP,
-                        SPEC_W,
-                        SPEC_H,
-                        mono_palette,
-                    );
-                }
-                VizMode::Spectrum => {
-                    render_spectrum_badge(
-                        &mut pb,
-                        &magnitudes,
-                        spectrum_peak,
-                        SPEC_LEFT,
-                        SPEC_TOP,
-                        SPEC_W,
-                        SPEC_H,
-                        mono_palette,
-                    );
+        if no_sound_active {
+            // ── NO SOUND mode: prohibit icon + text ──────────
+            if let Some(ref f) = badge_font {
+                render_no_sound_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+            }
+            clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
+            draw_prohibit_icon(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX);
+        } else {
+            // ── Normal mode: visualization + pulsing dot ─────
+            // Render visualization inside the badge area.
+            if let Some(mode) = viz {
+                use crate::config::VizMode;
+                match mode {
+                    VizMode::Waterfall => {
+                        render_spectrogram(
+                            &mut pb,
+                            &spectrogram_history,
+                            SPEC_LEFT,
+                            SPEC_TOP,
+                            SPEC_W,
+                            SPEC_H,
+                            spec_peak,
+                            mono_palette,
+                        );
+                    }
+                    VizMode::Amplitude => {
+                        render_amplitude_badge(
+                            &mut pb,
+                            &amp_history,
+                            amp_peak,
+                            SPEC_LEFT,
+                            SPEC_TOP,
+                            SPEC_W,
+                            SPEC_H,
+                            mono_palette,
+                        );
+                    }
+                    VizMode::Spectrum => {
+                        render_spectrum_badge(
+                            &mut pb,
+                            &magnitudes,
+                            spectrum_peak,
+                            SPEC_LEFT,
+                            SPEC_TOP,
+                            SPEC_W,
+                            SPEC_H,
+                            mono_palette,
+                        );
+                    }
                 }
             }
-        }
 
-        let vol_norm = if rms_peak > PEAK_FLOOR {
-            (frame_rms / rms_peak).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let dot_radius = DOT_RADIUS_MIN + (DOT_RADIUS_MAX - DOT_RADIUS_MIN) * vol_norm;
-        let dot_brightness = DOT_MIN_BRIGHTNESS + (1.0 - DOT_MIN_BRIGHTNESS) * vol_norm;
-        clear_dot_gap(&mut pb, DOT_CX, DOT_CY, dot_radius + DOT_GAP);
-        draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, dot_radius, dot_brightness);
+            let vol_norm = if rms_peak > PEAK_FLOOR {
+                (frame_rms / rms_peak).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let dot_radius = DOT_RADIUS_MIN + (DOT_RADIUS_MAX - DOT_RADIUS_MIN) * vol_norm;
+            let dot_brightness = DOT_MIN_BRIGHTNESS + (1.0 - DOT_MIN_BRIGHTNESS) * vol_norm;
+            clear_dot_gap(&mut pb, DOT_CX, DOT_CY, dot_radius + DOT_GAP);
+            draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, dot_radius, dot_brightness);
+        }
 
         // ── Blit to X11 window ───────────────────────────────
 

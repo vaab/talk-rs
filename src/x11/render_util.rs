@@ -509,6 +509,128 @@ pub fn apply_rounded_shape(
     Ok(())
 }
 
+// ── Font / glyph utilities ───────────────────────────────────────────
+
+/// Well-known system font paths, tried in order.  CJK-capable fonts
+/// come first so Chinese / Japanese / Korean text renders correctly.
+pub const FONT_SEARCH_PATHS: &[&str] = &[
+    // CJK-capable (Noto Sans CJK covers Latin + CJK + most scripts)
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+    // Droid fallback (broad Unicode coverage including CJK)
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    // Latin-only fallbacks
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+];
+
+/// Load a system TrueType font for text rendering.
+///
+/// Searches well-known paths; returns `None` if no font is found.
+/// `scale` sets the default rasterisation size (e.g. 30.0 for the
+/// text panel, 24.0 for the badge).
+pub fn load_system_font(scale: f32) -> Option<fontdue::Font> {
+    for path in FONT_SEARCH_PATHS {
+        if let Ok(data) = std::fs::read(path) {
+            let settings = fontdue::FontSettings {
+                collection_index: 0,
+                scale,
+                load_substitutions: true,
+            };
+            match fontdue::Font::from_bytes(data, settings) {
+                Ok(font) => {
+                    log::debug!("loaded font from {}", path);
+                    return Some(font);
+                }
+                Err(e) => {
+                    log::warn!("failed to parse font {}: {}", path, e);
+                }
+            }
+        }
+    }
+    log::warn!("no system font found");
+    None
+}
+
+/// Rasterise glyphs and return `(glyph_data, total_advance_width)`.
+pub fn rasterise_glyphs(
+    text: &str,
+    font: &fontdue::Font,
+    font_size: f32,
+) -> (Vec<(fontdue::Metrics, Vec<u8>)>, usize) {
+    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::new();
+    let mut total_w: usize = 0;
+    for ch in text.chars() {
+        let (metrics, bitmap) = font.rasterize(ch, font_size);
+        total_w += metrics.advance_width as usize;
+        glyphs.push((metrics, bitmap));
+    }
+    (glyphs, total_w)
+}
+
+/// Blit pre-rasterised glyphs into the pixel buffer at `start_x`,
+/// vertically centred, clipped to buffer bounds.  `opacity` (0.0–1.0)
+/// scales the per-glyph coverage alpha for smooth fade-out.
+pub fn blit_glyphs(
+    pb: &mut PixelBuffer,
+    glyphs: &[(fontdue::Metrics, Vec<u8>)],
+    start_x: i32,
+    color: [u8; 4],
+    opacity: f32,
+) {
+    let h = pb.height;
+    let w = pb.width;
+    let baseline = (h as i32 * 3) / 4;
+    let mut cursor_x = start_x;
+
+    for (metrics, bitmap) in glyphs {
+        blit_glyph_at(
+            pb, metrics, bitmap, cursor_x, baseline, w, h, color, opacity,
+        );
+        cursor_x += metrics.advance_width as i32;
+    }
+}
+
+/// Blit a single rasterised glyph at `cursor_x` with the given colour.
+/// `opacity` (0.0–1.0) is multiplied into the glyph coverage alpha.
+#[allow(clippy::too_many_arguments)]
+pub fn blit_glyph_at(
+    pb: &mut PixelBuffer,
+    metrics: &fontdue::Metrics,
+    bitmap: &[u8],
+    cursor_x: i32,
+    baseline: i32,
+    buf_w: usize,
+    buf_h: usize,
+    color: [u8; 4],
+    opacity: f32,
+) {
+    let gx = cursor_x + metrics.xmin;
+    let gy = baseline - metrics.height as i32 - metrics.ymin;
+
+    for row in 0..metrics.height {
+        for col in 0..metrics.width {
+            let alpha = bitmap[row * metrics.width + col];
+            if alpha == 0 {
+                continue;
+            }
+            let px = gx + col as i32;
+            let py = gy + row as i32;
+            if px >= 0 && (px as usize) < buf_w && py >= 0 && (py as usize) < buf_h {
+                let off = (py as usize * buf_w + px as usize) * 4;
+                let a = alpha as f32 / 255.0 * opacity;
+                for (c, &fg_val) in color.iter().enumerate().take(3) {
+                    let bg_val = pb.data[off + c] as f32;
+                    pb.data[off + c] = (bg_val + (fg_val as f32 - bg_val) * a) as u8;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,6 +26,7 @@ use crate::paste::{
 use crate::recording_cache;
 use crate::transcription;
 use crate::x11::overlay::{IndicatorKind, OverlayHandle};
+use crate::x11::render_util::RingBuffer;
 use crate::x11::visualizer::VisualizerHandle;
 use models::{resolve_model, resolve_provider};
 use picker::{run_pick, PickParams};
@@ -184,26 +185,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         log::info!("visualizer mode: {}", mode);
     }
 
-    // Initialize overlay (visual indicator on X11)
-    let overlay = if opts.no_overlay {
-        log::debug!("visual overlay disabled");
-        None
-    } else {
-        match OverlayHandle::new(viz_mode, opts.mono) {
-            Ok(h) => {
-                log::debug!(
-                    "overlay initialized (viz={:?}, mono={})",
-                    viz_mode,
-                    opts.mono
-                );
-                Some(h)
-            }
-            Err(e) => {
-                log::warn!("visual overlay unavailable: {}", e);
-                None
-            }
-        }
-    };
+    // Overlay is created AFTER capture_rate is determined (see below),
+    // because it needs the sample rate and a shared ring buffer.
 
     // Initialize visualizer (text panel for status messages / live
     // transcription text).  Audio visualization has moved into the
@@ -311,6 +294,44 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Start capture AFTER the start sound so the tone is not recorded.
     let raw_audio_rx = capture.start()?;
 
+    // Create shared ring buffer for overlay visualization (reads from
+    // the same PipeWire stream as the recording pipeline).
+    let ring = std::sync::Arc::new(std::sync::Mutex::new(RingBuffer::new(
+        capture_rate as usize / 2,
+    )));
+
+    // Silence notification channel (overlay → text panel).
+    let (silence_tx, silence_rx) = std::sync::mpsc::channel::<bool>();
+
+    // Initialize overlay (visual indicator on X11).
+    // Created here (after capture_rate is known) so we can pass
+    // the shared ring buffer and sample rate.
+    let overlay = if opts.no_overlay {
+        log::debug!("visual overlay disabled");
+        None
+    } else {
+        match OverlayHandle::new(
+            viz_mode,
+            opts.mono,
+            ring.clone(),
+            capture_rate,
+            Some(silence_tx),
+        ) {
+            Ok(h) => {
+                log::debug!(
+                    "overlay initialized (viz={:?}, mono={})",
+                    viz_mode,
+                    opts.mono
+                );
+                Some(h)
+            }
+            Err(e) => {
+                log::warn!("visual overlay unavailable: {}", e);
+                None
+            }
+        }
+    };
+
     // Show recording indicator
     if let Some(ref o) = overlay {
         log::debug!("showing recording overlay");
@@ -338,13 +359,37 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             .map(|p| p.start_boop_loop(std::time::Duration::from_millis(boop_interval_ms)))
     };
 
+    // Tee audio: split the raw capture stream so the overlay
+    // visualizer reads the same PipeWire data as the recording
+    // pipeline.  When the overlay is disabled, pass through directly.
+    let raw_for_resample = if overlay.is_some() {
+        let teed = crate::audio::tee::spawn_audio_tee(raw_audio_rx, ring.clone());
+        // Spawn silence notification thread: forwards silence events
+        // from the overlay to the visualizer text panel.
+        if let Some(ref viz) = visualizer {
+            let push = viz.message_pusher();
+            let _ = std::thread::Builder::new()
+                .name("silence-notifier".into())
+                .spawn(move || {
+                    while let Ok(is_silent) = silence_rx.recv() {
+                        if is_silent {
+                            push("No audio detected \u{2014} check your microphone".to_string());
+                        }
+                    }
+                });
+        }
+        teed
+    } else {
+        raw_audio_rx
+    };
+
     // Set up the resample pipeline (common to both modes).  Audio has
     // been buffering in the capture channel since capture.start() above.
     let capture_chunk = (capture_rate as usize * CHUNK_DURATION_MS as usize) / 1000;
     let audio_rx = resample::spawn_resample_task(
         capture_rate,
         encode_config.sample_rate,
-        raw_audio_rx,
+        raw_for_resample,
         capture_chunk,
     )?;
 
