@@ -94,6 +94,9 @@ pub enum Commands {
         /// Disable visual overlay indicator
         #[arg(long)]
         no_overlay: bool,
+        /// Disable auto-pause during silence (forward all audio to transcription)
+        #[arg(long)]
+        no_auto_pause: bool,
         /// Visualizer inside the recording badge (waterfall, amplitude, spectrum)
         #[arg(long, value_parser = clap::value_parser!(crate::config::VizMode))]
         viz: Option<crate::config::VizMode>,

@@ -21,6 +21,7 @@ pub async fn toggle_dispatch(
     no_chunk_paste: bool,
     monitor: bool,
     no_overlay: bool,
+    no_auto_pause: bool,
     viz: Option<VizMode>,
     mono: bool,
     save: Option<&std::path::Path>,
@@ -47,6 +48,7 @@ pub async fn toggle_dispatch(
                 no_chunk_paste,
                 monitor,
                 no_overlay,
+                no_auto_pause,
                 viz,
                 mono,
                 save,
@@ -75,6 +77,7 @@ async fn toggle_spawn(
     no_chunk_paste: bool,
     monitor: bool,
     no_overlay: bool,
+    no_auto_pause: bool,
     viz: Option<VizMode>,
     mono: bool,
     save: Option<&std::path::Path>,
@@ -131,6 +134,10 @@ async fn toggle_spawn(
 
     if no_overlay {
         cmd.arg("--no-overlay");
+    }
+
+    if no_auto_pause {
+        cmd.arg("--no-auto-pause");
     }
 
     if let Some(mode) = viz {

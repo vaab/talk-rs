@@ -127,6 +127,9 @@ impl OverlayHandle {
     /// * `sample_rate` — capture sample rate (for FFT/RMS sizing).
     /// * `silence_tx` — optional channel to notify when silence is
     ///   detected (`true`) or audio returns (`false`).
+    /// * `pause_flag` — shared atomic flag; the overlay sets it to
+    ///   `true` when auto-pause triggers (silence during recording)
+    ///   and clears it when speech resumes.
     ///
     /// Monitor geometry is queried via GDK4 **before** spawning the
     /// thread (GDK must be called from the main thread) and passed in.
@@ -138,6 +141,8 @@ impl OverlayHandle {
         audio_ring: Arc<Mutex<RingBuffer>>,
         sample_rate: u32,
         silence_tx: Option<std::sync::mpsc::Sender<bool>>,
+        pause_flag: Arc<std::sync::atomic::AtomicBool>,
+        auto_pause: bool,
     ) -> Result<Self, TalkError> {
         let geom = super::monitor::primary_monitor_geometry()?;
 
@@ -163,6 +168,8 @@ impl OverlayHandle {
                     audio_ring,
                     sample_rate,
                     silence_tx,
+                    pause_flag,
+                    auto_pause,
                 ) {
                     log::error!("overlay thread error: {}", e);
                 }
@@ -688,22 +695,57 @@ fn draw_prohibit_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32) {
     }
 }
 
-/// Render "NO SOUND" text in bright red, centred in the SPEC area.
-fn render_no_sound_text(
+/// Draw a pause icon (two vertical bars ⏸) in yellow.
+///
+/// Replaces the pulsing red dot when auto-pause is active.
+fn draw_pause_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32) {
+    // Warm yellow, BGRA
+    let color: [u8; 4] = [0x00, 0xC0, 0xFF, 0xFF];
+    let bar_h = (radius * 1.4) as i32;
+    let bar_w = (radius * 0.35).max(2.0) as i32;
+    let gap = (radius * 0.35).max(2.0) as i32;
+
+    let cx = cx as i32;
+    let cy = cy as i32;
+
+    // Left bar
+    let lx = cx - gap / 2 - bar_w;
+    let ly = cy - bar_h / 2;
+    // Right bar
+    let rx = cx + gap / 2;
+
+    for bar_x in [lx, rx] {
+        for dy in 0..bar_h {
+            for dx in 0..bar_w {
+                let px = bar_x + dx;
+                let py = ly + dy;
+                if px >= 0 && (px as usize) < pb.width && py >= 0 && (py as usize) < pb.height {
+                    let off = (py as usize * pb.width + px as usize) * 4;
+                    for (c, &val) in color.iter().enumerate().take(4) {
+                        pb.data[off + c] = val;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render centred text in the SPEC area with the given colour.
+#[allow(clippy::too_many_arguments)]
+fn render_badge_text(
     pb: &mut PixelBuffer,
     font: &fontdue::Font,
+    text: &str,
+    color: [u8; 4],
     x0: usize,
     y0: usize,
     w: usize,
     h: usize,
 ) {
     let font_size = 24.0f32;
-    let color: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF]; // bright red BGRA
-    let (glyphs, text_w) = rasterise_glyphs("NO SOUND", font, font_size);
+    let (glyphs, text_w) = rasterise_glyphs(text, font, font_size);
 
-    // Centre horizontally in the spec area
     let start_x = x0 as i32 + (w as i32 - text_w as i32) / 2;
-    // Centre vertically in the spec area
     let baseline = y0 as i32 + (h as i32 * 3) / 4;
 
     let buf_w = pb.width;
@@ -715,6 +757,32 @@ fn render_no_sound_text(
         );
         cursor_x += metrics.advance_width as i32;
     }
+}
+
+/// Render "NO SOUND" text in bright red, centred in the SPEC area.
+fn render_no_sound_text(
+    pb: &mut PixelBuffer,
+    font: &fontdue::Font,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) {
+    let color: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF]; // bright red BGRA
+    render_badge_text(pb, font, "NO SOUND", color, x0, y0, w, h);
+}
+
+/// Render "LISTENING" text in yellow, centred in the SPEC area.
+fn render_listening_text(
+    pb: &mut PixelBuffer,
+    font: &fontdue::Font,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) {
+    let color: [u8; 4] = [0x00, 0xC0, 0xFF, 0xFF]; // warm yellow BGRA
+    render_badge_text(pb, font, "LISTENING", color, x0, y0, w, h);
 }
 
 // ── Static PNG window (transcribing) ─────────────────────────────────
@@ -860,7 +928,7 @@ fn draw_image(
 /// * **Recording** — dynamic spectrogram badge at 60 fps reading from
 ///   the shared `audio_ring` buffer (fed by the audio tee); drains
 ///   commands non-blocking each frame.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn overlay_thread(
     rx: mpsc::Receiver<Command>,
     geom: super::monitor::MonitorGeometry,
@@ -869,6 +937,8 @@ fn overlay_thread(
     ring: Arc<Mutex<RingBuffer>>,
     sample_rate: u32,
     silence_tx: Option<std::sync::mpsc::Sender<bool>>,
+    pause_flag: Arc<std::sync::atomic::AtomicBool>,
+    auto_pause: bool,
 ) -> Result<(), TalkError> {
     let (conn, screen_num) = x11rb::connect(None)
         .map_err(|e| TalkError::Config(format!("failed to connect to X11: {}", e)))?;
@@ -919,7 +989,16 @@ fn overlay_thread(
     let mut no_sound_active: bool = false;
     let mut silence_notified: bool = false;
     const DEAD_SIGNAL_VARIANCE_CEIL: f32 = 1e-10; // ~6× below real mic noise floor
-    const DEAD_SIGNAL_TRIGGER_FRAMES: u32 = 1; // trigger immediately — variance is unambiguous
+    const DEAD_SIGNAL_TRIGGER_FRAMES: u32 = 30; // 0.5s grace for PipeWire to fill the ring buffer
+
+    // ── Auto-pause state ─────────────────────────────────────────────
+    // Pause the recording pipeline when the user stops speaking.
+    // Uses RMS threshold (not variance) because this distinguishes
+    // "quiet room with working mic" from "speech".
+    let mut quiet_frames: u32 = 0;
+    let mut auto_paused: bool = false;
+    const AUTOPAUSE_RMS_THRESHOLD: f32 = 0.003; // well above mic noise (~0.00004)
+    const AUTOPAUSE_TRIGGER_FRAMES: u32 = 15; // 0.3 seconds at 60fps
 
     // Diagnostic logging counter (logs every ~1 second = 60 frames).
     let mut diag_frame_counter: u32 = 0;
@@ -1007,6 +1086,9 @@ fn overlay_thread(
                     dead_signal_frames = 0;
                     no_sound_active = false;
                     silence_notified = false;
+                    quiet_frames = 0;
+                    auto_paused = false;
+                    pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 Command::Show(IndicatorKind::Transcribing) => {
@@ -1056,6 +1138,9 @@ fn overlay_thread(
                     dead_signal_frames = 0;
                     no_sound_active = false;
                     silence_notified = false;
+                    quiet_frames = 0;
+                    auto_paused = false;
+                    pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(Command::Show(IndicatorKind::Transcribing)) => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
@@ -1157,6 +1242,36 @@ fn overlay_thread(
             }
         }
 
+        // ── Auto-pause detection ─────────────────────────────
+        // Only active when enabled and we have a working device (not dead signal).
+        if auto_pause && !no_sound_active {
+            if frame_rms < AUTOPAUSE_RMS_THRESHOLD {
+                quiet_frames = quiet_frames.saturating_add(1);
+            } else {
+                quiet_frames = 0;
+                if auto_paused {
+                    auto_paused = false;
+                    pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    log::debug!("auto-pause: resumed (speech detected)");
+                }
+            }
+            if quiet_frames >= AUTOPAUSE_TRIGGER_FRAMES && !auto_paused {
+                auto_paused = true;
+                pause_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                log::debug!("auto-pause: paused (silence detected)");
+            }
+        } else if !auto_pause {
+            // Auto-pause disabled — ensure flag stays cleared.
+            quiet_frames = 0;
+        } else {
+            // Dead signal takes priority — reset auto-pause state.
+            quiet_frames = 0;
+            if auto_paused {
+                auto_paused = false;
+                pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         // Per-viz-mode data updates.
         if let Some(mode) = viz {
             use crate::config::VizMode;
@@ -1216,15 +1331,21 @@ fn overlay_thread(
         draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
 
         if no_sound_active {
-            // ── NO SOUND mode: prohibit icon + text ──────────
+            // ── NO SOUND mode: prohibit icon + red text ──────
             if let Some(ref f) = badge_font {
                 render_no_sound_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
             }
             clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
             draw_prohibit_icon(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX);
+        } else if auto_paused {
+            // ── AUTO-PAUSE mode: pause bars + yellow text ────
+            if let Some(ref f) = badge_font {
+                render_listening_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+            }
+            clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
+            draw_pause_icon(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX);
         } else {
             // ── Normal mode: visualization + pulsing dot ─────
-            // Render visualization inside the badge area.
             if let Some(mode) = viz {
                 use crate::config::VizMode;
                 match mode {

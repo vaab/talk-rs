@@ -54,6 +54,7 @@ pub struct DictateOpts {
     pub no_chunk_paste: bool,
     pub monitor: bool,
     pub no_overlay: bool,
+    pub no_auto_pause: bool,
     pub viz: Option<crate::config::VizMode>,
     pub mono: bool,
     pub daemon: bool,
@@ -75,6 +76,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.no_chunk_paste,
             opts.monitor,
             opts.no_overlay,
+            opts.no_auto_pause,
             opts.viz,
             opts.mono,
             opts.save.as_deref(),
@@ -303,6 +305,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Silence notification channel (overlay → text panel).
     let (silence_tx, silence_rx) = std::sync::mpsc::channel::<bool>();
 
+    // Auto-pause flag: overlay sets this when it detects silence during
+    // recording; the audio tee stops forwarding samples downstream.
+    let pause_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Initialize overlay (visual indicator on X11).
     // Created here (after capture_rate is known) so we can pass
     // the shared ring buffer and sample rate.
@@ -316,6 +322,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             ring.clone(),
             capture_rate,
             Some(silence_tx),
+            pause_flag.clone(),
+            !opts.no_auto_pause,
         ) {
             Ok(h) => {
                 log::debug!(
@@ -363,7 +371,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // visualizer reads the same PipeWire data as the recording
     // pipeline.  When the overlay is disabled, pass through directly.
     let raw_for_resample = if overlay.is_some() {
-        let teed = crate::audio::tee::spawn_audio_tee(raw_audio_rx, ring.clone());
+        let teed =
+            crate::audio::tee::spawn_audio_tee(raw_audio_rx, ring.clone(), pause_flag.clone());
         // Spawn silence notification thread: forwards silence events
         // from the overlay to the visualizer text panel.
         if let Some(ref viz) = visualizer {

@@ -23,6 +23,14 @@ happening.
   parallel and choose the best transcription from a GTK picker window.
 - *Visual overlay* -- non-intrusive X11 badge at the top of the screen
   (works without a compositor).
+- *Dead audio detection* -- overlay badge shows a red prohibit icon
+  and "NO SOUND" warning when no real microphone is detected (e.g.
+  headset unplugged); a notification also appears on the text panel.
+- *Auto-pause* -- automatically pauses audio forwarding during
+  silence, trimming dead air from transcription input.  Resumes
+  instantly with a 300 ms lookback buffer to preserve speech onset.
+  The badge shows yellow pause bars and "LISTENING" during pauses.
+  Disable with ~--no-auto-pause~.
 - *Audio visualizers* -- optional in-badge visualization during
   recording (~--viz waterfall~, ~--viz amplitude~, ~--viz spectrum~);
   monochrome mode with ~--mono~.
@@ -188,6 +196,7 @@ Options:
 | ~--no-boop~                 | Disable periodic boop sounds (keep start/stop)  |
 | ~--no-chunk-paste~          | Paste all text in one shot (disable chunking)    |
 | ~--no-overlay~              | Disable visual overlay                          |
+| ~--no-auto-pause~           | Disable auto-pause during silence (forward all audio) |
 | ~--viz <MODE>~              | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ |
 | ~--mono~                    | Monochrome visualizer (theme-aware)             |
 
