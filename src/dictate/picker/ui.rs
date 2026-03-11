@@ -91,6 +91,59 @@ pub(super) struct PickerSelection {
     pub(super) streaming: bool,
 }
 
+/// Escape text for use in Pango markup.
+fn escape_pango(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Build Pango markup showing an inline character-level diff.
+///
+/// Compares `reference` (text-area content) against `candidate`
+/// (AI transcription).
+/// - `Equal` chunks → plain escaped text
+/// - `Delete` chunks (in reference, not in candidate) → red background + strikethrough
+/// - `Insert` chunks (in candidate, not in reference) → green background
+///
+/// Text colour is left unchanged; only the background highlights the diff.
+///
+/// When `reference` is empty the candidate text is returned escaped
+/// but unstyled.
+fn diff_markup(reference: &str, candidate: &str, del_color: &str, ins_color: &str) -> String {
+    if reference.is_empty() || candidate.is_empty() {
+        return escape_pango(candidate);
+    }
+    let chunks = dissimilar::diff(reference, candidate);
+    let mut markup = String::new();
+    for chunk in &chunks {
+        match chunk {
+            dissimilar::Chunk::Equal(text) => {
+                markup.push_str(&escape_pango(text));
+            }
+            dissimilar::Chunk::Delete(text) => {
+                markup.push_str(&format!(
+                    "<span strikethrough=\"true\" background=\"{}\" bgalpha=\"50%\">",
+                    del_color
+                ));
+                markup.push_str(&escape_pango(text));
+                markup.push_str("</span>");
+            }
+            dissimilar::Chunk::Insert(text) => {
+                markup.push_str(&format!(
+                    "<span background=\"{}\" bgalpha=\"50%\">",
+                    ins_color
+                ));
+                markup.push_str(&escape_pango(text));
+                markup.push_str("</span>");
+            }
+        }
+    }
+    markup
+}
+
 /// Show a GTK4 picker window that appears immediately with a spinner,
 /// then progressively fills with transcription candidates as parallel
 /// API calls complete.
@@ -202,7 +255,10 @@ pub(super) async fn pick_with_streaming_gtk(
              .error {{ font-style: italic; color: alpha({err}, 0.8); }} \
              .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }} \
              .play-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
-             .waterfall {{ background-color: black; border-radius: 0.25em; }}",
+             .waterfall {{ background-color: black; border-radius: 0.25em; }} \
+             .copy-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
+             .editor-view {{ font-family: monospace; }} \
+             textview.editor-view text {{ background-color: transparent; }}",
             err = error_hex,
         )));
 
@@ -589,6 +645,35 @@ pub(super) async fn pick_with_streaming_gtk(
 
         root.append(&play_bar);
 
+        // ── Editable text area + copy button ─────────────────────
+        let editor_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        editor_bar.set_margin_start(4);
+        editor_bar.set_margin_end(4);
+        editor_bar.set_margin_bottom(4);
+
+        let text_buffer = gtk4::TextBuffer::new(None::<&gtk4::TextTagTable>);
+        let text_view = gtk4::TextView::with_buffer(&text_buffer);
+        text_view.set_editable(true);
+        text_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        text_view.add_css_class("editor-view");
+        text_view.add_css_class("transcript");
+
+        let editor_scroll = gtk4::ScrolledWindow::builder()
+            .hexpand(true)
+            .max_content_height(80)
+            .propagate_natural_height(true)
+            .build();
+        editor_scroll.set_child(Some(&text_view));
+        editor_bar.append(&editor_scroll);
+
+        let copy_btn = gtk4::Button::with_label("\u{2398}");
+        copy_btn.set_tooltip_text(Some("Copy to clipboard"));
+        copy_btn.add_css_class("copy-btn");
+        copy_btn.set_valign(gtk4::Align::Start);
+        editor_bar.append(&copy_btn);
+
+        root.append(&editor_bar);
+
         let scrolled = gtk4::ScrolledWindow::builder()
             .vexpand(true)
             .hexpand(true)
@@ -612,6 +697,14 @@ pub(super) async fn pick_with_streaming_gtk(
         let local_candidates: Rc<RefCell<CandidateList>> = Rc::new(RefCell::new(Vec::new()));
         // Transcript cells — used to swap spinner → label when results arrive.
         let transcript_cells: Rc<RefCell<Vec<gtk4::Box>>> = Rc::new(RefCell::new(Vec::new()));
+        // Raw candidate texts (unmodified) for diff computation.
+        let raw_texts: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        // Transcript labels for live diff updates (None for error/spinner rows).
+        let transcript_labels: Rc<RefCell<Vec<Option<gtk4::Label>>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        // Diff colours: deletion (red) from theme, insertion green (Tango palette).
+        let del_color = error_hex.clone();
+        let ins_color = String::from("#4e9a06");
 
         // Helper: build a row skeleton with provider + streaming + model labels.
         // Returns (hbox, transcript_cell) — caller fills the cell
@@ -688,7 +781,8 @@ pub(super) async fn pick_with_streaming_gtk(
         for (i, (provider, model, text, is_primary, streaming)) in cached_entries.iter().enumerate()
         {
             let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, *streaming);
-            cell.append(&make_transcript_label(text));
+            let label = make_transcript_label(text);
+            cell.append(&label);
 
             let row = gtk4::ListBoxRow::new();
             row.set_child(Some(&hbox));
@@ -709,6 +803,8 @@ pub(super) async fn pick_with_streaming_gtk(
                 *streaming,
             ));
             transcript_cells.borrow_mut().push(cell);
+            raw_texts.borrow_mut().push(text.clone());
+            transcript_labels.borrow_mut().push(Some(label));
         }
 
         // Pending batch entries: row with spinner in transcript cell.
@@ -731,13 +827,16 @@ pub(super) async fn pick_with_streaming_gtk(
                 false,
             ));
             transcript_cells.borrow_mut().push(cell);
+            raw_texts.borrow_mut().push(String::new());
+            transcript_labels.borrow_mut().push(None);
         }
 
         // Pending realtime entries: row with empty transcript label
         // (text fills incrementally, no spinner).
         for (provider, model) in &realtime_pending_info {
             let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, true);
-            cell.append(&make_transcript_label(""));
+            let label = make_transcript_label("");
+            cell.append(&label);
 
             let row = gtk4::ListBoxRow::new();
             row.set_child(Some(&hbox));
@@ -752,6 +851,8 @@ pub(super) async fn pick_with_streaming_gtk(
                 true,
             ));
             transcript_cells.borrow_mut().push(cell);
+            raw_texts.borrow_mut().push(String::new());
+            transcript_labels.borrow_mut().push(Some(label));
         }
 
         // Select first row when there are no cached entries.
@@ -761,12 +862,83 @@ pub(super) async fn pick_with_streaming_gtk(
             }
         }
 
+        // ── Row selection → populate text area ──────────────────
+        {
+            let cands_sel = Rc::clone(&local_candidates);
+            let buf_sel = text_buffer.clone();
+            list.connect_row_selected(move |_, row| {
+                if let Some(row) = row {
+                    let idx = row.index() as usize;
+                    let cands = cands_sel.borrow();
+                    if let Some((_, _, text, _, is_error, _)) = cands.get(idx) {
+                        if !text.is_empty() && !*is_error {
+                            buf_sel.set_text(text);
+                        }
+                    }
+                }
+            });
+        }
+
+        // ── Live diff update on text-area edits ─────────────────
+        {
+            let raw_for_diff = Rc::clone(&raw_texts);
+            let labels_for_diff = Rc::clone(&transcript_labels);
+            let dc = del_color.clone();
+            let ic = ins_color.clone();
+            text_buffer.connect_changed(move |buf| {
+                let reference = buf
+                    .text(&buf.start_iter(), &buf.end_iter(), false)
+                    .to_string();
+                let texts = raw_for_diff.borrow();
+                let labels = labels_for_diff.borrow();
+                for (i, maybe_label) in labels.iter().enumerate() {
+                    if let Some(label) = maybe_label {
+                        if let Some(raw) = texts.get(i) {
+                            if !raw.is_empty() {
+                                let markup = diff_markup(&reference, raw, &dc, &ic);
+                                label.set_markup(&markup);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Pre-populate the text area from the already-selected row.
+        // Placed AFTER connect_changed so set_text() triggers the
+        // diff computation on all candidate labels.
+        if let Some(row) = list.selected_row() {
+            let idx = row.index() as usize;
+            let cands = local_candidates.borrow();
+            if let Some((_, _, text, _, is_error, _)) = cands.get(idx) {
+                if !text.is_empty() && !*is_error {
+                    text_buffer.set_text(text);
+                }
+            }
+        }
+
+        // ── Copy button → clipboard ─────────────────────────────
+        {
+            let buf_copy = text_buffer.clone();
+            copy_btn.connect_clicked(move |_| {
+                let text = buf_copy
+                    .text(&buf_copy.start_iter(), &buf_copy.end_iter(), false)
+                    .to_string();
+                if !text.is_empty() {
+                    if let Some(display) = gtk4::gdk::Display::default() {
+                        display.clipboard().set_text(&text);
+                    }
+                }
+            });
+        }
+
         // Enter / double-click confirms selection (only if text is loaded)
         {
             let sel = Rc::clone(&sel_sender);
             let ml = main_loop.clone();
             let cands = Rc::clone(&local_candidates);
             let win = window.clone();
+            let buf_confirm = text_buffer.clone();
             list.connect_row_activated(move |_, row| {
                 let idx = row.index() as usize;
                 let ready = cands
@@ -774,6 +946,13 @@ pub(super) async fn pick_with_streaming_gtk(
                     .get(idx)
                     .is_some_and(|(_, _, text, _, is_error, _)| !text.is_empty() && !is_error);
                 if ready {
+                    // Use edited text-area content if available.
+                    let edited = buf_confirm
+                        .text(&buf_confirm.start_iter(), &buf_confirm.end_iter(), false)
+                        .to_string();
+                    if !edited.is_empty() {
+                        cands.borrow_mut()[idx].2 = edited;
+                    }
                     win.set_visible(false);
                     if let Some(tx) = sel.borrow_mut().take() {
                         let _ = tx.send(Some(idx));
@@ -834,10 +1013,15 @@ pub(super) async fn pick_with_streaming_gtk(
             let retry_tx = retry_tx.clone();
             let cands_for_err = Rc::clone(&local_candidates);
             let cells_for_err = Rc::clone(&transcript_cells);
+            let raw_for_err = Rc::clone(&raw_texts);
+            let labels_for_err = Rc::clone(&transcript_labels);
             move |cell: &gtk4::Box, idx: usize, msg: &str| {
                 while let Some(child) = cell.first_child() {
                     cell.remove(&child);
                 }
+                // Clear diff state for this row.
+                raw_for_err.borrow_mut()[idx] = String::new();
+                labels_for_err.borrow_mut()[idx] = None;
                 let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
 
                 let err = gtk4::Label::new(Some(msg));
@@ -855,6 +1039,7 @@ pub(super) async fn pick_with_streaming_gtk(
                     let tx = retry_tx.clone();
                     let cands_ref = Rc::clone(&cands_for_err);
                     let cells_ref = Rc::clone(&cells_for_err);
+                    let labels_ref = Rc::clone(&labels_for_err);
                     retry_btn.connect_clicked(move |_| {
                         let mut cands = cands_ref.borrow_mut();
                         if let Some((provider, model, text, _, is_error, streaming)) =
@@ -873,11 +1058,14 @@ pub(super) async fn pick_with_streaming_gtk(
                                     cell.remove(&child);
                                 }
                                 if is_streaming {
-                                    cell.append(&make_transcript_label(""));
+                                    let label = make_transcript_label("");
+                                    cell.append(&label);
+                                    labels_ref.borrow_mut()[idx] = Some(label);
                                 } else {
                                     let spinner = gtk4::Spinner::new();
                                     spinner.start();
                                     cell.append(&spinner);
+                                    labels_ref.borrow_mut()[idx] = None;
                                 }
                             }
                         }
@@ -893,6 +1081,11 @@ pub(super) async fn pick_with_streaming_gtk(
             let list = list.clone();
             let cands = Rc::clone(&local_candidates);
             let cells = Rc::clone(&transcript_cells);
+            let raw_poll = Rc::clone(&raw_texts);
+            let labels_poll = Rc::clone(&transcript_labels);
+            let buf_poll = text_buffer.clone();
+            let dc_poll = del_color.clone();
+            let ic_poll = ins_color.clone();
             let make_err = make_error_cell.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
                 // Cap messages per tick so the cursor timer and other
@@ -926,7 +1119,16 @@ pub(super) async fn pick_with_streaming_gtk(
                                 } else {
                                     let mut cands = cands.borrow_mut();
                                     cands[idx].2 = c.text.clone();
-                                    cells.borrow()[idx].append(&make_transcript_label(&c.text));
+                                    raw_poll.borrow_mut()[idx] = c.text.clone();
+                                    let reference = buf_poll
+                                        .text(&buf_poll.start_iter(), &buf_poll.end_iter(), false)
+                                        .to_string();
+                                    let label = make_transcript_label("");
+                                    let markup =
+                                        diff_markup(&reference, &c.text, &dc_poll, &ic_poll);
+                                    label.set_markup(&markup);
+                                    cells.borrow()[idx].append(&label);
+                                    labels_poll.borrow_mut()[idx] = Some(label);
                                 }
                             }
                         }
@@ -944,15 +1146,24 @@ pub(super) async fn pick_with_streaming_gtk(
                                 })
                             };
                             if let Some(idx) = idx {
+                                raw_poll.borrow_mut()[idx] = accumulated_text.clone();
+                                let reference = buf_poll
+                                    .text(&buf_poll.start_iter(), &buf_poll.end_iter(), false)
+                                    .to_string();
+                                let markup =
+                                    diff_markup(&reference, &accumulated_text, &dc_poll, &ic_poll);
                                 let cells = cells.borrow();
                                 if let Some(cell) = cells.get(idx) {
                                     // Reuse existing label to avoid expensive
                                     // widget destroy+create on every streaming
-                                    // delta — just update the text in place.
+                                    // delta — just update the markup in place.
                                     let reused = cell
                                         .first_child()
                                         .and_then(|w| w.downcast::<gtk4::Label>().ok())
-                                        .map(|label| label.set_text(&accumulated_text))
+                                        .map(|label| {
+                                            label.set_markup(&markup);
+                                            labels_poll.borrow_mut()[idx] = Some(label);
+                                        })
                                         .is_some();
                                     if !reused {
                                         // First update replacing a spinner or
@@ -960,7 +1171,10 @@ pub(super) async fn pick_with_streaming_gtk(
                                         while let Some(child) = cell.first_child() {
                                             cell.remove(&child);
                                         }
-                                        cell.append(&make_transcript_label(&accumulated_text));
+                                        let label = make_transcript_label("");
+                                        label.set_markup(&markup);
+                                        cell.append(&label);
+                                        labels_poll.borrow_mut()[idx] = Some(label);
                                     }
                                 }
                                 drop(cells);
