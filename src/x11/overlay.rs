@@ -12,8 +12,8 @@
 //! During **transcribing**, the badge is a static PNG (unchanged).
 
 use super::render_util::{
-    apply_rounded_shape, blit_glyph_at, compute_spectrum, rasterise_glyphs, rms, PixelBuffer,
-    RingBuffer, PEAK_DECAY, PEAK_FLOOR,
+    apply_rounded_shape, blit_glyph_at, compute_spectrum, map_spectrum_to_column, rasterise_glyphs,
+    rms, PixelBuffer, RingBuffer, FFT_SIZE, FREQ_MAX, FREQ_NOISE_FLOOR, PEAK_DECAY, PEAK_FLOOR,
 };
 use crate::error::TalkError;
 use std::collections::HashMap;
@@ -67,17 +67,9 @@ const SPEC_H: usize = SPEC_BOTTOM - SPEC_TOP;
 
 /// Target frames per second for the recording render loop.
 const FPS: u32 = 60;
-/// Number of audio samples fed into the FFT (must be power of two).
-const FFT_SIZE: usize = 2048;
 
-/// Lowest frequency shown in the spectrogram (Hz).
-const FREQ_MIN: f32 = 80.0;
-/// Hard upper limit for dynamic frequency scaling (Hz).
-const FREQ_MAX: f32 = 8000.0;
 /// Initial effective frequency ceiling; grows as higher harmonics appear.
 const FREQ_INITIAL_MAX: f32 = 320.0;
-/// Minimum FFT magnitude to count a bin as "active" for frequency scaling.
-const FREQ_NOISE_FLOOR: f32 = 0.01;
 
 // ── Colors (BGRA for little-endian ZPixmap, depth 24/32) ────────────
 
@@ -248,77 +240,6 @@ fn decode_png(bytes: &[u8]) -> Result<RgbaImage, TalkError> {
         height: info.height,
         data,
     })
-}
-
-// ── Spectrogram helpers ──────────────────────────────────────────────
-
-/// Map FFT magnitude bins to a fixed-height spectrogram column using
-/// logarithmic frequency spacing.
-///
-/// Returns a `Vec<f32>` of length `num_rows`, where index 0 is the
-/// lowest frequency (bottom of spectrogram) and the last index is
-/// the highest (top).
-fn map_spectrum_to_column(
-    magnitudes: &[f32],
-    num_rows: usize,
-    sample_rate: u32,
-    freq_max: f32,
-) -> Vec<f32> {
-    let n_bins = magnitudes.len();
-    if n_bins == 0 || num_rows == 0 {
-        return vec![0.0; num_rows];
-    }
-
-    let nyquist = sample_rate as f32 / 2.0;
-    let f_max = freq_max.min(nyquist);
-    let log_min = FREQ_MIN.ln();
-    let log_max = f_max.ln();
-
-    // Pre-compute the fractional bin index for each row centre.
-    let bin_centers: Vec<f32> = (0..num_rows)
-        .map(|row| {
-            let t = if num_rows > 1 {
-                row as f32 / (num_rows - 1) as f32
-            } else {
-                0.5
-            };
-            let freq = (log_min + t * (log_max - log_min)).exp();
-            (freq / nyquist * n_bins as f32).clamp(0.0, (n_bins - 1) as f32)
-        })
-        .collect();
-
-    let mut column = Vec::with_capacity(num_rows);
-
-    for row in 0..num_rows {
-        // Each row covers the band from the midpoint to its previous
-        // neighbour up to the midpoint to its next neighbour.
-        let lo = if row == 0 {
-            bin_centers[0]
-        } else {
-            (bin_centers[row - 1] + bin_centers[row]) * 0.5
-        };
-        let hi = if row + 1 >= num_rows {
-            bin_centers[num_rows - 1]
-        } else {
-            (bin_centers[row] + bin_centers[row + 1]) * 0.5
-        };
-
-        let bin_start = (lo.floor() as usize).min(n_bins - 1);
-        let bin_end = ((hi.ceil() as usize) + 1).min(n_bins);
-        // Guarantee at least one bin.
-        let bin_end = bin_end.max(bin_start + 1);
-
-        // Use peak (max) within the bin range — matches how real-time
-        // spectrum analysers work and avoids visual holes between harmonics.
-        let peak_val: f32 = magnitudes[bin_start..bin_end]
-            .iter()
-            .copied()
-            .fold(0.0f32, f32::max);
-
-        column.push(peak_val);
-    }
-
-    column
 }
 
 /// Render the spectrogram waterfall into the pixel buffer.
