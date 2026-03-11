@@ -895,7 +895,10 @@ pub(super) async fn pick_with_streaming_gtk(
             let cells = Rc::clone(&transcript_cells);
             let make_err = make_error_cell.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                loop {
+                // Cap messages per tick so the cursor timer and other
+                // main-loop sources stay responsive.
+                const MAX_MSGS_PER_TICK: usize = 5;
+                for _ in 0..MAX_MSGS_PER_TICK {
                     match msg_rx.try_recv() {
                         Ok(PickerMessage::Candidate(c)) => {
                             // Find the pre-created row by
@@ -941,16 +944,26 @@ pub(super) async fn pick_with_streaming_gtk(
                                 })
                             };
                             if let Some(idx) = idx {
-                                // Replace cell content with updated text.
-                                {
-                                    let cells = cells.borrow();
-                                    if let Some(cell) = cells.get(idx) {
+                                let cells = cells.borrow();
+                                if let Some(cell) = cells.get(idx) {
+                                    // Reuse existing label to avoid expensive
+                                    // widget destroy+create on every streaming
+                                    // delta — just update the text in place.
+                                    let reused = cell
+                                        .first_child()
+                                        .and_then(|w| w.downcast::<gtk4::Label>().ok())
+                                        .map(|label| label.set_text(&accumulated_text))
+                                        .is_some();
+                                    if !reused {
+                                        // First update replacing a spinner or
+                                        // error — do the full widget swap once.
                                         while let Some(child) = cell.first_child() {
                                             cell.remove(&child);
                                         }
                                         cell.append(&make_transcript_label(&accumulated_text));
                                     }
                                 }
+                                drop(cells);
                                 cands.borrow_mut()[idx].2 = accumulated_text;
                             }
                         }
@@ -981,7 +994,7 @@ pub(super) async fn pick_with_streaming_gtk(
                             // results may still arrive.
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            return glib::ControlFlow::Continue;
+                            break;
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             // All senders dropped (including retry
@@ -990,6 +1003,7 @@ pub(super) async fn pick_with_streaming_gtk(
                         }
                     }
                 }
+                glib::ControlFlow::Continue
             });
         }
 
