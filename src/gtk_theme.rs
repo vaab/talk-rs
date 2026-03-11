@@ -97,6 +97,8 @@ impl ThemeColors {
              row:selected, row:selected:backdrop {{ background-color: {sel}; color: {fg}; }} \
              .dim {{ opacity: 0.55; }} \
              row {{ border-radius: 8px; }} \
+             .close-btn {{ min-width: 24px; min-height: 24px; padding: 0; opacity: 0.35; }} \
+             .close-btn:hover {{ opacity: 0.9; }} \
              {extra}",
             bg = self.view_bg,
             fg = self.foreground,
@@ -116,6 +118,138 @@ pub fn load_css(css_text: &str) {
             &css,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+}
+
+/// Build a minimal title bar with a right-aligned close button.
+///
+/// Returns `(title_bar_box, close_button)` so callers can connect
+/// the button's `clicked` signal to their own close logic.
+pub fn build_title_bar() -> (gtk4::Box, gtk4::Button) {
+    let title_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    title_bar.append(&spacer);
+
+    let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+    close_btn.set_tooltip_text(Some("Close"));
+    close_btn.add_css_class("close-btn");
+    title_bar.append(&close_btn);
+
+    (title_bar, close_btn)
+}
+
+/// Install edge/corner resize handles on an undecorated GTK4 window.
+///
+/// Undecorated windows lack window-manager resize grips.  This adds
+/// motion and click controllers that detect pointer proximity to the
+/// window border and initiate a GDK resize drag.
+pub fn install_edge_resize(window: &gtk4::Window) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Pixel threshold from window border to trigger resize.
+    const EDGE_THRESHOLD: f64 = 6.0;
+
+    let active_edge: Rc<RefCell<Option<gtk4::gdk::SurfaceEdge>>> = Rc::new(RefCell::new(None));
+
+    // Motion controller: detect edge and update cursor.
+    {
+        let edge_ref = Rc::clone(&active_edge);
+        let motion = gtk4::EventControllerMotion::new();
+        let win_for_motion = window.clone();
+        motion.connect_motion(move |_ctrl, x, y| {
+            let w = win_for_motion.width() as f64;
+            let h = win_for_motion.height() as f64;
+            let top = y < EDGE_THRESHOLD;
+            let bottom = y > h - EDGE_THRESHOLD;
+            let left = x < EDGE_THRESHOLD;
+            let right = x > w - EDGE_THRESHOLD;
+
+            let edge = if top && left {
+                Some(gtk4::gdk::SurfaceEdge::NorthWest)
+            } else if top && right {
+                Some(gtk4::gdk::SurfaceEdge::NorthEast)
+            } else if bottom && left {
+                Some(gtk4::gdk::SurfaceEdge::SouthWest)
+            } else if bottom && right {
+                Some(gtk4::gdk::SurfaceEdge::SouthEast)
+            } else if top {
+                Some(gtk4::gdk::SurfaceEdge::North)
+            } else if bottom {
+                Some(gtk4::gdk::SurfaceEdge::South)
+            } else if left {
+                Some(gtk4::gdk::SurfaceEdge::West)
+            } else if right {
+                Some(gtk4::gdk::SurfaceEdge::East)
+            } else {
+                None
+            };
+
+            let prev = *edge_ref.borrow();
+            if edge != prev {
+                *edge_ref.borrow_mut() = edge;
+                let cursor_name = match edge {
+                    Some(gtk4::gdk::SurfaceEdge::North) | Some(gtk4::gdk::SurfaceEdge::South) => {
+                        Some("ns-resize")
+                    }
+                    Some(gtk4::gdk::SurfaceEdge::East) | Some(gtk4::gdk::SurfaceEdge::West) => {
+                        Some("ew-resize")
+                    }
+                    Some(gtk4::gdk::SurfaceEdge::NorthEast)
+                    | Some(gtk4::gdk::SurfaceEdge::SouthWest) => Some("nesw-resize"),
+                    Some(gtk4::gdk::SurfaceEdge::NorthWest)
+                    | Some(gtk4::gdk::SurfaceEdge::SouthEast) => Some("nwse-resize"),
+                    _ => None,
+                };
+                win_for_motion.set_cursor_from_name(cursor_name);
+            }
+        });
+
+        // Clear cursor when pointer leaves window.
+        let edge_leave = Rc::clone(&active_edge);
+        let win_leave = window.clone();
+        motion.connect_leave(move |_ctrl| {
+            *edge_leave.borrow_mut() = None;
+            win_leave.set_cursor_from_name(None);
+        });
+
+        window.add_controller(motion);
+    }
+
+    // Click controller: initiate resize when on an edge.
+    // Capture phase so it runs before WindowHandle's drag.
+    {
+        let edge_ref = Rc::clone(&active_edge);
+        let click = gtk4::GestureClick::new();
+        click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let win_for_resize = window.clone();
+        click.connect_pressed(move |gesture, _n_press, x, y| {
+            let edge = *edge_ref.borrow();
+            if let Some(edge) = edge {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                // Compute surface-relative coordinates for GDK.
+                let (sx, sy) = if let Some(native) = win_for_resize.native() {
+                    let (nx, ny) = native.surface_transform();
+                    (x + nx, y + ny)
+                } else {
+                    (x, y)
+                };
+                if let Some(native) = win_for_resize.native() {
+                    if let Some(surface) = native.surface() {
+                        use gtk4::gdk::prelude::ToplevelExt;
+                        if let Ok(toplevel) = surface.dynamic_cast::<gtk4::gdk::Toplevel>() {
+                            let device = gesture.current_event().and_then(|e| e.device());
+                            let timestamp = gesture.current_event().map_or(0, |e| e.time());
+                            toplevel.begin_resize(edge, device.as_ref(), 1, sx, sy, timestamp);
+                        }
+                    }
+                }
+            } else {
+                gesture.set_state(gtk4::EventSequenceState::Denied);
+            }
+        });
+        window.add_controller(click);
     }
 }
 

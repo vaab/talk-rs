@@ -46,7 +46,9 @@ fn show_recordings_window(
         .default_width(800)
         .default_height(500)
         .decorated(false)
+        .resizable(true)
         .build();
+    window.set_size_request(400, 250);
 
     crate::gtk_theme::load_css(&theme.base_css(
         ".transcript { font-family: monospace; opacity: 0.7; } \
@@ -62,6 +64,10 @@ fn show_recordings_window(
     root.set_margin_bottom(6);
     root.set_margin_start(6);
     root.set_margin_end(6);
+
+    // ── Title bar with close button ──────────────────────────
+    let (title_bar, close_btn) = crate::gtk_theme::build_title_bar();
+    root.append(&title_bar);
 
     let scrolled = gtk4::ScrolledWindow::builder()
         .vexpand(true)
@@ -499,6 +505,19 @@ fn show_recordings_window(
         window.add_controller(key_ctl);
     }
 
+    // Close button (same as Escape)
+    {
+        let ml = main_loop.clone();
+        let win = window.clone();
+        let player_ref = Rc::clone(&player);
+        let btn_ref = Rc::clone(&active_play_btn);
+        close_btn.connect_clicked(move |_| {
+            stop_playback(&player_ref, &btn_ref);
+            win.set_visible(false);
+            ml.quit();
+        });
+    }
+
     // Window close
     {
         let ml = main_loop.clone();
@@ -511,6 +530,8 @@ fn show_recordings_window(
             glib::Propagation::Proceed
         });
     }
+
+    crate::gtk_theme::install_edge_resize(&window);
 
     crate::gtk_theme::present_centred(&window);
     main_loop.run();
