@@ -1,6 +1,6 @@
 [package]
 name = "talk-rs"
-version = "%%version%%"
+version = "0.4.0-dev.202603100657"
 edition = "2021"
 authors = ["Valentin Lab <valentin.lab@kalysto.org>"]
 license = "MIT"

@@ -7,6 +7,7 @@ use crate::error::TalkError;
 struct WavPlaybackState {
     samples: Vec<f32>,
     position: usize,
+    paused: bool,
 }
 
 /// Plays audio files (WAV or OGG) through `cpal`'s default output device.
@@ -42,6 +43,7 @@ impl WavPlayer {
         let state = std::sync::Arc::new(std::sync::Mutex::new(WavPlaybackState {
             samples: Vec::new(),
             position: 0,
+            paused: false,
         }));
         let state_cb = std::sync::Arc::clone(&state);
 
@@ -54,6 +56,12 @@ impl WavPlayer {
                 },
                 move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     if let Ok(mut guard) = state_cb.try_lock() {
+                        if guard.paused {
+                            for s in output.iter_mut() {
+                                *s = 0.0;
+                            }
+                            return;
+                        }
                         let frames = output.len() / channels;
                         for frame_idx in 0..frames {
                             let sample = if guard.position < guard.samples.len() {
@@ -102,6 +110,7 @@ impl WavPlayer {
         if let Ok(mut guard) = self.state.lock() {
             guard.samples = samples;
             guard.position = 0;
+            guard.paused = false;
         }
         Ok(())
     }
@@ -111,6 +120,7 @@ impl WavPlayer {
         if let Ok(mut guard) = self.state.lock() {
             guard.samples.clear();
             guard.position = 0;
+            guard.paused = false;
         }
     }
 
@@ -120,5 +130,74 @@ impl WavPlayer {
             .lock()
             .map(|g| g.samples.is_empty() || g.position >= g.samples.len())
             .unwrap_or(true)
+    }
+
+    /// Playback progress as a fraction (0.0–1.0).
+    ///
+    /// Returns 0.0 when nothing is loaded or playback hasn't started.
+    pub(crate) fn progress(&self) -> f64 {
+        self.state
+            .lock()
+            .map(|g| {
+                if g.samples.is_empty() {
+                    0.0
+                } else {
+                    g.position as f64 / g.samples.len() as f64
+                }
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// Seek to a position expressed as a fraction (0.0–1.0).
+    pub(crate) fn seek(&self, fraction: f64) {
+        let fraction = fraction.clamp(0.0, 1.0);
+        if let Ok(mut guard) = self.state.lock() {
+            if !guard.samples.is_empty() {
+                guard.position = (fraction * guard.samples.len() as f64) as usize;
+            }
+        }
+    }
+
+    /// Pause playback (position is preserved).
+    pub(crate) fn pause(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.paused = true;
+        }
+    }
+
+    /// Resume playback from the current position.
+    pub(crate) fn resume(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.paused = false;
+        }
+    }
+
+    /// `true` when playback is paused.
+    pub(crate) fn is_paused(&self) -> bool {
+        self.state.lock().map(|g| g.paused).unwrap_or(false)
+    }
+
+    /// `true` when audio is loaded (samples are present).
+    pub(crate) fn has_audio(&self) -> bool {
+        self.state
+            .lock()
+            .map(|g| !g.samples.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Total duration of loaded audio in seconds.
+    ///
+    /// Returns 0.0 when nothing is loaded.
+    pub(crate) fn duration_secs(&self) -> f64 {
+        self.state
+            .lock()
+            .map(|g| {
+                if g.samples.is_empty() {
+                    0.0
+                } else {
+                    g.samples.len() as f64 / self.device_sample_rate as f64
+                }
+            })
+            .unwrap_or(0.0)
     }
 }
