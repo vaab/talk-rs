@@ -169,6 +169,8 @@ pub(super) async fn pick_with_streaming_gtk(
 
     // Clone audio path for the GTK play button before moving into closures.
     let audio_path_for_player = audio_path.clone();
+    // Clone audio path for the waterfall spectrogram background thread.
+    let audio_path_for_waterfall = audio_path.clone();
 
     // ── GTK window ──────────────────────────────────────────────
     let gtk_handle = tokio::task::spawn_blocking(move || -> Result<(), TalkError> {
@@ -199,7 +201,8 @@ pub(super) async fn pick_with_streaming_gtk(
             ".transcript {{ font-family: monospace; }} \
              .error {{ font-style: italic; color: alpha({err}, 0.8); }} \
              .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }} \
-             .play-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }}",
+             .play-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
+             .waterfall {{ background-color: black; border-radius: 0.25em; }}",
             err = error_hex,
         )));
 
@@ -224,58 +227,366 @@ pub(super) async fn pick_with_streaming_gtk(
         play_bar.set_margin_end(4);
         play_bar.set_margin_bottom(4);
 
-        let play_btn = gtk4::Button::with_label("\u{25b6}");
+        // ── Waterfall spectrogram (base layer) ─────────────────────
+        let waterfall_area = gtk4::DrawingArea::new();
+        waterfall_area.set_hexpand(true);
+        waterfall_area.set_vexpand(false);
+        waterfall_area.set_content_height(32);
+        waterfall_area.add_css_class("waterfall");
+
+        type WaterfallData = Option<(Vec<Vec<f32>>, f32)>;
+        let waterfall_data: Rc<RefCell<WaterfallData>> = Rc::new(RefCell::new(None));
+
+        // Waterfall draw — renders once when data arrives, and on resize.
+        {
+            let data_ref = Rc::clone(&waterfall_data);
+            waterfall_area.set_draw_func(move |_area, cr, width, height| {
+                let w = width as usize;
+                let h = height as usize;
+                if w == 0 || h == 0 {
+                    return;
+                }
+                let data = data_ref.borrow();
+                if let Some((ref columns, peak)) = *data {
+                    if peak > 0.0 && !columns.is_empty() {
+                        if let Ok(mut surface) = gtk4::cairo::ImageSurface::create(
+                            gtk4::cairo::Format::ARgb32,
+                            width,
+                            height,
+                        ) {
+                            let stride = surface.stride() as usize;
+                            if let Ok(mut surf_data) = surface.data() {
+                                let num_rows = crate::x11::render_util::WATERFALL_ROWS;
+                                for x in 0..w {
+                                    let col_idx = x * columns.len() / w;
+                                    let col = &columns[col_idx];
+                                    for y in 0..h {
+                                        let data_row =
+                                            (num_rows - 1) - (y * num_rows / h).min(num_rows - 1);
+                                        let magnitude = if data_row < col.len() {
+                                            col[data_row]
+                                        } else {
+                                            0.0
+                                        };
+                                        let norm = (magnitude / peak).clamp(0.0, 1.0);
+                                        let brightness = if norm > 0.0 {
+                                            (1.0 + norm * 9.0).log10()
+                                        } else {
+                                            0.0
+                                        };
+                                        let alpha = (brightness * 255.0) as u8;
+                                        let off = y * stride + x * 4;
+                                        if off + 3 < surf_data.len() {
+                                            surf_data[off] = alpha;
+                                            surf_data[off + 1] = alpha;
+                                            surf_data[off + 2] = alpha;
+                                            surf_data[off + 3] = alpha;
+                                        }
+                                    }
+                                }
+                            }
+                            cr.set_source_surface(&surface, 0.0, 0.0).unwrap_or(());
+                            cr.paint().unwrap_or(());
+                        }
+                        return;
+                    }
+                }
+                cr.set_source_rgb(0.0, 0.0, 0.0);
+                cr.paint().unwrap_or(());
+            });
+        }
+
+        // ── Cursor overlay (lightweight, redraws independently) ───
+        let cursor_area = gtk4::DrawingArea::new();
+        cursor_area.set_hexpand(true);
+        cursor_area.set_vexpand(true);
+
+        let cursor_pos: Rc<RefCell<f64>> = Rc::new(RefCell::new(0.0));
+
+        {
+            let pos_ref = Rc::clone(&cursor_pos);
+            cursor_area.set_draw_func(move |_area, cr, width, height| {
+                let pos = *pos_ref.borrow();
+                if pos > 0.0 {
+                    let cx = (pos * width as f64).clamp(0.0, width as f64 - 1.0);
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.85);
+                    cr.set_line_width(2.0);
+                    cr.move_to(cx, 0.0);
+                    cr.line_to(cx, height as f64);
+                    cr.stroke().unwrap_or(());
+                }
+            });
+        }
+
+        // Stack waterfall + cursor using gtk4::Overlay.
+        let wf_overlay = gtk4::Overlay::new();
+        wf_overlay.set_child(Some(&waterfall_area));
+        wf_overlay.add_overlay(&cursor_area);
+        wf_overlay.set_hexpand(true);
+
+        // Spawn background thread to compute waterfall columns.
+        {
+            let (wf_tx, wf_rx) = std::sync::mpsc::channel::<(Vec<Vec<f32>>, f32)>();
+            let wf_audio_path = audio_path_for_waterfall;
+            std::thread::spawn(move || {
+                match super::backend::read_wav_pcm_samples(&wf_audio_path) {
+                    Ok(samples) => {
+                        let result =
+                            crate::x11::render_util::generate_waterfall_columns(&samples, 16000);
+                        let _ = wf_tx.send(result);
+                    }
+                    Err(e) => {
+                        log::warn!("waterfall: failed to read WAV: {}", e);
+                    }
+                }
+            });
+
+            let wf_data_ref = Rc::clone(&waterfall_data);
+            let wf_area_ref = waterfall_area.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match wf_rx.try_recv() {
+                    Ok(result) => {
+                        *wf_data_ref.borrow_mut() = Some(result);
+                        wf_area_ref.queue_draw();
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                }
+            });
+        }
+
+        play_bar.append(&wf_overlay);
+
+        // ── Rewind button ────────────────────────────────────────
+        let rewind_btn = gtk4::Button::from_icon_name("media-skip-backward-symbolic");
+        rewind_btn.set_tooltip_text(Some("Rewind to start"));
+        rewind_btn.add_css_class("play-btn");
+        rewind_btn.set_sensitive(false); // starts at beginning
+
+        {
+            let player_ref = Rc::clone(&player);
+            let pos_ref = Rc::clone(&cursor_pos);
+            let wf_ref = waterfall_area.clone();
+            rewind_btn.connect_clicked(move |btn| {
+                if let Some(ref p) = *player_ref {
+                    p.seek(0.0);
+                }
+                *pos_ref.borrow_mut() = 0.0;
+                btn.set_sensitive(false);
+                wf_ref.queue_draw();
+            });
+        }
+
+        play_bar.append(&rewind_btn);
+
+        // ── Play/Pause button ─────────────────────────────────────
+        let play_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
         play_btn.set_tooltip_text(Some("Play recorded audio"));
         play_btn.add_css_class("play-btn");
         if player.is_none() {
             play_btn.set_sensitive(false);
         }
 
+        // Shared playback-active flag (avoids fragile icon-name checks).
+        let playing_flag: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
         {
             let player_ref = Rc::clone(&player);
             let audio = audio_path_for_player;
+            let pos_ref = Rc::clone(&cursor_pos);
+            let flag = Rc::clone(&playing_flag);
             play_btn.connect_clicked(move |btn| {
-                let is_playing = btn.label().is_some_and(|l| l == "\u{25a0}");
-                if is_playing {
-                    if let Some(ref p) = *player_ref {
-                        p.stop();
-                    }
-                    btn.set_label("\u{25b6}");
-                    btn.set_tooltip_text(Some("Play recorded audio"));
+                let Some(ref p) = *player_ref else {
+                    return;
+                };
+                if *flag.borrow() {
+                    // Pause
+                    p.pause();
+                    *flag.borrow_mut() = false;
+                    btn.set_icon_name("media-playback-start-symbolic");
+                    btn.set_tooltip_text(Some("Resume playback"));
+                } else if p.is_paused() || (p.has_audio() && !p.is_finished()) {
+                    // Resume
+                    p.resume();
+                    *flag.borrow_mut() = true;
+                    btn.set_icon_name("media-playback-pause-symbolic");
+                    btn.set_tooltip_text(Some("Pause playback"));
                 } else {
-                    if let Some(ref p) = *player_ref {
-                        if let Err(e) = p.play(&audio) {
-                            log::warn!("failed to play audio: {}", e);
-                            return;
-                        }
+                    // Start fresh (or restart from current cursor position)
+                    let pos = *pos_ref.borrow();
+                    if let Err(e) = p.play(&audio) {
+                        log::warn!("failed to play audio: {}", e);
+                        return;
                     }
-                    btn.set_label("\u{25a0}");
-                    btn.set_tooltip_text(Some("Stop playback"));
+                    if pos > 0.0 && pos < 1.0 {
+                        p.seek(pos);
+                    }
+                    *flag.borrow_mut() = true;
+                    btn.set_icon_name("media-playback-pause-symbolic");
+                    btn.set_tooltip_text(Some("Pause playback"));
                 }
             });
         }
 
-        // Poll for playback completion to auto-reset the button.
+        // Poll for playback progress and completion.
+        // Only redraws the cursor overlay — the waterfall is untouched.
+        //
+        // The cpal callback advances the sample position in buffer-sized
+        // chunks (~10-20 ms at 48 kHz).  To avoid visible staircase
+        // movement we interpolate: record the last raw progress and the
+        // wall-clock time it changed, then linearly extrapolate at
+        // display rate.
         {
             let player_poll = Rc::clone(&player);
             let btn_poll = play_btn.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-                let is_playing = btn_poll.label().is_some_and(|l| l == "\u{25a0}");
-                if is_playing {
-                    let finished = player_poll
-                        .as_ref()
-                        .as_ref()
-                        .is_none_or(|p| p.is_finished());
-                    if finished {
-                        btn_poll.set_label("\u{25b6}");
+            let rewind_poll = rewind_btn.clone();
+            let pos_poll = Rc::clone(&cursor_pos);
+            let cursor_poll = cursor_area.clone();
+            let flag_poll = Rc::clone(&playing_flag);
+
+            // (last_raw_progress, timestamp_of_that_reading)
+            let interp: Rc<RefCell<(f64, std::time::Instant)>> =
+                Rc::new(RefCell::new((0.0, std::time::Instant::now())));
+
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                let Some(ref p) = *player_poll else {
+                    return glib::ControlFlow::Continue;
+                };
+                if *flag_poll.borrow() {
+                    if p.is_finished() {
+                        *pos_poll.borrow_mut() = 0.0;
+                        *flag_poll.borrow_mut() = false;
+                        *interp.borrow_mut() = (0.0, std::time::Instant::now());
+                        btn_poll.set_icon_name("media-playback-start-symbolic");
                         btn_poll.set_tooltip_text(Some("Play recorded audio"));
+                        rewind_poll.set_sensitive(false);
+                    } else {
+                        let raw = p.progress();
+                        let now = std::time::Instant::now();
+                        let mut st = interp.borrow_mut();
+
+                        // When the cpal callback advances, reset the
+                        // interpolation reference point.
+                        if (raw - st.0).abs() > 1e-9 {
+                            *st = (raw, now);
+                        }
+
+                        let dur = p.duration_secs();
+                        let interpolated = if dur > 0.0 {
+                            let elapsed = now.duration_since(st.1).as_secs_f64();
+                            (st.0 + elapsed / dur).min(1.0)
+                        } else {
+                            raw
+                        };
+                        drop(st);
+
+                        *pos_poll.borrow_mut() = interpolated;
+                        rewind_poll.set_sensitive(interpolated > 0.0);
                     }
+                    cursor_poll.queue_draw();
+                } else if p.has_audio() && !p.is_finished() {
+                    let progress = p.progress();
+                    rewind_poll.set_sensitive(progress > 0.0);
+                    // Keep reference fresh so resuming doesn't cause
+                    // a jump from stale elapsed time.
+                    *interp.borrow_mut() = (progress, std::time::Instant::now());
                 }
                 glib::ControlFlow::Continue
             });
         }
 
         play_bar.append(&play_btn);
+
+        // ── Drag-to-seek on the waterfall ────────────────────────
+        // Dragging pauses playback; releasing resumes.
+        {
+            let player_drag = Rc::clone(&player);
+            let pos_drag = Rc::clone(&cursor_pos);
+            let cursor_drag = cursor_area.clone();
+            let btn_drag = play_btn.clone();
+            let rewind_drag = rewind_btn.clone();
+            let flag_drag = Rc::clone(&playing_flag);
+            let was_playing = Rc::new(RefCell::new(false));
+
+            let drag = gtk4::GestureDrag::new();
+
+            {
+                let player_ref = Rc::clone(&player_drag);
+                let pos_ref = Rc::clone(&pos_drag);
+                let cursor_ref = cursor_drag.clone();
+                let btn_ref = btn_drag.clone();
+                let flag_ref = Rc::clone(&flag_drag);
+                let was_ref = Rc::clone(&was_playing);
+                drag.connect_drag_begin(move |gesture, x, _y| {
+                    let Some(ref p) = *player_ref else {
+                        return;
+                    };
+                    let playing = *flag_ref.borrow() && !p.is_finished();
+                    *was_ref.borrow_mut() = playing;
+                    if playing {
+                        p.pause();
+                        *flag_ref.borrow_mut() = false;
+                        btn_ref.set_icon_name("media-playback-start-symbolic");
+                        btn_ref.set_tooltip_text(Some("Resume playback"));
+                    }
+                    if let Some(area) = gesture.widget().downcast_ref::<gtk4::DrawingArea>() {
+                        let w = area.width() as f64;
+                        if w > 0.0 {
+                            let frac = (x / w).clamp(0.0, 1.0);
+                            p.seek(frac);
+                            *pos_ref.borrow_mut() = frac;
+                            cursor_ref.queue_draw();
+                        }
+                    }
+                });
+            }
+
+            {
+                let player_ref = Rc::clone(&player_drag);
+                let pos_ref = Rc::clone(&pos_drag);
+                let cursor_ref = cursor_drag.clone();
+                let rewind_ref = rewind_drag.clone();
+                drag.connect_drag_update(move |gesture, offset_x, _offset_y| {
+                    let Some(ref p) = *player_ref else {
+                        return;
+                    };
+                    if let Some(area) = gesture.widget().downcast_ref::<gtk4::DrawingArea>() {
+                        let w = area.width() as f64;
+                        if w > 0.0 {
+                            let (start_x, _) = gesture.start_point().unwrap_or((0.0, 0.0));
+                            let frac = ((start_x + offset_x) / w).clamp(0.0, 1.0);
+                            p.seek(frac);
+                            *pos_ref.borrow_mut() = frac;
+                            rewind_ref.set_sensitive(frac > 0.0);
+                            cursor_ref.queue_draw();
+                        }
+                    }
+                });
+            }
+
+            {
+                let player_ref = Rc::clone(&player_drag);
+                let btn_ref = btn_drag.clone();
+                let flag_ref = Rc::clone(&flag_drag);
+                let was_ref = Rc::clone(&was_playing);
+                drag.connect_drag_end(move |_gesture, _offset_x, _offset_y| {
+                    let Some(ref p) = *player_ref else {
+                        return;
+                    };
+                    if *was_ref.borrow() {
+                        p.resume();
+                        *flag_ref.borrow_mut() = true;
+                        btn_ref.set_icon_name("media-playback-pause-symbolic");
+                        btn_ref.set_tooltip_text(Some("Pause playback"));
+                    }
+                });
+            }
+
+            // Attach drag to cursor overlay (sits on top, receives input).
+            cursor_area.add_controller(drag);
+        }
+
         root.append(&play_bar);
 
         let scrolled = gtk4::ScrolledWindow::builder()

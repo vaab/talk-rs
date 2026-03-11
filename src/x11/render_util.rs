@@ -31,6 +31,11 @@ pub const FREQ_MAX: f32 = 8000.0;
 /// Minimum FFT magnitude to count a bin as "active" for frequency scaling.
 pub const FREQ_NOISE_FLOOR: f32 = 0.01;
 
+/// Number of spectrogram columns for the picker waterfall strip.
+pub const WATERFALL_COLUMNS: usize = 4096;
+/// Number of frequency rows for the picker waterfall strip.
+pub const WATERFALL_ROWS: usize = 64;
+
 // ── Ring buffer ──────────────────────────────────────────────────────
 
 pub struct RingBuffer {
@@ -712,6 +717,63 @@ pub fn map_spectrum_to_column(
     }
 
     column
+}
+
+/// Generate waterfall spectrogram columns from PCM i16 audio.
+///
+/// Computes `WATERFALL_COLUMNS` evenly-spaced FFT windows across the
+/// entire audio, maps each to `WATERFALL_ROWS` frequency bins, and
+/// returns the column data plus the global peak magnitude.
+///
+/// The caller can render these columns at any display width by
+/// mapping column indices to pixel columns.
+pub fn generate_waterfall_columns(samples: &[i16], sample_rate: u32) -> (Vec<Vec<f32>>, f32) {
+    // Convert i16 samples to f32, padding to at least FFT_SIZE.
+    let padded: Vec<f32> = if samples.len() < FFT_SIZE {
+        let mut buf = Vec::with_capacity(FFT_SIZE);
+        for &s in samples {
+            buf.push(s as f32 / 32768.0);
+        }
+        buf.resize(FFT_SIZE, 0.0);
+        buf
+    } else {
+        samples.iter().map(|&s| s as f32 / 32768.0).collect()
+    };
+
+    let num_columns = if padded.len() <= FFT_SIZE {
+        1
+    } else {
+        WATERFALL_COLUMNS
+    };
+
+    let hop = padded.len().saturating_sub(FFT_SIZE) / (num_columns.max(2) - 1).max(1);
+
+    let mut columns = Vec::with_capacity(num_columns);
+    let mut global_peak: f32 = 0.0;
+
+    for col in 0..num_columns {
+        let start = (col * hop).min(padded.len().saturating_sub(FFT_SIZE));
+        let window = &padded[start..start + FFT_SIZE];
+
+        let magnitudes = compute_spectrum(window);
+
+        let frame_peak = magnitudes.iter().copied().fold(0.0f32, f32::max);
+        if frame_peak > global_peak {
+            global_peak = frame_peak;
+        }
+
+        let column = map_spectrum_to_column(&magnitudes, WATERFALL_ROWS, sample_rate, FREQ_MAX);
+        columns.push(column);
+    }
+
+    // If the audio was shorter than FFT_SIZE, replicate the single
+    // column to fill WATERFALL_COLUMNS.
+    if columns.len() == 1 && WATERFALL_COLUMNS > 1 {
+        let single = columns[0].clone();
+        columns.resize(WATERFALL_COLUMNS, single);
+    }
+
+    (columns, global_peak)
 }
 
 #[cfg(test)]

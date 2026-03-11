@@ -21,6 +21,8 @@ happening.
   Mistral V2 models in batch mode.
 - *Multi-candidate picker* -- with ~--pick~, run several providers in
   parallel and choose the best transcription from a GTK picker window.
+  A waterfall spectrogram of the recording is shown above the
+  candidate list; it loads asynchronously and adapts to window width.
 - *Visual overlay* -- non-intrusive X11 badge at the top of the screen
   (works without a compositor).
 - *Dead audio detection* -- overlay badge shows a red prohibit icon
