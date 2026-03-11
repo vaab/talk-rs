@@ -242,7 +242,9 @@ pub(super) async fn pick_with_streaming_gtk(
             .default_width(900)
             .default_height(500)
             .decorated(false)
+            .resizable(true)
             .build();
+        window.set_size_request(400, 250);
 
         // CSS notes:
         //   - GtkListBox CSS node is "list", not "listbox"
@@ -258,7 +260,8 @@ pub(super) async fn pick_with_streaming_gtk(
              .waterfall {{ background-color: black; border-radius: 0.25em; }} \
              .copy-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
              .editor-view {{ font-family: monospace; }} \
-             textview.editor-view text {{ background-color: transparent; }}",
+             textview.editor-view text {{ background-color: transparent; }} \
+",
             err = error_hex,
         )));
 
@@ -267,6 +270,10 @@ pub(super) async fn pick_with_streaming_gtk(
         root.set_margin_bottom(6);
         root.set_margin_start(6);
         root.set_margin_end(6);
+
+        // ── Title bar with close button ──────────────────────────
+        let (title_bar, close_btn) = crate::gtk_theme::build_title_bar();
+        root.append(&title_bar);
 
         // ── Audio player for playback button ─────────────────────
         let player: Rc<Option<WavPlayer>> = Rc::new(match WavPlayer::new() {
@@ -962,6 +969,24 @@ pub(super) async fn pick_with_streaming_gtk(
             });
         }
 
+        // Close button cancels (same as Escape)
+        {
+            let sel = Rc::clone(&sel_sender);
+            let ml = main_loop.clone();
+            let win = window.clone();
+            let player_ref = Rc::clone(&player);
+            close_btn.connect_clicked(move |_| {
+                if let Some(ref p) = *player_ref {
+                    p.stop();
+                }
+                win.set_visible(false);
+                if let Some(tx) = sel.borrow_mut().take() {
+                    let _ = tx.send(None);
+                }
+                ml.quit();
+            });
+        }
+
         // Escape cancels
         {
             let sel = Rc::clone(&sel_sender);
@@ -1220,6 +1245,8 @@ pub(super) async fn pick_with_streaming_gtk(
                 glib::ControlFlow::Continue
             });
         }
+
+        crate::gtk_theme::install_edge_resize(&window);
 
         crate::gtk_theme::present_centred(&window);
         list.grab_focus();
