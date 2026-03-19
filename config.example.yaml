@@ -19,6 +19,11 @@ providers:
     # Get this from: https://console.mistral.ai/
     api_key: <PLACEHOLDER>
 
+    # Base URL for the Mistral API (optional, defaults to "https://api.mistral.ai")
+    # Override to point at a self-hosted or API-compatible endpoint.
+    # Only the base URL — path segments are appended automatically.
+    # url: https://api.mistral.ai
+
     # Model name for transcription (optional, defaults to "voxtral-mini-2507")
     # Available models: voxtral-mini-2507, voxtral-mini-2602, voxtral-mini-latest
     # V2 models (2602+) support speaker diarization via --diarize
@@ -32,6 +37,7 @@ providers:
   # OpenAI API Configuration (optional)
   # openai:
   #   api_key: <PLACEHOLDER>
+  #   url: https://api.openai.com               # base URL (optional, for compatible endpoints)
   #   model: whisper-1                          # batch model (whisper-1, gpt-4o-transcribe)
   #   realtime_model: gpt-4o-mini-transcribe    # realtime WebSocket model
 
