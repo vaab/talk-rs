@@ -276,13 +276,9 @@ pub(super) async fn pick_with_streaming_gtk(
         root.append(&title_bar);
 
         // ── Audio player for playback button ─────────────────────
-        let player: Rc<Option<WavPlayer>> = Rc::new(match WavPlayer::new() {
-            Ok(p) => Some(p),
-            Err(e) => {
-                log::warn!("audio output unavailable, play button disabled: {}", e);
-                None
-            }
-        });
+        // Initialized in background after window presentation to avoid
+        // blocking the UI on cpal device probing (~1-2 s on PipeWire).
+        let player: Rc<RefCell<Option<WavPlayer>>> = Rc::new(RefCell::new(None));
 
         // Play-button bar above the transcription list.
         let play_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -432,7 +428,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let pos_ref = Rc::clone(&cursor_pos);
             let wf_ref = waterfall_area.clone();
             rewind_btn.connect_clicked(move |btn| {
-                if let Some(ref p) = *player_ref {
+                if let Some(ref p) = *player_ref.borrow() {
                     p.seek(0.0);
                 }
                 *pos_ref.borrow_mut() = 0.0;
@@ -447,7 +443,7 @@ pub(super) async fn pick_with_streaming_gtk(
         let play_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
         play_btn.set_tooltip_text(Some("Play recorded audio"));
         play_btn.add_css_class("play-btn");
-        if player.is_none() {
+        if player.borrow().is_none() {
             play_btn.set_sensitive(false);
         }
 
@@ -460,7 +456,8 @@ pub(super) async fn pick_with_streaming_gtk(
             let pos_ref = Rc::clone(&cursor_pos);
             let flag = Rc::clone(&playing_flag);
             play_btn.connect_clicked(move |btn| {
-                let Some(ref p) = *player_ref else {
+                let player_guard = player_ref.borrow();
+                let Some(ref p) = *player_guard else {
                     return;
                 };
                 if *flag.borrow() {
@@ -513,7 +510,8 @@ pub(super) async fn pick_with_streaming_gtk(
                 Rc::new(RefCell::new((0.0, std::time::Instant::now())));
 
             glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                let Some(ref p) = *player_poll else {
+                let player_guard = player_poll.borrow();
+                let Some(ref p) = *player_guard else {
                     return glib::ControlFlow::Continue;
                 };
                 if *flag_poll.borrow() {
@@ -582,7 +580,8 @@ pub(super) async fn pick_with_streaming_gtk(
                 let flag_ref = Rc::clone(&flag_drag);
                 let was_ref = Rc::clone(&was_playing);
                 drag.connect_drag_begin(move |gesture, x, _y| {
-                    let Some(ref p) = *player_ref else {
+                    let player_guard = player_ref.borrow();
+                    let Some(ref p) = *player_guard else {
                         return;
                     };
                     let playing = *flag_ref.borrow() && !p.is_finished();
@@ -611,7 +610,8 @@ pub(super) async fn pick_with_streaming_gtk(
                 let cursor_ref = cursor_drag.clone();
                 let rewind_ref = rewind_drag.clone();
                 drag.connect_drag_update(move |gesture, offset_x, _offset_y| {
-                    let Some(ref p) = *player_ref else {
+                    let player_guard = player_ref.borrow();
+                    let Some(ref p) = *player_guard else {
                         return;
                     };
                     if let Some(area) = gesture.widget().downcast_ref::<gtk4::DrawingArea>() {
@@ -634,7 +634,8 @@ pub(super) async fn pick_with_streaming_gtk(
                 let flag_ref = Rc::clone(&flag_drag);
                 let was_ref = Rc::clone(&was_playing);
                 drag.connect_drag_end(move |_gesture, _offset_x, _offset_y| {
-                    let Some(ref p) = *player_ref else {
+                    let player_guard = player_ref.borrow();
+                    let Some(ref p) = *player_guard else {
                         return;
                     };
                     if *was_ref.borrow() {
@@ -976,7 +977,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let win = window.clone();
             let player_ref = Rc::clone(&player);
             close_btn.connect_clicked(move |_| {
-                if let Some(ref p) = *player_ref {
+                if let Some(ref p) = *player_ref.borrow() {
                     p.stop();
                 }
                 win.set_visible(false);
@@ -996,7 +997,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let key_ctl = gtk4::EventControllerKey::new();
             key_ctl.connect_key_pressed(move |_, key, _, _| {
                 if key == gtk4::gdk::Key::Escape {
-                    if let Some(ref p) = *player_ref {
+                    if let Some(ref p) = *player_ref.borrow() {
                         p.stop();
                     }
                     win.set_visible(false);
@@ -1018,7 +1019,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let ml = main_loop.clone();
             let player_ref = Rc::clone(&player);
             window.connect_close_request(move |win| {
-                if let Some(ref p) = *player_ref {
+                if let Some(ref p) = *player_ref.borrow() {
                     p.stop();
                 }
                 win.set_visible(false);
@@ -1250,6 +1251,24 @@ pub(super) async fn pick_with_streaming_gtk(
 
         crate::gtk_theme::present_centred(&window);
         list.grab_focus();
+
+        // Initialize the audio player after the window is presented so
+        // the picker appears instantly instead of blocking on cpal
+        // device probing (~1-2 s on PipeWire).
+        {
+            let player_init = Rc::clone(&player);
+            let play_btn_init = play_btn.clone();
+            glib::idle_add_local_once(move || match WavPlayer::new() {
+                Ok(p) => {
+                    *player_init.borrow_mut() = Some(p);
+                    play_btn_init.set_sensitive(true);
+                }
+                Err(e) => {
+                    log::warn!("audio output unavailable, play button disabled: {}", e);
+                }
+            });
+        }
+
         main_loop.run();
         window.close();
 
