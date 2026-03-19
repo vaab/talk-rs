@@ -23,10 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::BatchTranscriber;
 
 /// Default API base URL for the OpenAI API.
-const API_BASE: &str = "https://api.openai.com";
-
-/// OpenAI API transcription endpoint.
-const OPENAI_API_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
+pub(crate) const API_BASE: &str = "https://api.openai.com";
 
 /// Timeout for batch file upload transcription requests.
 const BATCH_FILE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -133,13 +130,18 @@ pub(crate) fn is_transcription_model(model_id: &str) -> bool {
 ///
 /// Returns the error unchanged if it is not a model error or if
 /// suggestions cannot be fetched.
-pub(crate) async fn enrich_model_error(error: TalkError, api_key: &str, model: &str) -> TalkError {
+pub(crate) async fn enrich_model_error(
+    error: TalkError,
+    api_key: &str,
+    model: &str,
+    api_base: &str,
+) -> TalkError {
     if !is_model_error(&error) {
         return error;
     }
     match super::model_suggestions::fetch_transcription_models(
         api_key,
-        API_BASE,
+        api_base,
         is_transcription_model,
     )
     .await
@@ -257,14 +259,20 @@ pub struct OpenAIBatchTranscriber {
 impl OpenAIBatchTranscriber {
     /// Create a new OpenAI transcriber with the given configuration.
     ///
+    /// The transcription endpoint is derived from `config.url` (if set)
+    /// by appending `/v1/audio/transcriptions`.  When `config.url` is
+    /// `None`, the default OpenAI API base URL is used.
+    ///
     /// # Arguments
     ///
     /// * `config` - OpenAI API configuration containing the API key
     pub fn new(config: OpenAIConfig) -> Result<Self, TalkError> {
+        let base = config.url.as_deref().unwrap_or(API_BASE);
+        let endpoint = format!("{}/v1/audio/transcriptions", base.trim_end_matches('/'));
         Ok(Self {
             client: build_client()?,
             config,
-            endpoint: OPENAI_API_ENDPOINT.to_string(),
+            endpoint,
         })
     }
 
@@ -518,6 +526,51 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn test_new_uses_default_endpoint_when_url_is_none() {
+        let config = OpenAIConfig {
+            api_key: "key".to_string(),
+            url: None,
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+        };
+        let transcriber = OpenAIBatchTranscriber::new(config).expect("build client");
+        assert_eq!(
+            transcriber.endpoint,
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn test_new_uses_custom_url_for_endpoint() {
+        let config = OpenAIConfig {
+            api_key: "key".to_string(),
+            url: Some("https://custom.example.com".to_string()),
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+        };
+        let transcriber = OpenAIBatchTranscriber::new(config).expect("build client");
+        assert_eq!(
+            transcriber.endpoint,
+            "https://custom.example.com/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn test_new_trims_trailing_slash_from_url() {
+        let config = OpenAIConfig {
+            api_key: "key".to_string(),
+            url: Some("https://custom.example.com/".to_string()),
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+        };
+        let transcriber = OpenAIBatchTranscriber::new(config).expect("build client");
+        assert_eq!(
+            transcriber.endpoint,
+            "https://custom.example.com/v1/audio/transcriptions"
+        );
+    }
+
     #[tokio::test]
     async fn test_openai_transcriber_success() {
         let mock_server = MockServer::start().await;
@@ -537,6 +590,7 @@ mod tests {
 
         let config = OpenAIConfig {
             api_key: "sk-test-key".to_string(),
+            url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
@@ -567,6 +621,7 @@ mod tests {
 
         let config = OpenAIConfig {
             api_key: "sk-test-key".to_string(),
+            url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
@@ -604,6 +659,7 @@ mod tests {
 
         let config = OpenAIConfig {
             api_key: "invalid-key".to_string(),
+            url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
@@ -623,6 +679,7 @@ mod tests {
     async fn test_openai_transcriber_file_not_found() {
         let config = OpenAIConfig {
             api_key: "sk-test-key".to_string(),
+            url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
@@ -667,7 +724,7 @@ mod tests {
     #[tokio::test]
     async fn test_enrich_non_model_error_unchanged() {
         let err = TalkError::Transcription("connection timed out".to_string());
-        let enriched = enrich_model_error(err, "key", "whisper-1").await;
+        let enriched = enrich_model_error(err, "key", "whisper-1", API_BASE).await;
         assert_eq!(
             enriched.to_string(),
             "Transcription error: connection timed out"
@@ -697,6 +754,7 @@ mod tests {
 
         let config = OpenAIConfig {
             api_key: "sk-test-key".to_string(),
+            url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };

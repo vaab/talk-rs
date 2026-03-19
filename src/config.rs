@@ -85,6 +85,14 @@ pub struct MistralConfig {
     /// API key for Mistral transcription service.
     pub api_key: String,
 
+    /// Base URL for the Mistral API (defaults to `https://api.mistral.ai`).
+    ///
+    /// Override to point at a self-hosted or API-compatible endpoint.
+    /// Only the base URL is required — path segments are appended
+    /// automatically.
+    #[serde(default)]
+    pub url: Option<String>,
+
     /// Model name for transcription (defaults to "voxtral-mini-2507").
     #[serde(default = "default_mistral_model")]
     pub model: String,
@@ -107,6 +115,14 @@ fn default_mistral_model() -> String {
 pub struct OpenAIConfig {
     /// API key for OpenAI transcription service.
     pub api_key: String,
+
+    /// Base URL for the OpenAI API (defaults to `https://api.openai.com`).
+    ///
+    /// Override to point at a self-hosted or API-compatible endpoint.
+    /// Only the base URL is required — path segments are appended
+    /// automatically.
+    #[serde(default)]
+    pub url: Option<String>,
 
     /// Model name for batch transcription (defaults to "whisper-1").
     #[serde(default = "default_openai_model")]
@@ -262,9 +278,11 @@ impl Config {
     /// Environment variables can override config values:
     /// - TALK_RS_OUTPUT_DIR
     /// - TALK_RS_PROVIDERS_MISTRAL_API_KEY
+    /// - TALK_RS_PROVIDERS_MISTRAL_URL
     /// - TALK_RS_PROVIDERS_MISTRAL_MODEL
     /// - TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS
     /// - TALK_RS_PROVIDERS_OPENAI_API_KEY
+    /// - TALK_RS_PROVIDERS_OPENAI_URL
     /// - TALK_RS_PROVIDERS_OPENAI_MODEL
     /// - TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL
     pub fn load(path: Option<&Path>) -> Result<Self, TalkError> {
@@ -306,6 +324,9 @@ impl Config {
             if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
                 mistral.api_key = value;
             }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_URL")? {
+                mistral.url = Some(value);
+            }
             if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_MODEL")? {
                 mistral.model = value;
             }
@@ -317,6 +338,7 @@ impl Config {
             if let Some(api_key) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
                 config.providers.mistral = Some(MistralConfig {
                     api_key,
+                    url: env_var_string("TALK_RS_PROVIDERS_MISTRAL_URL")?,
                     model: env_var_string("TALK_RS_PROVIDERS_MISTRAL_MODEL")?
                         .unwrap_or_else(default_mistral_model),
                     context_bias: env_var_string("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?,
@@ -329,6 +351,9 @@ impl Config {
             if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_API_KEY")? {
                 openai.api_key = value;
             }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_URL")? {
+                openai.url = Some(value);
+            }
             if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_MODEL")? {
                 openai.model = value;
             }
@@ -340,6 +365,7 @@ impl Config {
             if let Some(api_key) = env_var_string("TALK_RS_PROVIDERS_OPENAI_API_KEY")? {
                 config.providers.openai = Some(OpenAIConfig {
                     api_key,
+                    url: env_var_string("TALK_RS_PROVIDERS_OPENAI_URL")?,
                     model: env_var_string("TALK_RS_PROVIDERS_OPENAI_MODEL")?
                         .unwrap_or_else(default_openai_model),
                     realtime_model: env_var_string("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?
@@ -438,9 +464,11 @@ mod tests {
         Ok(vec![
             EnvGuard::clear("TALK_RS_OUTPUT_DIR")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_URL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_API_KEY")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_URL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_MODEL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?,
         ])
@@ -711,6 +739,101 @@ paste:
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
         assert_eq!(paste.chunk_chars, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_url_defaults_to_none() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+  openai:
+    api_key: sk-test-key
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        assert!(m.url.is_none());
+        let o = config.providers.openai.as_ref().expect("openai present");
+        assert!(o.url.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_url_from_yaml() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+    url: https://custom-mistral.example.com
+  openai:
+    api_key: sk-test-key
+    url: https://custom-openai.example.com
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        assert_eq!(m.url.as_deref(), Some("https://custom-mistral.example.com"));
+        let o = config.providers.openai.as_ref().expect("openai present");
+        assert_eq!(o.url.as_deref(), Some("https://custom-openai.example.com"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_url_env_override() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _set_url = EnvGuard::set(
+            "TALK_RS_PROVIDERS_MISTRAL_URL",
+            "https://env-mistral.example.com",
+        )?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        assert_eq!(m.url.as_deref(), Some("https://env-mistral.example.com"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_url_env_override_openai() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _set_key = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_API_KEY", "sk-env-key")?;
+        let _set_url = EnvGuard::set(
+            "TALK_RS_PROVIDERS_OPENAI_URL",
+            "https://env-openai.example.com",
+        )?;
+
+        // No openai section in YAML — created purely from env vars.
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let o = config.providers.openai.as_ref().expect("openai from env");
+        assert_eq!(o.api_key, "sk-env-key");
+        assert_eq!(o.url.as_deref(), Some("https://env-openai.example.com"));
         Ok(())
     }
 }

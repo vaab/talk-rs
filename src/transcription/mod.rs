@@ -241,14 +241,16 @@ pub async fn enrich_model_error(
                 return error;
             };
             let model_name = model.unwrap_or(&cfg.model);
-            mistral::enrich_model_error(error, &cfg.api_key, model_name).await
+            let api_base = cfg.url.as_deref().unwrap_or(mistral::API_BASE);
+            mistral::enrich_model_error(error, &cfg.api_key, model_name, api_base).await
         }
         Provider::OpenAI => {
             let Some(ref cfg) = config.providers.openai else {
                 return error;
             };
             let model_name = model.unwrap_or(&cfg.model);
-            openai::enrich_model_error(error, &cfg.api_key, model_name).await
+            let api_base = cfg.url.as_deref().unwrap_or(openai::API_BASE);
+            openai::enrich_model_error(error, &cfg.api_key, model_name, api_base).await
         }
     }
 }

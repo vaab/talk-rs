@@ -148,6 +148,22 @@ pub fn pcm_bytes_to_base64(bytes: &[u8]) -> String {
     BASE64_STANDARD.encode(bytes)
 }
 
+/// Convert an HTTP(S) base URL to a WebSocket URL.
+///
+/// `https://` becomes `wss://`, `http://` becomes `ws://`.
+/// URLs that already use a `ws://` or `wss://` scheme are returned
+/// unchanged.
+fn http_to_ws(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("https://") {
+        format!("wss://{}", rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        format!("ws://{}", rest)
+    } else {
+        // Already ws:// or wss://, or some other scheme — pass through.
+        url.to_string()
+    }
+}
+
 /// Realtime transcriber that connects via WebSocket to the Voxtral API.
 pub struct MistralRealtimeTranscriber {
     config: MistralConfig,
@@ -157,12 +173,16 @@ pub struct MistralRealtimeTranscriber {
 impl MistralRealtimeTranscriber {
     /// Create a new realtime transcriber with the given configuration.
     ///
-    /// Uses the default realtime model and endpoint.
+    /// The WebSocket endpoint is derived from `config.url` when set,
+    /// converting the HTTP(S) scheme to WS(S).  Falls back to the
+    /// default Mistral WebSocket endpoint otherwise.
     pub fn new(config: MistralConfig) -> Self {
-        Self {
-            config,
-            endpoint: DEFAULT_REALTIME_ENDPOINT.to_string(),
-        }
+        let endpoint = config
+            .url
+            .as_deref()
+            .map(|u| http_to_ws(u.trim_end_matches('/')))
+            .unwrap_or_else(|| DEFAULT_REALTIME_ENDPOINT.to_string());
+        Self { config, endpoint }
     }
 
     /// Create a new realtime transcriber with a custom endpoint (for testing).
@@ -564,6 +584,50 @@ async fn receiver_loop<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_http_to_ws_https() {
+        assert_eq!(http_to_ws("https://api.mistral.ai"), "wss://api.mistral.ai");
+    }
+
+    #[test]
+    fn test_http_to_ws_http() {
+        assert_eq!(http_to_ws("http://localhost:8080"), "ws://localhost:8080");
+    }
+
+    #[test]
+    fn test_http_to_ws_already_wss() {
+        assert_eq!(http_to_ws("wss://api.mistral.ai"), "wss://api.mistral.ai");
+    }
+
+    #[test]
+    fn test_http_to_ws_already_ws() {
+        assert_eq!(http_to_ws("ws://localhost:8080"), "ws://localhost:8080");
+    }
+
+    #[test]
+    fn test_new_uses_custom_url() {
+        let config = MistralConfig {
+            api_key: "key".to_string(),
+            url: Some("https://custom.example.com".to_string()),
+            model: "voxtral-mini-2507".to_string(),
+            context_bias: None,
+        };
+        let transcriber = MistralRealtimeTranscriber::new(config);
+        assert_eq!(transcriber.endpoint, "wss://custom.example.com");
+    }
+
+    #[test]
+    fn test_new_default_endpoint() {
+        let config = MistralConfig {
+            api_key: "key".to_string(),
+            url: None,
+            model: "voxtral-mini-2507".to_string(),
+            context_bias: None,
+        };
+        let transcriber = MistralRealtimeTranscriber::new(config);
+        assert_eq!(transcriber.endpoint, "wss://api.mistral.ai");
+    }
 
     #[test]
     fn test_parse_event_text_delta() {

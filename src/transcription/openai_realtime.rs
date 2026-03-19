@@ -217,6 +217,21 @@ pub fn build_ws_url(endpoint: &str) -> String {
     format!("{}{}?{}", endpoint, REALTIME_PATH, REALTIME_INTENT)
 }
 
+/// Convert an HTTP(S) base URL to a WebSocket URL.
+///
+/// `https://` becomes `wss://`, `http://` becomes `ws://`.
+/// URLs that already use a `ws://` or `wss://` scheme are returned
+/// unchanged.
+fn http_to_ws(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("https://") {
+        format!("wss://{}", rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        format!("ws://{}", rest)
+    } else {
+        url.to_string()
+    }
+}
+
 // ── Transcriber ─────────────────────────────────────────────────────
 
 /// Realtime transcriber that connects via WebSocket to the OpenAI
@@ -231,22 +246,34 @@ pub struct OpenAIRealtimeTranscriber {
 impl OpenAIRealtimeTranscriber {
     /// Create a new realtime transcriber with the given configuration.
     ///
-    /// Uses the `realtime_model` from config as the default model.
+    /// The WebSocket endpoint is derived from `config.url` when set,
+    /// converting the HTTP(S) scheme to WS(S).  Falls back to the
+    /// default OpenAI WebSocket endpoint otherwise.
     pub fn new(config: OpenAIConfig) -> Self {
         let model = config.realtime_model.clone();
+        let endpoint = config
+            .url
+            .as_deref()
+            .map(|u| http_to_ws(u.trim_end_matches('/')))
+            .unwrap_or_else(|| DEFAULT_OPENAI_REALTIME_ENDPOINT.to_string());
         Self {
             config,
             model,
-            endpoint: DEFAULT_OPENAI_REALTIME_ENDPOINT.to_string(),
+            endpoint,
         }
     }
 
     /// Create a new realtime transcriber with an explicit model override.
     pub fn with_model(config: OpenAIConfig, model: String) -> Self {
+        let endpoint = config
+            .url
+            .as_deref()
+            .map(|u| http_to_ws(u.trim_end_matches('/')))
+            .unwrap_or_else(|| DEFAULT_OPENAI_REALTIME_ENDPOINT.to_string());
         Self {
             config,
             model,
-            endpoint: DEFAULT_OPENAI_REALTIME_ENDPOINT.to_string(),
+            endpoint,
         }
     }
 
@@ -780,6 +807,53 @@ async fn receiver_loop<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_http_to_ws_https() {
+        assert_eq!(http_to_ws("https://api.openai.com"), "wss://api.openai.com");
+    }
+
+    #[test]
+    fn test_http_to_ws_http() {
+        assert_eq!(http_to_ws("http://localhost:8080"), "ws://localhost:8080");
+    }
+
+    #[test]
+    fn test_new_uses_custom_url() {
+        let config = OpenAIConfig {
+            api_key: "key".to_string(),
+            url: Some("https://custom.example.com".to_string()),
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+        };
+        let transcriber = OpenAIRealtimeTranscriber::new(config);
+        assert_eq!(transcriber.endpoint, "wss://custom.example.com");
+    }
+
+    #[test]
+    fn test_new_default_endpoint() {
+        let config = OpenAIConfig {
+            api_key: "key".to_string(),
+            url: None,
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+        };
+        let transcriber = OpenAIRealtimeTranscriber::new(config);
+        assert_eq!(transcriber.endpoint, "wss://api.openai.com");
+    }
+
+    #[test]
+    fn test_with_model_uses_custom_url() {
+        let config = OpenAIConfig {
+            api_key: "key".to_string(),
+            url: Some("https://custom.example.com".to_string()),
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+        };
+        let transcriber =
+            OpenAIRealtimeTranscriber::with_model(config, "gpt-4o-transcribe".to_string());
+        assert_eq!(transcriber.endpoint, "wss://custom.example.com");
+    }
 
     #[test]
     fn test_resample_empty() {

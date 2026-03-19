@@ -131,8 +131,10 @@ providers:
 
 | Field                              | Default                   | Description                        |
 |------------------------------------+---------------------------+------------------------------------|
+| ~providers.mistral.url~            | ~https://api.mistral.ai~  | Mistral API base URL               |
 | ~providers.mistral.model~          | ~voxtral-mini-2507~       | Mistral transcription model        |
 | ~providers.mistral.context_bias~   | /none/                    | Comma-separated words for accuracy |
+| ~providers.openai.url~             | ~https://api.openai.com~  | OpenAI API base URL                |
 | ~providers.openai.model~           | ~whisper-1~               | OpenAI batch model                 |
 | ~providers.openai.realtime_model~  | ~gpt-4o-mini-transcribe~  | OpenAI realtime model              |
 | ~transcription.default_provider~   | ~mistral~                 | Default provider when unspecified  |

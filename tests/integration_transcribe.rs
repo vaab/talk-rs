@@ -109,6 +109,7 @@ async fn test_transcribe_with_mock_writes_to_file() {
 async fn test_transcribe_nonexistent_file_errors() {
     let config = MistralConfig {
         api_key: "test-api-key".to_string(),
+        url: None,
         model: "voxtral-mini-latest".to_string(),
         context_bias: None,
     };
