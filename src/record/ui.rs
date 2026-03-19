@@ -81,20 +81,18 @@ fn show_recordings_window(
 
     let main_loop = glib::MainLoop::new(None, false);
 
-    // Native audio player (cpal). Falls back to no-op if device unavailable.
-    let player: Rc<Option<WavPlayer>> = Rc::new(match WavPlayer::new() {
-        Ok(p) => Some(p),
-        Err(e) => {
-            log::warn!("audio output unavailable, play disabled: {}", e);
-            None
-        }
-    });
+    // Native audio player (cpal), initialized in background after the
+    // window is presented to avoid blocking the UI on device probing.
+    let player: Rc<RefCell<Option<WavPlayer>>> = Rc::new(RefCell::new(None));
     // Track which button is currently in "stop" mode.
     let active_play_btn: Rc<RefCell<Option<gtk4::Button>>> = Rc::new(RefCell::new(None));
 
     /// Stop any active playback and reset the corresponding button.
-    fn stop_playback(player: &Rc<Option<WavPlayer>>, btn_ref: &Rc<RefCell<Option<gtk4::Button>>>) {
-        if let Some(ref p) = **player {
+    fn stop_playback(
+        player: &Rc<RefCell<Option<WavPlayer>>>,
+        btn_ref: &Rc<RefCell<Option<gtk4::Button>>>,
+    ) {
+        if let Some(ref p) = *player.borrow() {
             p.stop();
         }
         if let Some(prev_btn) = btn_ref.borrow_mut().take() {
@@ -107,12 +105,13 @@ fn show_recordings_window(
     fn start_playback(
         audio_path: &std::path::Path,
         btn: &gtk4::Button,
-        player: &Rc<Option<WavPlayer>>,
+        player: &Rc<RefCell<Option<WavPlayer>>>,
         btn_ref: &Rc<RefCell<Option<gtk4::Button>>>,
     ) {
         stop_playback(player, btn_ref);
 
-        let Some(ref p) = **player else { return };
+        let player_guard = player.borrow();
+        let Some(ref p) = *player_guard else { return };
         if let Err(e) = p.play(audio_path) {
             log::warn!("failed to play {}: {}", audio_path.display(), e);
             return;
@@ -128,7 +127,7 @@ fn show_recordings_window(
         let btn_widget = btn.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
             let finished = player_poll
-                .as_ref()
+                .borrow()
                 .as_ref()
                 .is_none_or(|p| p.is_finished());
             if finished {
@@ -153,7 +152,7 @@ fn show_recordings_window(
         /// and buttons.
         fn build_row(
             recording: &RecordingEntry,
-            player: &Rc<Option<WavPlayer>>,
+            player: &Rc<RefCell<Option<WavPlayer>>>,
             active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
             window: &gtk4::Window,
             list: &gtk4::ListBox,
@@ -295,7 +294,7 @@ fn show_recordings_window(
             recordings: &[RecordingEntry],
             list: &gtk4::ListBox,
             expander: &gtk4::Expander,
-            player: &Rc<Option<WavPlayer>>,
+            player: &Rc<RefCell<Option<WavPlayer>>>,
             active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
             window: &gtk4::Window,
         ) {
@@ -388,7 +387,7 @@ fn show_recordings_window(
         struct WatchCtx {
             list: gtk4::ListBox,
             expander: gtk4::Expander,
-            player: Rc<Option<WavPlayer>>,
+            player: Rc<RefCell<Option<WavPlayer>>>,
             active_play_btn: Rc<RefCell<Option<gtk4::Button>>>,
             window: gtk4::Window,
         }
@@ -534,6 +533,21 @@ fn show_recordings_window(
     crate::gtk_theme::install_edge_resize(&window);
 
     crate::gtk_theme::present_centred(&window);
+
+    // Initialize the audio player after the window is presented so it
+    // appears instantly instead of blocking on cpal device probing.
+    {
+        let player_init = Rc::clone(&player);
+        glib::idle_add_local_once(move || match WavPlayer::new() {
+            Ok(p) => {
+                *player_init.borrow_mut() = Some(p);
+            }
+            Err(e) => {
+                log::warn!("audio output unavailable, play disabled: {}", e);
+            }
+        });
+    }
+
     main_loop.run();
     window.close();
 
