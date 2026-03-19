@@ -53,7 +53,7 @@ fn show_recordings_window(
     crate::gtk_theme::load_css(&theme.base_css(
         ".transcript { font-family: monospace; opacity: 0.7; } \
          .meta { font-family: monospace; } \
-         .play-btn, .folder-btn, .delete-btn { min-width: 28px; min-height: 28px; max-width: 28px; max-height: 28px; padding: 0; font-size: 14px; } \
+         .copy-btn, .play-btn, .folder-btn, .delete-btn { min-width: 28px; min-height: 28px; max-width: 28px; max-height: 28px; padding: 0; font-size: 14px; } \
          .folder-btn label, .delete-btn label { padding-top: 4px; } \
          .section-expander { margin: 4px 2px; } \
          .section-expander > title { font-weight: bold; opacity: 0.85; padding: 4px 0; }",
@@ -205,6 +205,22 @@ fn show_recordings_window(
             transcript.set_selectable(false);
             transcript.add_css_class("transcript");
             hbox.append(&transcript);
+
+            // Copy-to-clipboard button (only shown when transcript text exists)
+            if !recording.transcript_preview.is_empty() {
+                let copy_btn = gtk4::Button::with_label("\u{2398}");
+                copy_btn.set_tooltip_text(Some("Copy transcript to clipboard"));
+                copy_btn.add_css_class("copy-btn");
+                {
+                    let text = recording.transcript_preview.clone();
+                    copy_btn.connect_clicked(move |_| {
+                        if let Some(display) = gtk4::gdk::Display::default() {
+                            display.clipboard().set_text(&text);
+                        }
+                    });
+                }
+                hbox.append(&copy_btn);
+            }
 
             // Play button
             let play_btn = gtk4::Button::with_label("▶");
