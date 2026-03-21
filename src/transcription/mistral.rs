@@ -329,10 +329,20 @@ impl BatchTranscriber for MistralBatchTranscriber {
             )));
         }
 
-        // Open the audio file
+        // Open the audio file and determine its size so reqwest can
+        // set an explicit Content-Length header.  Without a known
+        // length the request is sent with Transfer-Encoding: chunked,
+        // which the Mistral API rejects with 411 Length Required.
         let file = File::open(audio_path).await.map_err(|err| {
             TalkError::Transcription(format!("Failed to open audio file: {}", err))
         })?;
+        let file_len = file
+            .metadata()
+            .await
+            .map_err(|err| {
+                TalkError::Transcription(format!("Failed to read audio file metadata: {}", err))
+            })?
+            .len();
 
         // Get file name for multipart form
         let file_name = audio_path
@@ -346,7 +356,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .text("model", self.config.model.clone())
             .part(
                 "file",
-                reqwest::multipart::Part::stream(file).file_name(file_name),
+                reqwest::multipart::Part::stream_with_length(file, file_len).file_name(file_name),
             );
 
         // Add context bias if configured
