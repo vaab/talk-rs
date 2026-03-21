@@ -1197,55 +1197,58 @@ fn overlay_thread(
             }
         }
 
-        // Per-viz-mode data updates.
-        if let Some(mode) = viz {
-            use crate::config::VizMode;
-            match mode {
-                VizMode::Waterfall => {
-                    // Dynamic frequency scaling.
-                    let nyquist = sample_rate as f32 / 2.0;
-                    let n_mag = magnitudes.len();
-                    for (i, &mag) in magnitudes.iter().enumerate().rev() {
-                        if mag > FREQ_NOISE_FLOOR {
-                            let freq = (i as f32 / n_mag as f32) * nyquist;
-                            if freq > effective_freq_max {
-                                effective_freq_max = freq.min(FREQ_MAX);
+        // Per-viz-mode data updates (freeze during auto-pause / no-sound
+        // so silence gaps don't appear in the visualization).
+        if !auto_paused && !no_sound_active {
+            if let Some(mode) = viz {
+                use crate::config::VizMode;
+                match mode {
+                    VizMode::Waterfall => {
+                        // Dynamic frequency scaling.
+                        let nyquist = sample_rate as f32 / 2.0;
+                        let n_mag = magnitudes.len();
+                        for (i, &mag) in magnitudes.iter().enumerate().rev() {
+                            if mag > FREQ_NOISE_FLOOR {
+                                let freq = (i as f32 / n_mag as f32) * nyquist;
+                                if freq > effective_freq_max {
+                                    effective_freq_max = freq.min(FREQ_MAX);
+                                }
+                                break;
                             }
-                            break;
+                        }
+                        let column = map_spectrum_to_column(
+                            &magnitudes,
+                            SPEC_H,
+                            sample_rate,
+                            effective_freq_max,
+                        );
+                        spectrogram_history.push(column);
+                        if spectrogram_history.len() > SPEC_W {
+                            spectrogram_history.drain(..spectrogram_history.len() - SPEC_W);
+                        }
+                        // All-time peak for opacity normalization.
+                        let frame_spec_max = magnitudes.iter().copied().fold(0.0f32, f32::max);
+                        if frame_spec_max > spec_peak {
+                            spec_peak = frame_spec_max;
                         }
                     }
-                    let column = map_spectrum_to_column(
-                        &magnitudes,
-                        SPEC_H,
-                        sample_rate,
-                        effective_freq_max,
-                    );
-                    spectrogram_history.push(column);
-                    if spectrogram_history.len() > SPEC_W {
-                        spectrogram_history.drain(..spectrogram_history.len() - SPEC_W);
+                    VizMode::Amplitude => {
+                        if frame_rms > amp_peak {
+                            amp_peak = frame_rms;
+                        }
+                        amp_history.push(frame_rms);
+                        if amp_history.len() > amp_max_frames {
+                            amp_history.drain(..amp_history.len() - amp_max_frames);
+                        }
                     }
-                    // All-time peak for opacity normalization.
-                    let frame_spec_max = magnitudes.iter().copied().fold(0.0f32, f32::max);
-                    if frame_spec_max > spec_peak {
-                        spec_peak = frame_spec_max;
+                    VizMode::Spectrum => {
+                        spectrum_peak *= PEAK_DECAY;
+                        let frame_peak = magnitudes.iter().copied().fold(0.0f32, f32::max);
+                        if frame_peak > spectrum_peak {
+                            spectrum_peak = frame_peak;
+                        }
+                        spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
                     }
-                }
-                VizMode::Amplitude => {
-                    if frame_rms > amp_peak {
-                        amp_peak = frame_rms;
-                    }
-                    amp_history.push(frame_rms);
-                    if amp_history.len() > amp_max_frames {
-                        amp_history.drain(..amp_history.len() - amp_max_frames);
-                    }
-                }
-                VizMode::Spectrum => {
-                    spectrum_peak *= PEAK_DECAY;
-                    let frame_peak = magnitudes.iter().copied().fold(0.0f32, f32::max);
-                    if frame_peak > spectrum_peak {
-                        spectrum_peak = frame_peak;
-                    }
-                    spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
                 }
             }
         }
