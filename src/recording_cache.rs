@@ -601,6 +601,52 @@ pub fn rotate_cache() -> Result<(), TalkError> {
     Ok(())
 }
 
+/// Prune cached OGG files, keeping only the `max` most recent.
+///
+/// OGG cache files share the same timestamp-based naming as WAV files,
+/// so lexicographic sort gives chronological order.
+pub fn prune_ogg_cache(max: usize) -> Result<(), TalkError> {
+    let dir = match recordings_dir() {
+        Ok(d) if d.exists() => d,
+        _ => return Ok(()),
+    };
+
+    let mut oggs: Vec<PathBuf> = Vec::new();
+    let entries = fs::read_dir(&dir).map_err(|e| {
+        TalkError::Config(format!(
+            "failed to read recordings directory {}: {}",
+            dir.display(),
+            e
+        ))
+    })?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("ogg") {
+            oggs.push(path);
+        }
+    }
+
+    oggs.sort();
+
+    if oggs.len() <= max {
+        return Ok(());
+    }
+
+    let to_remove = oggs.len() - max;
+    for ogg_path in &oggs[..to_remove] {
+        if let Err(e) = fs::remove_file(ogg_path) {
+            log::warn!("failed to remove cached OGG {}: {}", ogg_path.display(), e);
+        } else {
+            log::debug!("pruned cached OGG: {}", ogg_path.display());
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
