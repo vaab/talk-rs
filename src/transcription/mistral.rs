@@ -10,14 +10,12 @@ use crate::transcription::{
     TranscriptionMetadata, TranscriptionResult,
 };
 use async_trait::async_trait;
-use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::fs::File;
-use tokio_stream::wrappers::ReceiverStream;
 
 use super::http::{build_client, parse_u64_field, BATCH_FILE_TIMEOUT};
 use super::BatchTranscriber;
@@ -347,18 +345,27 @@ impl BatchTranscriber for MistralBatchTranscriber {
         audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
         file_name: &str,
     ) -> Result<TranscriptionResult, TalkError> {
-        // Convert the mpsc::Receiver into a Stream of Result<Vec<u8>, io::Error>
-        let byte_stream = ReceiverStream::new(audio_stream).map(Ok::<Vec<u8>, std::io::Error>);
+        // Collect all audio chunks into a single buffer so we can
+        // provide an explicit Content-Length.  The Mistral API rejects
+        // chunked Transfer-Encoding with 411 Length Required.
+        let mut audio_buf = Vec::new();
+        let mut rx = audio_stream;
+        while let Some(chunk) = rx.recv().await {
+            audio_buf.extend_from_slice(&chunk);
+        }
+        let audio_len = audio_buf.len() as u64;
+        log::info!(
+            "streaming upload: collected {} bytes for Mistral batch request",
+            audio_len
+        );
 
-        // Wrap the stream into a reqwest body for streaming upload
-        let body = reqwest::Body::wrap_stream(byte_stream);
-
-        // Create multipart form with streaming audio and model
+        // Create multipart form with known-length audio
         let mut form = reqwest::multipart::Form::new()
             .text("model", self.config.model.clone())
             .part(
                 "file",
-                reqwest::multipart::Part::stream(body).file_name(file_name.to_string()),
+                reqwest::multipart::Part::stream_with_length(audio_buf, audio_len)
+                    .file_name(file_name.to_string()),
             );
 
         // Add context bias if configured
