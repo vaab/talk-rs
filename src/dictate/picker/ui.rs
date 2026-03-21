@@ -224,6 +224,8 @@ pub(super) async fn pick_with_streaming_gtk(
     let audio_path_for_player = audio_path.clone();
     // Clone audio path for the waterfall spectrogram background thread.
     let audio_path_for_waterfall = audio_path.clone();
+    // Clone audio path for recording metadata writes from the GTK thread.
+    let audio_path_for_metadata = audio_path.clone();
 
     // ── GTK window ──────────────────────────────────────────────
     let gtk_handle = tokio::task::spawn_blocking(move || -> Result<(), TalkError> {
@@ -674,7 +676,7 @@ pub(super) async fn pick_with_streaming_gtk(
         editor_scroll.set_child(Some(&text_view));
         editor_bar.append(&editor_scroll);
 
-        let copy_btn = gtk4::Button::with_label("\u{2398}");
+        let copy_btn = gtk4::Button::with_label("\u{29C9}");
         copy_btn.set_tooltip_text(Some("Copy to clipboard"));
         copy_btn.add_css_class("copy-btn");
         copy_btn.set_valign(gtk4::Align::Start);
@@ -713,6 +715,74 @@ pub(super) async fn pick_with_streaming_gtk(
         // Diff colours: deletion (red) from theme, insertion green (Tango palette).
         let del_color = error_hex.clone();
         let ins_color = String::from("#4e9a06");
+
+        // ── Recording metadata auto-save ────────────────────────
+        // Writes a companion YAML alongside the WAV so the record
+        // UI can display the transcript via its inotify watcher.
+        //
+        // - Keyboard edits: debounced (1 s after last keystroke)
+        // - Programmatic changes (row selection, API result): immediate
+        // - Window close / confirm: immediate
+        //
+        // `save_pending_id` holds the glib source id of the pending
+        // debounce timer so it can be cancelled on each keystroke.
+
+        /// Shared context for recording metadata saves.
+        struct MetaSaveCtx {
+            audio_path: PathBuf,
+            /// Currently displayed (provider, model, streaming).
+            current: (Provider, String, bool),
+        }
+
+        let meta_save_ctx: Rc<RefCell<Option<MetaSaveCtx>>> = Rc::new(RefCell::new(None));
+        let save_pending_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+
+        /// Save current text buffer content as recording metadata.
+        fn save_metadata_now(
+            buf: &gtk4::TextBuffer,
+            ctx_ref: &Rc<RefCell<Option<MetaSaveCtx>>>,
+            pending: &Rc<RefCell<Option<glib::SourceId>>>,
+        ) {
+            use gtk4::prelude::*;
+
+            // Cancel any pending debounce timer.
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+
+            let ctx = ctx_ref.borrow();
+            let Some(ctx) = ctx.as_ref() else { return };
+            let text = buf
+                .text(&buf.start_iter(), &buf.end_iter(), false)
+                .to_string();
+            if text.is_empty() {
+                return;
+            }
+            let (provider, ref model, streaming) = ctx.current;
+            super::write_recording_metadata(&ctx.audio_path, provider, model, streaming, &text);
+        }
+
+        /// Schedule a debounced save: cancel any pending timer, start a
+        /// new 1 s timer.
+        fn schedule_debounced_save(
+            buf: &gtk4::TextBuffer,
+            ctx_ref: &Rc<RefCell<Option<MetaSaveCtx>>>,
+            pending: &Rc<RefCell<Option<glib::SourceId>>>,
+        ) {
+            // Cancel existing timer.
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+
+            let buf = buf.clone();
+            let ctx_ref = Rc::clone(ctx_ref);
+            let pending_inner = Rc::clone(pending);
+            let id = glib::timeout_add_local_once(std::time::Duration::from_secs(1), move || {
+                *pending_inner.borrow_mut() = None;
+                save_metadata_now(&buf, &ctx_ref, &Rc::new(RefCell::new(None)));
+            });
+            *pending.borrow_mut() = Some(id);
+        }
 
         // Helper: build a row skeleton with provider + streaming + model labels.
         // Returns (hbox, transcript_cell) — caller fills the cell
@@ -870,30 +940,51 @@ pub(super) async fn pick_with_streaming_gtk(
             }
         }
 
+        // Flag: true when text buffer is being updated programmatically
+        // (row selection, API result arrival).  The `connect_changed`
+        // handler uses this to decide between immediate vs debounced save.
+        let programmatic_change: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+        // Clone for pre-populate block below (before the closure captures it).
+        let audio_path_for_prepopulate = audio_path_for_metadata.clone();
+
         // ── Row selection → populate text area ──────────────────
         {
             let cands_sel = Rc::clone(&local_candidates);
             let buf_sel = text_buffer.clone();
+            let flag = Rc::clone(&programmatic_change);
+            let ctx_ref = Rc::clone(&meta_save_ctx);
             list.connect_row_selected(move |_, row| {
                 if let Some(row) = row {
                     let idx = row.index() as usize;
                     let cands = cands_sel.borrow();
-                    if let Some((_, _, text, _, is_error, _)) = cands.get(idx) {
+                    if let Some((provider, model, text, _, is_error, streaming)) = cands.get(idx) {
+                        // Update current provider/model/streaming for metadata saves.
+                        *ctx_ref.borrow_mut() = Some(MetaSaveCtx {
+                            audio_path: audio_path_for_metadata.clone(),
+                            current: (*provider, model.clone(), *streaming),
+                        });
                         if !text.is_empty() && !*is_error {
+                            *flag.borrow_mut() = true;
                             buf_sel.set_text(text);
+                            *flag.borrow_mut() = false;
                         }
                     }
                 }
             });
         }
 
-        // ── Live diff update on text-area edits ─────────────────
+        // ── Live diff update + metadata save on text-area edits ──
         {
             let raw_for_diff = Rc::clone(&raw_texts);
             let labels_for_diff = Rc::clone(&transcript_labels);
             let dc = del_color.clone();
             let ic = ins_color.clone();
+            let flag = Rc::clone(&programmatic_change);
+            let ctx_ref = Rc::clone(&meta_save_ctx);
+            let pending = Rc::clone(&save_pending_id);
             text_buffer.connect_changed(move |buf| {
+                // Diff update (existing logic).
                 let reference = buf
                     .text(&buf.start_iter(), &buf.end_iter(), false)
                     .to_string();
@@ -909,6 +1000,14 @@ pub(super) async fn pick_with_streaming_gtk(
                         }
                     }
                 }
+
+                // Metadata save: immediate for programmatic changes,
+                // debounced (1 s) for keyboard input.
+                if *flag.borrow() {
+                    save_metadata_now(buf, &ctx_ref, &pending);
+                } else {
+                    schedule_debounced_save(buf, &ctx_ref, &pending);
+                }
             });
         }
 
@@ -918,9 +1017,18 @@ pub(super) async fn pick_with_streaming_gtk(
         if let Some(row) = list.selected_row() {
             let idx = row.index() as usize;
             let cands = local_candidates.borrow();
-            if let Some((_, _, text, _, is_error, _)) = cands.get(idx) {
+            if let Some((provider, model, text, _, is_error, streaming)) = cands.get(idx) {
                 if !text.is_empty() && !*is_error {
+                    // Ensure metadata context is set before the first
+                    // text-buffer write so the connect_changed handler
+                    // can save the recording YAML.
+                    *meta_save_ctx.borrow_mut() = Some(MetaSaveCtx {
+                        audio_path: audio_path_for_prepopulate.clone(),
+                        current: (*provider, model.clone(), *streaming),
+                    });
+                    *programmatic_change.borrow_mut() = true;
                     text_buffer.set_text(text);
+                    *programmatic_change.borrow_mut() = false;
                 }
             }
         }
@@ -947,6 +1055,8 @@ pub(super) async fn pick_with_streaming_gtk(
             let cands = Rc::clone(&local_candidates);
             let win = window.clone();
             let buf_confirm = text_buffer.clone();
+            let ctx_ref = Rc::clone(&meta_save_ctx);
+            let pending = Rc::clone(&save_pending_id);
             list.connect_row_activated(move |_, row| {
                 let idx = row.index() as usize;
                 let ready = cands
@@ -961,6 +1071,8 @@ pub(super) async fn pick_with_streaming_gtk(
                     if !edited.is_empty() {
                         cands.borrow_mut()[idx].2 = edited;
                     }
+                    // Flush any pending debounce and save final text.
+                    save_metadata_now(&buf_confirm, &ctx_ref, &pending);
                     win.set_visible(false);
                     if let Some(tx) = sel.borrow_mut().take() {
                         let _ = tx.send(Some(idx));
@@ -976,7 +1088,11 @@ pub(super) async fn pick_with_streaming_gtk(
             let ml = main_loop.clone();
             let win = window.clone();
             let player_ref = Rc::clone(&player);
+            let buf_close = text_buffer.clone();
+            let ctx_ref = Rc::clone(&meta_save_ctx);
+            let pending = Rc::clone(&save_pending_id);
             close_btn.connect_clicked(move |_| {
+                save_metadata_now(&buf_close, &ctx_ref, &pending);
                 if let Some(ref p) = *player_ref.borrow() {
                     p.stop();
                 }
@@ -994,9 +1110,13 @@ pub(super) async fn pick_with_streaming_gtk(
             let ml = main_loop.clone();
             let win = window.clone();
             let player_ref = Rc::clone(&player);
+            let buf_esc = text_buffer.clone();
+            let ctx_ref = Rc::clone(&meta_save_ctx);
+            let pending = Rc::clone(&save_pending_id);
             let key_ctl = gtk4::EventControllerKey::new();
             key_ctl.connect_key_pressed(move |_, key, _, _| {
                 if key == gtk4::gdk::Key::Escape {
+                    save_metadata_now(&buf_esc, &ctx_ref, &pending);
                     if let Some(ref p) = *player_ref.borrow() {
                         p.stop();
                     }
@@ -1018,7 +1138,11 @@ pub(super) async fn pick_with_streaming_gtk(
             let sel = Rc::clone(&sel_sender);
             let ml = main_loop.clone();
             let player_ref = Rc::clone(&player);
+            let buf_wc = text_buffer.clone();
+            let ctx_ref = Rc::clone(&meta_save_ctx);
+            let pending = Rc::clone(&save_pending_id);
             window.connect_close_request(move |win| {
+                save_metadata_now(&buf_wc, &ctx_ref, &pending);
                 if let Some(ref p) = *player_ref.borrow() {
                     p.stop();
                 }
