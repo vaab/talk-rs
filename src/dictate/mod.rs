@@ -52,6 +52,7 @@ pub struct DictateOpts {
     pub no_sounds: bool,
     pub no_boop: bool,
     pub no_chunk_paste: bool,
+    pub no_paste: bool,
     pub monitor: bool,
     pub no_overlay: bool,
     pub no_auto_pause: bool,
@@ -410,6 +411,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         ));
     }
 
+    let mut t_stop: Option<std::time::Instant> = None;
     let result = if opts.realtime {
         // Realtime mode (--realtime): stream audio over WebSocket.
         // Each segment is pasted into the focused application as it
@@ -500,7 +502,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.diarize,
         )?;
 
-        let stream_result = dictate_streaming(
+        let (stream_result, t_stop_val) = dictate_streaming(
             &mut *capture,
             from_file,
             encode_config.clone(),
@@ -518,6 +520,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.diarize,
         )
         .await;
+        t_stop = t_stop_val;
 
         // If the initial streaming transcription failed (timeout,
         // API error, network issue), retry up to 5 times using the
@@ -655,6 +658,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     };
 
+    if let Some(t) = t_stop {
+        log::info!(
+            "timing: stop +{}ms transcription_done",
+            t.elapsed().as_millis()
+        );
+    }
+
     // Stop boop loop (idempotent — may already be cancelled by
     // dictate_streaming or dictate_realtime).
     if let Some(token) = boop_token {
@@ -752,12 +762,15 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     // Paste into focused application (batch mode only;
     // realtime mode pastes per-segment during recording)
-    if !opts.realtime {
+    if !opts.realtime && !opts.no_paste {
         // Hide transcribing overlay just before pasting.
         if let Some(ref o) = overlay {
             o.hide();
         }
-        paste_text_to_target(target_window.as_ref(), &text, 0, paste_chunk_chars).await?;
+        if let Some(t) = t_stop {
+            log::info!("timing: stop +{}ms paste_start", t.elapsed().as_millis());
+        }
+        paste_text_to_target(target_window.as_ref(), &text, 0, paste_chunk_chars, t_stop).await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
     }
 

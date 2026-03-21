@@ -125,7 +125,10 @@ pub(crate) async fn dictate_streaming(
     provider: Provider,
     model: Option<&str>,
     diarize: bool,
-) -> Result<TranscriptionResult, TalkError> {
+) -> (
+    Result<TranscriptionResult, TalkError>,
+    Option<std::time::Instant>,
+) {
     // ── WAV recording (independent of transcription) ────────────────
     log::info!("caching audio to: {}", cache_wav_path.display());
     let buffer = Arc::new(AudioBuffer::new());
@@ -142,14 +145,19 @@ pub(crate) async fn dictate_streaming(
 
     // ── Wait for recording to end ───────────────────────────────────
     let rec_start = std::time::Instant::now();
+    let mut t_stop: Option<std::time::Instant> = None;
     if from_file {
         log::info!("transcribing audio file (batch)...");
         tokio::select! {
             _ = shutdown.cancelled() => {
+                t_stop = Some(std::time::Instant::now());
                 log::info!("aborting after {:.2}s", rec_start.elapsed().as_secs_f64());
-                capture.stop()?;
+                if let Err(e) = capture.stop() {
+                    return (Err(e), t_stop);
+                }
             }
             _ = &mut encode_done_rx => {
+                t_stop = Some(std::time::Instant::now());
                 log::info!(
                     "audio file playback complete after {:.2}s",
                     rec_start.elapsed().as_secs_f64()
@@ -166,12 +174,17 @@ pub(crate) async fn dictate_streaming(
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
+                    t_stop = Some(std::time::Instant::now());
                     log::info!(
                         "shutdown signal received after {:.2}s recording — stopping capture",
                         rec_start.elapsed().as_secs_f64()
                     );
-                    capture.stop()?;
-                    log::info!("capture stopped");
+                    if let Err(e) = capture.stop() {
+                        return (Err(e), t_stop);
+                    }
+                    if let Some(t) = t_stop {
+                        log::info!("timing: stop +{}ms capture_stopped", t.elapsed().as_millis());
+                    }
                     break;
                 }
                 feeder_result = &mut feeder_handle => {
@@ -207,12 +220,17 @@ pub(crate) async fn dictate_streaming(
                         // Continue recording — will retry from WAV
                         // after recording stops.
                         shutdown.cancelled().await;
+                        t_stop = Some(std::time::Instant::now());
                         log::info!(
                             "shutdown after {:.2}s — stopping capture",
                             rec_start.elapsed().as_secs_f64()
                         );
-                        capture.stop()?;
-                        log::info!("capture stopped");
+                        if let Err(e) = capture.stop() {
+                            return (Err(e), t_stop);
+                        }
+                        if let Some(t) = t_stop {
+                            log::info!("timing: stop +{}ms capture_stopped", t.elapsed().as_millis());
+                        }
                         break;
                     }
 
@@ -254,11 +272,17 @@ pub(crate) async fn dictate_streaming(
                             // Fall through — will retry from WAV after
                             // recording stops.
                             shutdown.cancelled().await;
+                            t_stop = Some(std::time::Instant::now());
                             log::info!(
                                 "shutdown after {:.2}s — stopping capture",
                                 rec_start.elapsed().as_secs_f64()
                             );
-                            capture.stop()?;
+                            if let Err(e) = capture.stop() {
+                                return (Err(e), t_stop);
+                            }
+                            if let Some(t) = t_stop {
+                                log::info!("timing: stop +{}ms capture_stopped", t.elapsed().as_millis());
+                            }
                             break;
                         }
                     }
@@ -291,6 +315,9 @@ pub(crate) async fn dictate_streaming(
         Ok(Ok(())) => log::debug!("cache WAV task completed"),
         Ok(Err(err)) => log::warn!("cache WAV write error: {}", err),
         Err(err) => log::warn!("cache WAV task panicked: {}", err),
+    }
+    if let Some(t) = t_stop {
+        log::info!("timing: stop +{}ms wav_flushed", t.elapsed().as_millis());
     }
 
     // ── Wait for transcription result ───────────────────────────────
@@ -333,5 +360,5 @@ pub(crate) async fn dictate_streaming(
         t0.elapsed().as_secs_f64()
     );
 
-    result
+    (result, t_stop)
 }

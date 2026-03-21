@@ -120,6 +120,7 @@ pub async fn paste_text_to_target(
     text: &str,
     delete_chars_before_paste: usize,
     chunk_chars: usize,
+    t_stop: Option<std::time::Instant>,
 ) -> Result<(), TalkError> {
     let clipboard = X11Clipboard::new();
 
@@ -136,10 +137,14 @@ pub async fn paste_text_to_target(
 
     let saved_clipboard = clipboard.get_text().await.ok();
 
+    let mut first_paste_logged = false;
     if chunk_chars == 0 {
         // No chunking: paste the entire text in one shot.
         clipboard.set_text(text).await?;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        if let Some(t) = t_stop {
+            log::info!("timing: stop +{}ms first_paste", t.elapsed().as_millis());
+        }
         simulate_paste().await?;
         tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     } else {
@@ -147,6 +152,12 @@ pub async fn paste_text_to_target(
         for chunk in &chunks {
             clipboard.set_text(chunk).await?;
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if !first_paste_logged {
+                if let Some(t) = t_stop {
+                    log::info!("timing: stop +{}ms first_paste", t.elapsed().as_millis());
+                }
+                first_paste_logged = true;
+            }
             simulate_paste().await?;
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         }

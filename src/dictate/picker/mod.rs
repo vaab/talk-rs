@@ -302,6 +302,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         &selection.text,
         delete_chars,
         params.paste_chunk_chars,
+        None,
     )
     .await?;
     let _ =

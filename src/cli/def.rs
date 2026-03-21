@@ -88,6 +88,9 @@ pub enum Commands {
         /// Disable chunked pasting (paste all text in one shot)
         #[arg(long)]
         no_chunk_paste: bool,
+        /// Skip pasting transcription into the focused application
+        #[arg(long)]
+        no_paste: bool,
         /// Mix system audio (monitor) with microphone input
         #[arg(long)]
         monitor: bool,
