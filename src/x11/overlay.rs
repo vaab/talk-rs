@@ -73,8 +73,8 @@ const FREQ_INITIAL_MAX: f32 = 320.0;
 
 // ── Colors (BGRA for little-endian ZPixmap, depth 24/32) ────────────
 
-/// Badge background: fully transparent (compositor alpha).
-const BG_COLOR: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+/// Badge background: opaque black.
+const BG_COLOR: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
 
 /// Border colour: medium gray, fully opaque (BGRA).
 const BORDER_COLOR: [u8; 4] = [0x88, 0x88, 0x88, 0xFF];
@@ -286,13 +286,15 @@ fn render_spectrogram(
                 0.0
             };
 
-            let color = if mono.is_some() {
+            let mut color = if mono.is_some() {
                 // Premultiplied alpha: white × brightness.
                 let alpha = (brightness * 255.0) as u8;
                 [alpha, alpha, alpha, alpha]
             } else {
                 super::render_util::heat_map_color(norm, brightness)
             };
+            // Keep pixel fully opaque over the black background.
+            color[3] = 0xFF;
             pb.set_pixel(x, y, color);
         }
     }
@@ -966,10 +968,12 @@ fn overlay_thread(
                     let badge_y = mon_y + 4;
 
                     let win = if let Some(ref ctx) = argb_ctx {
-                        // 32-bit ARGB window — compositor handles transparency.
-                        create_argb_overlay_window(
+                        // 32-bit ARGB window with shape mask for rounded corners.
+                        let w = create_argb_overlay_window(
                             &conn, root, ctx, badge_x, badge_y, BADGE_W, BADGE_H,
-                        )?
+                        )?;
+                        apply_rounded_shape(&conn, w, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+                        w
                     } else {
                         // Fallback: opaque window with shape mask.
                         let w = create_overlay_window(
@@ -1599,14 +1603,14 @@ mod tests {
             &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None,
         );
 
-        // Leftmost columns of spectrogram area should still be BG (alpha=0).
+        // Leftmost columns of spectrogram area should still be BG.
         let check_col = SPEC_LEFT;
         let mid_y = SPEC_TOP + SPEC_H / 2;
         let off = (mid_y * pb.width + check_col) * 4;
         assert_eq!(
-            pb.data[off + 3],
-            0,
-            "leftmost spectrogram column should be transparent when history is short"
+            &pb.data[off..off + 4],
+            &BG_COLOR,
+            "leftmost spectrogram column should remain background when history is short"
         );
 
         // Rightmost columns should have content (non-zero alpha).
@@ -1734,14 +1738,14 @@ mod tests {
             "top edge centre should have non-zero alpha from border"
         );
 
-        // Interior centre should be transparent (no border there).
+        // Interior centre should remain at background color (no border there).
         let cx = BADGE_W as usize / 2;
         let cy = BADGE_H as usize / 2;
         let off_centre = (cy * pb.width + cx) * 4;
         assert_eq!(
-            pb.data[off_centre + 3],
-            0,
-            "badge interior should remain transparent"
+            &pb.data[off_centre..off_centre + 4],
+            &BG_COLOR,
+            "badge interior should remain at background color"
         );
     }
 
