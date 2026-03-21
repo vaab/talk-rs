@@ -10,7 +10,7 @@ mod streaming;
 mod text;
 mod toggle;
 
-use crate::audio::file_source::WavFileSource;
+use crate::audio::file_source::{OggFileSource, WavFileSource};
 use crate::audio::indicator::SoundPlayer;
 use crate::audio::monitor_capture::MonitorCapture;
 use crate::audio::pipewire_capture::PipeWireCapture;
@@ -58,6 +58,7 @@ pub struct DictateOpts {
     pub no_auto_pause: bool,
     pub viz: Option<crate::config::VizMode>,
     pub mono: bool,
+    pub upload_format: crate::transcription::UploadFormat,
     pub daemon: bool,
     pub target_window: Option<String>,
     pub verbose: u8,
@@ -80,6 +81,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.no_auto_pause,
             opts.viz,
             opts.mono,
+            opts.upload_format,
             opts.save.as_deref(),
             opts.verbose,
         )
@@ -222,10 +224,15 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     let (mut capture, capture_rate): (Box<dyn AudioCapture>, u32) =
         if let Some(ref path) = input_audio_file {
             log::info!("using audio file input: {}", path.display());
-            (
-                Box::new(WavFileSource::new(path, &encode_config)?),
-                encode_config.sample_rate,
-            )
+            let is_ogg = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("ogg"));
+            let source: Box<dyn AudioCapture> = if is_ogg {
+                Box::new(OggFileSource::new(path)?)
+            } else {
+                Box::new(WavFileSource::new(path, &encode_config)?)
+            };
+            (source, encode_config.sample_rate)
         } else {
             // Prefer PipeWire native capture — matches pw-cat's audio
             // routing (including Bluetooth devices) exactly.  Fall back
@@ -502,6 +509,14 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.diarize,
         )?;
 
+        // When --upload-format ogg, tee the encoded OGG stream to a
+        // cache file so retries can use it instead of the larger WAV.
+        let ogg_cache_path = if opts.upload_format == crate::transcription::UploadFormat::Ogg {
+            Some(cache_wav_path.with_extension("ogg"))
+        } else {
+            None
+        };
+
         let (stream_result, t_stop_val) = dictate_streaming(
             &mut *capture,
             from_file,
@@ -518,6 +533,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             provider,
             opts.model.as_deref(),
             opts.diarize,
+            ogg_cache_path.clone(),
         )
         .await;
         t_stop = t_stop_val;
@@ -589,9 +605,12 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         }
                     };
 
-                    let wav = cache_wav_path.to_path_buf();
-                    let mut task =
-                        tokio::spawn(async move { retry_transcriber.transcribe_file(&wav).await });
+                    let upload_path = ogg_cache_path
+                        .clone()
+                        .unwrap_or_else(|| cache_wav_path.to_path_buf());
+                    let mut task = tokio::spawn(async move {
+                        retry_transcriber.transcribe_file(&upload_path).await
+                    });
 
                     let outcome = tokio::select! {
                         res = &mut task => {
