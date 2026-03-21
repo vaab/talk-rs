@@ -53,8 +53,8 @@ fn show_recordings_window(
     crate::gtk_theme::load_css(&theme.base_css(
         ".transcript { font-family: monospace; opacity: 0.7; } \
          .meta { font-family: monospace; } \
-         .copy-btn, .play-btn, .folder-btn, .delete-btn { min-width: 28px; min-height: 28px; max-width: 28px; max-height: 28px; padding: 0; font-size: 14px; } \
-         .folder-btn label, .delete-btn label { padding-top: 4px; } \
+         .copy-btn, .play-btn, .dictate-btn, .folder-btn, .delete-btn { min-width: 28px; min-height: 28px; max-width: 28px; max-height: 28px; padding: 0; font-size: 14px; } \
+         .dictate-btn label, .folder-btn label, .delete-btn label { padding-top: 4px; } \
          .section-expander { margin: 4px 2px; } \
          .section-expander > title { font-weight: bold; opacity: 0.85; padding: 4px 0; }",
     ));
@@ -208,7 +208,7 @@ fn show_recordings_window(
 
             // Copy-to-clipboard button (only shown when transcript text exists)
             if !recording.transcript_preview.is_empty() {
-                let copy_btn = gtk4::Button::with_label("\u{2398}");
+                let copy_btn = gtk4::Button::with_label("\u{29C9}");
                 copy_btn.set_tooltip_text(Some("Copy transcript to clipboard"));
                 copy_btn.add_css_class("copy-btn");
                 {
@@ -239,6 +239,35 @@ fn show_recordings_window(
                     }
                 });
             }
+            // Dictate button — open the picker to transcribe this recording
+            // (only for WAV files that have no transcription yet)
+            if recording.transcript_preview.is_empty()
+                && recording.path.extension().is_some_and(|ext| ext == "wav")
+            {
+                let dictate_btn = gtk4::Button::with_label("\u{1D413}");
+                dictate_btn.set_tooltip_text(Some("Transcribe recording"));
+                dictate_btn.add_css_class("dictate-btn");
+                {
+                    let audio_path = recording.path.clone();
+                    dictate_btn.connect_clicked(move |_| {
+                        let exe = std::env::current_exe()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("talk-rs"));
+                        if let Err(e) = std::process::Command::new(exe)
+                            .args([
+                                "dictate",
+                                "--pick",
+                                "--input-audio-file",
+                                &audio_path.to_string_lossy(),
+                            ])
+                            .spawn()
+                        {
+                            log::warn!("failed to launch picker: {}", e);
+                        }
+                    });
+                }
+                hbox.append(&dictate_btn);
+            }
+
             hbox.append(&play_btn);
 
             // Folder button — open file manager with file highlighted
