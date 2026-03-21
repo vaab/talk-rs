@@ -509,13 +509,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.diarize,
         )?;
 
-        // When --upload-format ogg, tee the encoded OGG stream to a
-        // cache file so retries can use it instead of the larger WAV.
-        let ogg_cache_path = if opts.upload_format == crate::transcription::UploadFormat::Ogg {
-            Some(cache_wav_path.with_extension("ogg"))
-        } else {
-            None
-        };
+        // Always tee the encoded OGG stream to a cache file alongside
+        // the WAV — useful for retries with --upload-format ogg and for
+        // replaying via --input-audio-file.  Old OGG files are pruned
+        // to the 10 most recent after the recording completes.
+        let ogg_cache_path = Some(cache_wav_path.with_extension("ogg"));
 
         let (stream_result, t_stop_val) = dictate_streaming(
             &mut *capture,
@@ -734,6 +732,9 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     }
     if let Err(e) = recording_cache::rotate_cache() {
         log::warn!("failed to rotate recording cache: {}", e);
+    }
+    if let Err(e) = recording_cache::prune_ogg_cache(10) {
+        log::warn!("failed to prune OGG cache: {}", e);
     }
 
     // Copy cache WAV to --save path if specified
