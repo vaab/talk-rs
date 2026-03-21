@@ -231,3 +231,112 @@ pub(super) fn resample_linear(
     }
     Ok(resampled)
 }
+
+/// Return the `.wf` cache path for a given audio file.
+fn waterfall_cache_path(audio_path: &std::path::Path) -> std::path::PathBuf {
+    audio_path.with_extension("wf")
+}
+
+/// Write waterfall data to a binary `.wf` cache file.
+///
+/// Format (all little-endian):
+///   u32  num_columns
+///   u32  num_rows
+///   f32  peak
+///   f32 × (num_columns × num_rows)  column-major data
+pub(super) fn write_waterfall_cache(
+    audio_path: &std::path::Path,
+    columns: &[Vec<f32>],
+    peak: f32,
+) -> Result<(), TalkError> {
+    use std::io::Write;
+
+    let cache = waterfall_cache_path(audio_path);
+    let num_cols = columns.len() as u32;
+    let num_rows = columns.first().map_or(0, |c| c.len()) as u32;
+
+    let mut buf = Vec::with_capacity(12 + (num_cols * num_rows * 4) as usize);
+    buf.write_all(&num_cols.to_le_bytes())
+        .map_err(|e| TalkError::Config(format!("wf cache write: {e}")))?;
+    buf.write_all(&num_rows.to_le_bytes())
+        .map_err(|e| TalkError::Config(format!("wf cache write: {e}")))?;
+    buf.write_all(&peak.to_le_bytes())
+        .map_err(|e| TalkError::Config(format!("wf cache write: {e}")))?;
+    for col in columns {
+        for &val in col {
+            buf.write_all(&val.to_le_bytes())
+                .map_err(|e| TalkError::Config(format!("wf cache write: {e}")))?;
+        }
+    }
+    std::fs::write(&cache, &buf)
+        .map_err(|e| TalkError::Config(format!("wf cache write {}: {e}", cache.display())))?;
+    Ok(())
+}
+
+/// Read waterfall data from a `.wf` cache file, if it exists and is
+/// newer than the audio file.
+///
+/// Returns `None` if the cache is missing, stale, or corrupt.
+pub(super) fn read_waterfall_cache(audio_path: &std::path::Path) -> Option<(Vec<Vec<f32>>, f32)> {
+    let cache = waterfall_cache_path(audio_path);
+    let cache_meta = std::fs::metadata(&cache).ok()?;
+    let audio_meta = std::fs::metadata(audio_path).ok()?;
+
+    // Stale check: cache must be newer than the audio file.
+    if cache_meta.modified().ok()? < audio_meta.modified().ok()? {
+        return None;
+    }
+
+    let data = std::fs::read(&cache).ok()?;
+    if data.len() < 12 {
+        return None;
+    }
+
+    let num_cols = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    let num_rows = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+    let peak = f32::from_le_bytes(data[8..12].try_into().ok()?);
+
+    let expected = 12 + num_cols * num_rows * 4;
+    if data.len() < expected || num_cols == 0 || num_rows == 0 {
+        return None;
+    }
+
+    let mut columns = Vec::with_capacity(num_cols);
+    let mut offset = 12;
+    for _ in 0..num_cols {
+        let mut col = Vec::with_capacity(num_rows);
+        for _ in 0..num_rows {
+            col.push(f32::from_le_bytes(
+                data[offset..offset + 4].try_into().ok()?,
+            ));
+            offset += 4;
+        }
+        columns.push(col);
+    }
+
+    Some((columns, peak))
+}
+
+/// Read any supported audio file (WAV or OGG Opus) as mono 16-bit PCM
+/// at 16 kHz, suitable for [`crate::x11::render_util::generate_waterfall_columns`].
+pub(super) fn read_audio_as_i16(path: &std::path::Path) -> Result<Vec<i16>, TalkError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let samples_f32 = match ext.as_str() {
+        "wav" => read_wav_as_f32(path, 16_000)?,
+        "ogg" | "opus" => read_ogg_as_f32(path, 16_000)?,
+        _ => {
+            return Err(TalkError::Config(format!(
+                "unsupported audio format: {}",
+                path.display()
+            )))
+        }
+    };
+    Ok(samples_f32
+        .iter()
+        .map(|&s| (s * 32_767.0).clamp(-32_768.0, 32_767.0) as i16)
+        .collect())
+}
