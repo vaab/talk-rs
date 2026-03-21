@@ -144,7 +144,7 @@ fn show_recordings_window(
         });
     }
 
-    {
+    let _keep_monitors = {
         // Container inside the scrolled window for both sections
         let sections_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
@@ -525,9 +525,8 @@ fn show_recordings_window(
             );
         }
 
-        // Prevent monitors from being dropped
-        let _keep_monitors = monitors;
-    }
+        monitors
+    };
 
     // Escape to close
     {
