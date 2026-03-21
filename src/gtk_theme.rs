@@ -139,78 +139,104 @@ pub fn build_title_bar() -> (gtk4::Box, gtk4::Button) {
     (title_bar, close_btn)
 }
 
+/// Detect which window edge (if any) a pointer position is near.
+///
+/// Returns `Some(edge)` when the pointer is within `threshold` pixels
+/// of a window border; corners take priority over sides.
+fn detect_edge(x: f64, y: f64, w: f64, h: f64, threshold: f64) -> Option<gtk4::gdk::SurfaceEdge> {
+    let top = y < threshold;
+    let bottom = y > h - threshold;
+    let left = x < threshold;
+    let right = x > w - threshold;
+
+    if top && left {
+        Some(gtk4::gdk::SurfaceEdge::NorthWest)
+    } else if top && right {
+        Some(gtk4::gdk::SurfaceEdge::NorthEast)
+    } else if bottom && left {
+        Some(gtk4::gdk::SurfaceEdge::SouthWest)
+    } else if bottom && right {
+        Some(gtk4::gdk::SurfaceEdge::SouthEast)
+    } else if top {
+        Some(gtk4::gdk::SurfaceEdge::North)
+    } else if bottom {
+        Some(gtk4::gdk::SurfaceEdge::South)
+    } else if left {
+        Some(gtk4::gdk::SurfaceEdge::West)
+    } else if right {
+        Some(gtk4::gdk::SurfaceEdge::East)
+    } else {
+        None
+    }
+}
+
+/// Map a window edge to the appropriate CSS resize cursor name.
+fn edge_cursor(edge: Option<gtk4::gdk::SurfaceEdge>) -> Option<&'static str> {
+    match edge {
+        Some(gtk4::gdk::SurfaceEdge::North) | Some(gtk4::gdk::SurfaceEdge::South) => {
+            Some("ns-resize")
+        }
+        Some(gtk4::gdk::SurfaceEdge::East) | Some(gtk4::gdk::SurfaceEdge::West) => {
+            Some("ew-resize")
+        }
+        Some(gtk4::gdk::SurfaceEdge::NorthEast) | Some(gtk4::gdk::SurfaceEdge::SouthWest) => {
+            Some("nesw-resize")
+        }
+        Some(gtk4::gdk::SurfaceEdge::NorthWest) | Some(gtk4::gdk::SurfaceEdge::SouthEast) => {
+            Some("nwse-resize")
+        }
+        _ => None,
+    }
+}
+
 /// Install edge/corner resize handles on an undecorated GTK4 window.
 ///
 /// Undecorated windows lack window-manager resize grips.  This adds
 /// motion and click controllers that detect pointer proximity to the
 /// window border and initiate a GDK resize drag.
+///
+/// The click controller recomputes the edge from its own pointer
+/// coordinates (rather than relying on cached motion state) to avoid
+/// a race where hand jitter between the last motion event and the
+/// press event causes the cached edge to be stale.
 pub fn install_edge_resize(window: &gtk4::Window) {
-    use std::cell::RefCell;
+    use std::cell::Cell;
     use std::rc::Rc;
 
-    /// Pixel threshold from window border to trigger resize.
-    const EDGE_THRESHOLD: f64 = 6.0;
+    /// Pixel threshold from window border to show a resize cursor.
+    const CURSOR_THRESHOLD: f64 = 6.0;
 
-    let active_edge: Rc<RefCell<Option<gtk4::gdk::SurfaceEdge>>> = Rc::new(RefCell::new(None));
+    /// Pixel threshold for clicks to initiate a resize — slightly
+    /// larger than the cursor zone to forgive hand jitter between
+    /// hover and press.
+    const CLICK_THRESHOLD: f64 = 10.0;
 
     // Motion controller: detect edge and update cursor.
     {
-        let edge_ref = Rc::clone(&active_edge);
+        // Track previous edge to avoid redundant cursor changes.
+        let prev_edge: Rc<Cell<Option<gtk4::gdk::SurfaceEdge>>> = Rc::new(Cell::new(None));
         let motion = gtk4::EventControllerMotion::new();
-        let win_for_motion = window.clone();
+        let win = window.clone();
+        let prev = Rc::clone(&prev_edge);
         motion.connect_motion(move |_ctrl, x, y| {
-            let w = win_for_motion.width() as f64;
-            let h = win_for_motion.height() as f64;
-            let top = y < EDGE_THRESHOLD;
-            let bottom = y > h - EDGE_THRESHOLD;
-            let left = x < EDGE_THRESHOLD;
-            let right = x > w - EDGE_THRESHOLD;
-
-            let edge = if top && left {
-                Some(gtk4::gdk::SurfaceEdge::NorthWest)
-            } else if top && right {
-                Some(gtk4::gdk::SurfaceEdge::NorthEast)
-            } else if bottom && left {
-                Some(gtk4::gdk::SurfaceEdge::SouthWest)
-            } else if bottom && right {
-                Some(gtk4::gdk::SurfaceEdge::SouthEast)
-            } else if top {
-                Some(gtk4::gdk::SurfaceEdge::North)
-            } else if bottom {
-                Some(gtk4::gdk::SurfaceEdge::South)
-            } else if left {
-                Some(gtk4::gdk::SurfaceEdge::West)
-            } else if right {
-                Some(gtk4::gdk::SurfaceEdge::East)
-            } else {
-                None
-            };
-
-            let prev = *edge_ref.borrow();
-            if edge != prev {
-                *edge_ref.borrow_mut() = edge;
-                let cursor_name = match edge {
-                    Some(gtk4::gdk::SurfaceEdge::North) | Some(gtk4::gdk::SurfaceEdge::South) => {
-                        Some("ns-resize")
-                    }
-                    Some(gtk4::gdk::SurfaceEdge::East) | Some(gtk4::gdk::SurfaceEdge::West) => {
-                        Some("ew-resize")
-                    }
-                    Some(gtk4::gdk::SurfaceEdge::NorthEast)
-                    | Some(gtk4::gdk::SurfaceEdge::SouthWest) => Some("nesw-resize"),
-                    Some(gtk4::gdk::SurfaceEdge::NorthWest)
-                    | Some(gtk4::gdk::SurfaceEdge::SouthEast) => Some("nwse-resize"),
-                    _ => None,
-                };
-                win_for_motion.set_cursor_from_name(cursor_name);
+            let edge = detect_edge(
+                x,
+                y,
+                win.width() as f64,
+                win.height() as f64,
+                CURSOR_THRESHOLD,
+            );
+            if edge != prev.get() {
+                prev.set(edge);
+                win.set_cursor_from_name(edge_cursor(edge));
             }
         });
 
         // Clear cursor when pointer leaves window.
-        let edge_leave = Rc::clone(&active_edge);
+        let prev_leave = Rc::clone(&prev_edge);
         let win_leave = window.clone();
         motion.connect_leave(move |_ctrl| {
-            *edge_leave.borrow_mut() = None;
+            prev_leave.set(None);
             win_leave.set_cursor_from_name(None);
         });
 
@@ -219,23 +245,31 @@ pub fn install_edge_resize(window: &gtk4::Window) {
 
     // Click controller: initiate resize when on an edge.
     // Capture phase so it runs before WindowHandle's drag.
+    //
+    // Recomputes the edge from (x, y) at press time — does NOT read
+    // the motion controller's cached edge.
     {
-        let edge_ref = Rc::clone(&active_edge);
         let click = gtk4::GestureClick::new();
         click.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let win_for_resize = window.clone();
+        let win = window.clone();
         click.connect_pressed(move |gesture, _n_press, x, y| {
-            let edge = *edge_ref.borrow();
+            let edge = detect_edge(
+                x,
+                y,
+                win.width() as f64,
+                win.height() as f64,
+                CLICK_THRESHOLD,
+            );
             if let Some(edge) = edge {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
                 // Compute surface-relative coordinates for GDK.
-                let (sx, sy) = if let Some(native) = win_for_resize.native() {
+                let (sx, sy) = if let Some(native) = win.native() {
                     let (nx, ny) = native.surface_transform();
                     (x + nx, y + ny)
                 } else {
                     (x, y)
                 };
-                if let Some(native) = win_for_resize.native() {
+                if let Some(native) = win.native() {
                     if let Some(surface) = native.surface() {
                         use gtk4::gdk::prelude::ToplevelExt;
                         if let Ok(toplevel) = surface.dynamic_cast::<gtk4::gdk::Toplevel>() {
