@@ -106,6 +106,9 @@ pub enum Commands {
         /// Use monochrome colors for the visualizer (theme-aware)
         #[arg(long)]
         mono: bool,
+        /// Audio format for batch uploads (wav or ogg)
+        #[arg(long, value_enum, default_value_t)]
+        upload_format: crate::transcription::UploadFormat,
         /// Run as daemon process (internal, used by --toggle)
         #[arg(long, hide = true)]
         daemon: bool,

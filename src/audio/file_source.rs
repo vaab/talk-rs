@@ -1,6 +1,6 @@
-//! WAV file audio source.
+//! Audio file sources (WAV and OGG Opus).
 //!
-//! Reads a WAV file and produces PCM i16 chunks through the same
+//! Reads audio files and produces PCM i16 chunks through the same
 //! channel interface as the live microphone capture, enabling
 //! reproducible benchmarks across transcription providers.
 
@@ -306,6 +306,224 @@ async fn read_wav_chunks(
     log::info!(
         "file source: read {} samples ({:.1}s) from {}",
         samples_read,
+        duration,
+        path.display()
+    );
+
+    Ok(())
+}
+
+// ── OGG Opus file source ────────────────────────────────────────────
+
+/// Opus always decodes at 48 kHz.
+const OPUS_DECODE_RATE: u32 = 48_000;
+
+/// Audio capture that decodes PCM samples from an OGG Opus file.
+///
+/// The file is decoded to 48 kHz mono PCM, then resampled to 16 kHz
+/// to match the [`AudioConfig`] used by all transcription paths.
+pub struct OggFileSource {
+    path: PathBuf,
+    running: Arc<AtomicBool>,
+}
+
+impl OggFileSource {
+    /// Create a new OGG Opus file source.
+    ///
+    /// The file header is validated eagerly so that errors surface
+    /// before audio capture is "started".
+    pub fn new(path: &Path) -> Result<Self, TalkError> {
+        validate_ogg_header(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            running: Arc::new(AtomicBool::new(false)),
+        })
+    }
+}
+
+impl AudioCapture for OggFileSource {
+    fn start(&mut self) -> Result<mpsc::Receiver<Vec<i16>>, TalkError> {
+        if self.running.load(Ordering::Acquire) {
+            return Err(TalkError::Audio("File source already running".to_string()));
+        }
+
+        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        let running = Arc::clone(&self.running);
+        let path = self.path.clone();
+
+        running.store(true, Ordering::Release);
+
+        tokio::spawn(async move {
+            if let Err(e) = read_ogg_chunks(&path, &sender, &running).await {
+                log::error!("OGG file reader error: {}", e);
+            }
+            running.store(false, Ordering::Release);
+        });
+
+        Ok(receiver)
+    }
+
+    fn stop(&mut self) -> Result<(), TalkError> {
+        self.running.store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Validate that a file has a valid OGG Opus header.
+fn validate_ogg_header(path: &Path) -> Result<(), TalkError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        TalkError::Audio(format!(
+            "failed to open audio file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let mut reader = ogg::reading::PacketReader::new(std::io::BufReader::new(file));
+    let head_pkt = reader
+        .read_packet()
+        .map_err(|e| {
+            TalkError::Audio(format!(
+                "{}: failed to read OGG header: {}",
+                path.display(),
+                e
+            ))
+        })?
+        .ok_or_else(|| TalkError::Audio(format!("{}: OGG file has no packets", path.display())))?;
+
+    if head_pkt.data.len() < 19 || &head_pkt.data[..8] != b"OpusHead" {
+        return Err(TalkError::Audio(format!(
+            "{}: not an Opus file (missing OpusHead)",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+/// Decode an OGG Opus file and send PCM i16 chunks through the channel.
+///
+/// Decodes at 48 kHz (Opus native), resamples to 16 kHz, converts
+/// f32 → i16, and sends 20 ms chunks matching live capture timing.
+async fn read_ogg_chunks(
+    path: &Path,
+    sender: &mpsc::Sender<Vec<i16>>,
+    running: &AtomicBool,
+) -> Result<(), TalkError> {
+    let audio_config = AudioConfig::new(); // 16 kHz target
+
+    // Decode the entire OGG file to mono f32 at 48 kHz
+    let file = std::fs::File::open(path).map_err(|e| {
+        TalkError::Audio(format!(
+            "failed to open audio file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let mut reader = ogg::reading::PacketReader::new(std::io::BufReader::new(file));
+
+    // Read OpusHead to get channel count
+    let head_pkt = reader
+        .read_packet()
+        .map_err(|e| TalkError::Audio(format!("failed to read OGG header: {}", e)))?
+        .ok_or_else(|| TalkError::Audio("OGG file has no packets".to_string()))?;
+
+    let channel_count = head_pkt.data[9] as usize;
+    let opus_channels = if channel_count >= 2 {
+        opus::Channels::Stereo
+    } else {
+        opus::Channels::Mono
+    };
+
+    let mut decoder = opus::Decoder::new(OPUS_DECODE_RATE, opus_channels)
+        .map_err(|e| TalkError::Audio(format!("failed to create Opus decoder: {}", e)))?;
+
+    // Skip OpusTags packet
+    let _ = reader.read_packet();
+
+    // Decode all audio packets to mono f32 at 48 kHz
+    let max_frame_samples = 5760 * channel_count; // 120ms at 48kHz
+    let mut decode_buf = vec![0.0f32; max_frame_samples];
+    let mut all_samples = Vec::new();
+
+    loop {
+        match reader.read_packet() {
+            Ok(Some(pkt)) => {
+                let samples_per_channel =
+                    decoder
+                        .decode_float(&pkt.data, &mut decode_buf, false)
+                        .map_err(|e| TalkError::Audio(format!("Opus decode error: {}", e)))?;
+                // Mix to mono
+                for i in 0..samples_per_channel {
+                    if channel_count >= 2 {
+                        let mut sum: f32 = 0.0;
+                        for ch in 0..channel_count {
+                            sum += decode_buf[i * channel_count + ch];
+                        }
+                        all_samples.push(sum / channel_count as f32);
+                    } else {
+                        all_samples.push(decode_buf[i]);
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("OGG read error (continuing): {}", e);
+                break;
+            }
+        }
+    }
+
+    // Resample 48 kHz → 16 kHz via linear interpolation
+    let resampled = if OPUS_DECODE_RATE != audio_config.sample_rate {
+        let ratio = audio_config.sample_rate as f64 / OPUS_DECODE_RATE as f64;
+        let out_len = (all_samples.len() as f64 * ratio).ceil() as usize;
+        let mut out = Vec::with_capacity(out_len);
+        for i in 0..out_len {
+            let src_pos = i as f64 / ratio;
+            let idx = src_pos as usize;
+            let frac = src_pos - idx as f64;
+            let a = all_samples.get(idx).copied().unwrap_or(0.0);
+            let b = all_samples.get(idx + 1).copied().unwrap_or(a);
+            out.push(a + (b - a) * frac as f32);
+        }
+        out
+    } else {
+        all_samples
+    };
+
+    // Convert f32 → i16 and send in 20ms chunks
+    let frames_per_chunk = (audio_config.sample_rate as usize * CHUNK_DURATION_MS as usize) / 1000;
+    let mut chunk = Vec::with_capacity(frames_per_chunk);
+    let mut total_samples = 0usize;
+
+    for sample_f32 in &resampled {
+        if !running.load(Ordering::Acquire) {
+            break;
+        }
+        let clamped = sample_f32.clamp(-1.0, 1.0);
+        let sample_i16 = (clamped * i16::MAX as f32) as i16;
+        chunk.push(sample_i16);
+        total_samples += 1;
+
+        if chunk.len() >= frames_per_chunk {
+            let batch = std::mem::replace(&mut chunk, Vec::with_capacity(frames_per_chunk));
+            if sender.send(batch).await.is_err() {
+                log::debug!("audio channel closed, stopping OGG reader");
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Send remaining partial chunk
+    if !chunk.is_empty() && running.load(Ordering::Acquire) {
+        let _ = sender.send(chunk).await;
+    }
+
+    let duration = total_samples as f64 / audio_config.sample_rate as f64;
+    log::info!(
+        "OGG source: decoded {} samples ({:.1}s) from {}",
+        total_samples,
         duration,
         path.display()
     );

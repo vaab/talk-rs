@@ -14,6 +14,16 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// Audio format for batch uploads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum UploadFormat {
+    /// Uncompressed WAV (default).
+    #[default]
+    Wav,
+    /// OGG Opus compressed audio (smaller uploads).
+    Ogg,
+}
+
 pub(crate) mod http;
 pub mod mistral;
 pub mod model_suggestions;
