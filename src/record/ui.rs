@@ -572,7 +572,7 @@ fn show_recordings_window(
 
 #[cfg(test)]
 mod tests {
-    use super::super::audio::wav_duration_secs;
+    use super::super::audio::{ogg_duration_secs, wav_duration_secs};
     use super::super::entries::{format_duration, format_size};
 
     #[test]
@@ -609,6 +609,55 @@ mod tests {
     fn test_format_size_megabytes() {
         assert_eq!(format_size(1_000_000), "1.0 MB");
         assert_eq!(format_size(15_500_000), "15.5 MB");
+    }
+
+    #[test]
+    fn test_ogg_duration_secs_valid_file() {
+        use crate::audio::writer::{AudioWriter, OggOpusWriter};
+        use crate::config::AudioConfig;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let ogg_path = dir.path().join("test.ogg");
+
+        // Build a small OGG Opus file: ~1 second of a 440 Hz sine at 16 kHz.
+        let mut writer = OggOpusWriter::new(AudioConfig::new()).expect("create writer");
+        let header = writer.header().expect("header");
+        // 16 000 samples = 1 second at 16 kHz mono.
+        let pcm: Vec<i16> = (0..16_000)
+            .map(|i| {
+                ((i as f32 / 16_000.0 * 440.0 * std::f32::consts::TAU).sin() * 16_000.0) as i16
+            })
+            .collect();
+        let audio = writer.write_pcm(&pcm).expect("write pcm");
+        let tail = writer.finalize().expect("finalize");
+        std::fs::write(&ogg_path, [header, audio, tail].concat()).expect("write file");
+
+        let duration = ogg_duration_secs(&ogg_path).expect("should compute duration");
+        // Opus encodes at 48 kHz internally.  The 16 kHz input is
+        // resampled, so the granule position reflects 48 kHz ticks.
+        // Allow generous tolerance for codec frame rounding.
+        assert!(
+            duration > 0.5 && duration < 2.0,
+            "expected ~1 s, got {:.3} s",
+            duration,
+        );
+    }
+
+    #[test]
+    fn test_ogg_duration_secs_too_small() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let ogg_path = dir.path().join("tiny.ogg");
+        std::fs::write(&ogg_path, b"too small").expect("write");
+        assert!(ogg_duration_secs(&ogg_path).is_none());
+    }
+
+    #[test]
+    fn test_ogg_duration_secs_not_ogg() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let path = dir.path().join("not.ogg");
+        // Write 1 KB of zeros — no OggS magic anywhere.
+        std::fs::write(&path, vec![0u8; 1024]).expect("write");
+        assert!(ogg_duration_secs(&path).is_none());
     }
 
     #[test]
