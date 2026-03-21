@@ -56,7 +56,9 @@ pub(super) fn format_size(bytes: u64) -> String {
 ///
 /// Reads `output_dir` from the user configuration file.
 pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
+    let t = std::time::Instant::now();
     let config = Config::load(None)?;
+    log::debug!("list_ogg: config load {:.0?}", t.elapsed());
     let dir = config.output_dir;
     if !dir.exists() {
         return Ok(Vec::new());
@@ -110,11 +112,17 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
         });
     }
 
+    log::debug!(
+        "list_ogg: {} entries, total {:.0?}",
+        result.len(),
+        t.elapsed(),
+    );
     Ok(result)
 }
 
 /// Gather WAV dictation cache entries (with companion YML), sorted newest-first.
 pub(super) fn list_wav_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
+    let t = std::time::Instant::now();
     let dir = recording_cache::recordings_dir()?;
     if !dir.exists() {
         return Ok(Vec::new());
@@ -187,6 +195,11 @@ pub(super) fn list_wav_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
         });
     }
 
+    log::debug!(
+        "list_wav: {} entries, total {:.0?}",
+        result.len(),
+        t.elapsed(),
+    );
     Ok(result)
 }
 
