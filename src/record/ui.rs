@@ -18,28 +18,30 @@ use crate::recording_cache;
 const WINDOW_TITLE: &str = "talk-rs — Recordings";
 
 /// Open the GTK4 recordings browser.
+///
+/// The window appears immediately with a loading indicator; recording
+/// listings are populated asynchronously via an idle callback so the
+/// user never stares at a blank wait.
 pub async fn record_ui() -> Result<(), TalkError> {
-    let ogg_recordings = list_ogg_recordings()?;
-    let wav_recordings = list_wav_recordings()?;
-
-    tokio::task::spawn_blocking(move || show_recordings_window(ogg_recordings, wav_recordings))
+    tokio::task::spawn_blocking(show_recordings_window)
         .await
         .map_err(|e| TalkError::Config(format!("GTK task failed: {}", e)))?
 }
 
 /// Build and run the GTK4 recordings browser window.
-fn show_recordings_window(
-    ogg_recordings: Vec<RecordingEntry>,
-    wav_recordings: Vec<RecordingEntry>,
-) -> Result<(), TalkError> {
+fn show_recordings_window() -> Result<(), TalkError> {
     use gtk4::glib;
     use gtk4::prelude::*;
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    let t0 = std::time::Instant::now();
+
     gtk4::init().map_err(|e| TalkError::Config(format!("failed to initialize GTK: {}", e)))?;
+    log::debug!("record-ui: gtk4::init {:.0?}", t0.elapsed());
 
     let theme = crate::gtk_theme::ThemeColors::resolve();
+    log::debug!("record-ui: theme resolve {:.0?}", t0.elapsed());
 
     let window = gtk4::Window::builder()
         .title(WINDOW_TITLE)
@@ -144,10 +146,24 @@ fn show_recordings_window(
         });
     }
 
-    let _keep_monitors = {
-        // Container inside the scrolled window for both sections
-        let sections_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    // Container inside the scrolled window for both sections.
+    let sections_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
+    // Loading indicator — shown until the idle callback populates data.
+    let loading_label = gtk4::Label::new(Some("Loading recordings…"));
+    loading_label.set_vexpand(true);
+    loading_label.set_valign(gtk4::Align::Center);
+    loading_label.add_css_class("dim");
+    sections_box.append(&loading_label);
+
+    scrolled.set_child(Some(&sections_box));
+    root.append(&scrolled);
+
+    // Monitors must survive the lifetime of the window; the idle
+    // callback fills this with gio::FileMonitor instances.
+    let monitors: Rc<RefCell<Vec<gtk4::gio::FileMonitor>>> = Rc::new(RefCell::new(Vec::new()));
+
+    {
         /// Build a single row (hbox) for a recording entry with all columns
         /// and buttons.
         fn build_row(
@@ -387,146 +403,186 @@ fn show_recordings_window(
             (expander, list)
         }
 
-        // ── WAV dictation cache section (first) ──
-        let (wav_expander, wav_list) = create_section("Dictation cache (0)");
-        populate_section(
-            "Dictation cache",
-            &wav_recordings,
-            &wav_list,
-            &wav_expander,
-            &player,
-            &active_play_btn,
-            &window,
-        );
-        sections_box.append(&wav_expander);
+        // ── Deferred data loading ───────────────────────────────
+        // Populate recordings and set up file watches AFTER the
+        // window is painted so the user sees the loading label.
+        //
+        // We hook the window's `map` signal and schedule a short
+        // timeout from there — this ensures at least one frame is
+        // drawn (showing "Loading recordings…") before the data
+        // loading grabs the GTK thread.
+        let player_idle = Rc::clone(&player);
+        let btn_idle = Rc::clone(&active_play_btn);
+        let win_idle = window.clone();
+        let sections_idle = sections_box.clone();
+        let loading_idle = loading_label.clone();
+        let monitors_idle = Rc::clone(&monitors);
+        let loaded = std::cell::Cell::new(false);
 
-        // ── OGG recordings section (second) ──
-        let (ogg_expander, ogg_list) = create_section("Recordings (0)");
-        populate_section(
-            "Recordings",
-            &ogg_recordings,
-            &ogg_list,
-            &ogg_expander,
-            &player,
-            &active_play_btn,
-            &window,
-        );
-        sections_box.append(&ogg_expander);
+        window.connect_map(move |_| {
+            // Guard: only load once (map can fire on re-show).
+            if loaded.replace(true) {
+                return;
+            }
+            let player_idle = Rc::clone(&player_idle);
+            let btn_idle = Rc::clone(&btn_idle);
+            let win_idle = win_idle.clone();
+            let sections_idle = sections_idle.clone();
+            let loading_idle = loading_idle.clone();
+            let monitors_idle = Rc::clone(&monitors_idle);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
+                let t = std::time::Instant::now();
 
-        scrolled.set_child(Some(&sections_box));
-        root.append(&scrolled);
+                // ── WAV dictation cache section ──
+                let (wav_expander, wav_list) = create_section("Dictation cache (0)");
+                let wav_recordings = list_wav_recordings().unwrap_or_default();
+                log::debug!(
+                    "record-ui: list_wav_recordings ({} entries) {:.0?}",
+                    wav_recordings.len(),
+                    t.elapsed(),
+                );
+                populate_section(
+                    "Dictation cache",
+                    &wav_recordings,
+                    &wav_list,
+                    &wav_expander,
+                    &player_idle,
+                    &btn_idle,
+                    &win_idle,
+                );
+                sections_idle.append(&wav_expander);
 
-        // Focus the first non-empty list
-        if wav_list.first_child().is_some() {
-            wav_list.grab_focus();
-        } else if ogg_list.first_child().is_some() {
-            ogg_list.grab_focus();
-        }
+                // ── OGG recordings section ──
+                let (ogg_expander, ogg_list) = create_section("Recordings (0)");
+                let ogg_recordings = list_ogg_recordings().unwrap_or_default();
+                log::debug!(
+                    "record-ui: list_ogg_recordings ({} entries) {:.0?}",
+                    ogg_recordings.len(),
+                    t.elapsed(),
+                );
+                populate_section(
+                    "Recordings",
+                    &ogg_recordings,
+                    &ogg_list,
+                    &ogg_expander,
+                    &player_idle,
+                    &btn_idle,
+                    &win_idle,
+                );
+                sections_idle.append(&ogg_expander);
 
-        // ── Inotify via gio::FileMonitor ──
-        // Keep monitors alive for the lifetime of the window.
-        let monitors: Rc<RefCell<Vec<gtk4::gio::FileMonitor>>> = Rc::new(RefCell::new(Vec::new()));
-
-        /// Shared context passed to [`watch_directory`] to avoid exceeding
-        /// the clippy argument-count limit.
-        struct WatchCtx {
-            list: gtk4::ListBox,
-            expander: gtk4::Expander,
-            player: Rc<RefCell<Option<WavPlayer>>>,
-            active_play_btn: Rc<RefCell<Option<gtk4::Button>>>,
-            window: gtk4::Window,
-        }
-
-        // Helper: set up a directory monitor that refreshes a section on changes.
-        fn watch_directory(
-            dir: &std::path::Path,
-            label: &'static str,
-            ctx: &WatchCtx,
-            list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
-            monitors: &Rc<RefCell<Vec<gtk4::gio::FileMonitor>>>,
-        ) {
-            use gtk4::prelude::*;
-
-            let gio_dir = gtk4::gio::File::for_path(dir);
-            let monitor = match gio_dir.monitor_directory(
-                gtk4::gio::FileMonitorFlags::NONE,
-                gtk4::gio::Cancellable::NONE,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    log::warn!("failed to watch {}: {}", dir.display(), e);
-                    return;
+                // Focus the first non-empty list
+                if wav_list.first_child().is_some() {
+                    wav_list.grab_focus();
+                } else if ogg_list.first_child().is_some() {
+                    ogg_list.grab_focus();
                 }
-            };
 
-            let list_ref = ctx.list.clone();
-            let exp_ref = ctx.expander.clone();
-            let player_ref = Rc::clone(&ctx.player);
-            let btn_ref = Rc::clone(&ctx.active_play_btn);
-            let win_ref = ctx.window.clone();
+                // Remove loading indicator
+                sections_idle.remove(&loading_idle);
 
-            monitor.connect_changed(move |_monitor, _file, _other, event| {
-                use gtk4::gio::FileMonitorEvent;
-                match event {
-                    FileMonitorEvent::Created
-                    | FileMonitorEvent::Deleted
-                    | FileMonitorEvent::ChangesDoneHint => {}
-                    _ => return,
+                // ── Inotify via gio::FileMonitor ──
+                /// Shared context passed to [`watch_directory`] to avoid
+                /// exceeding the clippy argument-count limit.
+                struct WatchCtx {
+                    list: gtk4::ListBox,
+                    expander: gtk4::Expander,
+                    player: Rc<RefCell<Option<WavPlayer>>>,
+                    active_play_btn: Rc<RefCell<Option<gtk4::Button>>>,
+                    window: gtk4::Window,
                 }
-                if let Ok(entries) = list_fn() {
-                    populate_section(
-                        label,
-                        &entries,
-                        &list_ref,
-                        &exp_ref,
-                        &player_ref,
-                        &btn_ref,
-                        &win_ref,
+
+                fn watch_directory(
+                    dir: &std::path::Path,
+                    label: &'static str,
+                    ctx: &WatchCtx,
+                    list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
+                    monitors: &Rc<RefCell<Vec<gtk4::gio::FileMonitor>>>,
+                ) {
+                    use gtk4::prelude::*;
+
+                    let gio_dir = gtk4::gio::File::for_path(dir);
+                    let monitor = match gio_dir.monitor_directory(
+                        gtk4::gio::FileMonitorFlags::NONE,
+                        gtk4::gio::Cancellable::NONE,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            log::warn!("failed to watch {}: {}", dir.display(), e);
+                            return;
+                        }
+                    };
+
+                    let list_ref = ctx.list.clone();
+                    let exp_ref = ctx.expander.clone();
+                    let player_ref = Rc::clone(&ctx.player);
+                    let btn_ref = Rc::clone(&ctx.active_play_btn);
+                    let win_ref = ctx.window.clone();
+
+                    monitor.connect_changed(move |_monitor, _file, _other, event| {
+                        use gtk4::gio::FileMonitorEvent;
+                        match event {
+                            FileMonitorEvent::Created
+                            | FileMonitorEvent::Deleted
+                            | FileMonitorEvent::ChangesDoneHint => {}
+                            _ => return,
+                        }
+                        if let Ok(entries) = list_fn() {
+                            populate_section(
+                                label,
+                                &entries,
+                                &list_ref,
+                                &exp_ref,
+                                &player_ref,
+                                &btn_ref,
+                                &win_ref,
+                            );
+                        }
+                    });
+
+                    monitors.borrow_mut().push(monitor);
+                }
+
+                // Watch WAV cache directory
+                if let Ok(wav_dir) = recording_cache::recordings_dir() {
+                    let ctx = WatchCtx {
+                        list: wav_list,
+                        expander: wav_expander,
+                        player: Rc::clone(&player_idle),
+                        active_play_btn: Rc::clone(&btn_idle),
+                        window: win_idle.clone(),
+                    };
+                    watch_directory(
+                        &wav_dir,
+                        "Dictation cache",
+                        &ctx,
+                        list_wav_recordings,
+                        &monitors_idle,
                     );
                 }
+
+                // Watch OGG output directory
+                if let Ok(config) = Config::load(None) {
+                    let ctx = WatchCtx {
+                        list: ogg_list,
+                        expander: ogg_expander,
+                        player: Rc::clone(&player_idle),
+                        active_play_btn: Rc::clone(&btn_idle),
+                        window: win_idle.clone(),
+                    };
+                    watch_directory(
+                        &config.output_dir,
+                        "Recordings",
+                        &ctx,
+                        list_ogg_recordings,
+                        &monitors_idle,
+                    );
+                }
+
+                log::debug!("record-ui: data loaded + watches {:.0?}", t.elapsed());
             });
-
-            monitors.borrow_mut().push(monitor);
-        }
-
-        // Watch WAV cache directory
-        if let Ok(wav_dir) = recording_cache::recordings_dir() {
-            let ctx = WatchCtx {
-                list: wav_list,
-                expander: wav_expander,
-                player: Rc::clone(&player),
-                active_play_btn: Rc::clone(&active_play_btn),
-                window: window.clone(),
-            };
-            watch_directory(
-                &wav_dir,
-                "Dictation cache",
-                &ctx,
-                list_wav_recordings,
-                &monitors,
-            );
-        }
-
-        // Watch OGG output directory
-        if let Ok(config) = Config::load(None) {
-            let ctx = WatchCtx {
-                list: ogg_list,
-                expander: ogg_expander,
-                player: Rc::clone(&player),
-                active_play_btn: Rc::clone(&active_play_btn),
-                window: window.clone(),
-            };
-            watch_directory(
-                &config.output_dir,
-                "Recordings",
-                &ctx,
-                list_ogg_recordings,
-                &monitors,
-            );
-        }
-
-        monitors
-    };
+        });
+    }
 
     // Escape to close
     {
@@ -576,7 +632,9 @@ fn show_recordings_window(
 
     crate::gtk_theme::install_edge_resize(&window);
 
+    log::debug!("record-ui: window built {:.0?}", t0.elapsed());
     crate::gtk_theme::present_centred(&window);
+    log::debug!("record-ui: window presented {:.0?}", t0.elapsed());
 
     // Initialize the audio player after the window is presented so it
     // appears instantly instead of blocking on cpal device probing.
