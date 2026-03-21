@@ -12,9 +12,9 @@ use crate::config::{Config, Provider};
 use crate::error::TalkError;
 use crate::paste::paste_text_to_target;
 use crate::recording_cache;
-use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber};
+use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber, TranscriptionMetadata};
 use crate::x11::x11_centre_and_raise;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::models::build_retry_candidates;
 use ui::{pick_with_streaming_gtk, PICKER_TITLE};
@@ -29,6 +29,45 @@ pub(crate) struct PickParams {
     pub model: Option<String>,
     pub target_window: Option<String>,
     pub paste_chunk_chars: usize,
+}
+
+/// Write (or overwrite) a companion recording metadata YAML alongside
+/// the WAV so the record UI can display the transcript preview.
+///
+/// Called on every meaningful text change in the picker (debounced for
+/// keyboard input, immediate for programmatic updates and on exit).
+/// Uses an empty [`TranscriptionMetadata`] since the picker does not
+/// carry API-level detail.
+pub(super) fn write_recording_metadata(
+    audio_path: &Path,
+    provider: Provider,
+    model: &str,
+    streaming: bool,
+    text: &str,
+) {
+    let stem = audio_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let wav_filename = audio_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if stem.is_empty() || wav_filename.is_empty() {
+        return;
+    }
+
+    if let Err(e) = recording_cache::write_metadata(
+        stem,
+        provider,
+        model,
+        streaming,
+        text,
+        wav_filename,
+        &TranscriptionMetadata::default(),
+    ) {
+        log::warn!("failed to write recording metadata from picker: {}", e);
+    }
 }
 
 /// Run pick mode: show a GTK picker with cached and live transcriptions.
@@ -227,6 +266,16 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
     ) {
         log::warn!("failed to update picker selection: {}", e);
     }
+
+    // Write companion recording metadata YAML so the record UI
+    // can display the transcript preview.
+    write_recording_metadata(
+        &audio_path_for_selection,
+        selection.provider,
+        &selection.model,
+        selection.streaming,
+        &selection.text,
+    );
 
     // If the user selected the cached entry, nothing to do — the
     // text is already in the target window.
