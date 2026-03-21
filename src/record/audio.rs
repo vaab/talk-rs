@@ -17,27 +17,57 @@ pub(super) fn wav_duration_secs(path: &std::path::Path) -> Option<f64> {
     Some((size - 44) as f64 / 32_000.0)
 }
 
-/// Compute OGG Opus duration in seconds from the last page's granule position.
+/// Compute OGG Opus duration in seconds from the last page's granule
+/// position.
 ///
-/// Iterates all packets to find the last absolute granule position,
-/// then divides by 48 000 (Opus always uses 48 kHz per RFC 7845).
+/// Seeks to near the end of the file and scans backward for the last
+/// OGG page header (`OggS`), reading the absolute granule position
+/// from it.  This is O(1) regardless of file size — only the last
+/// ~64 KB are read, instead of iterating every packet sequentially.
 pub(super) fn ogg_duration_secs(path: &std::path::Path) -> Option<f64> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = ogg::reading::PacketReader::new(std::io::BufReader::new(file));
-    let mut last_absgp: u64 = 0;
-    loop {
-        match reader.read_packet() {
-            Ok(Some(pkt)) => {
-                last_absgp = pkt.absgp_page();
-            }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-    if last_absgp == 0 {
+    use std::io::{Read, Seek, SeekFrom};
+
+    /// Size of the tail buffer.  OGG pages are at most ~65 535 bytes
+    /// (255 segments × 255 bytes each), so this guarantees at least
+    /// one complete page in the buffer.
+    const TAIL_SIZE: u64 = 65_536;
+
+    /// Minimum OGG page header size (capture pattern through the
+    /// segment-count byte, inclusive).
+    const MIN_HEADER: usize = 27;
+
+    /// Offset of the 8-byte absolute granule position within an OGG
+    /// page header (immediately after the 4-byte magic and 2 flag
+    /// bytes).
+    const GRANULE_OFFSET: usize = 6;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_size = file.metadata().ok()?.len();
+    if file_size < MIN_HEADER as u64 {
         return None;
     }
-    Some(last_absgp as f64 / OPUS_SAMPLE_RATE as f64)
+
+    // Read the tail of the file.
+    let start = file_size.saturating_sub(TAIL_SIZE);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((file_size - start) as usize);
+    file.read_to_end(&mut buf).ok()?;
+
+    // Scan backward for the last OGG page capture pattern.
+    // Verify the version byte (must be 0) to reduce false positives.
+    let last_page = (0..buf.len().saturating_sub(MIN_HEADER))
+        .rev()
+        .find(|&i| buf[i..i + 4] == *b"OggS" && buf[i + 4] == 0)?;
+
+    let granule = u64::from_le_bytes(
+        buf[last_page + GRANULE_OFFSET..last_page + GRANULE_OFFSET + 8]
+            .try_into()
+            .ok()?,
+    );
+    if granule == 0 {
+        return None;
+    }
+    Some(granule as f64 / OPUS_SAMPLE_RATE as f64)
 }
 
 /// Read a WAV file and return mono `f32` samples resampled to `target_rate`.
