@@ -19,27 +19,11 @@ use std::time::Instant;
 use tokio::fs::File;
 use tokio_stream::wrappers::ReceiverStream;
 
+use super::http::{build_client, parse_u64_field, BATCH_FILE_TIMEOUT};
 use super::BatchTranscriber;
 
 /// Default API base URL for the Mistral API.
 pub(crate) const API_BASE: &str = "https://api.mistral.ai";
-
-/// Timeout for batch file upload transcription requests.
-const BATCH_FILE_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Timeout for the lightweight model-listing preflight check.
-const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// TCP connect timeout — fail fast when the server is unreachable.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Build an HTTP client with a TCP connect timeout.
-fn build_client() -> Result<Client, TalkError> {
-    Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|e| TalkError::Config(format!("failed to build HTTP client: {}", e)))
-}
 
 /// Response from Mistral API transcription endpoint.
 #[derive(Debug, Deserialize)]
@@ -58,15 +42,6 @@ struct MistralResponse {
     /// Usage payload returned by Mistral.
     #[serde(default)]
     usage: Option<serde_json::Value>,
-}
-
-fn parse_u64_field(value: &serde_json::Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(|v| {
-        v.as_u64().or_else(|| {
-            v.as_i64()
-                .and_then(|n| if n >= 0 { Some(n as u64) } else { None })
-        })
-    })
 }
 
 fn parse_mistral_token_usage(usage: &serde_json::Value) -> Option<TokenUsage> {
@@ -139,115 +114,33 @@ pub(crate) fn is_transcription_model(model_id: &str) -> bool {
 }
 
 /// Enrich a model error with available Mistral transcription models.
-///
-/// Returns the error unchanged if it is not a model error or if
-/// suggestions cannot be fetched.
 pub(crate) async fn enrich_model_error(
     error: TalkError,
     api_key: &str,
     model: &str,
     api_base: &str,
 ) -> TalkError {
-    if !is_model_error(&error) {
-        return error;
-    }
-    match super::model_suggestions::fetch_transcription_models(
+    super::http::enrich_model_error(
+        error,
         api_key,
+        model,
         api_base,
+        is_model_error,
         is_transcription_model,
     )
     .await
-    {
-        Ok(models) if !models.is_empty() => TalkError::Transcription(format!(
-            "Model '{}' not found. Available transcription models: {}",
-            model,
-            models.join(", ")
-        )),
-        Ok(_) => TalkError::Transcription(format!(
-            "Model '{}' not found (no transcription models available in account)",
-            model
-        )),
-        Err(e) => {
-            log::warn!("could not fetch model suggestions: {}", e);
-            error
-        }
-    }
 }
 
-// ── Shared model validation ─────────────────────────────────────────
-
-/// Response from the Mistral `/v1/models` endpoint.
-#[derive(Debug, Deserialize)]
-struct ModelsResponse {
-    data: Vec<ModelInfo>,
-}
-
-/// A single entry in the Mistral models list.
-#[derive(Debug, Deserialize)]
-struct ModelInfo {
-    id: String,
-}
+// ── Model validation (delegates to shared http helper) ──────────────
 
 /// Validate that `model` is available in the Mistral account reachable
-/// at `api_base` (e.g. `"https://api.mistral.ai"`).
-///
-/// On success, returns `Ok(())`.  On failure, returns a helpful error
-/// that lists the available transcription models.
+/// at `api_base`.
 pub(crate) async fn validate_mistral_model(
     api_key: &str,
     model: &str,
     api_base: &str,
 ) -> Result<(), TalkError> {
-    let models_url = format!("{}/v1/models", api_base);
-
-    let client = build_client()?;
-    let response = client
-        .get(&models_url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .timeout(VALIDATE_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| TalkError::Config(format!("Failed to connect to Mistral API: {}", e)))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(TalkError::Config(format!(
-            "Mistral API error ({}): {}",
-            status, body
-        )));
-    }
-
-    let models: ModelsResponse = response.json().await.map_err(|e| {
-        TalkError::Config(format!("Failed to parse Mistral models response: {}", e))
-    })?;
-
-    // Check whether the requested model exists.
-    if models.data.iter().any(|m| m.id == model) {
-        return Ok(());
-    }
-
-    // Model not found — collect transcription-relevant alternatives.
-    let mut transcription_models: Vec<&str> = models
-        .data
-        .iter()
-        .map(|m| m.id.as_str())
-        .filter(|id| id.contains("voxtral") || id.contains("transcri"))
-        .collect();
-    transcription_models.sort();
-
-    if transcription_models.is_empty() {
-        Err(TalkError::Config(format!(
-            "Model '{}' not found in Mistral account",
-            model
-        )))
-    } else {
-        Err(TalkError::Config(format!(
-            "Model '{}' not found. Available transcription models: {}",
-            model,
-            transcription_models.join(", ")
-        )))
-    }
+    super::http::validate_model("Mistral", api_key, model, api_base, is_transcription_model).await
 }
 
 /// Transcriber implementation using the Mistral API.

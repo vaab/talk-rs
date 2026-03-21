@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+pub(crate) mod http;
 pub mod mistral;
 pub mod model_suggestions;
 pub mod openai;
