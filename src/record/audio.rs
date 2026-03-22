@@ -9,6 +9,7 @@ pub(super) const OPUS_SAMPLE_RATE: u32 = 48_000;
 ///
 /// Assumes 16-bit mono 16 kHz PCM with a 44-byte header:
 /// `(file_size - 44) / (16000 * 2)` = seconds.
+#[cfg(test)]
 pub(super) fn wav_duration_secs(path: &std::path::Path) -> Option<f64> {
     let size = std::fs::metadata(path).ok()?.len();
     if size <= 44 {

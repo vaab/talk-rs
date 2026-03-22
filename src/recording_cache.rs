@@ -1,7 +1,7 @@
 //! Recording cache management for talk-rs.
 //!
 //! Keeps the last N recordings in `~/.cache/talk-rs/recordings/` with
-//! companion YAML metadata files.  Each recording is a WAV file named
+//! companion YAML metadata files.  Each recording is an OGG file named
 //! with an ISO-8601 timestamp; the metadata file encodes the provider,
 //! model, and mode in its filename and contains the transcript plus
 //! recording metadata.
@@ -21,14 +21,14 @@ use std::path::PathBuf;
 
 /// Maximum number of recordings to keep in the cache.
 const MAX_CACHED_RECORDINGS: usize = 10;
-const LAST_RECORDING_POINTER: &str = "last_recording.wav";
+const LAST_RECORDING_POINTER: &str = "last_recording.ogg";
 const LAST_METADATA_POINTER: &str = "last_metadata.yml";
 const LAST_PASTE_STATE_FILE: &str = "last_paste.yml";
 
 /// Metadata associated with a cached recording.
 #[derive(Debug, Serialize)]
 pub struct RecordingMetadata {
-    /// Filename of the WAV recording (basename only).
+    /// Filename of the cached audio recording (basename only).
     pub recording: String,
     /// Transcription provider used.
     pub provider: String,
@@ -283,16 +283,16 @@ fn ensure_recordings_dir() -> Result<PathBuf, TalkError> {
     Ok(dir)
 }
 
-/// Generate a timestamped WAV path in the recordings cache directory.
+/// Generate a timestamped OGG path in the recordings cache directory.
 ///
-/// Returns `(wav_path, timestamp_string)` so the same timestamp can be
-/// used for both the WAV and metadata filenames.
+/// Returns `(ogg_path, timestamp_string)` so the same timestamp can be
+/// used for both the OGG and metadata filenames.
 pub fn generate_recording_path() -> Result<(PathBuf, String), TalkError> {
     let dir = ensure_recordings_dir()?;
     let now = Local::now();
     let ts = now.format("%Y-%m-%dT%H-%M-%S").to_string();
-    let wav_path = dir.join(format!("{}.wav", ts));
-    Ok((wav_path, ts))
+    let ogg_path = dir.join(format!("{}.ogg", ts));
+    Ok((ogg_path, ts))
 }
 
 /// Build the metadata YAML filename from components.
@@ -313,13 +313,13 @@ pub fn write_metadata(
     model: &str,
     realtime: bool,
     transcript: &str,
-    wav_filename: &str,
+    audio_filename: &str,
     transcription_metadata: &TranscriptionMetadata,
 ) -> Result<PathBuf, TalkError> {
     let dir = ensure_recordings_dir()?;
 
     let meta = RecordingMetadata {
-        recording: wav_filename.to_string(),
+        recording: audio_filename.to_string(),
         provider: provider.to_string(),
         model: model.to_string(),
         realtime,
@@ -343,8 +343,8 @@ pub fn write_metadata(
         ))
     })?;
 
-    let wav_path = dir.join(wav_filename);
-    if let Err(e) = write_last_pointers(&wav_path, &meta_path) {
+    let audio_path = dir.join(audio_filename);
+    if let Err(e) = write_last_pointers(&audio_path, &meta_path) {
         log::warn!("failed to update last recording pointers: {}", e);
     }
 
@@ -353,16 +353,16 @@ pub fn write_metadata(
 }
 
 fn write_last_pointers(
-    wav_path: &std::path::Path,
+    audio_path: &std::path::Path,
     meta_path: &std::path::Path,
 ) -> Result<(), TalkError> {
     let dir = ensure_recordings_dir()?;
-    let wav_link = dir.join(LAST_RECORDING_POINTER);
+    let audio_link = dir.join(LAST_RECORDING_POINTER);
     let yml_link = dir.join(LAST_METADATA_POINTER);
 
-    if wav_link.exists() {
-        fs::remove_file(&wav_link).map_err(|e| {
-            TalkError::Config(format!("failed to replace {}: {}", wav_link.display(), e))
+    if audio_link.exists() {
+        fs::remove_file(&audio_link).map_err(|e| {
+            TalkError::Config(format!("failed to replace {}: {}", audio_link.display(), e))
         })?;
     }
     if yml_link.exists() {
@@ -371,10 +371,10 @@ fn write_last_pointers(
         })?;
     }
 
-    symlink(wav_path, &wav_link).map_err(|e| {
+    symlink(audio_path, &audio_link).map_err(|e| {
         TalkError::Config(format!(
             "failed to create pointer {}: {}",
-            wav_link.display(),
+            audio_link.display(),
             e
         ))
     })?;
@@ -418,7 +418,7 @@ pub fn last_metadata_path() -> Result<PathBuf, TalkError> {
 
 pub fn latest_recording_path() -> Result<PathBuf, TalkError> {
     let dir = recordings_dir()?;
-    let mut wavs: Vec<PathBuf> = Vec::new();
+    let mut oggs: Vec<PathBuf> = Vec::new();
     let entries = fs::read_dir(&dir).map_err(|e| {
         TalkError::Config(format!(
             "failed to read recordings directory {}: {}",
@@ -435,21 +435,24 @@ pub fn latest_recording_path() -> Result<PathBuf, TalkError> {
         if name == LAST_RECORDING_POINTER {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) == Some("wav") && !path.is_symlink() {
-            wavs.push(path);
+        if path.extension().and_then(|e| e.to_str()) == Some("ogg") && !path.is_symlink() {
+            oggs.push(path);
         }
     }
 
-    wavs.sort();
-    wavs.pop().ok_or_else(|| {
+    oggs.sort();
+    oggs.pop().ok_or_else(|| {
         TalkError::Config(format!("no cached recordings found in {}", dir.display()))
     })
 }
 
 pub fn metadata_path_for_recording(
-    wav_path: &std::path::Path,
+    audio_path: &std::path::Path,
 ) -> Result<Option<PathBuf>, TalkError> {
-    let stem = wav_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let stem = audio_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     if stem.is_empty() {
         return Ok(None);
     }
@@ -474,7 +477,7 @@ pub fn metadata_path_for_recording(
     };
 
     // First look next to the audio file itself.
-    if let Some(audio_dir) = wav_path.parent() {
+    if let Some(audio_dir) = audio_path.parent() {
         let ymls = find_yml(audio_dir)?;
         if let Some(last) = ymls.last() {
             return Ok(Some(last.clone()));
@@ -530,9 +533,9 @@ pub fn read_last_paste_state() -> Result<Option<LastPasteState>, TalkError> {
 }
 
 /// Rotate the cache: keep only the most recent `MAX_CACHED_RECORDINGS`
-/// recording pairs (WAV + YAML).
+/// recording pairs (OGG + YAML).
 ///
-/// Recordings are identified by their `.wav` extension.  Each WAV is
+/// Recordings are identified by their `.ogg` extension.  Each OGG is
 /// paired with zero or more `.yml` files sharing the same timestamp
 /// prefix.  The oldest pairs beyond the limit are deleted.
 pub fn rotate_cache() -> Result<(), TalkError> {
@@ -541,9 +544,9 @@ pub fn rotate_cache() -> Result<(), TalkError> {
         _ => return Ok(()), // Nothing to rotate
     };
 
-    // Collect WAV files sorted by name (which is timestamp-based,
+    // Collect OGG files sorted by name (which is timestamp-based,
     // so lexicographic order == chronological order).
-    let mut wavs: Vec<PathBuf> = Vec::new();
+    let mut oggs: Vec<PathBuf> = Vec::new();
     let entries = fs::read_dir(&dir).map_err(|e| {
         TalkError::Config(format!(
             "failed to read recordings directory {}: {}",
@@ -560,29 +563,29 @@ pub fn rotate_cache() -> Result<(), TalkError> {
         if name == LAST_RECORDING_POINTER {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) == Some("wav") && !path.is_symlink() {
-            wavs.push(path);
+        if path.extension().and_then(|e| e.to_str()) == Some("ogg") && !path.is_symlink() {
+            oggs.push(path);
         }
     }
 
-    wavs.sort();
+    oggs.sort();
 
     // If within limit, nothing to do
-    if wavs.len() <= MAX_CACHED_RECORDINGS {
+    if oggs.len() <= MAX_CACHED_RECORDINGS {
         return Ok(());
     }
 
     // Remove oldest entries beyond the limit
-    let to_remove = wavs.len() - MAX_CACHED_RECORDINGS;
-    for wav_path in &wavs[..to_remove] {
-        // Extract the timestamp prefix from the WAV filename
-        let stem = wav_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let to_remove = oggs.len() - MAX_CACHED_RECORDINGS;
+    for ogg_path in &oggs[..to_remove] {
+        // Extract the timestamp prefix from the OGG filename
+        let stem = ogg_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-        // Delete the WAV file
-        if let Err(e) = fs::remove_file(wav_path) {
-            log::warn!("failed to remove cached WAV {}: {}", wav_path.display(), e);
+        // Delete the OGG file
+        if let Err(e) = fs::remove_file(ogg_path) {
+            log::warn!("failed to remove cached OGG {}: {}", ogg_path.display(), e);
         } else {
-            log::debug!("rotated out cached WAV: {}", wav_path.display());
+            log::debug!("rotated out cached OGG: {}", ogg_path.display());
         }
 
         // Delete all matching YAML files (same timestamp prefix)
@@ -607,52 +610,6 @@ pub fn rotate_cache() -> Result<(), TalkError> {
                     }
                 }
             }
-        }
-    }
-
-    Ok(())
-}
-
-/// Prune cached OGG files, keeping only the `max` most recent.
-///
-/// OGG cache files share the same timestamp-based naming as WAV files,
-/// so lexicographic sort gives chronological order.
-pub fn prune_ogg_cache(max: usize) -> Result<(), TalkError> {
-    let dir = match recordings_dir() {
-        Ok(d) if d.exists() => d,
-        _ => return Ok(()),
-    };
-
-    let mut oggs: Vec<PathBuf> = Vec::new();
-    let entries = fs::read_dir(&dir).map_err(|e| {
-        TalkError::Config(format!(
-            "failed to read recordings directory {}: {}",
-            dir.display(),
-            e
-        ))
-    })?;
-
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("ogg") {
-            oggs.push(path);
-        }
-    }
-
-    oggs.sort();
-
-    if oggs.len() <= max {
-        return Ok(());
-    }
-
-    let to_remove = oggs.len() - max;
-    for ogg_path in &oggs[..to_remove] {
-        if let Err(e) = fs::remove_file(ogg_path) {
-            log::warn!("failed to remove cached OGG {}: {}", ogg_path.display(), e);
-        } else {
-            log::debug!("pruned cached OGG: {}", ogg_path.display());
         }
     }
 
@@ -710,7 +667,7 @@ mod tests {
     #[test]
     fn test_recording_metadata_serialisation() {
         let meta = RecordingMetadata {
-            recording: "2026-02-18T12-33-45.wav".to_string(),
+            recording: "2026-02-18T12-33-45.ogg".to_string(),
             provider: "openai".to_string(),
             model: "whisper-1".to_string(),
             realtime: false,
@@ -720,7 +677,7 @@ mod tests {
             provider_api: None,
         };
         let yaml = serde_yaml::to_string(&meta).expect("serialise");
-        assert!(yaml.contains("recording: 2026-02-18T12-33-45.wav"));
+        assert!(yaml.contains("recording: 2026-02-18T12-33-45.ogg"));
         assert!(yaml.contains("provider: openai"));
         assert!(yaml.contains("model: whisper-1"));
         assert!(yaml.contains("realtime: false"));
@@ -731,7 +688,7 @@ mod tests {
     #[test]
     fn test_recording_metadata_serialisation_with_provider_metadata() {
         let meta = RecordingMetadata {
-            recording: "2026-02-18T12-33-45.wav".to_string(),
+            recording: "2026-02-18T12-33-45.ogg".to_string(),
             provider: "openai".to_string(),
             model: "gpt-4o-transcribe".to_string(),
             realtime: false,
@@ -777,39 +734,39 @@ mod tests {
         let dir = TempDir::new().expect("create temp dir");
         let rec_dir = dir.path();
 
-        // Create 12 fake WAV + YML pairs
+        // Create 12 fake OGG + YML pairs
         for i in 0..12 {
             let ts = format!("2026-02-{:02}T12-00-00", i + 1);
-            let wav = rec_dir.join(format!("{}.wav", ts));
+            let ogg = rec_dir.join(format!("{}.ogg", ts));
             let yml = rec_dir.join(format!("{}_openai_whisper-1_batch.yml", ts));
-            fs::write(&wav, "fake wav").expect("write wav");
+            fs::write(&ogg, "fake ogg").expect("write ogg");
             fs::write(&yml, "fake yml").expect("write yml");
         }
 
         // Manually run rotation on this directory
         rotate_in_dir(rec_dir, MAX_CACHED_RECORDINGS).expect("rotate");
 
-        // Count remaining WAV files
-        let remaining_wavs: Vec<_> = fs::read_dir(rec_dir)
+        // Count remaining OGG files
+        let remaining_oggs: Vec<_> = fs::read_dir(rec_dir)
             .expect("read dir")
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("wav"))
+            .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("ogg"))
             .collect();
 
-        assert_eq!(remaining_wavs.len(), MAX_CACHED_RECORDINGS);
+        assert_eq!(remaining_oggs.len(), MAX_CACHED_RECORDINGS);
 
         // Verify the oldest 2 were removed
-        assert!(!rec_dir.join("2026-02-01T12-00-00.wav").exists());
+        assert!(!rec_dir.join("2026-02-01T12-00-00.ogg").exists());
         assert!(!rec_dir
             .join("2026-02-01T12-00-00_openai_whisper-1_batch.yml")
             .exists());
-        assert!(!rec_dir.join("2026-02-02T12-00-00.wav").exists());
+        assert!(!rec_dir.join("2026-02-02T12-00-00.ogg").exists());
         assert!(!rec_dir
             .join("2026-02-02T12-00-00_openai_whisper-1_batch.yml")
             .exists());
 
         // Verify the newest are still there
-        assert!(rec_dir.join("2026-02-12T12-00-00.wav").exists());
+        assert!(rec_dir.join("2026-02-12T12-00-00.ogg").exists());
         assert!(rec_dir
             .join("2026-02-12T12-00-00_openai_whisper-1_batch.yml")
             .exists());
@@ -820,11 +777,11 @@ mod tests {
         let dir = TempDir::new().expect("create temp dir");
         let rec_dir = dir.path();
 
-        // Create 5 WAV files (under the limit)
+        // Create 5 OGG files (under the limit)
         for i in 0..5 {
             let ts = format!("2026-02-{:02}T12-00-00", i + 1);
-            let wav = rec_dir.join(format!("{}.wav", ts));
-            fs::write(&wav, "fake wav").expect("write wav");
+            let ogg = rec_dir.join(format!("{}.ogg", ts));
+            fs::write(&ogg, "fake ogg").expect("write ogg");
         }
 
         rotate_in_dir(rec_dir, MAX_CACHED_RECORDINGS).expect("rotate");
@@ -847,7 +804,7 @@ mod tests {
     fn test_read_metadata_brief_transcript() {
         let dir = TempDir::new().expect("create temp dir");
         let path = dir.path().join("meta.yml");
-        let content = "recording: x.wav\nprovider: openai\nmodel: whisper-1\nrealtime: false\ntranscript: hello world\ntimestamp: 2026-01-01T00-00-00\n";
+        let content = "recording: x.ogg\nprovider: openai\nmodel: whisper-1\nrealtime: false\ntranscript: hello world\ntimestamp: 2026-01-01T00-00-00\n";
         fs::write(&path, content).expect("write metadata");
 
         let brief = read_metadata_brief(&path).expect("read brief");
@@ -871,7 +828,7 @@ mod tests {
 
     /// Testable rotation function that operates on an arbitrary directory.
     fn rotate_in_dir(dir: &std::path::Path, max: usize) -> Result<(), TalkError> {
-        let mut wavs: Vec<PathBuf> = Vec::new();
+        let mut oggs: Vec<PathBuf> = Vec::new();
         let entries = fs::read_dir(dir).map_err(|e| {
             TalkError::Config(format!(
                 "failed to read recordings directory {}: {}",
@@ -884,22 +841,22 @@ mod tests {
             let entry = entry
                 .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("wav") {
-                wavs.push(path);
+            if path.extension().and_then(|e| e.to_str()) == Some("ogg") {
+                oggs.push(path);
             }
         }
 
-        wavs.sort();
+        oggs.sort();
 
-        if wavs.len() <= max {
+        if oggs.len() <= max {
             return Ok(());
         }
 
-        let to_remove = wavs.len() - max;
-        for wav_path in &wavs[..to_remove] {
-            let stem = wav_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let to_remove = oggs.len() - max;
+        for ogg_path in &oggs[..to_remove] {
+            let stem = ogg_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-            let _ = fs::remove_file(wav_path);
+            let _ = fs::remove_file(ogg_path);
 
             if !stem.is_empty() {
                 let yml_prefix = format!("{}_", stem);

@@ -1,12 +1,12 @@
 //! Recording entry listing and file operations for the recordings browser.
 
-use super::audio::{ogg_duration_secs, wav_duration_secs};
+use super::audio::ogg_duration_secs;
 use crate::config::Config;
 use crate::error::TalkError;
 use crate::recording_cache;
 use std::path::PathBuf;
 
-/// Entry for one cached recording (WAV or OGG).
+/// Entry for one cached recording.
 pub(super) struct RecordingEntry {
     pub(super) path: PathBuf,
     pub(super) date_label: String,
@@ -137,8 +137,8 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     Ok(result)
 }
 
-/// Gather WAV dictation cache entries (with companion YML), sorted newest-first.
-pub(super) fn list_wav_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
+/// Gather dictation cache entries (with companion YML), sorted newest-first.
+pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     let t = std::time::Instant::now();
     let dir = recording_cache::recordings_dir()?;
     if !dir.exists() {
@@ -153,41 +153,41 @@ pub(super) fn list_wav_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
         ))
     })?;
 
-    let mut wavs: Vec<PathBuf> = Vec::new();
+    let mut oggs: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = entry
             .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
         let path = entry.path();
 
-        // Skip symlinks (last_recording.wav, last_metadata.yml)
+        // Skip symlinks (last_recording.ogg, last_metadata.yml)
         if path.is_symlink() {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) == Some("wav") {
-            wavs.push(path);
+        if path.extension().and_then(|e| e.to_str()) == Some("ogg") {
+            oggs.push(path);
         }
     }
 
     // Sort lexicographically (timestamp-based names → chronological)
-    wavs.sort();
+    oggs.sort();
     // Reverse for newest-first
-    wavs.reverse();
+    oggs.reverse();
 
-    let mut result = Vec::with_capacity(wavs.len());
-    for wav_path in wavs {
-        let stem = wav_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let mut result = Vec::with_capacity(oggs.len());
+    for ogg_path in oggs {
+        let stem = ogg_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let date_label = date_label_from_stem(stem);
 
-        let duration_label = wav_duration_secs(&wav_path)
+        let duration_label = ogg_duration_secs(&ogg_path)
             .map(format_duration)
             .unwrap_or_else(|| "?:??".to_string());
 
-        let size_label = std::fs::metadata(&wav_path)
+        let size_label = std::fs::metadata(&ogg_path)
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
         // Try to read transcript from companion metadata YAML
-        let transcript_preview = match recording_cache::metadata_path_for_recording(&wav_path) {
+        let transcript_preview = match recording_cache::metadata_path_for_recording(&ogg_path) {
             Ok(Some(meta_path)) => recording_cache::read_metadata_brief(&meta_path)
                 .map(|b| {
                     // Single line, truncated preview (char-safe)
@@ -204,7 +204,7 @@ pub(super) fn list_wav_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
         };
 
         result.push(RecordingEntry {
-            path: wav_path,
+            path: ogg_path,
             date_label,
             duration_label,
             size_label,
@@ -213,7 +213,7 @@ pub(super) fn list_wav_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     }
 
     log::debug!(
-        "list_wav: {} entries, total {:.0?}",
+        "list_cache: {} entries, total {:.0?}",
         result.len(),
         t.elapsed(),
     );
@@ -222,8 +222,8 @@ pub(super) fn list_wav_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
 
 /// Delete a recording and its companion metadata YAML files.
 ///
-/// For WAV files, also removes matching `*_<model>.yml` companion files.
-/// For OGG files, only the single file is removed (no companions).
+/// For cache audio files, also removes matching `*_<model>.yml`
+/// companion files.
 pub(super) fn delete_recording(file_path: &std::path::Path) -> Result<(), TalkError> {
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -233,8 +233,9 @@ pub(super) fn delete_recording(file_path: &std::path::Path) -> Result<(), TalkEr
         log::warn!("failed to remove {}: {}", file_path.display(), e);
     }
 
-    // For WAV files, also delete matching YAML metadata files
-    if ext == "wav" && !stem.is_empty() {
+    // For cache audio files, also delete matching YAML metadata files.
+    // Keep `wav` for backward compatibility with older cache entries.
+    if (ext == "wav" || ext == "ogg") && !stem.is_empty() {
         if let Ok(dir) = recording_cache::recordings_dir() {
             let yml_prefix = format!("{}_", stem);
             if let Ok(entries) = std::fs::read_dir(&dir) {

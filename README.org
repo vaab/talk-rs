@@ -45,7 +45,7 @@ happening.
 - *Retry last* -- re-transcribe the last cached recording without
   speaking again (~--retry-last~).
 - *Recordings browser* -- ~record --ui~ opens a GTK4 window listing
-  all recordings (OGG from ~output_dir~) and dictation cache (WAV).
+all recordings (OGG from ~output_dir~) and dictation cache (OGG).
   Play, delete, or open in the file manager; sections auto-refresh
   via inotify when files change externally.
 - *Standalone commands* -- ~record~ and ~transcribe~ can be used
@@ -194,7 +194,7 @@ Options:
 | ~--replace-last-paste~      | Delete previous paste before inserting new text |
 | ~--save <PATH>~             | Save audio recording to a file                  |
 | ~--output-yaml <FILE>~      | Write transcription metadata YAML               |
-| ~--input-audio-file <FILE>~ | Feed a pre-recorded WAV instead of live mic     |
+| ~--input-audio-file <FILE>~ | Feed a pre-recorded audio file instead of live mic |
 | ~--monitor~                 | Mix system audio (monitor) with mic input       |
 | ~--no-sounds~               | Disable audio indicators                        |
 | ~--no-boop~                 | Disable periodic boop sounds (keep start/stop)  |

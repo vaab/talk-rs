@@ -1,11 +1,11 @@
 //! Batch dictation mode.
 //!
 //! Encodes audio and streams it directly to a single transcription
-//! request.  Audio is independently recorded to a cache WAV via the
+//! request.  Audio is independently recorded to a cache OGG via the
 //! shared [`AudioBuffer`](super::realtime::AudioBuffer) so that a
 //! transcription failure never truncates the recording.
 
-use super::realtime::{buffer_feeder, wav_recording_task, AudioBuffer};
+use super::realtime::{buffer_feeder, ogg_recording_task, AudioBuffer};
 use crate::audio::indicator::SoundPlayer;
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::{AudioConfig, Config, Provider};
@@ -32,7 +32,6 @@ fn spawn_encode_pipeline(
     buffer: &Arc<AudioBuffer>,
     audio_config: AudioConfig,
     transcriber: Box<dyn BatchTranscriber>,
-    ogg_cache_path: Option<std::path::PathBuf>,
 ) -> (
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), TalkError>>,
@@ -46,42 +45,12 @@ fn spawn_encode_pipeline(
     // Feeder: buffer → fwd_tx
     let feeder_handle = tokio::spawn(buffer_feeder(Arc::clone(buffer), fwd_tx, 0));
 
-    // Optional: tee OGG bytes to a cache file for --upload-format ogg retries
-    let ogg_file_tx = ogg_cache_path.map(|path| {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(25);
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let file = match tokio::fs::File::create(&path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    log::warn!("failed to create OGG cache {}: {}", path.display(), e);
-                    return;
-                }
-            };
-            let mut writer = tokio::io::BufWriter::new(file);
-            while let Some(chunk) = rx.recv().await {
-                if let Err(e) = writer.write_all(&chunk).await {
-                    log::warn!("failed to write OGG cache: {}", e);
-                    return;
-                }
-            }
-            if let Err(e) = writer.flush().await {
-                log::warn!("failed to flush OGG cache: {}", e);
-            }
-            log::info!("OGG cache saved to: {}", path.display());
-        });
-        tx
-    });
-
-    // Encode: fwd_rx → OGG Opus → stream_tx (+ optional file tee)
+    // Encode: fwd_rx → OGG Opus → stream_tx
     let encode_handle = tokio::spawn(async move {
         let mut rx = fwd_rx;
         let mut writer = OggOpusWriter::new(audio_config)?;
 
         let header = writer.header()?;
-        if let Some(ref ogg_tx) = ogg_file_tx {
-            let _ = ogg_tx.send(header.clone()).await;
-        }
         if stream_tx.send(header).await.is_err() {
             log::warn!("transcription stream closed during header send");
             let _ = encode_done_tx.send(());
@@ -90,27 +59,19 @@ fn spawn_encode_pipeline(
 
         while let Some(pcm_chunk) = rx.recv().await {
             let encoded_data = writer.write_pcm(&pcm_chunk)?;
-            if !encoded_data.is_empty() {
-                if let Some(ref ogg_tx) = ogg_file_tx {
-                    let _ = ogg_tx.send(encoded_data.clone()).await;
-                }
-                if stream_tx.send(encoded_data).await.is_err() {
-                    log::warn!("transcription stream closed during audio send");
-                    break;
-                }
+            if !encoded_data.is_empty() && stream_tx.send(encoded_data).await.is_err() {
+                log::warn!("transcription stream closed during audio send");
+                break;
             }
         }
 
         // Finalize writer
         let remaining = writer.finalize()?;
         if !remaining.is_empty() {
-            if let Some(ref ogg_tx) = ogg_file_tx {
-                let _ = ogg_tx.send(remaining.clone()).await;
-            }
             let _ = stream_tx.send(remaining).await;
         }
 
-        // stream_tx + ogg_file_tx are dropped here, closing both channels
+        // stream_tx is dropped here, closing the channel.
         let _ = encode_done_tx.send(());
         Ok::<(), TalkError>(())
     });
@@ -142,7 +103,7 @@ fn abort_pipeline(
 
 /// Batch dictation mode.
 ///
-/// Records audio to a cache WAV via [`wav_recording_task`] and
+/// Records audio to a cache OGG via [`ogg_recording_task`] and
 /// independently streams encoded OGG to a transcription API.  If the
 /// transcription pipeline fails during recording, it is restarted
 /// immediately from the beginning of the shared [`AudioBuffer`] so
@@ -153,7 +114,7 @@ pub(crate) async fn dictate_streaming(
     from_file: bool,
     audio_config: AudioConfig,
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
-    cache_wav_path: &std::path::Path,
+    cache_ogg_path: &std::path::Path,
     transcriber: Box<dyn BatchTranscriber>,
     shutdown: &CancellationToken,
     player: Option<&SoundPlayer>,
@@ -164,33 +125,27 @@ pub(crate) async fn dictate_streaming(
     provider: Provider,
     model: Option<&str>,
     diarize: bool,
-    ogg_cache_path: Option<std::path::PathBuf>,
 ) -> (
     Result<TranscriptionResult, TalkError>,
     Option<std::time::Instant>,
 ) {
-    // ── WAV recording (independent of transcription) ────────────────
-    log::info!("caching audio to: {}", cache_wav_path.display());
+    // ── OGG recording (independent of transcription) ────────────────
+    log::info!("caching audio to: {}", cache_ogg_path.display());
     let buffer = Arc::new(AudioBuffer::new());
-    let cache_wav_task = tokio::spawn(wav_recording_task(
+    let cache_ogg_task = tokio::spawn(ogg_recording_task(
         audio_rx,
-        cache_wav_path.to_path_buf(),
+        cache_ogg_path.to_path_buf(),
         audio_config.clone(),
         Arc::clone(&buffer),
     ));
 
     // ── Initial transcription pipeline ──────────────────────────────
     let (mut feeder_handle, mut encode_handle, mut transcribe_handle, mut encode_done_rx) =
-        spawn_encode_pipeline(
-            &buffer,
-            audio_config.clone(),
-            transcriber,
-            ogg_cache_path.clone(),
-        );
+        spawn_encode_pipeline(&buffer, audio_config.clone(), transcriber);
 
     // ── Wait for recording to end ───────────────────────────────────
     let rec_start = std::time::Instant::now();
-    let mut t_stop: Option<std::time::Instant> = None;
+    let t_stop: Option<std::time::Instant>;
     if from_file {
         log::info!("transcribing audio file (batch)...");
         tokio::select! {
@@ -240,10 +195,10 @@ pub(crate) async fn dictate_streaming(
                         Err(e) => format!("feeder panic: {}", e),
                     };
                     log::warn!(
-                        "transcription pipeline failed during recording: {} — \
-                         WAV recording continues",
-                        reason
-                    );
+                         "transcription pipeline failed during recording: {} — \
+                         OGG recording continues",
+                         reason
+                     );
 
                     abort_pipeline(
                         &feeder_handle,
@@ -262,7 +217,7 @@ pub(crate) async fn dictate_streaming(
                         if let Some(viz) = visualizer {
                             viz.push_message(&msg);
                         }
-                        // Continue recording — will retry from WAV
+                        // Continue recording — will retry from OGG
                         // after recording stops.
                         shutdown.cancelled().await;
                         t_stop = Some(std::time::Instant::now());
@@ -295,7 +250,6 @@ pub(crate) async fn dictate_streaming(
                                 &buffer,
                                 audio_config.clone(),
                                 new_transcriber,
-                                ogg_cache_path.clone(),
                             );
                             feeder_handle = pipeline.0;
                             encode_handle = pipeline.1;
@@ -315,7 +269,7 @@ pub(crate) async fn dictate_streaming(
                             if let Some(viz) = visualizer {
                                 viz.push_message(&msg);
                             }
-                            // Fall through — will retry from WAV after
+                            // Fall through — will retry from OGG after
                             // recording stops.
                             shutdown.cancelled().await;
                             t_stop = Some(std::time::Instant::now());
@@ -353,17 +307,17 @@ pub(crate) async fn dictate_streaming(
         }
     }
 
-    // ── Wait for WAV recording task (no timeout) ────────────────────
+    // ── Wait for OGG recording task (no timeout) ────────────────────
     //
-    // The WAV task finishes as soon as the source channel closes (a
-    // header-patch + fsync — very fast).  Never abandon it.
-    match cache_wav_task.await {
-        Ok(Ok(())) => log::debug!("cache WAV task completed"),
-        Ok(Err(err)) => log::warn!("cache WAV write error: {}", err),
-        Err(err) => log::warn!("cache WAV task panicked: {}", err),
+    // The OGG task finishes as soon as the source channel closes
+    // (trailing bytes + fsync — very fast).  Never abandon it.
+    match cache_ogg_task.await {
+        Ok(Ok(())) => log::debug!("cache OGG task completed"),
+        Ok(Err(err)) => log::warn!("cache OGG write error: {}", err),
+        Err(err) => log::warn!("cache OGG task panicked: {}", err),
     }
     if let Some(t) = t_stop {
-        log::info!("timing: stop +{}ms wav_flushed", t.elapsed().as_millis());
+        log::info!("timing: stop +{}ms ogg_flushed", t.elapsed().as_millis());
     }
 
     // ── Wait for transcription result ───────────────────────────────

@@ -208,17 +208,18 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     };
 
     // Generate cache recording path (always, even without --save)
-    let (cache_wav_path, cache_timestamp) = recording_cache::generate_recording_path()?;
-    log::info!("cache recording: {}", cache_wav_path.display());
+    let (cache_path, cache_timestamp) = recording_cache::generate_recording_path()?;
+    log::info!("cache recording: {}", cache_path.display());
 
     let provider = resolve_provider(opts.provider, &config);
     let effective_model = resolve_model(opts.model.as_deref(), &config, provider, opts.realtime);
 
-    // Create audio source: live microphone or WAV file input.
+    // Create audio source: live microphone or audio file input.
     //
     // For live capture, record at the device's native rate (typically
     // 48 kHz) and downsample to 16 kHz with a proper anti-aliasing
-    // filter.  WAV file input is assumed to be 16 kHz already.
+    // filter.  PCM WAV input is assumed to be 16 kHz already; OGG/Opus
+    // input is decoded by `OggFileSource`.
     let encode_config = AudioConfig::new(); // 16 kHz target for encoder
     let from_file = input_audio_file.is_some();
     let (mut capture, capture_rate): (Box<dyn AudioCapture>, u32) =
@@ -465,7 +466,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             config.clone(),
             provider,
             opts.model.as_deref(),
-            &cache_wav_path,
+            &cache_path,
             audio_rx,
             &mut *capture,
             from_file,
@@ -509,18 +510,12 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.diarize,
         )?;
 
-        // Always tee the encoded OGG stream to a cache file alongside
-        // the WAV — useful for retries with --upload-format ogg and for
-        // replaying via --input-audio-file.  Old OGG files are pruned
-        // to the 10 most recent after the recording completes.
-        let ogg_cache_path = Some(cache_wav_path.with_extension("ogg"));
-
         let (stream_result, t_stop_val) = dictate_streaming(
             &mut *capture,
             from_file,
             encode_config.clone(),
             audio_rx,
-            &cache_wav_path,
+            &cache_path,
             transcriber,
             &shutdown,
             player.as_ref(),
@@ -531,14 +526,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             provider,
             opts.model.as_deref(),
             opts.diarize,
-            ogg_cache_path.clone(),
         )
         .await;
         t_stop = t_stop_val;
 
         // If the initial streaming transcription failed (timeout,
         // API error, network issue), retry up to 5 times using the
-        // saved WAV file.  Each retry creates a fresh transcriber
+        // saved OGG file.  Each retry creates a fresh transcriber
         // and applies the same 5-second timeout.
         const MAX_RETRIES: u32 = 5;
         const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -603,9 +597,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         }
                     };
 
-                    let upload_path = ogg_cache_path
-                        .clone()
-                        .unwrap_or_else(|| cache_wav_path.to_path_buf());
+                    let upload_path = cache_path.clone();
                     let mut task = tokio::spawn(async move {
                         retry_transcriber.transcribe_file(&upload_path).await
                     });
@@ -647,7 +639,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     Some(r) => r,
                     None => {
                         // All retries exhausted — show error, skip YAML/paste,
-                        // preserve WAV for the picker.
+                        // preserve OGG for the picker.
                         let final_msg = format!(
                             "Transcription failed after {} attempts: {}",
                             MAX_RETRIES, last_err,
@@ -714,17 +706,17 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     let metadata = result.metadata;
 
     // Write recording cache metadata and rotate old entries.
-    let cache_wav_filename = cache_wav_path
+    let cache_filename = cache_path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("recording.wav");
+        .unwrap_or("recording.ogg");
     let cache_meta_path = recording_cache::write_metadata(
         &cache_timestamp,
         provider,
         &effective_model,
         opts.realtime,
         &text,
-        cache_wav_filename,
+        cache_filename,
         &metadata,
     );
     if let Err(ref e) = cache_meta_path {
@@ -733,13 +725,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     if let Err(e) = recording_cache::rotate_cache() {
         log::warn!("failed to rotate recording cache: {}", e);
     }
-    if let Err(e) = recording_cache::prune_ogg_cache(10) {
-        log::warn!("failed to prune OGG cache: {}", e);
-    }
 
-    // Copy cache WAV to --save path if specified
+    // Copy cache OGG to --save path if specified
     if let Some(ref path) = save_path {
-        if let Err(e) = std::fs::copy(&cache_wav_path, path) {
+        if let Err(e) = std::fs::copy(&cache_path, path) {
             log::warn!("failed to copy recording to {}: {}", path.display(), e);
         } else {
             log::info!("audio saved to: {}", path.display());
