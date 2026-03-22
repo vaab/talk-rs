@@ -3,7 +3,7 @@
 //! Captures audio from the system, encodes it with Opus, and writes to a file.
 //! Supports graceful shutdown via SIGINT (Ctrl+C).
 
-mod audio;
+pub(crate) mod audio;
 mod entries;
 pub(crate) mod player;
 pub(crate) mod ui;

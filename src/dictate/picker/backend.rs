@@ -6,7 +6,6 @@
 
 use super::ui::{PickerCandidate, PickerMessage};
 use crate::config::Provider;
-use crate::error::TalkError;
 use crate::transcription::{BatchTranscriber, RealtimeTranscriber, TranscriptionEvent};
 use std::path::PathBuf;
 
@@ -163,65 +162,4 @@ pub(super) fn spawn_transcription(
         };
         let _ = tx.send(msg);
     });
-}
-
-/// Read all PCM i16 samples from a 16-bit WAV file.
-///
-/// Skips directly to the `data` chunk and reads every sample as
-/// little-endian i16.  Returns an error if the file is not a valid
-/// WAV or does not contain 16-bit PCM.
-pub(super) fn read_wav_pcm_samples(path: &std::path::Path) -> Result<Vec<i16>, TalkError> {
-    use byteorder::{LittleEndian, ReadBytesExt};
-    use std::io::{Read, Seek, SeekFrom};
-
-    let err = |msg: &str| TalkError::Audio(format!("{}: {msg}", path.display()));
-
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| TalkError::Audio(format!("failed to open WAV {}: {e}", path.display())))?;
-
-    // Validate RIFF/WAVE header.
-    let mut tag = [0u8; 4];
-    file.read_exact(&mut tag)
-        .map_err(|_| err("truncated RIFF"))?;
-    if &tag != b"RIFF" {
-        return Err(err("not a WAV file (missing RIFF)"));
-    }
-    file.read_u32::<LittleEndian>()
-        .map_err(|_| err("truncated RIFF"))?; // file size
-    file.read_exact(&mut tag)
-        .map_err(|_| err("truncated WAVE"))?;
-    if &tag != b"WAVE" {
-        return Err(err("not a WAV file (missing WAVE)"));
-    }
-
-    // Walk chunks until we find "data".
-    let data_size: u32 = loop {
-        if file.read_exact(&mut tag).is_err() {
-            return Err(err("data chunk not found"));
-        }
-        let chunk_size = file
-            .read_u32::<LittleEndian>()
-            .map_err(|_| err("truncated chunk header"))?;
-        if &tag == b"data" {
-            break chunk_size;
-        }
-        // Skip unknown chunk (pad to even).
-        let skip = if chunk_size % 2 == 0 {
-            chunk_size as i64
-        } else {
-            chunk_size as i64 + 1
-        };
-        file.seek(SeekFrom::Current(skip))
-            .map_err(|_| err("seek past chunk failed"))?;
-    };
-
-    let num_samples = data_size as usize / 2; // 16-bit = 2 bytes per sample
-    let mut samples = Vec::with_capacity(num_samples);
-    for _ in 0..num_samples {
-        match file.read_i16::<LittleEndian>() {
-            Ok(s) => samples.push(s),
-            Err(_) => break,
-        }
-    }
-    Ok(samples)
 }

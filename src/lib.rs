@@ -11,6 +11,7 @@ pub mod record;
 pub mod recording_cache;
 pub mod transcribe;
 pub mod transcription;
+pub mod widgets;
 pub mod x11;
 
 pub use clipboard::{Clipboard, MockClipboard, X11Clipboard};

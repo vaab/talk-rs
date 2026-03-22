@@ -164,103 +164,9 @@ fn show_recordings_window() -> Result<(), TalkError> {
     // callback fills this with gio::FileMonitor instances.
     let monitors: Rc<RefCell<Vec<gtk4::gio::FileMonitor>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // ── Waterfall spectrogram workers ─────────────────────
-    // A pool of background threads computes waterfall data for
-    // recordings without transcripts.  Each item is queued from
-    // build_row; workers check the .wf cache first (instant) and
-    // only fall back to FFT computation on cache miss.
-    type WfColumns = (Vec<Vec<f32>>, f32);
-    let (wf_work_tx, wf_work_rx) = std::sync::mpsc::channel::<std::path::PathBuf>();
-    let (wf_result_tx, wf_result_rx) =
-        std::sync::mpsc::channel::<(std::path::PathBuf, Vec<Vec<f32>>, f32)>();
-
-    {
-        let wf_work_rx = std::sync::Arc::new(std::sync::Mutex::new(wf_work_rx));
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| (n.get() / 2).clamp(1, 4))
-            .unwrap_or(2);
-        for _ in 0..num_workers {
-            let rx = std::sync::Arc::clone(&wf_work_rx);
-            let tx = wf_result_tx.clone();
-            std::thread::spawn(move || {
-                loop {
-                    let path = {
-                        let lock = rx.lock().unwrap_or_else(|e| e.into_inner());
-                        match lock.recv() {
-                            Ok(p) => p,
-                            Err(_) => return, // channel closed
-                        }
-                    };
-                    // Cache hit → instant result, no FFT needed.
-                    if let Some((cols, peak)) = super::audio::read_waterfall_cache(&path) {
-                        let _ = tx.send((path, cols, peak));
-                    } else {
-                        // Cache miss → compute from audio and persist.
-                        match super::audio::read_audio_as_i16(&path) {
-                            Ok(samples) => {
-                                let (cols, peak) =
-                                    crate::x11::render_util::generate_waterfall_columns(
-                                        &samples, 16_000,
-                                    );
-                                if let Err(e) =
-                                    super::audio::write_waterfall_cache(&path, &cols, peak)
-                                {
-                                    log::warn!("waterfall cache write: {}", e);
-                                }
-                                let _ = tx.send((path, cols, peak));
-                            }
-                            Err(e) => {
-                                log::warn!("waterfall: {}: {}", path.display(), e);
-                            }
-                        }
-                    }
-                    // Yield between items so the GTK thread stays responsive.
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            });
-        }
-        // Drop our copy so the channel closes when wf_work_tx is dropped.
-        drop(wf_result_tx);
-    }
-
-    // Registry: maps audio path → (data slot, DrawingArea) so the
-    // result poller can dispatch computed waterfalls to the right widget.
-    type WfRegistry = std::collections::HashMap<
-        std::path::PathBuf,
-        (Rc<RefCell<Option<WfColumns>>>, gtk4::DrawingArea),
-    >;
-    let wf_registry: Rc<RefCell<WfRegistry>> = Rc::new(RefCell::new(Default::default()));
-
-    // Single GTK poller: checks the result channel and dispatches
-    // waterfall data to the matching DrawingArea.  Processes up to
-    // a small batch per tick for fast progressive display without
-    // blocking the main loop.
-    {
-        let reg = Rc::clone(&wf_registry);
-        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            use gtk4::prelude::*;
-            for _ in 0..5 {
-                match wf_result_rx.try_recv() {
-                    Ok((path, cols, peak)) => {
-                        if let Some((data, area)) = reg.borrow().get(&path) {
-                            *data.borrow_mut() = Some((cols, peak));
-                            area.queue_draw();
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        return glib::ControlFlow::Break;
-                    }
-                }
-            }
-            glib::ControlFlow::Continue
-        });
-    }
-
     {
         /// Build a single row (hbox) for a recording entry with all columns
         /// and buttons.
-        #[allow(clippy::too_many_arguments)]
         fn build_row(
             recording: &RecordingEntry,
             player: &Rc<RefCell<Option<WavPlayer>>>,
@@ -269,8 +175,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
             list: &gtk4::ListBox,
             expander: &gtk4::Expander,
             section_label: &str,
-            wf_work_tx: &std::sync::mpsc::Sender<std::path::PathBuf>,
-            wf_registry: &Rc<RefCell<WfRegistry>>,
         ) -> gtk4::ListBoxRow {
             use gtk4::prelude::*;
 
@@ -309,83 +213,19 @@ fn show_recordings_window() -> Result<(), TalkError> {
             size_label.add_css_class("meta");
             hbox.append(&size_label);
 
-            // Transcript preview or waterfall spectrogram
+            // Transcript preview or interactive player bar
             if recording.transcript_preview.is_empty() {
-                // No transcript — show a waterfall spectrogram of the audio.
-                let wf_area = gtk4::DrawingArea::new();
-                wf_area.set_hexpand(true);
-                wf_area.set_vexpand(false);
-                wf_area.set_content_height(28);
-                wf_area.add_css_class("waterfall");
-
-                type WaterfallData = Option<(Vec<Vec<f32>>, f32)>;
-                let wf_data: Rc<RefCell<WaterfallData>> = Rc::new(RefCell::new(None));
-
-                {
-                    let data_ref = Rc::clone(&wf_data);
-                    wf_area.set_draw_func(move |_area, cr, width, height| {
-                        let w = width as usize;
-                        let h = height as usize;
-                        if w == 0 || h == 0 {
-                            return;
-                        }
-                        let data = data_ref.borrow();
-                        if let Some((ref columns, peak)) = *data {
-                            if peak > 0.0 && !columns.is_empty() {
-                                if let Ok(mut surface) = gtk4::cairo::ImageSurface::create(
-                                    gtk4::cairo::Format::ARgb32,
-                                    width,
-                                    height,
-                                ) {
-                                    let stride = surface.stride() as usize;
-                                    if let Ok(mut surf_data) = surface.data() {
-                                        let num_rows = crate::x11::render_util::WATERFALL_ROWS;
-                                        for x in 0..w {
-                                            let col_idx = x * columns.len() / w;
-                                            let col = &columns[col_idx];
-                                            for y in 0..h {
-                                                let data_row = (num_rows - 1)
-                                                    - (y * num_rows / h).min(num_rows - 1);
-                                                let magnitude = if data_row < col.len() {
-                                                    col[data_row]
-                                                } else {
-                                                    0.0
-                                                };
-                                                let norm = (magnitude / peak).clamp(0.0, 1.0);
-                                                let brightness = if norm > 0.0 {
-                                                    (1.0 + norm * 9.0).log10()
-                                                } else {
-                                                    0.0
-                                                };
-                                                let alpha = (brightness * 255.0) as u8;
-                                                let off = y * stride + x * 4;
-                                                if off + 3 < surf_data.len() {
-                                                    surf_data[off] = alpha;
-                                                    surf_data[off + 1] = alpha;
-                                                    surf_data[off + 2] = alpha;
-                                                    surf_data[off + 3] = alpha;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    cr.set_source_surface(&surface, 0.0, 0.0).unwrap_or(());
-                                    cr.paint().unwrap_or(());
-                                }
-                            }
-                        }
-                    });
-                }
-
-                // Register and queue for background loading (cache
-                // read or FFT computation).  All I/O stays off the
-                // GTK main loop.
-                wf_registry.borrow_mut().insert(
-                    recording.path.clone(),
-                    (Rc::clone(&wf_data), wf_area.clone()),
+                // No transcript — show the shared audio player bar
+                // with waterfall spectrogram, cursor, drag-to-seek,
+                // and play/pause/rewind controls.
+                let player_bar = crate::widgets::audio_player_bar::build_audio_player_bar(
+                    &recording.path,
+                    player,
+                    active_play_btn,
+                    None, // waterfall computed in background by the widget
+                    28,
                 );
-                let _ = wf_work_tx.send(recording.path.clone());
-
-                hbox.append(&wf_area);
+                hbox.append(&player_bar);
             } else {
                 let transcript = gtk4::Label::new(Some(&recording.transcript_preview));
                 transcript.set_xalign(0.0);
@@ -395,6 +235,55 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 transcript.set_selectable(false);
                 transcript.add_css_class("transcript");
                 hbox.append(&transcript);
+            }
+
+            // Dictate button — open the picker to transcribe this recording
+            if recording.transcript_preview.is_empty() {
+                let dictate_btn = gtk4::Button::with_label("\u{1D413}");
+                dictate_btn.set_tooltip_text(Some("Transcribe recording"));
+                dictate_btn.add_css_class("dictate-btn");
+                {
+                    let audio_path = recording.path.clone();
+                    dictate_btn.connect_clicked(move |_| {
+                        let exe = std::env::current_exe()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("talk-rs"));
+                        log::debug!("dictate: launching picker for {}", audio_path.display());
+                        if let Err(e) = std::process::Command::new(exe)
+                            .args([
+                                "dictate",
+                                "--pick",
+                                "--input-audio-file",
+                                &audio_path.to_string_lossy(),
+                            ])
+                            .spawn()
+                        {
+                            log::warn!("failed to launch picker: {}", e);
+                        }
+                    });
+                }
+                hbox.append(&dictate_btn);
+            }
+
+            // Play button (simple toggle for entries with transcripts;
+            // entries without transcripts use the full audio_player_bar).
+            if !recording.transcript_preview.is_empty() {
+                let play_btn = gtk4::Button::with_label("▶");
+                play_btn.set_tooltip_text(Some("Play recording"));
+                play_btn.add_css_class("play-btn");
+                {
+                    let audio_path = recording.path.clone();
+                    let player_ref = Rc::clone(player);
+                    let active_btn_ref = Rc::clone(active_play_btn);
+                    play_btn.connect_clicked(move |btn| {
+                        let is_playing = active_btn_ref.borrow().as_ref().is_some_and(|b| b == btn);
+                        if is_playing {
+                            stop_playback(&player_ref, &active_btn_ref);
+                        } else {
+                            start_playback(&audio_path, btn, &player_ref, &active_btn_ref);
+                        }
+                    });
+                }
+                hbox.append(&play_btn);
             }
 
             // Copy-to-clipboard button (only shown when transcript text exists)
@@ -412,54 +301,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 }
                 hbox.append(&copy_btn);
             }
-
-            // Play button
-            let play_btn = gtk4::Button::with_label("▶");
-            play_btn.set_tooltip_text(Some("Play recording"));
-            play_btn.add_css_class("play-btn");
-            {
-                let audio_path = recording.path.clone();
-                let player_ref = Rc::clone(player);
-                let active_btn_ref = Rc::clone(active_play_btn);
-                play_btn.connect_clicked(move |btn| {
-                    let is_playing = active_btn_ref.borrow().as_ref().is_some_and(|b| b == btn);
-                    if is_playing {
-                        stop_playback(&player_ref, &active_btn_ref);
-                    } else {
-                        start_playback(&audio_path, btn, &player_ref, &active_btn_ref);
-                    }
-                });
-            }
-            // Dictate button — open the picker to transcribe this recording
-            // (only for WAV files that have no transcription yet)
-            if recording.transcript_preview.is_empty()
-                && recording.path.extension().is_some_and(|ext| ext == "wav")
-            {
-                let dictate_btn = gtk4::Button::with_label("\u{1D413}");
-                dictate_btn.set_tooltip_text(Some("Transcribe recording"));
-                dictate_btn.add_css_class("dictate-btn");
-                {
-                    let audio_path = recording.path.clone();
-                    dictate_btn.connect_clicked(move |_| {
-                        let exe = std::env::current_exe()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("talk-rs"));
-                        if let Err(e) = std::process::Command::new(exe)
-                            .args([
-                                "dictate",
-                                "--pick",
-                                "--input-audio-file",
-                                &audio_path.to_string_lossy(),
-                            ])
-                            .spawn()
-                        {
-                            log::warn!("failed to launch picker: {}", e);
-                        }
-                    });
-                }
-                hbox.append(&dictate_btn);
-            }
-
-            hbox.append(&play_btn);
 
             // Folder button — open file manager with file highlighted
             let folder_btn = gtk4::Button::with_label("🖿\u{FE0E}");
@@ -491,18 +332,35 @@ fn show_recordings_window() -> Result<(), TalkError> {
 
                     // Walk up widget tree to find the ListBoxRow
                     let mut widget: Option<gtk4::Widget> = btn.parent();
-                    loop {
+                    let row_to_remove: Option<gtk4::ListBoxRow> = loop {
                         match widget {
                             Some(ref w) => {
                                 if let Some(row) = w.downcast_ref::<gtk4::ListBoxRow>() {
-                                    list_ref.remove(row);
-                                    break;
+                                    break Some(row.clone());
                                 }
                                 widget = w.parent();
                             }
-                            None => return,
+                            None => break None,
                         }
+                    };
+                    let Some(row) = row_to_remove else {
+                        return;
+                    };
+
+                    // Select an adjacent row before removal so the
+                    // scroll position stays stable.
+                    let idx = row.index();
+                    let next = list_ref.row_at_index(idx + 1).or_else(|| {
+                        if idx > 0 {
+                            list_ref.row_at_index(idx - 1)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(ref adjacent) = next {
+                        list_ref.select_row(Some(adjacent));
                     }
+                    list_ref.remove(&row);
 
                     // Count remaining rows and update expander title
                     let mut count = 0;
@@ -520,6 +378,8 @@ fn show_recordings_window() -> Result<(), TalkError> {
 
             let row = gtk4::ListBoxRow::new();
             row.set_child(Some(&hbox));
+            // Tag with audio path so FileMonitor can find rows by path.
+            row.set_widget_name(&recording.path.to_string_lossy());
             row
         }
 
@@ -538,20 +398,15 @@ fn show_recordings_window() -> Result<(), TalkError> {
             player: &Rc<RefCell<Option<WavPlayer>>>,
             active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
             window: &gtk4::Window,
-            wf_work_tx: &std::sync::mpsc::Sender<std::path::PathBuf>,
-            wf_registry: &Rc<RefCell<WfRegistry>>,
         ) {
             use gtk4::prelude::*;
 
             const BATCH_SIZE: usize = 20;
 
-            // Remove existing rows and drop their registry entries.
+            // Remove existing rows.
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
-            wf_registry
-                .borrow_mut()
-                .retain(|_, (_, area)| area.parent().is_some());
 
             let total = recordings.len();
             expander.set_label(Some(&format!("{} ({})", label, total)));
@@ -565,8 +420,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
             let player = Rc::clone(player);
             let btn = Rc::clone(active_play_btn);
             let win = window.clone();
-            let wf_tx = wf_work_tx.clone();
-            let wf_reg = Rc::clone(wf_registry);
             let label = label.to_string();
 
             // Schedule first batch; each batch schedules the next
@@ -580,9 +433,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 let end = (start + BATCH_SIZE).min(entries.len());
 
                 for recording in &entries[start..end] {
-                    let row = build_row(
-                        recording, &player, &btn, &win, &list, &expander, &label, &wf_tx, &wf_reg,
-                    );
+                    let row = build_row(recording, &player, &btn, &win, &list, &expander, &label);
                     list.append(&row);
                 }
 
@@ -643,8 +494,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
         let sections_idle = sections_box.clone();
         let loading_idle = loading_label.clone();
         let monitors_idle = Rc::clone(&monitors);
-        let wf_work_idle = wf_work_tx.clone();
-        let wf_reg_idle = Rc::clone(&wf_registry);
         let loaded = std::cell::Cell::new(false);
 
         window.connect_map(move |_| {
@@ -658,8 +507,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
             let sections_idle = sections_idle.clone();
             let loading_idle = loading_idle.clone();
             let monitors_idle = Rc::clone(&monitors_idle);
-            let wf_work_idle = wf_work_idle.clone();
-            let wf_reg_idle = Rc::clone(&wf_reg_idle);
             glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
                 let t = std::time::Instant::now();
 
@@ -681,8 +528,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     let player = Rc::clone(&player_idle);
                     let btn = Rc::clone(&btn_idle);
                     let win = win_idle.clone();
-                    let wf_tx = wf_work_idle.clone();
-                    let wf_reg = Rc::clone(&wf_reg_idle);
                     let wav_list_ref = wav_list.clone();
                     let wav_exp_ref = wav_expander.clone();
                     glib::idle_add_local_once(move || {
@@ -700,8 +545,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                             &player,
                             &btn,
                             &win,
-                            &wf_tx,
-                            &wf_reg,
                         );
                         if wav_list_ref.first_child().is_some() {
                             wav_list_ref.grab_focus();
@@ -713,8 +556,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     let player = Rc::clone(&player_idle);
                     let btn = Rc::clone(&btn_idle);
                     let win = win_idle.clone();
-                    let wf_tx = wf_work_idle.clone();
-                    let wf_reg = Rc::clone(&wf_reg_idle);
                     let ogg_list_ref = ogg_list.clone();
                     let ogg_exp_ref = ogg_expander.clone();
                     glib::idle_add_local_once(move || {
@@ -732,8 +573,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                             &player,
                             &btn,
                             &win,
-                            &wf_tx,
-                            &wf_reg,
                         );
                     });
                 }
@@ -747,8 +586,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     player: Rc<RefCell<Option<WavPlayer>>>,
                     active_play_btn: Rc<RefCell<Option<gtk4::Button>>>,
                     window: gtk4::Window,
-                    wf_work_tx: std::sync::mpsc::Sender<std::path::PathBuf>,
-                    wf_registry: Rc<RefCell<WfRegistry>>,
                 }
 
                 fn watch_directory(
@@ -777,8 +614,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     let player_ref = Rc::clone(&ctx.player);
                     let btn_ref = Rc::clone(&ctx.active_play_btn);
                     let win_ref = ctx.window.clone();
-                    let wf_tx_ref = ctx.wf_work_tx.clone();
-                    let wf_reg_ref = Rc::clone(&ctx.wf_registry);
 
                     monitor.connect_changed(move |_monitor, file, _other, event| {
                         use gtk4::gio::FileMonitorEvent;
@@ -788,15 +623,71 @@ fn show_recordings_window() -> Result<(), TalkError> {
                             | FileMonitorEvent::ChangesDoneHint => {}
                             _ => return,
                         }
-                        // Ignore waterfall cache files (.wf) — they are
-                        // written by our own worker threads and should
-                        // not trigger a full section rebuild.
-                        if let Some(name) = file.basename() {
-                            let name = name.to_string_lossy();
-                            if name.ends_with(".wf") {
+
+                        let name = match file.basename() {
+                            Some(n) => n.to_string_lossy().to_string(),
+                            None => return,
+                        };
+
+                        // Ignore waterfall cache files (.wf).
+                        if name.ends_with(".wf") {
+                            return;
+                        }
+
+                        // YAML changed → update the affected row in place
+                        // instead of rebuilding the entire list.
+                        if name.ends_with(".yml") {
+                            // Extract stem (everything before the first _
+                            // after the timestamp, or the whole basename
+                            // minus the extension for simple names).
+                            // The stem matches the audio file's stem.
+                            let yml_stem = name.split('_').next().unwrap_or("");
+                            if yml_stem.is_empty() {
                                 return;
                             }
+
+                            // Find the matching row by widget_name (audio path).
+                            let mut idx = 0;
+                            while let Some(row) = list_ref.row_at_index(idx) {
+                                let row_name = row.widget_name();
+                                let row_path = std::path::Path::new(row_name.as_str());
+                                let row_stem =
+                                    row_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                                if row_stem == yml_stem {
+                                    // Rebuild just this row.
+                                    if let Ok(entries) = list_fn() {
+                                        if let Some(entry) = entries.iter().find(|e| {
+                                            e.path
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("")
+                                                == yml_stem
+                                        }) {
+                                            let new_row = build_row(
+                                                entry,
+                                                &player_ref,
+                                                &btn_ref,
+                                                &win_ref,
+                                                &list_ref,
+                                                &exp_ref,
+                                                label,
+                                            );
+                                            // Insert new row at same position,
+                                            // then remove the old one.
+                                            list_ref.insert(&new_row, idx);
+                                            list_ref.remove(&row);
+                                        }
+                                    }
+                                    return;
+                                }
+                                idx += 1;
+                            }
+                            // Row not found — might be for a different section.
+                            return;
                         }
+
+                        // Audio file created/deleted → full rebuild
+                        // (rare: only happens when recording or deleting).
                         if let Ok(entries) = list_fn() {
                             populate_section(
                                 label,
@@ -806,8 +697,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                                 &player_ref,
                                 &btn_ref,
                                 &win_ref,
-                                &wf_tx_ref,
-                                &wf_reg_ref,
                             );
                         }
                     });
@@ -823,8 +712,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                         player: Rc::clone(&player_idle),
                         active_play_btn: Rc::clone(&btn_idle),
                         window: win_idle.clone(),
-                        wf_work_tx: wf_work_idle.clone(),
-                        wf_registry: Rc::clone(&wf_reg_idle),
                     };
                     watch_directory(
                         &wav_dir,
@@ -843,8 +730,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
                         player: Rc::clone(&player_idle),
                         active_play_btn: Rc::clone(&btn_idle),
                         window: win_idle.clone(),
-                        wf_work_tx: wf_work_idle.clone(),
-                        wf_registry: Rc::clone(&wf_reg_idle),
                     };
                     watch_directory(
                         &config.output_dir,

@@ -103,12 +103,29 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
+        // Try to read transcript from companion metadata YAML
+        let transcript_preview =
+            match crate::recording_cache::metadata_path_for_recording(&ogg_path) {
+                Ok(Some(meta_path)) => crate::recording_cache::read_metadata_brief(&meta_path)
+                    .map(|b| {
+                        let line = b.transcript.replace('\n', " ");
+                        if line.chars().count() > 200 {
+                            let truncated: String = line.chars().take(200).collect();
+                            format!("{truncated}…")
+                        } else {
+                            line
+                        }
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+
         result.push(RecordingEntry {
             path: ogg_path,
             date_label,
             duration_label,
             size_label,
-            transcript_preview: String::new(),
+            transcript_preview,
         });
     }
 

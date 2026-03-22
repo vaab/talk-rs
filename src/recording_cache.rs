@@ -449,30 +449,42 @@ pub fn latest_recording_path() -> Result<PathBuf, TalkError> {
 pub fn metadata_path_for_recording(
     wav_path: &std::path::Path,
 ) -> Result<Option<PathBuf>, TalkError> {
-    let dir = recordings_dir()?;
     let stem = wav_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     if stem.is_empty() {
         return Ok(None);
     }
-    let mut ymls: Vec<PathBuf> = Vec::new();
-    let entries = fs::read_dir(&dir).map_err(|e| {
-        TalkError::Config(format!(
-            "failed to read recordings directory {}: {}",
-            dir.display(),
-            e
-        ))
-    })?;
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.starts_with(stem) && path.extension().and_then(|e| e.to_str()) == Some("yml") {
-            ymls.push(path);
+
+    // Search for companion YAMLs matching the stem in a directory.
+    let find_yml = |dir: &std::path::Path| -> Result<Vec<PathBuf>, TalkError> {
+        let mut ymls = Vec::new();
+        let entries = fs::read_dir(dir).map_err(|e| {
+            TalkError::Config(format!("failed to read directory {}: {}", dir.display(), e))
+        })?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with(stem) && path.extension().and_then(|e| e.to_str()) == Some("yml") {
+                ymls.push(path);
+            }
+        }
+        ymls.sort();
+        Ok(ymls)
+    };
+
+    // First look next to the audio file itself.
+    if let Some(audio_dir) = wav_path.parent() {
+        let ymls = find_yml(audio_dir)?;
+        if let Some(last) = ymls.last() {
+            return Ok(Some(last.clone()));
         }
     }
-    ymls.sort();
-    Ok(ymls.pop())
+
+    // Fall back to the recordings cache directory.
+    let cache_dir = recordings_dir()?;
+    let ymls = find_yml(&cache_dir)?;
+    Ok(ymls.last().cloned())
 }
 
 pub fn read_metadata_brief(path: &std::path::Path) -> Result<RecordingMetadataBrief, TalkError> {
