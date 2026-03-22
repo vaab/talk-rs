@@ -615,14 +615,81 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     let btn_ref = Rc::clone(&ctx.active_play_btn);
                     let win_ref = ctx.window.clone();
 
+                    /// Refresh the audio row whose stem matches a YAML
+                    /// companion file.  Used for YAML created, changed,
+                    /// and deleted events.
+                    #[allow(clippy::too_many_arguments)]
+                    fn update_row_for_yml(
+                        yml_name: &str,
+                        list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
+                        player: &Rc<RefCell<Option<WavPlayer>>>,
+                        active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
+                        window: &gtk4::Window,
+                        list: &gtk4::ListBox,
+                        expander: &gtk4::Expander,
+                        label: &str,
+                    ) {
+                        use gtk4::prelude::*;
+
+                        // Extract stem (timestamp part before the first
+                        // underscore) — it matches the audio file's stem.
+                        let yml_stem = yml_name.split('_').next().unwrap_or("");
+                        if yml_stem.is_empty() {
+                            return;
+                        }
+
+                        // Find the matching row by widget_name (audio path).
+                        let mut idx = 0;
+                        while let Some(row) = list.row_at_index(idx) {
+                            let row_name = row.widget_name();
+                            let row_path = std::path::Path::new(row_name.as_str());
+                            let row_stem =
+                                row_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                            if row_stem == yml_stem {
+                                // Rebuild just this row with fresh data.
+                                if let Ok(entries) = list_fn() {
+                                    if let Some(entry) = entries.iter().find(|e| {
+                                        e.path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
+                                            == yml_stem
+                                    }) {
+                                        let new_row = build_row(
+                                            entry,
+                                            player,
+                                            active_play_btn,
+                                            window,
+                                            list,
+                                            expander,
+                                            label,
+                                        );
+                                        // Insert new row at same position,
+                                        // then remove the old one.
+                                        list.insert(&new_row, idx);
+                                        list.remove(&row);
+                                    }
+                                }
+                                return;
+                            }
+                            idx += 1;
+                        }
+                        // Row not found — might be for a different section.
+                    }
+
+                    /// Count `ListBoxRow` children in a `ListBox`.
+                    fn count_list_rows(list: &gtk4::ListBox) -> i32 {
+                        use gtk4::prelude::*;
+                        let mut count = 0;
+                        let mut child = list.first_child();
+                        while let Some(w) = child {
+                            if w.downcast_ref::<gtk4::ListBoxRow>().is_some() {
+                                count += 1;
+                            }
+                            child = w.next_sibling();
+                        }
+                        count
+                    }
+
                     monitor.connect_changed(move |_monitor, file, _other, event| {
                         use gtk4::gio::FileMonitorEvent;
-                        match event {
-                            FileMonitorEvent::Created
-                            | FileMonitorEvent::Deleted
-                            | FileMonitorEvent::ChangesDoneHint => {}
-                            _ => return,
-                        }
 
                         let name = match file.basename() {
                             Some(n) => n.to_string_lossy().to_string(),
@@ -634,70 +701,212 @@ fn show_recordings_window() -> Result<(), TalkError> {
                             return;
                         }
 
-                        // YAML changed → update the affected row in place
-                        // instead of rebuilding the entire list.
-                        if name.ends_with(".yml") {
-                            // Extract stem (everything before the first _
-                            // after the timestamp, or the whole basename
-                            // minus the extension for simple names).
-                            // The stem matches the audio file's stem.
-                            let yml_stem = name.split('_').next().unwrap_or("");
-                            if yml_stem.is_empty() {
-                                return;
-                            }
+                        let is_yml = name.ends_with(".yml");
+                        let is_audio = name.ends_with(".wav") || name.ends_with(".ogg");
 
-                            // Find the matching row by widget_name (audio path).
-                            let mut idx = 0;
-                            while let Some(row) = list_ref.row_at_index(idx) {
-                                let row_name = row.widget_name();
-                                let row_path = std::path::Path::new(row_name.as_str());
-                                let row_stem =
-                                    row_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                                if row_stem == yml_stem {
-                                    // Rebuild just this row.
-                                    if let Ok(entries) = list_fn() {
-                                        if let Some(entry) = entries.iter().find(|e| {
-                                            e.path
-                                                .file_stem()
-                                                .and_then(|s| s.to_str())
-                                                .unwrap_or("")
-                                                == yml_stem
-                                        }) {
-                                            let new_row = build_row(
-                                                entry,
-                                                &player_ref,
-                                                &btn_ref,
-                                                &win_ref,
-                                                &list_ref,
-                                                &exp_ref,
-                                                label,
-                                            );
-                                            // Insert new row at same position,
-                                            // then remove the old one.
-                                            list_ref.insert(&new_row, idx);
-                                            list_ref.remove(&row);
-                                        }
-                                    }
+                        match event {
+                            // ── Deletion ─────────────────────────────────
+                            FileMonitorEvent::Deleted => {
+                                if is_yml {
+                                    // Companion YAML deleted — rebuild the
+                                    // matching audio row so transcript is
+                                    // cleared.
+                                    log::debug!(
+                                        "record-ui: watch: yml deleted, refreshing row: {}",
+                                        name,
+                                    );
+                                    update_row_for_yml(
+                                        &name,
+                                        list_fn,
+                                        &player_ref,
+                                        &btn_ref,
+                                        &win_ref,
+                                        &list_ref,
+                                        &exp_ref,
+                                        label,
+                                    );
                                     return;
                                 }
-                                idx += 1;
-                            }
-                            // Row not found — might be for a different section.
-                            return;
-                        }
+                                if !is_audio {
+                                    log::debug!(
+                                        "record-ui: watch: non-audio Deleted (ignored): {}",
+                                        name,
+                                    );
+                                    return;
+                                }
 
-                        // Audio file created/deleted → full rebuild
-                        // (rare: only happens when recording or deleting).
-                        if let Ok(entries) = list_fn() {
-                            populate_section(
-                                label,
-                                entries,
-                                &list_ref,
-                                &exp_ref,
-                                &player_ref,
-                                &btn_ref,
-                                &win_ref,
-                            );
+                                // Audio file deleted → remove matching row.
+                                let file_path = match file.path() {
+                                    Some(p) => p.to_string_lossy().to_string(),
+                                    None => return,
+                                };
+
+                                let mut idx = 0;
+                                while let Some(row) = list_ref.row_at_index(idx) {
+                                    if row.widget_name().as_str() == file_path {
+                                        // Select adjacent row before removal
+                                        // so scroll position stays stable.
+                                        let next = list_ref.row_at_index(idx + 1).or_else(|| {
+                                            if idx > 0 {
+                                                list_ref.row_at_index(idx - 1)
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        if let Some(ref adj) = next {
+                                            list_ref.select_row(Some(adj));
+                                        }
+                                        list_ref.remove(&row);
+
+                                        let count = count_list_rows(&list_ref);
+                                        exp_ref.set_label(Some(&format!("{} ({})", label, count,)));
+                                        log::debug!(
+                                            "record-ui: watch: removed row for deleted audio: {}",
+                                            name,
+                                        );
+                                        return;
+                                    }
+                                    idx += 1;
+                                }
+                                // Row not found — already removed by the
+                                // delete button before inotify fired.
+                                log::debug!(
+                                    "record-ui: watch: Deleted audio row not found \
+                                     (already removed?): {}",
+                                    name,
+                                );
+                            }
+
+                            // ── Creation / write-complete ────────────────
+                            FileMonitorEvent::Created | FileMonitorEvent::ChangesDoneHint => {
+                                if is_yml {
+                                    log::debug!(
+                                        "record-ui: watch: yml {:?}, refreshing row: {}",
+                                        event,
+                                        name,
+                                    );
+                                    update_row_for_yml(
+                                        &name,
+                                        list_fn,
+                                        &player_ref,
+                                        &btn_ref,
+                                        &win_ref,
+                                        &list_ref,
+                                        &exp_ref,
+                                        label,
+                                    );
+                                    return;
+                                }
+                                if !is_audio {
+                                    log::debug!(
+                                        "record-ui: watch: non-audio {:?} (ignored): {}",
+                                        event,
+                                        name,
+                                    );
+                                    return;
+                                }
+
+                                // Audio file appeared or finished writing →
+                                // add a new row or refresh an existing one.
+                                let file_path = match file.path() {
+                                    Some(p) => p.to_string_lossy().to_string(),
+                                    None => return,
+                                };
+
+                                // Check if a row already exists (e.g.
+                                // Created followed by ChangesDoneHint).
+                                let mut existing_idx: Option<i32> = None;
+                                {
+                                    let mut idx = 0;
+                                    while let Some(row) = list_ref.row_at_index(idx) {
+                                        if row.widget_name().as_str() == file_path {
+                                            existing_idx = Some(idx);
+                                            break;
+                                        }
+                                        idx += 1;
+                                    }
+                                }
+
+                                let entries = match list_fn() {
+                                    Ok(e) => e,
+                                    Err(e) => {
+                                        log::warn!(
+                                            "record-ui: watch: failed to list entries: {}",
+                                            e,
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                let entry = match entries
+                                    .iter()
+                                    .find(|e| e.path.to_string_lossy() == file_path)
+                                {
+                                    Some(e) => e,
+                                    None => {
+                                        log::debug!(
+                                            "record-ui: watch: {:?} file not in listing: {}",
+                                            event,
+                                            name,
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                let new_row = build_row(
+                                    entry,
+                                    &player_ref,
+                                    &btn_ref,
+                                    &win_ref,
+                                    &list_ref,
+                                    &exp_ref,
+                                    label,
+                                );
+
+                                if let Some(old_idx) = existing_idx {
+                                    // Replace existing row at the same
+                                    // position (refresh metadata).
+                                    list_ref.insert(&new_row, old_idx);
+                                    if let Some(old_row) = list_ref.row_at_index(old_idx + 1) {
+                                        list_ref.remove(&old_row);
+                                    }
+                                    log::debug!(
+                                        "record-ui: watch: refreshed existing row: {}",
+                                        name,
+                                    );
+                                } else {
+                                    // Insert at the correct sorted position
+                                    // (newest-first = reverse-alpha on
+                                    // timestamp filenames).
+                                    let mut insert_pos: i32 = 0;
+                                    let mut idx = 0;
+                                    while let Some(row) = list_ref.row_at_index(idx) {
+                                        if file_path.as_str() >= row.widget_name().as_str() {
+                                            break;
+                                        }
+                                        insert_pos = idx + 1;
+                                        idx += 1;
+                                    }
+                                    list_ref.insert(&new_row, insert_pos);
+                                    log::debug!(
+                                        "record-ui: watch: inserted new row at {}: {}",
+                                        insert_pos,
+                                        name,
+                                    );
+                                }
+
+                                let count = count_list_rows(&list_ref);
+                                exp_ref.set_label(Some(&format!("{} ({})", label, count)));
+                            }
+
+                            // ── Unhandled events ─────────────────────────
+                            other => {
+                                log::debug!(
+                                    "record-ui: watch: unhandled event {:?} for: {}",
+                                    other,
+                                    name,
+                                );
+                            }
                         }
                     });
 
