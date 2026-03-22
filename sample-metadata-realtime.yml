@@ -1,4 +1,4 @@
-recording: 2026-02-19T01-59-10.wav
+recording: 2026-02-19T01-59-10.ogg
 provider: openai
 model: gpt-4o-transcribe
 realtime: true

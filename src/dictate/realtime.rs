@@ -3,14 +3,14 @@
 //! Streams raw PCM audio to the transcription API and receives
 //! incremental transcription events.  Returns the accumulated text.
 //!
-//! Also provides [`AudioBuffer`], [`wav_recording_task`], and
-//! [`buffer_feeder`] — the shared infrastructure that decouples WAV
+//! Also provides [`AudioBuffer`], [`ogg_recording_task`], and
+//! [`buffer_feeder`] — the shared infrastructure that decouples OGG
 //! recording from transcription so that a transcription failure never
 //! truncates the cached recording.
 
 use super::text::flush_sentences;
 use crate::audio::indicator::SoundPlayer;
-use crate::audio::{AudioCapture, AudioWriter, WavWriter};
+use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::{AudioConfig, Config, Provider};
 use crate::error::TalkError;
 use crate::transcription::{
@@ -21,18 +21,18 @@ use crate::x11::visualizer::VisualizerHandle;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 // ── Shared audio buffer ─────────────────────────────────────────────
 
 /// Append-only buffer of PCM audio chunks.
 ///
-/// The WAV recording task pushes every chunk here.  Feeder tasks read
+/// The OGG recording task pushes every chunk here.  Feeder tasks read
 /// from any position and wait for new data.  When the recording stops,
 /// [`close`](AudioBuffer::close) is called to unblock waiting feeders.
 ///
-/// This decouples the WAV recording from transcription: the WAV task
+/// This decouples the OGG recording from transcription: the OGG task
 /// writes chunks to the file and the buffer unconditionally, while
 /// feeder tasks can fail and be restarted from cursor 0 without
 /// affecting the recording.
@@ -88,23 +88,23 @@ impl AudioBuffer {
     }
 }
 
-// ── WAV recording task ──────────────────────────────────────────────
+// ── OGG recording task ──────────────────────────────────────────────
 
-/// Record every PCM chunk to a WAV file and into the shared buffer.
+/// Record every PCM chunk to an OGG file and into the shared buffer.
 ///
 /// This task is completely independent of the transcription pipeline.
 /// It runs until the `source` channel closes (capture stopped), then
-/// patches the WAV header with the final data size and syncs to disk.
-pub(super) async fn wav_recording_task(
+/// appends any trailing OGG bytes and syncs to disk.
+pub(super) async fn ogg_recording_task(
     mut source: tokio::sync::mpsc::Receiver<Vec<i16>>,
-    wav_path: PathBuf,
+    ogg_path: PathBuf,
     audio_config: AudioConfig,
     buffer: Arc<AudioBuffer>,
 ) -> Result<(), TalkError> {
-    let mut writer = WavWriter::new(audio_config);
+    let mut writer = OggOpusWriter::new(audio_config)?;
     let header = writer.header()?;
 
-    let mut file = tokio::fs::File::create(&wav_path)
+    let mut file = tokio::fs::File::create(&ogg_path)
         .await
         .map_err(TalkError::Io)?;
     file.write_all(&header).await.map_err(TalkError::Io)?;
@@ -112,10 +112,14 @@ pub(super) async fn wav_recording_task(
     let mut total_samples: u64 = 0;
 
     while let Some(pcm_chunk) = source.recv().await {
-        // Write PCM bytes to the WAV file.
+        // Write encoded bytes to the OGG file.
         total_samples += pcm_chunk.len() as u64;
-        let pcm_bytes = writer.write_pcm(&pcm_chunk)?;
-        file.write_all(&pcm_bytes).await.map_err(TalkError::Io)?;
+        let encoded_bytes = writer.write_pcm(&pcm_chunk)?;
+        if !encoded_bytes.is_empty() {
+            file.write_all(&encoded_bytes)
+                .await
+                .map_err(TalkError::Io)?;
+        }
 
         // Append to the shared buffer (feeders read from here).
         buffer.push(pcm_chunk).await;
@@ -124,19 +128,19 @@ pub(super) async fn wav_recording_task(
     // No more audio — tell feeders there is nothing left to wait for.
     buffer.close();
 
-    // Patch WAV header with actual data size.
-    let final_header = writer.finalize()?;
-    file.seek(std::io::SeekFrom::Start(0))
-        .await
-        .map_err(TalkError::Io)?;
-    file.write_all(&final_header).await.map_err(TalkError::Io)?;
+    let trailing_bytes = writer.finalize()?;
+    if !trailing_bytes.is_empty() {
+        file.write_all(&trailing_bytes)
+            .await
+            .map_err(TalkError::Io)?;
+    }
     file.sync_all().await.map_err(TalkError::Io)?;
 
     log::info!(
-        "cache WAV: {} samples ({:.1}s) saved to {}",
+        "cache OGG: {} samples ({:.1}s) saved to {}",
         total_samples,
         total_samples as f64 / 16000.0,
-        wav_path.display()
+        ogg_path.display()
     );
 
     Ok(())
@@ -186,7 +190,7 @@ pub(super) async fn buffer_feeder(
 /// Streams raw PCM audio to the transcription API and receives
 /// incremental transcription events. Returns the accumulated text.
 ///
-/// Audio is always tee'd to `cache_wav_path` so the recording is
+/// Audio is always tee'd to `cache_ogg_path` so the recording is
 /// cached for later review.
 ///
 /// `player` and `boop_token` are passed so that when recording stops
@@ -200,7 +204,7 @@ pub(crate) async fn dictate_realtime(
     config: Config,
     provider: Provider,
     model: Option<&str>,
-    cache_wav_path: &std::path::Path,
+    cache_ogg_path: &std::path::Path,
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     capture: &mut dyn AudioCapture,
     from_file: bool,
@@ -210,12 +214,12 @@ pub(crate) async fn dictate_realtime(
     visualizer: Option<&VisualizerHandle>,
     shutdown: &CancellationToken,
 ) -> Result<TranscriptionResult, TalkError> {
-    // Always record audio to the cache WAV independently of transcription.
-    log::info!("caching audio to: {}", cache_wav_path.display());
+    // Always record audio to the cache OGG independently of transcription.
+    log::info!("caching audio to: {}", cache_ogg_path.display());
     let buffer = Arc::new(AudioBuffer::new());
-    let wav_task = tokio::spawn(wav_recording_task(
+    let ogg_task = tokio::spawn(ogg_recording_task(
         audio_rx,
-        cache_wav_path.to_path_buf(),
+        cache_ogg_path.to_path_buf(),
         AudioConfig::new(),
         Arc::clone(&buffer),
     ));
@@ -511,13 +515,13 @@ pub(crate) async fn dictate_realtime(
     ctrlc_task.abort();
     feeder_handle.abort();
 
-    // Wait for WAV recording task to finish (no timeout — it
-    // completes as soon as the source channel closes and the header
-    // is patched, which is fast).
-    match wav_task.await {
-        Ok(Ok(())) => log::debug!("cache WAV saved"),
-        Ok(Err(e)) => log::warn!("cache WAV write error: {}", e),
-        Err(e) => log::warn!("cache WAV task panicked: {}", e),
+    // Wait for OGG recording task to finish (no timeout — it
+    // completes as soon as the source channel closes and any trailing
+    // bytes are flushed, which is fast).
+    match ogg_task.await {
+        Ok(Ok(())) => log::debug!("cache OGG saved"),
+        Ok(Err(e)) => log::warn!("cache OGG write error: {}", e),
+        Err(e) => log::warn!("cache OGG task panicked: {}", e),
     }
 
     let provider_specific = match provider {
@@ -565,8 +569,8 @@ pub(crate) async fn dictate_realtime(
     })
 }
 
-// Old `audio_tee_to_wav` removed — replaced by `wav_recording_task`
-// + `buffer_feeder` above.  The WAV recording is now fully decoupled
+// Old `audio_tee_to_wav` removed — replaced by `ogg_recording_task`
+// + `buffer_feeder` above.  The OGG recording is now fully decoupled
 // from the transcription pipeline.
 
 #[cfg(test)]
@@ -689,20 +693,32 @@ mod tests {
         assert!(c2.is_none());
     }
 
-    // ── wav_recording_task tests ────────────────────────────────────
+    fn read_ogg_packets(path: &std::path::Path) -> Vec<Vec<u8>> {
+        let file = std::fs::File::open(path).expect("open ogg");
+        let mut reader = ogg::reading::PacketReader::new(std::io::BufReader::new(file));
+        let mut packets = Vec::new();
+
+        while let Some(packet) = reader.read_packet().expect("read packet") {
+            packets.push(packet.data);
+        }
+
+        packets
+    }
+
+    // ── ogg_recording_task tests ────────────────────────────────────
 
     #[tokio::test]
-    async fn wav_recording_task_writes_complete_wav() {
+    async fn ogg_recording_task_writes_complete_ogg() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let wav_path = dir.path().join("test.wav");
+        let ogg_path = dir.path().join("test.ogg");
         let audio_config = AudioConfig::new();
         let buffer = Arc::new(AudioBuffer::new());
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
         let buf_clone = Arc::clone(&buffer);
-        let path_clone = wav_path.clone();
-        let handle = tokio::spawn(wav_recording_task(rx, path_clone, audio_config, buf_clone));
+        let path_clone = ogg_path.clone();
+        let handle = tokio::spawn(ogg_recording_task(rx, path_clone, audio_config, buf_clone));
 
         // Send 5 chunks of 320 samples (20ms at 16kHz mono).
         for i in 0..5u16 {
@@ -713,34 +729,33 @@ mod tests {
         }
         drop(tx); // close channel → task finishes
 
-        handle.await.expect("task join").expect("wav write");
+        handle.await.expect("task join").expect("ogg write");
 
-        // Verify WAV file.
-        let data = std::fs::read(&wav_path).expect("read wav");
-        assert_eq!(&data[0..4], b"RIFF");
-        assert_eq!(&data[8..12], b"WAVE");
+        let data = std::fs::read(&ogg_path).expect("read ogg");
+        assert_eq!(&data[0..4], b"OggS");
 
-        // Total PCM data: 5 chunks × 320 samples × 2 bytes = 3200 bytes.
-        // WAV header is 44 bytes.
-        assert_eq!(data.len(), 44 + 5 * 320 * 2);
+        let packets = read_ogg_packets(&ogg_path);
+        assert_eq!(&packets[0][..8], b"OpusHead");
+        assert_eq!(&packets[1][..8], b"OpusTags");
+        assert_eq!(packets.len(), 7);
     }
 
     #[tokio::test]
-    async fn wav_recording_task_populates_buffer() {
+    async fn ogg_recording_task_populates_buffer() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let wav_path = dir.path().join("test.wav");
+        let ogg_path = dir.path().join("test.ogg");
         let audio_config = AudioConfig::new();
         let buffer = Arc::new(AudioBuffer::new());
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         let buf_clone = Arc::clone(&buffer);
-        let handle = tokio::spawn(wav_recording_task(rx, wav_path, audio_config, buf_clone));
+        let handle = tokio::spawn(ogg_recording_task(rx, ogg_path, audio_config, buf_clone));
 
         tx.send(vec![1, 2, 3]).await.expect("send");
         tx.send(vec![4, 5, 6]).await.expect("send");
         drop(tx);
 
-        handle.await.expect("join").expect("wav");
+        handle.await.expect("join").expect("ogg");
 
         // Buffer should have both chunks and be closed.
         let (chunks, _) = buffer.read_from(0).await;
@@ -754,18 +769,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wav_recording_independent_of_feeder_failure() {
-        // Verify that the WAV file is complete even when the feeder
+    async fn ogg_recording_independent_of_feeder_failure() {
+        // Verify that the OGG file is complete even when the feeder
         // (downstream transcription pipeline) fails.
         let dir = tempfile::tempdir().expect("create temp dir");
-        let wav_path = dir.path().join("test.wav");
+        let ogg_path = dir.path().join("test.ogg");
         let audio_config = AudioConfig::new();
         let buffer = Arc::new(AudioBuffer::new());
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         let buf_clone = Arc::clone(&buffer);
-        let path_clone = wav_path.clone();
-        let wav_handle = tokio::spawn(wav_recording_task(rx, path_clone, audio_config, buf_clone));
+        let path_clone = ogg_path.clone();
+        let ogg_handle = tokio::spawn(ogg_recording_task(rx, path_clone, audio_config, buf_clone));
 
         // Start a feeder that will be killed.
         let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(10);
@@ -780,17 +795,17 @@ mod tests {
         // Wait for feeder to notice and exit.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), feeder).await;
 
-        // Send more audio AFTER the feeder died — WAV must still record.
+        // Send more audio AFTER the feeder died — OGG must still record.
         tx.send(vec![30; 320])
             .await
             .expect("send after feeder death");
         drop(tx);
 
-        wav_handle.await.expect("join").expect("wav");
+        ogg_handle.await.expect("join").expect("ogg");
 
-        // All 3 chunks must be in the WAV.
-        let data = std::fs::read(&wav_path).expect("read wav");
-        assert_eq!(data.len(), 44 + 3 * 320 * 2);
+        // All 3 chunks must be encoded into the OGG stream.
+        let packets = read_ogg_packets(&ogg_path);
+        assert_eq!(packets.len(), 5);
 
         // All 3 chunks must be in the buffer.
         let (chunks, _) = buffer.read_from(0).await;

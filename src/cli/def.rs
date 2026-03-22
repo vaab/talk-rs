@@ -52,7 +52,7 @@ pub enum Commands {
         /// Write recording metadata YAML to this file path
         #[arg(long, value_name = "FILE")]
         output_yaml: Option<String>,
-        /// Feed a pre-recorded WAV file instead of live microphone capture
+        /// Feed a pre-recorded audio file instead of live microphone capture
         #[arg(long, value_name = "FILE")]
         input_audio_file: Option<String>,
         /// Reuse the last cached recording as input audio

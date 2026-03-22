@@ -3,10 +3,10 @@
 //! Opens a window listing all cached recordings with metadata
 //! (date, duration, size, transcript preview) and controls to
 //! play or delete each entry.  Recordings are split into two
-//! collapsible sections: OGG recordings and WAV dictation cache.
+//! collapsible sections: OGG recordings and dictation cache.
 
 use super::entries::{
-    delete_recording, list_ogg_recordings, list_wav_recordings, open_in_file_manager,
+    delete_recording, list_cache_recordings, list_ogg_recordings, open_in_file_manager,
     RecordingEntry,
 };
 use super::player::WavPlayer;
@@ -514,7 +514,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 // doesn't look frozen while sections are populated.
                 sections_idle.remove(&loading_idle);
 
-                // ── WAV dictation cache section ──
+                // ── Dictation cache section ──
                 let (wav_expander, wav_list) = create_section("Dictation cache (0)");
                 sections_idle.append(&wav_expander);
 
@@ -531,9 +531,9 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     let wav_list_ref = wav_list.clone();
                     let wav_exp_ref = wav_expander.clone();
                     glib::idle_add_local_once(move || {
-                        let wav_recordings = list_wav_recordings().unwrap_or_default();
+                        let wav_recordings = list_cache_recordings().unwrap_or_default();
                         log::debug!(
-                            "record-ui: list_wav_recordings ({} entries) {:.0?}",
+                            "record-ui: list_cache_recordings ({} entries) {:.0?}",
                             wav_recordings.len(),
                             t.elapsed(),
                         );
@@ -913,7 +913,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     monitors.borrow_mut().push(monitor);
                 }
 
-                // Watch WAV cache directory
+                // Watch dictation cache directory
                 if let Ok(wav_dir) = recording_cache::recordings_dir() {
                     let ctx = WatchCtx {
                         list: wav_list,
@@ -926,7 +926,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                         &wav_dir,
                         "Dictation cache",
                         &ctx,
-                        list_wav_recordings,
+                        list_cache_recordings,
                         &monitors_idle,
                     );
                 }
