@@ -244,7 +244,7 @@ fn waterfall_cache_path(audio_path: &std::path::Path) -> std::path::PathBuf {
 ///   u32  num_rows
 ///   f32  peak
 ///   f32 × (num_columns × num_rows)  column-major data
-pub(super) fn write_waterfall_cache(
+fn write_waterfall_cache(
     audio_path: &std::path::Path,
     columns: &[Vec<f32>],
     peak: f32,
@@ -277,7 +277,7 @@ pub(super) fn write_waterfall_cache(
 /// newer than the audio file.
 ///
 /// Returns `None` if the cache is missing, stale, or corrupt.
-pub(super) fn read_waterfall_cache(audio_path: &std::path::Path) -> Option<(Vec<Vec<f32>>, f32)> {
+fn read_waterfall_cache(audio_path: &std::path::Path) -> Option<(Vec<Vec<f32>>, f32)> {
     let cache = waterfall_cache_path(audio_path);
     let cache_meta = std::fs::metadata(&cache).ok()?;
     let audio_meta = std::fs::metadata(audio_path).ok()?;
@@ -317,9 +317,26 @@ pub(super) fn read_waterfall_cache(audio_path: &std::path::Path) -> Option<(Vec<
     Some((columns, peak))
 }
 
+/// Load waterfall columns for an audio file, using the `.wf` binary
+/// cache when available.  On cache miss the columns are computed from
+/// the audio and persisted for next time.
+pub(crate) fn load_waterfall(
+    audio_path: &std::path::Path,
+) -> Result<(Vec<Vec<f32>>, f32), TalkError> {
+    if let Some(cached) = read_waterfall_cache(audio_path) {
+        return Ok(cached);
+    }
+    let samples = read_audio_as_i16(audio_path)?;
+    let result = crate::x11::render_util::generate_waterfall_columns(&samples, 16_000);
+    if let Err(e) = write_waterfall_cache(audio_path, &result.0, result.1) {
+        log::warn!("waterfall cache write: {}", e);
+    }
+    Ok(result)
+}
+
 /// Read any supported audio file (WAV or OGG Opus) as mono 16-bit PCM
 /// at 16 kHz, suitable for [`crate::x11::render_util::generate_waterfall_columns`].
-pub(super) fn read_audio_as_i16(path: &std::path::Path) -> Result<Vec<i16>, TalkError> {
+pub(crate) fn read_audio_as_i16(path: &std::path::Path) -> Result<Vec<i16>, TalkError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

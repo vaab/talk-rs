@@ -49,24 +49,72 @@ pub(super) fn write_recording_metadata(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    let wav_filename = audio_path
+    let audio_filename = audio_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    if stem.is_empty() || wav_filename.is_empty() {
+    if stem.is_empty() || audio_filename.is_empty() {
         return;
     }
 
-    if let Err(e) = recording_cache::write_metadata(
-        stem,
-        provider,
-        model,
-        streaming,
-        text,
-        wav_filename,
-        &TranscriptionMetadata::default(),
-    ) {
-        log::warn!("failed to write recording metadata from picker: {}", e);
+    // Determine where to write the YAML: next to the audio file if
+    // it lives outside the recordings cache, otherwise in the cache.
+    let cache_dir = recording_cache::recordings_dir().ok();
+    let audio_dir = audio_path.parent();
+    let in_cache = cache_dir
+        .as_ref()
+        .zip(audio_dir)
+        .is_some_and(|(c, d)| c == d);
+
+    if in_cache {
+        // Audio is in the recordings cache — use the standard path.
+        if let Err(e) = recording_cache::write_metadata(
+            stem,
+            provider,
+            model,
+            streaming,
+            text,
+            audio_filename,
+            &TranscriptionMetadata::default(),
+        ) {
+            log::warn!("failed to write recording metadata from picker: {}", e);
+        }
+    } else if let Some(dir) = audio_dir {
+        // Audio lives elsewhere (e.g. OGG recordings dir) — write
+        // the YAML next to the audio file.
+        let mode = if streaming { "realtime" } else { "batch" };
+        let filename = format!(
+            "{}_{}_{}_{}.yml",
+            stem,
+            provider.to_string().to_lowercase(),
+            model.replace('/', "-"),
+            mode,
+        );
+        let meta = recording_cache::RecordingMetadata {
+            recording: audio_filename.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            realtime: streaming,
+            transcript: text.to_string(),
+            timestamp: stem.to_string(),
+            metadata: None,
+            provider_api: None,
+        };
+        let yaml = match serde_yaml::to_string(&meta) {
+            Ok(y) => y,
+            Err(e) => {
+                log::warn!("failed to serialise recording metadata: {}", e);
+                return;
+            }
+        };
+        let meta_path = dir.join(filename);
+        if let Err(e) = std::fs::write(&meta_path, yaml) {
+            log::warn!(
+                "failed to write recording metadata {}: {}",
+                meta_path.display(),
+                e
+            );
+        }
     }
 }
 

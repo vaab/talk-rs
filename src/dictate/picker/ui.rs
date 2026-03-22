@@ -9,7 +9,7 @@ use crate::error::TalkError;
 use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber};
 use std::path::PathBuf;
 
-use super::backend::{read_wav_pcm_samples, run_realtime_transcription, spawn_transcription};
+use super::backend::{run_realtime_transcription, spawn_transcription};
 use super::cache;
 use crate::record::player::WavPlayer;
 
@@ -385,19 +385,17 @@ pub(super) async fn pick_with_streaming_gtk(
         wf_overlay.add_overlay(&cursor_area);
         wf_overlay.set_hexpand(true);
 
-        // Spawn background thread to compute waterfall columns.
+        // Load waterfall data: cache hit → instant, miss → compute + persist.
         {
             let (wf_tx, wf_rx) = std::sync::mpsc::channel::<(Vec<Vec<f32>>, f32)>();
             let wf_audio_path = audio_path_for_waterfall;
             std::thread::spawn(move || {
-                match super::backend::read_wav_pcm_samples(&wf_audio_path) {
-                    Ok(samples) => {
-                        let result =
-                            crate::x11::render_util::generate_waterfall_columns(&samples, 16000);
+                match crate::record::audio::load_waterfall(&wf_audio_path) {
+                    Ok(result) => {
                         let _ = wf_tx.send(result);
                     }
                     Err(e) => {
-                        log::warn!("waterfall: failed to read WAV: {}", e);
+                        log::warn!("waterfall: {}: {}", wf_audio_path.display(), e);
                     }
                 }
             });
@@ -1236,6 +1234,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let buf_poll = text_buffer.clone();
             let dc_poll = del_color.clone();
             let ic_poll = ins_color.clone();
+            let flag_poll = Rc::clone(&programmatic_change);
             let make_err = make_error_cell.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
                 // Cap messages per tick so the cursor timer and other
@@ -1270,6 +1269,22 @@ pub(super) async fn pick_with_streaming_gtk(
                                     let mut cands = cands.borrow_mut();
                                     cands[idx].2 = c.text.clone();
                                     raw_poll.borrow_mut()[idx] = c.text.clone();
+
+                                    // If this is the currently selected row and
+                                    // the text buffer is still empty, populate it
+                                    // (first result arriving for the selected row).
+                                    let is_selected = list
+                                        .selected_row()
+                                        .is_some_and(|r| r.index() as usize == idx);
+                                    let buf_empty = buf_poll
+                                        .text(&buf_poll.start_iter(), &buf_poll.end_iter(), false)
+                                        .is_empty();
+                                    if is_selected && buf_empty {
+                                        *flag_poll.borrow_mut() = true;
+                                        buf_poll.set_text(&c.text);
+                                        *flag_poll.borrow_mut() = false;
+                                    }
+
                                     let reference = buf_poll
                                         .text(&buf_poll.start_iter(), &buf_poll.end_iter(), false)
                                         .to_string();
@@ -1412,12 +1427,12 @@ pub(super) async fn pick_with_streaming_gtk(
     let done_tx = msg_tx.clone();
     let retry_msg_tx = msg_tx.clone();
 
-    // Read WAV samples once for realtime transcribers (shared via Arc).
+    // Read audio samples once for realtime transcribers (shared via Arc).
     let wav_samples = if !realtime_transcribers.is_empty() {
-        match read_wav_pcm_samples(&audio_path) {
+        match crate::record::audio::read_audio_as_i16(&audio_path) {
             Ok(samples) => Some(std::sync::Arc::new(samples)),
             Err(e) => {
-                log::warn!("failed to read WAV for realtime: {}", e);
+                log::warn!("failed to read audio for realtime: {}", e);
                 None
             }
         }
