@@ -233,10 +233,12 @@ pub(super) fn delete_recording(file_path: &std::path::Path) -> Result<(), TalkEr
         log::warn!("failed to remove {}: {}", file_path.display(), e);
     }
 
-    // For cache audio files, also delete matching YAML metadata files.
+    // For cache audio files, also delete matching YAML metadata
+    // files and the waterfall spectrogram cache (.wf).
     // Keep `wav` for backward compatibility with older cache entries.
     if (ext == "wav" || ext == "ogg") && !stem.is_empty() {
         if let Ok(dir) = recording_cache::recordings_dir() {
+            // Remove companion YAML files (<stem>_<model>.yml).
             let yml_prefix = format!("{}_", stem);
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
@@ -249,6 +251,18 @@ pub(super) fn delete_recording(file_path: &std::path::Path) -> Result<(), TalkEr
                             log::warn!("failed to remove metadata {}: {}", path.display(), e);
                         }
                     }
+                }
+            }
+
+            // Remove waterfall spectrogram cache (<stem>.wf).
+            let wf_path = dir.join(format!("{}.wf", stem));
+            if wf_path.exists() {
+                if let Err(e) = std::fs::remove_file(&wf_path) {
+                    log::warn!(
+                        "failed to remove waterfall cache {}: {}",
+                        wf_path.display(),
+                        e
+                    );
                 }
             }
         }
