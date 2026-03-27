@@ -237,32 +237,30 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 hbox.append(&transcript);
             }
 
-            // Dictate button — open the picker to transcribe this recording
-            if recording.transcript_preview.is_empty() {
-                let dictate_btn = gtk4::Button::with_label("\u{1D413}");
-                dictate_btn.set_tooltip_text(Some("Transcribe recording"));
-                dictate_btn.add_css_class("dictate-btn");
-                {
-                    let audio_path = recording.path.clone();
-                    dictate_btn.connect_clicked(move |_| {
-                        let exe = std::env::current_exe()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("talk-rs"));
-                        log::debug!("dictate: launching picker for {}", audio_path.display());
-                        if let Err(e) = std::process::Command::new(exe)
-                            .args([
-                                "dictate",
-                                "--pick",
-                                "--input-audio-file",
-                                &audio_path.to_string_lossy(),
-                            ])
-                            .spawn()
-                        {
-                            log::warn!("failed to launch picker: {}", e);
-                        }
-                    });
-                }
-                hbox.append(&dictate_btn);
+            // Dictate button — open the picker to (re-)transcribe this recording
+            let dictate_btn = gtk4::Button::with_label("\u{1D413}");
+            dictate_btn.set_tooltip_text(Some("Transcribe recording"));
+            dictate_btn.add_css_class("dictate-btn");
+            {
+                let audio_path = recording.path.clone();
+                dictate_btn.connect_clicked(move |_| {
+                    let exe = std::env::current_exe()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("talk-rs"));
+                    log::debug!("dictate: launching picker for {}", audio_path.display());
+                    if let Err(e) = std::process::Command::new(exe)
+                        .args([
+                            "dictate",
+                            "--pick",
+                            "--input-audio-file",
+                            &audio_path.to_string_lossy(),
+                        ])
+                        .spawn()
+                    {
+                        log::warn!("failed to launch picker: {}", e);
+                    }
+                });
             }
+            hbox.append(&dictate_btn);
 
             // Play button (simple toggle for entries with transcripts;
             // entries without transcripts use the full audio_player_bar).
