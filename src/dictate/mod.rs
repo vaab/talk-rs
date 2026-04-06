@@ -136,6 +136,15 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             }
         }
         input_audio_file = Some(last_audio);
+    } else if let Some(ref audio) = input_audio_file {
+        // Load existing recording metadata so the picker can show
+        // the cached transcript instead of re-transcribing.
+        if let Ok(Some(meta)) = recording_cache::metadata_path_for_recording(audio) {
+            if let Ok(previous) = recording_cache::read_metadata_brief(&meta) {
+                replace_char_count = Some(previous.transcript.chars().count());
+                cached_brief = Some(previous);
+            }
+        }
     }
 
     if opts.pick {

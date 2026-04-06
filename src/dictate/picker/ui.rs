@@ -166,8 +166,13 @@ pub(super) async fn pick_with_streaming_gtk(
     mut cached_entries: Vec<(Provider, String, String, bool, bool)>,
     config: Config,
     mut realtime_transcribers: Vec<(Provider, String, Box<dyn RealtimeTranscriber>)>,
+    mut deferred_candidates: Vec<(Provider, String, bool)>,
 ) -> Result<Option<PickerSelection>, TalkError> {
-    if transcribers.is_empty() && cached_entries.is_empty() && realtime_transcribers.is_empty() {
+    if transcribers.is_empty()
+        && cached_entries.is_empty()
+        && realtime_transcribers.is_empty()
+        && deferred_candidates.is_empty()
+    {
         return Ok(None);
     }
 
@@ -183,6 +188,12 @@ pub(super) async fn pick_with_streaming_gtk(
         .sort_by(|(pa, ma, _), (pb, mb, _)| pa.to_string().cmp(&pb.to_string()).then(ma.cmp(mb)));
     realtime_transcribers
         .sort_by(|(pa, ma, _), (pb, mb, _)| pa.to_string().cmp(&pb.to_string()).then(ma.cmp(mb)));
+    deferred_candidates.sort_by(|(pa, ma, sa), (pb, mb, sb)| {
+        pa.to_string()
+            .cmp(&pb.to_string())
+            .then(ma.cmp(mb))
+            .then(sa.cmp(sb))
+    });
 
     // Extract (provider, model) labels before transcribers are consumed
     // so the GTK thread can pre-create rows with spinners.
@@ -226,6 +237,9 @@ pub(super) async fn pick_with_streaming_gtk(
     let audio_path_for_waterfall = audio_path.clone();
     // Clone audio path for recording metadata writes from the GTK thread.
     let audio_path_for_metadata = audio_path.clone();
+
+    // Check before spawn_blocking moves deferred_candidates.
+    let has_deferred_realtime = deferred_candidates.iter().any(|(_, _, s)| *s);
 
     // ── GTK window ──────────────────────────────────────────────
     let gtk_handle = tokio::task::spawn_blocking(move || -> Result<(), TalkError> {
@@ -710,6 +724,10 @@ pub(super) async fn pick_with_streaming_gtk(
         // Transcript labels for live diff updates (None for error/spinner rows).
         let transcript_labels: Rc<RefCell<Vec<Option<gtk4::Label>>>> =
             Rc::new(RefCell::new(Vec::new()));
+        // Deferred row indices — rows awaiting user click, excluded
+        // from the InitialBatchDone "no response" sweep.
+        let deferred_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
         // Diff colours: deletion (red) from theme, insertion green (Tango palette).
         let del_color = error_hex.clone();
         let ins_color = String::from("#4e9a06");
@@ -929,6 +947,76 @@ pub(super) async fn pick_with_streaming_gtk(
             transcript_cells.borrow_mut().push(cell);
             raw_texts.borrow_mut().push(String::new());
             transcript_labels.borrow_mut().push(Some(label));
+        }
+
+        // Deferred entries: row with a "▶" (transcribe) button.
+        // These models are not auto-transcribed — the user clicks to
+        // start transcription on demand via the retry channel.
+        for (provider, model, streaming) in &deferred_candidates {
+            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, *streaming);
+
+            let transcribe_btn = gtk4::Button::with_label("\u{25B6}");
+            transcribe_btn.set_tooltip_text(Some("Transcribe with this model"));
+            transcribe_btn.add_css_class("retry-btn");
+            {
+                let tx = retry_tx.clone();
+                let provider = *provider;
+                let model = model.clone();
+                let streaming = *streaming;
+                let cells_ref = Rc::clone(&transcript_cells);
+                let labels_ref = Rc::clone(&transcript_labels);
+                let cands_ref = Rc::clone(&local_candidates);
+                let deferred_ref = Rc::clone(&deferred_indices);
+                transcribe_btn.connect_clicked(move |_| {
+                    let idx = {
+                        let cands = cands_ref.borrow();
+                        cands.iter().position(|(p, m, _, _, _, s)| {
+                            *p == provider && *m == model && *s == streaming
+                        })
+                    };
+                    if let Some(idx) = idx {
+                        deferred_ref.borrow_mut().remove(&idx);
+                        let _ = tx.send((provider, model.clone(), streaming));
+                        // Replace button with spinner (batch) or
+                        // empty label (realtime).
+                        let cells = cells_ref.borrow();
+                        if let Some(cell) = cells.get(idx) {
+                            while let Some(child) = cell.first_child() {
+                                cell.remove(&child);
+                            }
+                            if streaming {
+                                let label = make_transcript_label("");
+                                cell.append(&label);
+                                labels_ref.borrow_mut()[idx] = Some(label);
+                            } else {
+                                let spinner = gtk4::Spinner::new();
+                                spinner.start();
+                                cell.append(&spinner);
+                                labels_ref.borrow_mut()[idx] = None;
+                            }
+                        }
+                    }
+                });
+            }
+            cell.append(&transcribe_btn);
+
+            let row = gtk4::ListBoxRow::new();
+            row.set_child(Some(&hbox));
+            list.append(&row);
+
+            let deferred_idx = local_candidates.borrow().len();
+            local_candidates.borrow_mut().push((
+                *provider,
+                model.clone(),
+                String::new(),
+                false,
+                false,
+                *streaming,
+            ));
+            deferred_indices.borrow_mut().insert(deferred_idx);
+            transcript_cells.borrow_mut().push(cell);
+            raw_texts.borrow_mut().push(String::new());
+            transcript_labels.borrow_mut().push(None);
         }
 
         // Select first row when there are no cached entries.
@@ -1236,6 +1324,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let ic_poll = ins_color.clone();
             let flag_poll = Rc::clone(&programmatic_change);
             let make_err = make_error_cell.clone();
+            let deferred_poll = Rc::clone(&deferred_indices);
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
                 // Cap messages per tick so the cursor timer and other
                 // main-loop sources stay responsive.
@@ -1348,15 +1437,19 @@ pub(super) async fn pick_with_streaming_gtk(
                         }
                         Ok(PickerMessage::InitialBatchDone) => {
                             // Mark remaining batch spinners as failed.
-                            // Realtime rows (streaming=true) may still
-                            // be receiving data — skip them.
+                            // Realtime rows (streaming=true) and deferred
+                            // rows (not yet triggered) are skipped.
+                            let deferred = deferred_poll.borrow();
                             let failed: Vec<usize> = {
                                 let mut cands = cands.borrow_mut();
                                 let indices: Vec<usize> = cands
                                     .iter()
                                     .enumerate()
-                                    .filter(|(_, (_, _, text, _, is_error, streaming))| {
-                                        text.is_empty() && !*is_error && !*streaming
+                                    .filter(|(i, (_, _, text, _, is_error, streaming))| {
+                                        text.is_empty()
+                                            && !*is_error
+                                            && !*streaming
+                                            && !deferred.contains(i)
                                     })
                                     .map(|(i, _)| i)
                                     .collect();
@@ -1428,7 +1521,9 @@ pub(super) async fn pick_with_streaming_gtk(
     let retry_msg_tx = msg_tx.clone();
 
     // Read audio samples once for realtime transcribers (shared via Arc).
-    let wav_samples = if !realtime_transcribers.is_empty() {
+    // Also pre-load when deferred streaming models exist — they will
+    // need samples when the user triggers them via the retry channel.
+    let wav_samples = if !realtime_transcribers.is_empty() || has_deferred_realtime {
         match crate::record::audio::read_audio_as_i16(&audio_path) {
             Ok(samples) => Some(std::sync::Arc::new(samples)),
             Err(e) => {
