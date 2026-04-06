@@ -16,7 +16,7 @@ use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber, Transcri
 use crate::x11::x11_centre_and_raise;
 use std::path::{Path, PathBuf};
 
-use super::models::build_retry_candidates;
+use super::models::{build_retry_candidates, resolve_model, resolve_provider};
 use ui::{pick_with_streaming_gtk, PICKER_TITLE};
 
 /// Parameters for the pick-mode path.
@@ -254,19 +254,48 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         log::debug!("  needs API call: {}:{} (streaming={})", p, m, s);
     }
 
-    // Split filtered candidates into batch and realtime groups.
-    let batch_filtered: Vec<(Provider, String)> = filtered
+    // Resolve the default model so only it is transcribed immediately.
+    // All other candidates are deferred — shown in the UI with a
+    // "transcribe" button that the user can click on demand.
+    let default_provider = resolve_provider(params.provider, &config);
+    let default_model = resolve_model(params.model.as_deref(), &config, default_provider, false);
+    log::debug!(
+        "picker default model: {}:{} (batch)",
+        default_provider,
+        default_model,
+    );
+
+    let is_default = |p: &Provider, m: &str| *p == default_provider && m == default_model;
+
+    // Split filtered candidates into default (immediate) and deferred.
+    let mut default_filtered: Vec<(Provider, String, bool)> = Vec::new();
+    let mut deferred: Vec<(Provider, String, bool)> = Vec::new();
+    for (p, m, s) in filtered {
+        if is_default(&p, &m) {
+            default_filtered.push((p, m, s));
+        } else {
+            deferred.push((p, m, s));
+        }
+    }
+    log::debug!(
+        "picker: {} immediate, {} deferred",
+        default_filtered.len(),
+        deferred.len(),
+    );
+
+    // Split default candidates into batch and realtime groups.
+    let batch_filtered: Vec<(Provider, String)> = default_filtered
         .iter()
         .filter(|(_, _, s)| !s)
         .map(|(p, m, _)| (*p, m.clone()))
         .collect();
-    let realtime_filtered: Vec<(Provider, String)> = filtered
+    let realtime_filtered: Vec<(Provider, String)> = default_filtered
         .iter()
         .filter(|(_, _, s)| *s)
         .map(|(p, m, _)| (*p, m.clone()))
         .collect();
 
-    // Create batch transcribers before entering GTK (needs &Config).
+    // Create batch transcribers for the default model only.
     let mut transcribers: Vec<(Provider, String, Box<dyn BatchTranscriber>)> = Vec::new();
     for (provider, model) in batch_filtered {
         match transcription::create_batch_transcriber(&config, provider, Some(&model), false) {
@@ -275,7 +304,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         }
     }
 
-    // Create realtime transcribers.
+    // Create realtime transcribers for the default model only.
     let mut rt_transcribers: Vec<(Provider, String, Box<dyn RealtimeTranscriber>)> = Vec::new();
     for (provider, model) in realtime_filtered {
         match transcription::create_realtime_transcriber(&config, provider, Some(&model)) {
@@ -284,7 +313,11 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         }
     }
 
-    if transcribers.is_empty() && cached_entries.is_empty() && rt_transcribers.is_empty() {
+    if transcribers.is_empty()
+        && cached_entries.is_empty()
+        && rt_transcribers.is_empty()
+        && deferred.is_empty()
+    {
         return Err(TalkError::Transcription(
             "no transcription providers available".to_string(),
         ));
@@ -297,6 +330,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         cached_entries,
         config,
         rt_transcribers,
+        deferred,
     )
     .await?;
     let selection = match selected {
