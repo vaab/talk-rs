@@ -346,6 +346,8 @@ impl BatchTranscriber for MistralBatchTranscriber {
         // Collect all audio chunks into a single buffer so we can
         // provide an explicit Content-Length.  The Mistral API rejects
         // chunked Transfer-Encoding with 411 Length Required.
+        log::warn!("[DBG] mistral stream: awaiting audio chunks from encoder");
+        let collect_start = Instant::now();
         let mut audio_buf = Vec::new();
         let mut rx = audio_stream;
         while let Some(chunk) = rx.recv().await {
@@ -355,6 +357,11 @@ impl BatchTranscriber for MistralBatchTranscriber {
         log::info!(
             "streaming upload: collected {} bytes for Mistral batch request",
             audio_len
+        );
+        log::warn!(
+            "[DBG] mistral stream: audio collected ({} bytes in {}ms), building request",
+            audio_len,
+            collect_start.elapsed().as_millis()
         );
 
         // Create multipart form with known-length audio
@@ -378,6 +385,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 .text("timestamp_granularities", "segment");
         }
 
+        log::warn!("[DBG] mistral stream: POST {} beginning", self.endpoint);
         let started = Instant::now();
         let response = self
             .client
@@ -387,6 +395,18 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .send()
             .await
             .map_err(|err| {
+                log::warn!(
+                    "[DBG] mistral stream: send failed after {}ms: \
+                     is_connect={}, is_timeout={}, is_request={}, \
+                     is_body={}, is_decode={}, status={:?}",
+                    started.elapsed().as_millis(),
+                    err.is_connect(),
+                    err.is_timeout(),
+                    err.is_request(),
+                    err.is_body(),
+                    err.is_decode(),
+                    err.status()
+                );
                 TalkError::Transcription(format!(
                     "Failed to send streaming request to Mistral API: {:#}",
                     err
@@ -394,12 +414,27 @@ impl BatchTranscriber for MistralBatchTranscriber {
             })?;
 
         let request_latency_ms = started.elapsed().as_millis() as u64;
+        log::warn!(
+            "[DBG] mistral stream: response headers received after {}ms, status={}",
+            request_latency_ms,
+            response.status()
+        );
         let headers = response.headers().clone();
 
         // Check response status
         if !response.status().is_success() {
             let status = response.status();
+            log::warn!(
+                "[DBG] mistral stream: non-success status={}, reading error body",
+                status
+            );
+            let body_start = Instant::now();
             let body = response.text().await.unwrap_or_default();
+            log::warn!(
+                "[DBG] mistral stream: error body read ({} bytes in {}ms)",
+                body.len(),
+                body_start.elapsed().as_millis()
+            );
             return Err(TalkError::Transcription(format!(
                 "Mistral API error ({}): {}",
                 status, body
@@ -407,9 +442,25 @@ impl BatchTranscriber for MistralBatchTranscriber {
         }
 
         // Parse JSON response
+        log::warn!("[DBG] mistral stream: reading JSON body");
+        let body_start = Instant::now();
         let mistral_response: MistralResponse = response.json().await.map_err(|err| {
+            log::warn!(
+                "[DBG] mistral stream: JSON parse failed after {}ms: \
+                 is_connect={}, is_timeout={}, is_body={}, is_decode={}",
+                body_start.elapsed().as_millis(),
+                err.is_connect(),
+                err.is_timeout(),
+                err.is_body(),
+                err.is_decode()
+            );
             TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
         })?;
+        log::warn!(
+            "[DBG] mistral stream: JSON parsed ({} chars text) after {}ms body read",
+            mistral_response.text.len(),
+            body_start.elapsed().as_millis()
+        );
 
         let token_usage = mistral_response
             .usage
