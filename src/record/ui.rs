@@ -284,13 +284,17 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 hbox.append(&play_btn);
             }
 
-            // Copy-to-clipboard button (only shown when transcript text exists)
-            if !recording.transcript_preview.is_empty() {
+            // Copy-to-clipboard button (only shown when transcript text exists).
+            //
+            // The clipboard must receive the FULL transcript, not the
+            // display preview (which is truncated to ~200 chars with
+            // an ellipsis for the GTK label).
+            if !recording.transcript_full.is_empty() {
                 let copy_btn = gtk4::Button::with_label("\u{29C9}");
                 copy_btn.set_tooltip_text(Some("Copy transcript to clipboard"));
                 copy_btn.add_css_class("copy-btn");
                 {
-                    let text = recording.transcript_preview.clone();
+                    let text = recording.transcript_full.clone();
                     copy_btn.connect_clicked(move |_| {
                         if let Some(display) = gtk4::gdk::Display::default() {
                             display.clipboard().set_text(&text);
