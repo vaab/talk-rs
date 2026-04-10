@@ -12,7 +12,39 @@ pub(super) struct RecordingEntry {
     pub(super) date_label: String,
     pub(super) duration_label: String,
     pub(super) size_label: String,
+    /// Full single-line transcript (newlines collapsed to spaces), used
+    /// for the copy-to-clipboard action. Empty when no transcript is
+    /// available.
+    pub(super) transcript_full: String,
+    /// Display-ready preview of the transcript: same as
+    /// `transcript_full` when short, otherwise truncated to
+    /// `TRANSCRIPT_PREVIEW_CHARS` chars with a trailing ellipsis.
     pub(super) transcript_preview: String,
+}
+
+/// Maximum number of characters shown in the transcript preview label
+/// before truncation + ellipsis.
+const TRANSCRIPT_PREVIEW_CHARS: usize = 200;
+
+/// Build the (full, preview) transcript pair used by the recordings
+/// browser.
+///
+/// - `full` is the transcript with newlines collapsed to spaces, used
+///   for the clipboard copy action. It is never truncated.
+/// - `preview` is the same string truncated to
+///   [`TRANSCRIPT_PREVIEW_CHARS`] characters with a trailing ellipsis
+///   when longer, used for the GTK display label.
+///
+/// Both values are empty iff `raw` is empty.
+fn transcript_variants(raw: &str) -> (String, String) {
+    let full = raw.replace('\n', " ");
+    let preview = if full.chars().count() > TRANSCRIPT_PREVIEW_CHARS {
+        let truncated: String = full.chars().take(TRANSCRIPT_PREVIEW_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        full.clone()
+    };
+    (full, preview)
 }
 
 /// Parse a date label from a timestamp-based filename stem.
@@ -104,20 +136,12 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
             .unwrap_or_else(|_| "?".to_string());
 
         // Try to read transcript from companion metadata YAML
-        let transcript_preview =
+        let (transcript_full, transcript_preview) =
             match crate::recording_cache::metadata_path_for_recording(&ogg_path) {
                 Ok(Some(meta_path)) => crate::recording_cache::read_metadata_brief(&meta_path)
-                    .map(|b| {
-                        let line = b.transcript.replace('\n', " ");
-                        if line.chars().count() > 200 {
-                            let truncated: String = line.chars().take(200).collect();
-                            format!("{truncated}…")
-                        } else {
-                            line
-                        }
-                    })
+                    .map(|b| transcript_variants(&b.transcript))
                     .unwrap_or_default(),
-                _ => String::new(),
+                _ => (String::new(), String::new()),
             };
 
         result.push(RecordingEntry {
@@ -125,6 +149,7 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
             date_label,
             duration_label,
             size_label,
+            transcript_full,
             transcript_preview,
         });
     }
@@ -187,27 +212,20 @@ pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> 
             .unwrap_or_else(|_| "?".to_string());
 
         // Try to read transcript from companion metadata YAML
-        let transcript_preview = match recording_cache::metadata_path_for_recording(&ogg_path) {
-            Ok(Some(meta_path)) => recording_cache::read_metadata_brief(&meta_path)
-                .map(|b| {
-                    // Single line, truncated preview (char-safe)
-                    let line = b.transcript.replace('\n', " ");
-                    if line.chars().count() > 200 {
-                        let truncated: String = line.chars().take(200).collect();
-                        format!("{truncated}…")
-                    } else {
-                        line
-                    }
-                })
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
+        let (transcript_full, transcript_preview) =
+            match recording_cache::metadata_path_for_recording(&ogg_path) {
+                Ok(Some(meta_path)) => recording_cache::read_metadata_brief(&meta_path)
+                    .map(|b| transcript_variants(&b.transcript))
+                    .unwrap_or_default(),
+                _ => (String::new(), String::new()),
+            };
 
         result.push(RecordingEntry {
             path: ogg_path,
             date_label,
             duration_label,
             size_label,
+            transcript_full,
             transcript_preview,
         });
     }
@@ -287,4 +305,113 @@ pub(super) fn open_in_file_manager(file_path: &std::path::Path, parent_window: &
             }
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_variants_empty_stays_empty() {
+        let (full, preview) = transcript_variants("");
+        assert_eq!(full, "");
+        assert_eq!(preview, "");
+    }
+
+    #[test]
+    fn transcript_variants_short_text_is_not_truncated() {
+        let raw = "Hello, world!";
+        let (full, preview) = transcript_variants(raw);
+        assert_eq!(full, "Hello, world!");
+        assert_eq!(preview, "Hello, world!");
+        assert!(!preview.contains('…'));
+    }
+
+    #[test]
+    fn transcript_variants_collapses_newlines_to_spaces() {
+        let raw = "first line\nsecond line\nthird";
+        let (full, preview) = transcript_variants(raw);
+        assert_eq!(full, "first line second line third");
+        assert_eq!(preview, "first line second line third");
+    }
+
+    #[test]
+    fn transcript_variants_boundary_exactly_preview_chars() {
+        // Exactly TRANSCRIPT_PREVIEW_CHARS chars: must NOT be truncated.
+        let raw: String = "a".repeat(TRANSCRIPT_PREVIEW_CHARS);
+        let (full, preview) = transcript_variants(&raw);
+        assert_eq!(full.chars().count(), TRANSCRIPT_PREVIEW_CHARS);
+        assert_eq!(preview.chars().count(), TRANSCRIPT_PREVIEW_CHARS);
+        assert_eq!(full, raw);
+        assert_eq!(preview, raw);
+        assert!(!preview.contains('…'));
+    }
+
+    #[test]
+    fn transcript_variants_long_text_is_truncated_with_ellipsis() {
+        // TRANSCRIPT_PREVIEW_CHARS + 1 chars: must be truncated.
+        let raw: String = "b".repeat(TRANSCRIPT_PREVIEW_CHARS + 1);
+        let (full, preview) = transcript_variants(&raw);
+
+        // Full is untouched.
+        assert_eq!(full.chars().count(), TRANSCRIPT_PREVIEW_CHARS + 1);
+        assert_eq!(full, raw);
+
+        // Preview is TRANSCRIPT_PREVIEW_CHARS chars + ellipsis.
+        assert_eq!(preview.chars().count(), TRANSCRIPT_PREVIEW_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        let without_ellipsis: String = preview.chars().take(TRANSCRIPT_PREVIEW_CHARS).collect();
+        assert_eq!(without_ellipsis, "b".repeat(TRANSCRIPT_PREVIEW_CHARS));
+    }
+
+    #[test]
+    fn transcript_variants_very_long_text_preserves_full() {
+        // Simulate a realistic long transcript.
+        let raw: String = "The quick brown fox jumps over the lazy dog. ".repeat(50);
+        let (full, preview) = transcript_variants(&raw);
+
+        assert_eq!(full, raw);
+        assert!(full.chars().count() > TRANSCRIPT_PREVIEW_CHARS);
+        assert!(preview.ends_with('…'));
+        // Preview should be exactly TRANSCRIPT_PREVIEW_CHARS chars from `full` plus ellipsis.
+        let expected_prefix: String = full.chars().take(TRANSCRIPT_PREVIEW_CHARS).collect();
+        assert!(preview.starts_with(&expected_prefix));
+    }
+
+    #[test]
+    fn transcript_variants_multibyte_chars_counted_correctly() {
+        // 201 CJK characters — each is one char but multiple bytes.
+        // A byte-based truncation would panic or split a code point;
+        // a char-based truncation is safe and produces exactly
+        // TRANSCRIPT_PREVIEW_CHARS + 1 chars (with the ellipsis).
+        let raw: String = "漢".repeat(TRANSCRIPT_PREVIEW_CHARS + 1);
+        let (full, preview) = transcript_variants(&raw);
+
+        assert_eq!(full.chars().count(), TRANSCRIPT_PREVIEW_CHARS + 1);
+        assert_eq!(preview.chars().count(), TRANSCRIPT_PREVIEW_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        let without_ellipsis: String = preview.chars().take(TRANSCRIPT_PREVIEW_CHARS).collect();
+        assert_eq!(without_ellipsis, "漢".repeat(TRANSCRIPT_PREVIEW_CHARS));
+    }
+
+    #[test]
+    fn transcript_variants_long_text_with_newlines() {
+        // Long text with embedded newlines: newlines must be collapsed
+        // to spaces first, then truncation is applied to the single-line
+        // form. This mirrors the real data flow from YAML metadata.
+        let long_line = "word ".repeat(60); // 300 chars
+        let raw = format!("{long_line}\n{long_line}");
+        let (full, preview) = transcript_variants(&raw);
+
+        // No newlines in either output.
+        assert!(!full.contains('\n'));
+        assert!(!preview.contains('\n'));
+
+        // Full retains both lines joined by a space.
+        assert!(full.chars().count() > TRANSCRIPT_PREVIEW_CHARS);
+
+        // Preview is truncated + ellipsis.
+        assert!(preview.ends_with('…'));
+        assert_eq!(preview.chars().count(), TRANSCRIPT_PREVIEW_CHARS + 1);
+    }
 }
