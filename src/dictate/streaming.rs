@@ -305,6 +305,12 @@ pub(crate) async fn dictate_streaming(
         if let Some(o) = overlay {
             o.show(IndicatorKind::Transcribing);
         }
+        if let Some(t) = t_stop {
+            log::warn!(
+                "[DBG] streaming: overlay→Transcribing, +{}ms since SIGINT",
+                t.elapsed().as_millis()
+            );
+        }
     }
 
     // ── Wait for OGG recording task (no timeout) ────────────────────
@@ -318,6 +324,10 @@ pub(crate) async fn dictate_streaming(
     }
     if let Some(t) = t_stop {
         log::info!("timing: stop +{}ms ogg_flushed", t.elapsed().as_millis());
+        log::warn!(
+            "[DBG] streaming: cache_ogg finalized, +{}ms since SIGINT",
+            t.elapsed().as_millis()
+        );
     }
 
     // ── Wait for transcription result ───────────────────────────────
@@ -328,12 +338,40 @@ pub(crate) async fn dictate_streaming(
     // take a while to process long recordings.
     let t0 = std::time::Instant::now();
     log::info!("waiting for transcription result");
+    log::warn!("[DBG] streaming: awaiting transcribe_handle (no timeout)");
+
+    // Heartbeat: log every 2s while transcribe_handle is pending so
+    // we can distinguish a slow HTTP response from a deadlock or lost
+    // task.  Cancelled via `heartbeat_cancel` once the await returns.
+    let heartbeat_cancel = CancellationToken::new();
+    let hb_token = heartbeat_cancel.clone();
+    let hb_start = std::time::Instant::now();
+    let hb_handle = tokio::spawn(async move {
+        let mut elapsed = 0u64;
+        loop {
+            tokio::select! {
+                _ = hb_token.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    elapsed += 2;
+                    log::warn!(
+                        "[DBG] streaming: still waiting for transcribe result ({}s elapsed, wall {:.1}s)",
+                        elapsed,
+                        hb_start.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        }
+    });
 
     let result = match transcribe_handle.await {
         Ok(Ok(result)) => {
             log::info!(
                 "transcription completed after {:.2}s",
                 t0.elapsed().as_secs_f64()
+            );
+            log::warn!(
+                "[DBG] streaming: transcribe_handle returned OK after {}ms",
+                t0.elapsed().as_millis()
             );
             Ok(result)
         }
@@ -343,13 +381,28 @@ pub(crate) async fn dictate_streaming(
                 t0.elapsed().as_secs_f64(),
                 err
             );
+            log::warn!(
+                "[DBG] streaming: transcribe_handle returned ERR after {}ms",
+                t0.elapsed().as_millis()
+            );
             Err(err)
         }
-        Err(err) => Err(TalkError::Transcription(format!(
-            "transcription task panicked: {}",
-            err
-        ))),
+        Err(err) => {
+            log::warn!(
+                "[DBG] streaming: transcribe_handle PANICKED after {}ms: {}",
+                t0.elapsed().as_millis(),
+                err
+            );
+            Err(TalkError::Transcription(format!(
+                "transcription task panicked: {}",
+                err
+            )))
+        }
     };
+
+    // Stop the heartbeat task before continuing.
+    heartbeat_cancel.cancel();
+    let _ = hb_handle.await;
 
     // Clean up: abort remaining pipeline tasks (may already be done).
     feeder_handle.abort();

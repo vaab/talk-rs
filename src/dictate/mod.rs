@@ -584,6 +584,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                 let mut succeeded = None;
 
                 for attempt in 1..=MAX_RETRIES {
+                    log::warn!(
+                        "[DBG] retry loop: attempt {}/{} starting",
+                        attempt,
+                        MAX_RETRIES
+                    );
                     let reason = last_err.to_string();
                     let msg = format!(
                         "Transcription failed: {}. Retrying ({}/{})...",
@@ -602,12 +607,24 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     ) {
                         Ok(t) => t,
                         Err(e) => {
+                            log::warn!(
+                                "[DBG] retry loop: transcriber creation failed on attempt {}: {}",
+                                attempt,
+                                e
+                            );
                             last_err = e;
                             continue;
                         }
                     };
 
                     let upload_path = cache_path.clone();
+                    log::warn!(
+                        "[DBG] retry loop: transcribe_file {} starting (attempt {}/{})",
+                        upload_path.display(),
+                        attempt,
+                        MAX_RETRIES
+                    );
+                    let attempt_start = std::time::Instant::now();
                     let task = tokio::spawn(async move {
                         retry_transcriber.transcribe_file(&upload_path).await
                     });
@@ -624,6 +641,12 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     match outcome {
                         Ok(r) => {
                             log::info!("transcription succeeded on retry {}", attempt);
+                            log::warn!(
+                                "[DBG] retry loop: attempt {}/{} SUCCEEDED after {}ms",
+                                attempt,
+                                MAX_RETRIES,
+                                attempt_start.elapsed().as_millis()
+                            );
                             if let Some(ref viz) = visualizer {
                                 viz.set_text("");
                             }
@@ -631,6 +654,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                             break;
                         }
                         Err(e) => {
+                            log::warn!(
+                                "[DBG] retry loop: attempt {}/{} FAILED after {}ms: {}",
+                                attempt,
+                                MAX_RETRIES,
+                                attempt_start.elapsed().as_millis(),
+                                e
+                            );
                             last_err = e;
                         }
                     }
