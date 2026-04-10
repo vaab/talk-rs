@@ -14,10 +14,15 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use super::http::build_client;
+
 /// Cache TTL — model lists rarely change.
 const CACHE_TTL: Duration = Duration::from_secs(3600);
 
-/// Timeout for a single `/v1/models` request.
+/// Overall timeout for a single `/v1/models` request.
+///
+/// This is a simple GET — an overall cap is appropriate (unlike
+/// transcription requests where server processing time varies).
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of retry attempts (matches the transcription retry
@@ -26,9 +31,6 @@ const MAX_RETRIES: u32 = 5;
 
 /// Delay between retry attempts.
 const RETRY_DELAY: Duration = Duration::from_millis(500);
-
-/// TCP connect timeout — fail fast when the server is unreachable.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ── Cache ───────────────────────────────────────────────────────────
 
@@ -71,10 +73,7 @@ pub(crate) async fn fetch_transcription_models(
     }
 
     // Fetch with retries.
-    let client = Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|e| TalkError::Config(format!("failed to build HTTP client: {}", e)))?;
+    let client = build_client()?;
     let models_url = format!("{}/v1/models", api_base);
     let mut last_err: Option<TalkError> = None;
 

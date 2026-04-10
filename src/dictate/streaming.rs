@@ -321,34 +321,34 @@ pub(crate) async fn dictate_streaming(
     }
 
     // ── Wait for transcription result ───────────────────────────────
-    const TRANSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    //
+    // No artificial timeout here — the HTTP client's `read_timeout`,
+    // `tcp_user_timeout`, and TCP keepalive settings detect dead
+    // connections within a few seconds.  The server may legitimately
+    // take a while to process long recordings.
     let t0 = std::time::Instant::now();
-    log::info!(
-        "waiting for transcription (timeout: {:?})",
-        TRANSCRIPTION_TIMEOUT
-    );
+    log::info!("waiting for transcription result");
 
-    let result = tokio::select! {
-        res = &mut transcribe_handle => {
-            log::info!("transcription completed after {:.2}s", t0.elapsed().as_secs_f64());
-            match res {
-                Ok(Ok(result)) => Ok(result),
-                Ok(Err(err)) => Err(err),
-                Err(err) => Err(TalkError::Transcription(format!(
-                    "transcription task panicked: {}", err
-                ))),
-            }
-        }
-        _ = tokio::time::sleep(TRANSCRIPTION_TIMEOUT) => {
-            log::warn!(
-                "transcription timed out after {:.2}s — aborting",
+    let result = match transcribe_handle.await {
+        Ok(Ok(result)) => {
+            log::info!(
+                "transcription completed after {:.2}s",
                 t0.elapsed().as_secs_f64()
             );
-            transcribe_handle.abort();
-            Err(TalkError::Transcription(
-                "transcription timed out after 5 s".to_string(),
-            ))
+            Ok(result)
         }
+        Ok(Err(err)) => {
+            log::warn!(
+                "transcription failed after {:.2}s: {}",
+                t0.elapsed().as_secs_f64(),
+                err
+            );
+            Err(err)
+        }
+        Err(err) => Err(TalkError::Transcription(format!(
+            "transcription task panicked: {}",
+            err
+        ))),
     };
 
     // Clean up: abort remaining pipeline tasks (may already be done).

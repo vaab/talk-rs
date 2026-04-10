@@ -9,19 +9,57 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
-/// Timeout for batch file upload transcription requests.
-pub(crate) const BATCH_FILE_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// Timeout for the lightweight model-listing preflight check.
 pub(crate) const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// TCP connect timeout — fail fast when the server is unreachable.
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build an HTTP client with a TCP connect timeout.
+/// Kernel-level unacknowledged-data timeout (Linux only).
+///
+/// If transmitted data (upload bytes, TCP ACKs) goes unacknowledged
+/// for this duration, the kernel forcefully closes the socket.  This
+/// is the primary mechanism for detecting silent VPN/network drops
+/// during active data transfer — unlike TCP keepalive, it fires even
+/// when the send buffer is full.
+#[cfg(target_os = "linux")]
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// TCP keepalive idle time — start sending probes after this much
+/// silence on an otherwise idle connection.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(5);
+
+/// Interval between TCP keepalive probes once probing starts.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Number of unanswered keepalive probes before declaring the
+/// connection dead.
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Build an HTTP client tuned for VPN-hostile networks.
+///
+/// The client uses aggressive idle and kernel-level timeouts to
+/// detect dead connections within a few seconds, rather than relying
+/// on large overall request timeouts.  Individual requests should
+/// **not** set their own `.timeout()` — the per-frame and kernel
+/// timeouts handle stalls automatically.
 pub(crate) fn build_client() -> Result<Client, TalkError> {
-    Client::builder()
+    // NOTE: `read_timeout` is intentionally omitted.  In reqwest 0.13
+    // it acts as a non-resetting wall-clock timer during the
+    // upload + wait-for-headers phase, which would kill legitimate
+    // requests where upload + server processing exceeds the value.
+    // Dead connections are detected by `tcp_user_timeout` (during
+    // active transfer) and TCP keepalive (during idle phases).
+    let builder = Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .tcp_keepalive(TCP_KEEPALIVE)
+        .tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
+        .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES);
+
+    #[cfg(target_os = "linux")]
+    let builder = builder.tcp_user_timeout(TCP_USER_TIMEOUT);
+
+    builder
         .build()
         .map_err(|e| TalkError::Config(format!("failed to build HTTP client: {}", e)))
 }
