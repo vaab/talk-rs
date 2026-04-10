@@ -541,10 +541,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
         // If the initial streaming transcription failed (timeout,
         // API error, network issue), retry up to 5 times using the
-        // saved OGG file.  Each retry creates a fresh transcriber
-        // and applies the same 5-second timeout.
+        // saved OGG file.  Each retry creates a fresh transcriber.
+        // Dead connections are caught by the HTTP client's
+        // `tcp_user_timeout` / `read_timeout` / keepalive settings —
+        // no artificial per-retry timeout is needed.
         const MAX_RETRIES: u32 = 5;
-        const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
         match stream_result {
             Ok(r) => r,
@@ -607,26 +608,17 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     };
 
                     let upload_path = cache_path.clone();
-                    let mut task = tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         retry_transcriber.transcribe_file(&upload_path).await
                     });
 
-                    let outcome = tokio::select! {
-                        res = &mut task => {
-                            match res {
-                                Ok(Ok(r)) => Ok(r),
-                                Ok(Err(e)) => Err(e),
-                                Err(e) => Err(TalkError::Transcription(
-                                    format!("retry task panicked: {}", e),
-                                )),
-                            }
-                        }
-                        _ = tokio::time::sleep(RETRY_TIMEOUT) => {
-                            task.abort();
-                            Err(TalkError::Transcription(
-                                "transcription timed out after 5 s".to_string(),
-                            ))
-                        }
+                    let outcome = match task.await {
+                        Ok(Ok(r)) => Ok(r),
+                        Ok(Err(e)) => Err(e),
+                        Err(e) => Err(TalkError::Transcription(format!(
+                            "retry task panicked: {}",
+                            e,
+                        ))),
                     };
 
                     match outcome {

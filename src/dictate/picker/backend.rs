@@ -115,10 +115,13 @@ pub(super) async fn run_realtime_transcription(
     }
 }
 
-/// Spawn a single batch transcription task with an 8-second timeout.
+/// Spawn a single batch transcription task.
 ///
-/// Sends a [`PickerMessage::Candidate`] (success or error) to `tx`
-/// when complete.
+/// Dead connections are detected by the HTTP client's
+/// `tcp_user_timeout` / `read_timeout` / keepalive settings — no
+/// artificial outer timeout is needed.  Sends a
+/// [`PickerMessage::Candidate`] (success or error) to `tx` when
+/// complete.
 pub(super) fn spawn_transcription(
     tasks: &mut tokio::task::JoinSet<()>,
     tx: std::sync::mpsc::Sender<PickerMessage>,
@@ -128,34 +131,20 @@ pub(super) fn spawn_transcription(
     transcriber: Box<dyn BatchTranscriber>,
 ) {
     tasks.spawn(async move {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            transcriber.transcribe_file(&audio),
-        )
-        .await;
-        let msg = match result {
-            Ok(Ok(res)) => {
+        let msg = match transcriber.transcribe_file(&audio).await {
+            Ok(res) => {
                 let text = res.text.trim().to_string();
                 if text.is_empty() {
                     return;
                 }
                 PickerMessage::Candidate(PickerCandidate::success(provider, model, text, false))
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 log::warn!("candidate {}:{} failed: {}", provider, model, e);
                 PickerMessage::Candidate(PickerCandidate::error(
                     provider,
                     model,
                     format!("{e}"),
-                    false,
-                ))
-            }
-            Err(_) => {
-                log::warn!("candidate {}:{} timed out after 8s", provider, model);
-                PickerMessage::Candidate(PickerCandidate::error(
-                    provider,
-                    model,
-                    "timed out".into(),
                     false,
                 ))
             }

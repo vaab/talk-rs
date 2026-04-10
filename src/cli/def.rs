@@ -8,6 +8,10 @@ pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
+    /// Write logs to a file (in addition to stderr)
+    #[arg(long, value_name = "PATH", env = "TALK_RS_LOG_FILE")]
+    pub log_file: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }

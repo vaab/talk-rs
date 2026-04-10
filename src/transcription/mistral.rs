@@ -13,11 +13,10 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::Path;
-use std::time::Duration;
 use std::time::Instant;
 use tokio::fs::File;
 
-use super::http::{build_client, parse_u64_field, BATCH_FILE_TIMEOUT};
+use super::http::{build_client, parse_u64_field};
 use super::BatchTranscriber;
 
 /// Default API base URL for the Mistral API.
@@ -263,19 +262,18 @@ impl BatchTranscriber for MistralBatchTranscriber {
         }
 
         let started = Instant::now();
-        // [Fix #3] Send request with timeout to prevent hanging on
-        // unresponsive servers. Without this, Client::new() has no default
-        // timeout and the request could block forever.
         let response = self
             .client
             .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .timeout(BATCH_FILE_TIMEOUT)
             .multipart(form)
             .send()
             .await
             .map_err(|err| {
-                TalkError::Transcription(format!("Failed to send request to Mistral API: {}", err))
+                TalkError::Transcription(format!(
+                    "Failed to send request to Mistral API: {:#}",
+                    err
+                ))
             })?;
 
         let request_latency_ms = started.elapsed().as_millis() as u64;
@@ -381,18 +379,16 @@ impl BatchTranscriber for MistralBatchTranscriber {
         }
 
         let started = Instant::now();
-        // Send request to Mistral API with extended timeout for long recordings
         let response = self
             .client
             .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .timeout(Duration::from_secs(600))
             .multipart(form)
             .send()
             .await
             .map_err(|err| {
                 TalkError::Transcription(format!(
-                    "Failed to send streaming request to Mistral API: {}",
+                    "Failed to send streaming request to Mistral API: {:#}",
                     err
                 ))
             })?;
