@@ -20,7 +20,7 @@ pub struct Cli {
 pub enum Commands {
     /// Record audio from the system and save to a file
     Record {
-        /// Output file path (defaults to <output_dir>/memo-YYYY-MM-DD-HH-MM-SS.ogg)
+        /// Output file path (defaults to <output_dir>/YYYY/MM/YYYY-MM-DDTHH-MM-SS+ZZZZ.ogg)
         #[arg(value_name = "FILE")]
         file: Option<String>,
         /// Mix system audio (monitor) with microphone input

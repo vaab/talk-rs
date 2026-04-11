@@ -19,17 +19,24 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 /// Generate a default timestamped filename for a recording.
+///
+/// Uses an ISO 8601 local timestamp with numeric timezone offset, e.g.
+/// `2026-04-11T13-15-52+0200.ogg`.  Colons in the time portion are
+/// replaced by dashes so the filename is safe on every filesystem.  The
+/// format matches the ``memo`` tool so recordings from both tools can
+/// coexist in the same directory.
 fn default_filename() -> String {
     let now = Local::now();
-    now.format("memo-%Y-%m-%d-%H-%M-%S.ogg").to_string()
+    now.format("%Y-%m-%dT%H-%M-%S%z.ogg").to_string()
 }
 
 /// Resolve the output file path from CLI arguments and the configured
 /// `output_dir`.
 ///
-/// - No arguments → `<output_dir>/YYYY/MM/memo-YYYY-MM-DD-HH-MM-SS.ogg`
+/// - No arguments → `<output_dir>/YYYY/MM/YYYY-MM-DDTHH-MM-SS±ZZZZ.ogg`
 ///   (auto-namespaced by year and month to keep the flat directory from
-///   growing unbounded).
+///   growing unbounded).  The filename is an ISO 8601 local timestamp
+///   with numeric timezone offset, matching the `memo` tool's scheme.
 /// - One argument → used as-is
 /// - More than one → error
 ///
@@ -208,6 +215,7 @@ pub async fn record(args: Vec<String>, monitor: bool) -> Result<(), TalkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
 
     #[test]
     fn test_resolve_output_path_no_args_nests_by_year_and_month() {
@@ -247,24 +255,38 @@ mod tests {
             month_name
         );
 
-        // Filename must follow the memo-YYYY-MM-DD-HH-MM-SS.ogg pattern.
+        // Filename must follow the ISO 8601 local timestamp pattern
+        // with numeric timezone, e.g. ``2026-04-11T13-15-52+0200.ogg``,
+        // matching the ``memo`` tool's scheme.
         let filename = result
             .file_name()
             .expect("should have filename")
             .to_string_lossy();
-        assert!(
-            filename.starts_with("memo-"),
-            "filename should start with memo-"
-        );
         assert!(filename.ends_with(".ogg"), "filename should end with .ogg");
 
-        // Sanity: the year/month in the directory path should match the
-        // year/month embedded in the filename.
-        assert!(
-            filename.contains(&format!("memo-{}-{}-", year_name, month_name)),
-            "filename {} should carry the same year-month as its parent dirs {}/{}",
-            filename,
+        // The stem must parse back as a ``chrono`` local timestamp with
+        // a numeric timezone offset.  This is the real specification:
+        // whatever we produce must round-trip through the same format.
+        let stem = filename
+            .strip_suffix(".ogg")
+            .expect("filename should end with .ogg");
+        let parsed = chrono::DateTime::parse_from_str(stem, "%Y-%m-%dT%H-%M-%S%z")
+            .unwrap_or_else(|e| panic!("filename stem {} should parse as timestamp: {}", stem, e));
+
+        // Sanity: the year/month in the directory path must match the
+        // year/month embedded in the parsed timestamp.
+        assert_eq!(
+            format!("{:04}", parsed.year()),
             year_name,
+            "parsed year from filename {} should equal parent year dir {}",
+            filename,
+            year_name
+        );
+        assert_eq!(
+            format!("{:02}", parsed.month()),
+            month_name,
+            "parsed month from filename {} should equal parent month dir {}",
+            filename,
             month_name
         );
     }

@@ -83,77 +83,84 @@ async fn test_record_with_mock_capture_creates_file() {
 
 /// Test that the default filename format is generated correctly.
 ///
-/// This test verifies the parsing logic for the default filename pattern
-/// `memo-YYYY-MM-DD-HH-MM-SS.ogg` without performing actual recording.
+/// The default filename is an ISO 8601 local datetime with a numeric
+/// timezone offset (e.g. `2026-04-11T13-15-52+0200.ogg`), matching the
+/// `memo` tool's naming scheme.  This test verifies that the filename
+/// produced by the format string round-trips through `chrono`'s parser
+/// and resolves to approximately "now", without requiring a real
+/// recording.
 #[test]
 fn test_record_default_filename_format() {
-    use chrono::Local;
+    use chrono::{DateTime, Datelike, Local};
     use std::path::PathBuf;
 
-    // Simulate the parse_args logic from record.rs
-    let now = Local::now();
-    let filename = now.format("memo-%Y-%m-%d-%H-%M-%S.ogg").to_string();
+    // Reproduce the format string used by `record::default_filename()`.
+    // Keep this in sync with `src/record/mod.rs`.
+    let before = Local::now();
+    let filename = before.format("%Y-%m-%dT%H-%M-%S%z.ogg").to_string();
+    let after = Local::now();
     let path = PathBuf::from(&filename);
 
-    // Verify filename structure
     let filename_str = path
         .file_name()
         .expect("should have filename")
         .to_string_lossy();
 
     assert!(
-        filename_str.starts_with("memo-"),
-        "filename should start with 'memo-'"
+        filename_str.ends_with(".ogg"),
+        "filename should end with ``.ogg``, got {}",
+        filename_str
+    );
+
+    // The stem must parse as a chrono datetime with timezone offset.
+    let stem = filename_str
+        .strip_suffix(".ogg")
+        .expect("filename ends with .ogg");
+    let parsed = DateTime::parse_from_str(stem, "%Y-%m-%dT%H-%M-%S%z")
+        .unwrap_or_else(|e| panic!("filename stem {} should parse: {}", stem, e));
+
+    // The parsed timestamp must carry a real timezone offset (even UTC
+    // produces `+0000`, so this just exercises that `%z` was honoured).
+    let offset_secs = parsed.offset().local_minus_utc();
+    assert!(
+        offset_secs.abs() < 24 * 3600,
+        "parsed offset {} seconds should be a valid timezone",
+        offset_secs
+    );
+
+    // The parsed instant must fall within the window this test observed.
+    // `parse_from_str` returns a `DateTime<FixedOffset>`, which compares
+    // correctly against `DateTime<Local>` values taken before and after.
+    assert!(
+        parsed >= before - chrono::Duration::seconds(1),
+        "parsed {} should not be earlier than before {}",
+        parsed,
+        before
     );
     assert!(
-        filename_str.ends_with(".ogg"),
-        "filename should end with '.ogg'"
+        parsed <= after + chrono::Duration::seconds(1),
+        "parsed {} should not be later than after {}",
+        parsed,
+        after
     );
 
-    // Verify the format matches the pattern: memo-YYYY-MM-DD-HH-MM-SS.ogg
-    // Should be exactly 28 characters: "memo-" (5) + "YYYY-MM-DD-HH-MM-SS" (19) + ".ogg" (4)
-    assert_eq!(
-        filename_str.len(),
-        28,
-        "filename should be exactly 28 characters, got {}",
-        filename_str.len()
+    // Sanity check the calendar components: year must be 4 digits, month
+    // 1..=12, day 1..=31.
+    assert!(
+        (2000..=9999).contains(&parsed.year()),
+        "year {} should be 4-digit",
+        parsed.year()
     );
-
-    // Verify date components are numeric
-    // Format: memo-%Y-%m-%d-%H-%M-%S.ogg
-    // When split by '-': ["memo", "YYYY", "MM", "DD", "HH", "MM", "SS.ogg"]
-    let parts: Vec<&str> = filename_str.split('-').collect();
-    assert_eq!(parts.len(), 7, "should have 7 parts separated by hyphens");
-
-    // parts[0] = "memo"
-    assert_eq!(parts[0], "memo");
-
-    // parts[1] = YYYY (4 digits)
-    assert_eq!(parts[1].len(), 4);
-    assert!(parts[1].chars().all(|c| c.is_ascii_digit()));
-
-    // parts[2] = MM (2 digits)
-    assert_eq!(parts[2].len(), 2);
-    assert!(parts[2].chars().all(|c| c.is_ascii_digit()));
-
-    // parts[3] = DD (2 digits)
-    assert_eq!(parts[3].len(), 2);
-    assert!(parts[3].chars().all(|c| c.is_ascii_digit()));
-
-    // parts[4] = HH (2 digits)
-    assert_eq!(parts[4].len(), 2);
-    assert!(parts[4].chars().all(|c| c.is_ascii_digit()));
-
-    // parts[5] = MM (2 digits)
-    assert_eq!(parts[5].len(), 2);
-    assert!(parts[5].chars().all(|c| c.is_ascii_digit()));
-
-    // parts[6] = SS.ogg (6 characters: SS.ogg)
-    assert_eq!(parts[6].len(), 6);
-    let ss_ogg = parts[6];
-    assert!(ss_ogg[0..2].chars().all(|c| c.is_ascii_digit()));
-    assert_eq!(&ss_ogg[2..3], ".");
-    assert_eq!(&ss_ogg[3..6], "ogg");
+    assert!(
+        (1..=12).contains(&parsed.month()),
+        "month {} out of range",
+        parsed.month()
+    );
+    assert!(
+        (1..=31).contains(&parsed.day()),
+        "day {} out of range",
+        parsed.day()
+    );
 }
 
 /// Test that record creates an output file with real audio hardware.
