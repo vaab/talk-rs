@@ -287,10 +287,17 @@ fn ensure_recordings_dir() -> Result<PathBuf, TalkError> {
 ///
 /// Returns `(ogg_path, timestamp_string)` so the same timestamp can be
 /// used for both the OGG and metadata filenames.
+///
+/// The timestamp is an ISO 8601 local datetime with numeric timezone
+/// offset (e.g. `2026-04-11T13-15-52+0200`).  Colons in the time portion
+/// are replaced by dashes so the filename is filesystem-safe, and the
+/// timezone offset disambiguates recordings made across DST transitions
+/// or from hosts in different timezones.  This format matches the
+/// `memo` tool's naming scheme.
 pub fn generate_recording_path() -> Result<(PathBuf, String), TalkError> {
     let dir = ensure_recordings_dir()?;
     let now = Local::now();
-    let ts = now.format("%Y-%m-%dT%H-%M-%S").to_string();
+    let ts = now.format("%Y-%m-%dT%H-%M-%S%z").to_string();
     let ogg_path = dir.join(format!("{}.ogg", ts));
     Ok((ogg_path, ts))
 }
@@ -506,7 +513,7 @@ pub fn read_metadata_brief(path: &std::path::Path) -> Result<RecordingMetadataBr
 pub fn write_last_paste_state(window_id: Option<&str>, text: &str) -> Result<PathBuf, TalkError> {
     let dir = ensure_recordings_dir()?;
     let state = LastPasteState {
-        timestamp: Local::now().format("%Y-%m-%dT%H-%M-%S").to_string(),
+        timestamp: Local::now().format("%Y-%m-%dT%H-%M-%S%z").to_string(),
         char_count: text.chars().count(),
         window_id: window_id.map(ToString::to_string),
         text: text.to_string(),
