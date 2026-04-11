@@ -4,7 +4,7 @@ use super::audio::ogg_duration_secs;
 use crate::config::Config;
 use crate::error::TalkError;
 use crate::recording_cache;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Entry for one cached recording.
 pub(super) struct RecordingEntry {
@@ -84,9 +84,54 @@ pub(super) fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Recursively collect every `.ogg` file under `dir` into `out`.
+///
+/// Used by [`list_ogg_recordings`] so the recordings browser still works
+/// after the archival directory was namespaced into `YYYY/MM/`
+/// subdirectories.  Flat top-level files (pre-migration or user-placed)
+/// are also picked up, so the reader tolerates both layouts at once.
+///
+/// Symlinks are skipped defensively (both directory and file symlinks) to
+/// avoid cycles and to match the existing flat reader's behaviour.
+/// Errors on a subtree are logged and the walk continues — a single
+/// unreadable nested directory must not break the whole listing.
+fn collect_oggs_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), TalkError> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        TalkError::Config(format!(
+            "failed to read recordings directory {}: {}",
+            dir.display(),
+            e
+        ))
+    })?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
+        let path = entry.path();
+
+        // Skip symlinks (both file and directory) to avoid cycles and
+        // accidental escape from the recordings root.
+        if path.is_symlink() {
+            continue;
+        }
+
+        if path.is_dir() {
+            if let Err(err) = collect_oggs_recursive(&path, out) {
+                log::warn!("list_ogg: skipping subtree {}: {}", path.display(), err);
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("ogg") {
+            out.push(path);
+        }
+    }
+
+    Ok(())
+}
+
 /// Gather OGG recordings (actual `talk-rs record` output), sorted newest-first.
 ///
-/// Reads `output_dir` from the user configuration file.
+/// Reads `output_dir` from the user configuration file and walks it
+/// recursively, so files living in `YYYY/MM/` subdirectories are listed
+/// alongside any legacy flat files.
 pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     let t = std::time::Instant::now();
     let config = Config::load(None)?;
@@ -96,30 +141,17 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
         return Ok(Vec::new());
     }
 
-    let entries = std::fs::read_dir(&dir).map_err(|e| {
-        TalkError::Config(format!(
-            "failed to read recordings directory {}: {}",
-            dir.display(),
-            e
-        ))
-    })?;
-
     let mut oggs: Vec<PathBuf> = Vec::new();
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
-        let path = entry.path();
+    collect_oggs_recursive(&dir, &mut oggs)?;
 
-        // Skip symlinks
-        if path.is_symlink() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) == Some("ogg") {
-            oggs.push(path);
-        }
-    }
-
-    oggs.sort();
+    // Sort by file name (the timestamp-bearing basename) rather than by
+    // full path.  This keeps chronological ordering correct when flat
+    // (`<dir>/2026-04-05T…`) and nested (`<dir>/2026/04/2026-04-10T…`)
+    // files coexist during a transition: path-based sorting would place
+    // `2026-04-05T…` before `2026/04/2026-04-10T…` because `-` < `/` in
+    // ASCII, producing an out-of-order result.  Sorting by file name
+    // alone ignores the directory prefix and yields the right order.
+    oggs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     oggs.reverse();
 
     let mut result = Vec::with_capacity(oggs.len());
@@ -413,5 +445,147 @@ mod tests {
         // Preview is truncated + ellipsis.
         assert!(preview.ends_with('…'));
         assert_eq!(preview.chars().count(), TRANSCRIPT_PREVIEW_CHARS + 1);
+    }
+
+    // ---- collect_oggs_recursive ----
+
+    use tempfile::TempDir;
+
+    /// Basename helper for assertions.
+    fn basename(p: &Path) -> &str {
+        p.file_name().and_then(|n| n.to_str()).unwrap_or("")
+    }
+
+    #[test]
+    fn collect_oggs_flat_layout() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.ogg"), b"").unwrap();
+        std::fs::write(dir.join("b.ogg"), b"").unwrap();
+        std::fs::write(dir.join("ignored.txt"), b"").unwrap();
+        std::fs::write(dir.join("also-ignored.wf"), b"").unwrap();
+
+        let mut out = Vec::new();
+        collect_oggs_recursive(dir, &mut out).expect("collect");
+
+        let mut names: Vec<_> = out.iter().map(|p| basename(p).to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a.ogg", "b.ogg"]);
+    }
+
+    #[test]
+    fn collect_oggs_nested_layout() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Build `<dir>/2026/04/` and `<dir>/2025/12/`.
+        let nested_2026_04 = dir.join("2026").join("04");
+        let nested_2025_12 = dir.join("2025").join("12");
+        std::fs::create_dir_all(&nested_2026_04).unwrap();
+        std::fs::create_dir_all(&nested_2025_12).unwrap();
+
+        std::fs::write(nested_2026_04.join("2026-04-10T08-23-15+0200.ogg"), b"").unwrap();
+        std::fs::write(nested_2025_12.join("2025-12-27T04-31-23+0100.ogg"), b"").unwrap();
+
+        // Sidecars that must NOT be picked up.
+        std::fs::write(
+            nested_2026_04.join("2026-04-10T08-23-15+0200-voxtral.json"),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(nested_2026_04.join("2026-04-10T08-23-15+0200.txt"), b"").unwrap();
+
+        let mut out = Vec::new();
+        collect_oggs_recursive(dir, &mut out).expect("collect");
+
+        assert_eq!(out.len(), 2, "should find exactly 2 nested .ogg files");
+        let mut names: Vec<_> = out.iter().map(|p| basename(p).to_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "2025-12-27T04-31-23+0100.ogg".to_string(),
+                "2026-04-10T08-23-15+0200.ogg".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_oggs_mixed_flat_and_nested() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Legacy flat file (pre-migration or user-placed).
+        std::fs::write(dir.join("2026-04-05T10-00-00+0200.ogg"), b"").unwrap();
+
+        // Post-migration nested file.
+        let nested = dir.join("2026").join("04");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("2026-04-10T10-00-00+0200.ogg"), b"").unwrap();
+
+        let mut out = Vec::new();
+        collect_oggs_recursive(dir, &mut out).expect("collect");
+
+        assert_eq!(out.len(), 2, "should find both flat and nested files");
+
+        // Sort by file name (same rule list_ogg_recordings uses) and
+        // verify chronological order.  Path-based sorting would produce
+        // the wrong order here because `-` < `/` in ASCII.
+        out.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        let names: Vec<_> = out.iter().map(|p| basename(p).to_string()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "2026-04-05T10-00-00+0200.ogg".to_string(),
+                "2026-04-10T10-00-00+0200.ogg".to_string(),
+            ],
+            "file-name-based sort must place the Apr-5 flat file before the Apr-10 nested file"
+        );
+    }
+
+    #[test]
+    fn collect_oggs_skips_symlinks() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+
+        // Real file.
+        std::fs::write(dir.join("real.ogg"), b"").unwrap();
+
+        // File symlink pointing at the real file — must be skipped.
+        std::os::unix::fs::symlink(dir.join("real.ogg"), dir.join("link.ogg")).unwrap();
+
+        // Directory symlink pointing at `.` — would cause infinite
+        // recursion if followed.  Must be skipped.
+        std::os::unix::fs::symlink(dir, dir.join("self-link")).unwrap();
+
+        let mut out = Vec::new();
+        collect_oggs_recursive(dir, &mut out).expect("collect");
+
+        assert_eq!(out.len(), 1, "symlinks must be skipped");
+        assert_eq!(basename(&out[0]), "real.ogg");
+    }
+
+    #[test]
+    fn collect_oggs_empty_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut out = Vec::new();
+        collect_oggs_recursive(tmp.path(), &mut out).expect("collect");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_oggs_deep_nesting() {
+        // Sanity check: the walker handles more than two levels (e.g.
+        // `year/month/day/` if the layout ever gets deeper).
+        let tmp = TempDir::new().expect("tempdir");
+        let deep = tmp.path().join("2026").join("04").join("10");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("memo.ogg"), b"").unwrap();
+
+        let mut out = Vec::new();
+        collect_oggs_recursive(tmp.path(), &mut out).expect("collect");
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(basename(&out[0]), "memo.ogg");
     }
 }

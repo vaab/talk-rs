@@ -27,12 +27,23 @@ fn default_filename() -> String {
 /// Resolve the output file path from CLI arguments and the configured
 /// `output_dir`.
 ///
-/// - No arguments → `<output_dir>/memo-YYYY-MM-DD-HH-MM-SS.ogg`
+/// - No arguments → `<output_dir>/YYYY/MM/memo-YYYY-MM-DD-HH-MM-SS.ogg`
+///   (auto-namespaced by year and month to keep the flat directory from
+///   growing unbounded).
 /// - One argument → used as-is
 /// - More than one → error
+///
+/// This is a pure computation: it does not create the directory.  The
+/// caller is responsible for calling [`std::fs::create_dir_all`] on the
+/// parent before opening the file.
 fn resolve_output_path(args: &[String], output_dir: &Path) -> Result<PathBuf, TalkError> {
     match args.len() {
-        0 => Ok(output_dir.join(default_filename())),
+        0 => {
+            let now = Local::now();
+            let year = now.format("%Y").to_string();
+            let month = now.format("%m").to_string();
+            Ok(output_dir.join(year).join(month).join(default_filename()))
+        }
         1 => Ok(PathBuf::from(&args[0])),
         _ => Err(TalkError::Audio(
             "record command takes at most one argument (output file path)".to_string(),
@@ -87,6 +98,25 @@ pub async fn record(args: Vec<String>, monitor: bool) -> Result<(), TalkError> {
         output_path.extension().and_then(|e| e.to_str()),
         Some("wav")
     );
+
+    // Ensure the parent directory exists.  For auto-generated paths this
+    // creates the `YYYY/MM/` subdirectory; for user-provided paths it
+    // creates any missing intermediate directories (principle of least
+    // surprise when the user passes a nested path).
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                TalkError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to create recording directory {}: {}",
+                        parent.display(),
+                        err
+                    ),
+                ))
+            })?;
+        }
+    }
 
     // Create output file
     let mut file = tokio::fs::File::create(&output_path)
@@ -180,16 +210,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_output_path_no_args_uses_output_dir() {
+    fn test_resolve_output_path_no_args_nests_by_year_and_month() {
         let output_dir = PathBuf::from("/tmp/test-output");
         let args: Vec<String> = vec![];
         let result = resolve_output_path(&args, &output_dir).expect("resolve should succeed");
 
-        // Path must live inside output_dir.
+        // Path must live inside output_dir/YYYY/MM/.
+        let month_dir = result.parent().expect("should have month parent");
+        let year_dir = month_dir.parent().expect("should have year parent");
+        let root = year_dir.parent().expect("should have root parent");
+
         assert_eq!(
-            result.parent().expect("should have parent"),
-            output_dir,
-            "default recording should be placed in output_dir"
+            root, output_dir,
+            "root above the YYYY/MM subdirs should be output_dir"
+        );
+
+        let year_name = year_dir
+            .file_name()
+            .expect("year dir name")
+            .to_string_lossy();
+        let month_name = month_dir
+            .file_name()
+            .expect("month dir name")
+            .to_string_lossy();
+
+        assert_eq!(year_name.len(), 4, "year segment should be 4 digits");
+        assert!(
+            year_name.chars().all(|c| c.is_ascii_digit()),
+            "year segment should be all digits, got: {}",
+            year_name
+        );
+        assert_eq!(month_name.len(), 2, "month segment should be 2 digits");
+        assert!(
+            month_name.chars().all(|c| c.is_ascii_digit()),
+            "month segment should be all digits, got: {}",
+            month_name
         );
 
         // Filename must follow the memo-YYYY-MM-DD-HH-MM-SS.ogg pattern.
@@ -202,6 +257,16 @@ mod tests {
             "filename should start with memo-"
         );
         assert!(filename.ends_with(".ogg"), "filename should end with .ogg");
+
+        // Sanity: the year/month in the directory path should match the
+        // year/month embedded in the filename.
+        assert!(
+            filename.contains(&format!("memo-{}-{}-", year_name, month_name)),
+            "filename {} should carry the same year-month as its parent dirs {}/{}",
+            filename,
+            year_name,
+            month_name
+        );
     }
 
     #[test]

@@ -13,9 +13,63 @@ use super::player::WavPlayer;
 use crate::config::Config;
 use crate::error::TalkError;
 use crate::recording_cache;
+use std::path::{Path, PathBuf};
 
 /// Window title — also used for single-instance detection.
 const WINDOW_TITLE: &str = "talk-rs — Recordings";
+
+fn basename(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+}
+
+fn collect_directories_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+    out.push(dir.to_path_buf());
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            log::warn!(
+                "record-ui: watch: failed to read {}: {}",
+                dir.display(),
+                err,
+            );
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                log::warn!(
+                    "record-ui: watch: failed to inspect {}: {}",
+                    dir.display(),
+                    err,
+                );
+                continue;
+            }
+        };
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                log::warn!(
+                    "record-ui: watch: failed to inspect type under {}: {}",
+                    dir.display(),
+                    err,
+                );
+                continue;
+            }
+        };
+
+        if file_type.is_dir() {
+            collect_directories_recursive(&entry.path(), out);
+        }
+    }
+}
 
 /// Open the GTK4 recordings browser.
 ///
@@ -591,7 +645,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 }
 
                 fn watch_directory(
-                    dir: &std::path::Path,
+                    dir: &Path,
                     label: &'static str,
                     ctx: &WatchCtx,
                     list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
@@ -599,23 +653,29 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 ) {
                     use gtk4::prelude::*;
 
-                    let gio_dir = gtk4::gio::File::for_path(dir);
-                    let monitor = match gio_dir.monitor_directory(
-                        gtk4::gio::FileMonitorFlags::NONE,
-                        gtk4::gio::Cancellable::NONE,
-                    ) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            log::warn!("failed to watch {}: {}", dir.display(), e);
-                            return;
+                    fn row_index_by_path(list: &gtk4::ListBox, file_path: &str) -> Option<i32> {
+                        let mut idx = 0;
+                        while let Some(row) = list.row_at_index(idx) {
+                            if row.widget_name().as_str() == file_path {
+                                return Some(idx);
+                            }
+                            idx += 1;
                         }
-                    };
+                        None
+                    }
 
-                    let list_ref = ctx.list.clone();
-                    let exp_ref = ctx.expander.clone();
-                    let player_ref = Rc::clone(&ctx.player);
-                    let btn_ref = Rc::clone(&ctx.active_play_btn);
-                    let win_ref = ctx.window.clone();
+                    fn sorted_insert_pos(list: &gtk4::ListBox, file_path: &str) -> i32 {
+                        let mut insert_pos: i32 = 0;
+                        let mut idx = 0;
+                        while let Some(row) = list.row_at_index(idx) {
+                            if basename(file_path) >= basename(row.widget_name().as_str()) {
+                                break;
+                            }
+                            insert_pos = idx + 1;
+                            idx += 1;
+                        }
+                        insert_pos
+                    }
 
                     /// Refresh the audio row whose stem matches a YAML
                     /// companion file.  Used for YAML created, changed,
@@ -690,229 +750,351 @@ fn show_recordings_window() -> Result<(), TalkError> {
                         count
                     }
 
-                    monitor.connect_changed(move |_monitor, file, _other, event| {
-                        use gtk4::gio::FileMonitorEvent;
+                    #[allow(clippy::too_many_arguments)]
+                    fn insert_or_refresh_row(
+                        entry: &RecordingEntry,
+                        existing_idx: Option<i32>,
+                        player: &Rc<RefCell<Option<WavPlayer>>>,
+                        active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
+                        window: &gtk4::Window,
+                        list: &gtk4::ListBox,
+                        expander: &gtk4::Expander,
+                        label: &str,
+                    ) {
+                        let new_row = build_row(
+                            entry,
+                            player,
+                            active_play_btn,
+                            window,
+                            list,
+                            expander,
+                            label,
+                        );
 
-                        let name = match file.basename() {
-                            Some(n) => n.to_string_lossy().to_string(),
-                            None => return,
-                        };
-
-                        // Ignore waterfall cache files (.wf).
-                        if name.ends_with(".wf") {
-                            return;
+                        if let Some(old_idx) = existing_idx {
+                            list.insert(&new_row, old_idx);
+                            if let Some(old_row) = list.row_at_index(old_idx + 1) {
+                                list.remove(&old_row);
+                            }
+                        } else {
+                            let file_path = entry.path.to_string_lossy().to_string();
+                            let insert_pos = sorted_insert_pos(list, &file_path);
+                            list.insert(&new_row, insert_pos);
                         }
 
-                        let is_yml = name.ends_with(".yml");
-                        let is_audio = name.ends_with(".wav") || name.ends_with(".ogg");
+                        let count = count_list_rows(list);
+                        expander.set_label(Some(&format!("{} ({})", label, count)));
+                    }
 
-                        match event {
-                            // ── Deletion ─────────────────────────────────
-                            FileMonitorEvent::Deleted => {
-                                if is_yml {
-                                    // Companion YAML deleted — rebuild the
-                                    // matching audio row so transcript is
-                                    // cleared.
-                                    log::debug!(
-                                        "record-ui: watch: yml deleted, refreshing row: {}",
-                                        name,
-                                    );
-                                    update_row_for_yml(
-                                        &name,
-                                        list_fn,
-                                        &player_ref,
-                                        &btn_ref,
-                                        &win_ref,
-                                        &list_ref,
-                                        &exp_ref,
-                                        label,
-                                    );
-                                    return;
-                                }
-                                if !is_audio {
-                                    log::debug!(
-                                        "record-ui: watch: non-audio Deleted (ignored): {}",
-                                        name,
-                                    );
-                                    return;
-                                }
+                    #[allow(clippy::too_many_arguments)]
+                    fn refresh_rows_under_subtree(
+                        subtree: &Path,
+                        list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
+                        player: &Rc<RefCell<Option<WavPlayer>>>,
+                        active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
+                        window: &gtk4::Window,
+                        list: &gtk4::ListBox,
+                        expander: &gtk4::Expander,
+                        label: &str,
+                    ) {
+                        let entries = match list_fn() {
+                            Ok(entries) => entries,
+                            Err(err) => {
+                                log::warn!(
+                                    "record-ui: watch: failed to list entries for subtree refresh: {}",
+                                    err,
+                                );
+                                return;
+                            }
+                        };
 
-                                // Audio file deleted → remove matching row.
-                                let file_path = match file.path() {
-                                    Some(p) => p.to_string_lossy().to_string(),
-                                    None => return,
-                                };
+                        for entry in entries.iter().filter(|entry| entry.path.starts_with(subtree)) {
+                            let file_path = entry.path.to_string_lossy().to_string();
+                            if row_index_by_path(list, &file_path).is_none() {
+                                insert_or_refresh_row(
+                                    entry,
+                                    None,
+                                    player,
+                                    active_play_btn,
+                                    window,
+                                    list,
+                                    expander,
+                                    label,
+                                );
+                            }
+                        }
+                    }
 
-                                let mut idx = 0;
-                                while let Some(row) = list_ref.row_at_index(idx) {
-                                    if row.widget_name().as_str() == file_path {
-                                        // Select adjacent row before removal
-                                        // so scroll position stays stable.
-                                        let next = list_ref.row_at_index(idx + 1).or_else(|| {
-                                            if idx > 0 {
-                                                list_ref.row_at_index(idx - 1)
-                                            } else {
-                                                None
-                                            }
-                                        });
-                                        if let Some(ref adj) = next {
-                                            list_ref.select_row(Some(adj));
-                                        }
-                                        list_ref.remove(&row);
+                    fn install_monitor(
+                        dir: &Path,
+                        label: &'static str,
+                        ctx: &WatchCtx,
+                        list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
+                        monitors: &Rc<RefCell<Vec<gtk4::gio::FileMonitor>>>,
+                    ) {
+                        let gio_dir = gtk4::gio::File::for_path(dir);
+                        let monitor = match gio_dir.monitor_directory(
+                            gtk4::gio::FileMonitorFlags::NONE,
+                            gtk4::gio::Cancellable::NONE,
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                log::warn!("failed to watch {}: {}", dir.display(), e);
+                                return;
+                            }
+                        };
 
-                                        let count = count_list_rows(&list_ref);
-                                        exp_ref.set_label(Some(&format!("{} ({})", label, count,)));
+                        log::debug!("record-ui: watch: installed monitor on {}", dir.display());
+
+                        let list_ref = ctx.list.clone();
+                        let exp_ref = ctx.expander.clone();
+                        let player_ref = Rc::clone(&ctx.player);
+                        let btn_ref = Rc::clone(&ctx.active_play_btn);
+                        let win_ref = ctx.window.clone();
+                        let monitors_weak = Rc::downgrade(monitors);
+
+                        monitor.connect_changed(move |_monitor, file, _other, event| {
+                            use gtk4::gio::FileMonitorEvent;
+
+                            let name = match file.basename() {
+                                Some(n) => n.to_string_lossy().to_string(),
+                                None => return,
+                            };
+
+                            let file_path_buf = file.path();
+
+                            // Ignore waterfall cache files (.wf).
+                            if name.ends_with(".wf") {
+                                return;
+                            }
+
+                            let is_yml = name.ends_with(".yml");
+                            let is_audio = name.ends_with(".wav") || name.ends_with(".ogg");
+
+                            match event {
+                                // ── Deletion ─────────────────────────────────
+                                FileMonitorEvent::Deleted => {
+                                    if is_yml {
+                                        // Companion YAML deleted — rebuild the
+                                        // matching audio row so transcript is
+                                        // cleared.
                                         log::debug!(
-                                            "record-ui: watch: removed row for deleted audio: {}",
+                                            "record-ui: watch: yml deleted, refreshing row: {}",
+                                            name,
+                                        );
+                                        update_row_for_yml(
+                                            &name,
+                                            list_fn,
+                                            &player_ref,
+                                            &btn_ref,
+                                            &win_ref,
+                                            &list_ref,
+                                            &exp_ref,
+                                            label,
+                                        );
+                                        return;
+                                    }
+                                    if !is_audio {
+                                        log::debug!(
+                                            "record-ui: watch: non-audio Deleted (ignored): {}",
                                             name,
                                         );
                                         return;
                                     }
-                                    idx += 1;
-                                }
-                                // Row not found — already removed by the
-                                // delete button before inotify fired.
-                                log::debug!(
-                                    "record-ui: watch: Deleted audio row not found \
-                                     (already removed?): {}",
-                                    name,
-                                );
-                            }
 
-                            // ── Creation / write-complete ────────────────
-                            FileMonitorEvent::Created | FileMonitorEvent::ChangesDoneHint => {
-                                if is_yml {
-                                    log::debug!(
-                                        "record-ui: watch: yml {:?}, refreshing row: {}",
-                                        event,
-                                        name,
-                                    );
-                                    update_row_for_yml(
-                                        &name,
-                                        list_fn,
-                                        &player_ref,
-                                        &btn_ref,
-                                        &win_ref,
-                                        &list_ref,
-                                        &exp_ref,
-                                        label,
-                                    );
-                                    return;
-                                }
-                                if !is_audio {
-                                    log::debug!(
-                                        "record-ui: watch: non-audio {:?} (ignored): {}",
-                                        event,
-                                        name,
-                                    );
-                                    return;
-                                }
+                                    // Audio file deleted → remove matching row.
+                                    let file_path = match &file_path_buf {
+                                        Some(p) => p.to_string_lossy().to_string(),
+                                        None => return,
+                                    };
 
-                                // Audio file appeared or finished writing →
-                                // add a new row or refresh an existing one.
-                                let file_path = match file.path() {
-                                    Some(p) => p.to_string_lossy().to_string(),
-                                    None => return,
-                                };
-
-                                // Check if a row already exists (e.g.
-                                // Created followed by ChangesDoneHint).
-                                let mut existing_idx: Option<i32> = None;
-                                {
                                     let mut idx = 0;
                                     while let Some(row) = list_ref.row_at_index(idx) {
                                         if row.widget_name().as_str() == file_path {
-                                            existing_idx = Some(idx);
-                                            break;
+                                            // Select adjacent row before removal
+                                            // so scroll position stays stable.
+                                            let next = list_ref.row_at_index(idx + 1).or_else(|| {
+                                                if idx > 0 {
+                                                    list_ref.row_at_index(idx - 1)
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                            if let Some(ref adj) = next {
+                                                list_ref.select_row(Some(adj));
+                                            }
+                                            list_ref.remove(&row);
+
+                                            let count = count_list_rows(&list_ref);
+                                            exp_ref
+                                                .set_label(Some(&format!("{} ({})", label, count,)));
+                                            log::debug!(
+                                                "record-ui: watch: removed row for deleted audio: {}",
+                                                name,
+                                            );
+                                            return;
                                         }
                                         idx += 1;
                                     }
+                                    // Row not found — already removed by the
+                                    // delete button before inotify fired.
+                                    log::debug!(
+                                        "record-ui: watch: Deleted audio row not found \
+                                         (already removed?): {}",
+                                        name,
+                                    );
                                 }
 
-                                let entries = match list_fn() {
-                                    Ok(e) => e,
-                                    Err(e) => {
-                                        log::warn!(
-                                            "record-ui: watch: failed to list entries: {}",
-                                            e,
+                                // ── Creation / write-complete ────────────────
+                                FileMonitorEvent::Created | FileMonitorEvent::ChangesDoneHint => {
+                                    if matches!(event, FileMonitorEvent::Created)
+                                        && file_path_buf.as_ref().is_some_and(|path| path.is_dir())
+                                    {
+                                        let Some(dir_path) = file_path_buf.as_ref() else {
+                                            return;
+                                        };
+                                        log::debug!(
+                                            "record-ui: watch: new subdir {}, installing recursive watcher and refreshing rows",
+                                            dir_path.display(),
+                                        );
+                                        if let Some(monitors_rc) = monitors_weak.upgrade() {
+                                            watch_directory(
+                                                dir_path,
+                                                label,
+                                                &WatchCtx {
+                                                    list: list_ref.clone(),
+                                                    expander: exp_ref.clone(),
+                                                    player: Rc::clone(&player_ref),
+                                                    active_play_btn: Rc::clone(&btn_ref),
+                                                    window: win_ref.clone(),
+                                                },
+                                                list_fn,
+                                                &monitors_rc,
+                                            );
+                                        }
+                                        refresh_rows_under_subtree(
+                                            dir_path,
+                                            list_fn,
+                                            &player_ref,
+                                            &btn_ref,
+                                            &win_ref,
+                                            &list_ref,
+                                            &exp_ref,
+                                            label,
                                         );
                                         return;
                                     }
-                                };
 
-                                let entry = match entries
-                                    .iter()
-                                    .find(|e| e.path.to_string_lossy() == file_path)
-                                {
-                                    Some(e) => e,
-                                    None => {
+                                    if is_yml {
                                         log::debug!(
-                                            "record-ui: watch: {:?} file not in listing: {}",
+                                            "record-ui: watch: yml {:?}, refreshing row: {}",
+                                            event,
+                                            name,
+                                        );
+                                        update_row_for_yml(
+                                            &name,
+                                            list_fn,
+                                            &player_ref,
+                                            &btn_ref,
+                                            &win_ref,
+                                            &list_ref,
+                                            &exp_ref,
+                                            label,
+                                        );
+                                        return;
+                                    }
+                                    if !is_audio {
+                                        log::debug!(
+                                            "record-ui: watch: non-audio {:?} (ignored): {}",
                                             event,
                                             name,
                                         );
                                         return;
                                     }
-                                };
 
-                                let new_row = build_row(
-                                    entry,
-                                    &player_ref,
-                                    &btn_ref,
-                                    &win_ref,
-                                    &list_ref,
-                                    &exp_ref,
-                                    label,
-                                );
+                                    // Audio file appeared or finished writing →
+                                    // add a new row or refresh an existing one.
+                                    let file_path = match &file_path_buf {
+                                        Some(p) => p.to_string_lossy().to_string(),
+                                        None => return,
+                                    };
 
-                                if let Some(old_idx) = existing_idx {
-                                    // Replace existing row at the same
-                                    // position (refresh metadata).
-                                    list_ref.insert(&new_row, old_idx);
-                                    if let Some(old_row) = list_ref.row_at_index(old_idx + 1) {
-                                        list_ref.remove(&old_row);
-                                    }
-                                    log::debug!(
-                                        "record-ui: watch: refreshed existing row: {}",
-                                        name,
-                                    );
-                                } else {
-                                    // Insert at the correct sorted position
-                                    // (newest-first = reverse-alpha on
-                                    // timestamp filenames).
-                                    let mut insert_pos: i32 = 0;
-                                    let mut idx = 0;
-                                    while let Some(row) = list_ref.row_at_index(idx) {
-                                        if file_path.as_str() >= row.widget_name().as_str() {
-                                            break;
+                                    // Check if a row already exists (e.g.
+                                    // Created followed by ChangesDoneHint).
+                                    let existing_idx = row_index_by_path(&list_ref, &file_path);
+
+                                    let entries = match list_fn() {
+                                        Ok(e) => e,
+                                        Err(e) => {
+                                            log::warn!(
+                                                "record-ui: watch: failed to list entries: {}",
+                                                e,
+                                            );
+                                            return;
                                         }
-                                        insert_pos = idx + 1;
-                                        idx += 1;
+                                    };
+
+                                    let entry = match entries
+                                        .iter()
+                                        .find(|e| e.path.to_string_lossy() == file_path)
+                                    {
+                                        Some(e) => e,
+                                        None => {
+                                            log::debug!(
+                                                "record-ui: watch: {:?} file not in listing: {}",
+                                                event,
+                                                name,
+                                            );
+                                            return;
+                                        }
+                                    };
+
+                                    insert_or_refresh_row(
+                                        entry,
+                                        existing_idx,
+                                        &player_ref,
+                                        &btn_ref,
+                                        &win_ref,
+                                        &list_ref,
+                                        &exp_ref,
+                                        label,
+                                    );
+
+                                    if existing_idx.is_some() {
+                                        log::debug!(
+                                            "record-ui: watch: refreshed existing row: {}",
+                                            name,
+                                        );
+                                    } else {
+                                        let insert_pos = row_index_by_path(&list_ref, &file_path)
+                                            .unwrap_or_default();
+                                        log::debug!(
+                                            "record-ui: watch: inserted new row at {}: {}",
+                                            insert_pos,
+                                            name,
+                                        );
                                     }
-                                    list_ref.insert(&new_row, insert_pos);
+                                }
+
+                                // ── Unhandled events ─────────────────────────
+                                other => {
                                     log::debug!(
-                                        "record-ui: watch: inserted new row at {}: {}",
-                                        insert_pos,
+                                        "record-ui: watch: unhandled event {:?} for: {}",
+                                        other,
                                         name,
                                     );
                                 }
-
-                                let count = count_list_rows(&list_ref);
-                                exp_ref.set_label(Some(&format!("{} ({})", label, count)));
                             }
+                        });
 
-                            // ── Unhandled events ─────────────────────────
-                            other => {
-                                log::debug!(
-                                    "record-ui: watch: unhandled event {:?} for: {}",
-                                    other,
-                                    name,
-                                );
-                            }
-                        }
-                    });
+                        monitors.borrow_mut().push(monitor);
+                    }
 
-                    monitors.borrow_mut().push(monitor);
+                    let mut dirs = Vec::new();
+                    collect_directories_recursive(dir, &mut dirs);
+                    for watched_dir in dirs {
+                        install_monitor(&watched_dir, label, ctx, list_fn, monitors);
+                    }
                 }
 
                 // Watch dictation cache directory
@@ -1032,6 +1214,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
 mod tests {
     use super::super::audio::{ogg_duration_secs, wav_duration_secs};
     use super::super::entries::{format_duration, format_size};
+    use super::{basename, collect_directories_recursive};
 
     #[test]
     fn test_format_duration_seconds() {
@@ -1067,6 +1250,41 @@ mod tests {
     fn test_format_size_megabytes() {
         assert_eq!(format_size(1_000_000), "1.0 MB");
         assert_eq!(format_size(15_500_000), "15.5 MB");
+    }
+
+    #[test]
+    fn test_basename_ignores_parent_directories() {
+        assert_eq!(
+            basename("/tmp/2026/04/2026-04-11T12-00-00.ogg"),
+            "2026-04-11T12-00-00.ogg"
+        );
+        assert_eq!(
+            basename("2026-04-11T12-00-00.ogg"),
+            "2026-04-11T12-00-00.ogg"
+        );
+    }
+
+    #[test]
+    fn test_collect_directories_recursive_includes_nested_subdirs() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        std::fs::create_dir_all(dir.path().join("2026/04")).expect("create nested dirs");
+        std::fs::create_dir_all(dir.path().join("2025/12")).expect("create sibling dirs");
+        std::fs::write(dir.path().join("2026/04/clip.ogg"), b"ogg").expect("write sample file");
+
+        let mut dirs = Vec::new();
+        collect_directories_recursive(dir.path(), &mut dirs);
+        dirs.sort();
+
+        let mut expected = vec![
+            dir.path().to_path_buf(),
+            dir.path().join("2025"),
+            dir.path().join("2025/12"),
+            dir.path().join("2026"),
+            dir.path().join("2026/04"),
+        ];
+        expected.sort();
+
+        assert_eq!(dirs, expected);
     }
 
     #[test]
