@@ -16,6 +16,7 @@ use super::render_util::{
     rms, PixelBuffer, RingBuffer, FFT_SIZE, FREQ_MAX, FREQ_NOISE_FLOOR, PEAK_DECAY, PEAK_FLOOR,
 };
 use crate::error::TalkError;
+use crate::telemetry::TranscriptionEvent;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -168,6 +169,7 @@ impl OverlayHandle {
     /// thread (GDK must be called from the main thread) and passed in.
     ///
     /// Returns `Err` if the X11 display cannot be opened.
+    #[allow(clippy::too_many_arguments)] // Overlay threading inherently needs many params
     pub fn new(
         viz: Option<crate::config::VizMode>,
         mono: bool,
@@ -176,6 +178,7 @@ impl OverlayHandle {
         silence_tx: Option<std::sync::mpsc::Sender<bool>>,
         pause_flag: Arc<std::sync::atomic::AtomicBool>,
         auto_pause: bool,
+        telemetry_rx: Option<tokio::sync::broadcast::Receiver<TranscriptionEvent>>,
     ) -> Result<Self, TalkError> {
         let geom = super::monitor::primary_monitor_geometry()?;
 
@@ -203,6 +206,7 @@ impl OverlayHandle {
                     silence_tx,
                     pause_flag,
                     auto_pause,
+                    telemetry_rx,
                 ) {
                     log::error!("overlay thread error: {}", e);
                 }
@@ -586,6 +590,122 @@ fn render_time_grid(
     }
 }
 
+// ── Phase layer rendering ───────────────────────────────────────────
+
+/// Network transcription phase as derived from [`TranscriptionEvent`]s.
+///
+/// The overlay maintains a simple state machine driven by events
+/// arriving from the telemetry broker.  Each variant maps to a
+/// distinct colour in the phase overlay layer drawn above the
+/// waterfall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// No HTTP activity in progress.
+    Idle,
+    /// `RequestStarted` received, waiting for first byte pull.
+    Connecting,
+    /// `ConnectionEstablished` received, body bytes flowing.
+    Uploading,
+    /// `UploadComplete` received, waiting for response headers.
+    WaitingResponse,
+    /// `ResponseHeaders` received, body arriving / JSON parsing.
+    Receiving,
+    /// `RequestCompleted { success: true }` received.
+    Done,
+    /// `RequestCompleted { success: false }` received.
+    Error,
+}
+
+impl Phase {
+    /// BGRA colour for this phase, or `None` for `Idle` (nothing
+    /// drawn).  Colours are chosen to stand out against the
+    /// monochrome waterfall without being garish.
+    fn color(self) -> Option<[u8; 4]> {
+        match self {
+            Self::Idle => None,
+            // dim blue  RGB(80,130,200) → BGRA
+            Self::Connecting => Some([200, 130, 80, 255]),
+            // bright blue  RGB(60,170,255)
+            Self::Uploading => Some([255, 170, 60, 255]),
+            // amber  RGB(255,180,50)
+            Self::WaitingResponse => Some([50, 180, 255, 255]),
+            // teal  RGB(60,200,180)
+            Self::Receiving => Some([180, 200, 60, 255]),
+            // green  RGB(60,255,110)
+            Self::Done => Some([110, 255, 60, 255]),
+            // red  RGB(200,40,40)
+            Self::Error => Some([40, 40, 200, 255]),
+        }
+    }
+
+    /// Advance the state machine given a telemetry event.
+    fn advance(self, event: &TranscriptionEvent) -> Self {
+        match event {
+            TranscriptionEvent::RequestStarted { .. } => Self::Connecting,
+            TranscriptionEvent::ConnectionEstablished { .. } => Self::Uploading,
+            TranscriptionEvent::UploadComplete { .. } => Self::WaitingResponse,
+            TranscriptionEvent::ResponseHeaders { .. } => Self::Receiving,
+            TranscriptionEvent::RequestCompleted { success: true, .. } => Self::Done,
+            TranscriptionEvent::RequestCompleted { success: false, .. } => Self::Error,
+            TranscriptionEvent::RetryScheduled { .. } => Self::Connecting,
+            TranscriptionEvent::PasteStarted { .. } => Self::Done, // green during paste
+            TranscriptionEvent::Done { .. } | TranscriptionEvent::PasteCompleted { .. } => {
+                Self::Idle
+            }
+            TranscriptionEvent::Failed { .. } => Self::Error,
+            // Upload/download progress don't change the phase.
+            _ => self,
+        }
+    }
+}
+
+/// Height of the phase colour line drawn at the top of the spec area.
+const PHASE_LINE_HEIGHT: usize = 2;
+
+/// Render the phase overlay: a thin horizontal colour band at the
+/// top of the spectrogram area, one colour per column, right-aligned
+/// in the same way as the waterfall.
+///
+/// Columns without a phase (`None`) are skipped — nothing drawn,
+/// the waterfall underneath is unobscured.  Columns with a phase
+/// get a solid-colour stripe of [`PHASE_LINE_HEIGHT`] pixels drawn
+/// as a direct pixel overwrite (no alpha blend needed — the top
+/// rows of the spec area are almost always empty in practice).
+fn render_phase_line(
+    pb: &mut PixelBuffer,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    phase_history: &[Option<[u8; 4]>],
+) {
+    let n = phase_history.len();
+    if n == 0 || w == 0 {
+        return;
+    }
+
+    let num = n.min(w);
+
+    for col_idx in 0..num {
+        let color = match phase_history[n - num + col_idx] {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Right-align: newest column at `x0 + w - 1`.
+        let x = x0 + w - num + col_idx;
+        if x >= pb.width {
+            continue;
+        }
+
+        for dy in 0..PHASE_LINE_HEIGHT {
+            let y = y0 + dy;
+            if y < pb.height {
+                pb.set_pixel(x, y, color);
+            }
+        }
+    }
+}
+
 /// Draw the red dot with brightness driven by current volume level.
 /// Clear a circle to `BG_COLOR` (transparent), creating a gap between
 /// the red dot and the spectrogram underneath.
@@ -884,6 +1004,19 @@ fn render_listening_text(
     render_badge_text(pb, font, "LISTENING", color, x0, y0, w, h);
 }
 
+/// Render "TRANSCRIBING" text in light blue, centred in the SPEC area.
+fn render_transcribing_text(
+    pb: &mut PixelBuffer,
+    font: &fontdue::Font,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) {
+    let color: [u8; 4] = [0xFF, 0xCC, 0x66, 0xFF]; // light blue BGRA
+    render_badge_text(pb, font, "TRANSCRIBING", color, x0, y0, w, h);
+}
+
 // ── Static PNG window (transcribing) ─────────────────────────────────
 
 /// Apply a 1-bit shape mask based on the image alpha channel.
@@ -1038,6 +1171,7 @@ fn overlay_thread(
     silence_tx: Option<std::sync::mpsc::Sender<bool>>,
     pause_flag: Arc<std::sync::atomic::AtomicBool>,
     auto_pause: bool,
+    mut telemetry_rx: Option<tokio::sync::broadcast::Receiver<TranscriptionEvent>>,
 ) -> Result<(), TalkError> {
     let (conn, screen_num) = x11rb::connect(None)
         .map_err(|e| TalkError::Config(format!("failed to connect to X11: {}", e)))?;
@@ -1122,6 +1256,22 @@ fn overlay_thread(
     // waterfall's temporal resolution from the 60 fps render rate.
     let mut column_frame_counter: u32 = 0;
 
+    // ── Phase overlay state ──────────────────────��───────────────
+    //
+    // Parallel to `spectrogram_history`: for each column we store
+    // the colour of the HTTP phase that was active when the column
+    // was pushed.  `None` = no HTTP activity (normal audio).
+    // The state machine is driven by events from the telemetry
+    // broker, drained non-blockingly every frame.
+    let mut current_phase: Phase = Phase::Idle;
+    let mut phase_history: Vec<Option<[u8; 4]>> = Vec::new();
+
+    // True when the recording has ended and the HTTP transcription is
+    // in flight.  The render loop keeps running: empty columns are
+    // pushed so the waterfall continues to scroll, and the phase
+    // colour layer shows the HTTP lifecycle on top.
+    let mut is_transcribing: bool = false;
+
     // Running total of columns ever pushed into the spectrogram
     // history since the last reset (`spectrogram_history.clear()`).
     // Used by the time-grid overlay to compute absolute column
@@ -1192,8 +1342,11 @@ fn overlay_thread(
                     current_window = Some(win);
                     current_gc = Some(gc);
                     is_recording = true;
+                    is_transcribing = false;
                     spectrogram_history.clear();
+                    phase_history.clear();
                     columns_pushed_total = 0;
+                    current_phase = Phase::Idle;
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
                     spectrum_peak = PEAK_FLOOR;
@@ -1245,8 +1398,11 @@ fn overlay_thread(
         loop {
             match rx.try_recv() {
                 Ok(Command::Show(IndicatorKind::Recording)) => {
+                    is_transcribing = false;
                     spectrogram_history.clear();
+                    phase_history.clear();
                     columns_pushed_total = 0;
+                    current_phase = Phase::Idle;
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
                     spectrum_peak = PEAK_FLOOR;
@@ -1262,19 +1418,12 @@ fn overlay_thread(
                     pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(Command::Show(IndicatorKind::Transcribing)) => {
-                    destroy_current(&conn, &mut current_window, &mut current_gc);
-                    is_recording = false;
-                    show_transcribing(
-                        &conn,
-                        screen,
-                        root,
-                        &transcribing_img,
-                        mon_x,
-                        mon_y,
-                        mon_w,
-                        &mut current_window,
-                    )?;
-                    break;
+                    // Keep the render loop running instead of
+                    // switching to the static PNG.  The waterfall
+                    // continues to scroll (with empty columns since
+                    // recording has stopped), and the phase colour
+                    // layer renders the HTTP lifecycle on top.
+                    is_transcribing = true;
                 }
                 Ok(Command::Hide) => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
@@ -1296,6 +1445,31 @@ fn overlay_thread(
         }
         if !is_recording {
             continue;
+        }
+
+        // ── Drain telemetry events (non-blocking) ───────────
+        //
+        // The overlay thread is a plain OS thread (not async).
+        // We use `try_recv()` to drain all pending events from
+        // the broadcast channel without blocking the render loop.
+        if let Some(ref mut trx) = telemetry_rx {
+            loop {
+                match trx.try_recv() {
+                    Ok(event) => {
+                        current_phase = current_phase.advance(&event);
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                        log::debug!("overlay telemetry: skipped {} lagged events", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        // Sender dropped — no more events coming.
+                        telemetry_rx = None;
+                        break;
+                    }
+                }
+            }
         }
 
         // ── Read audio and compute visualization frame ──────
@@ -1457,7 +1631,7 @@ fn overlay_thread(
                 use crate::config::VizMode;
                 match mode {
                     VizMode::Waterfall => {
-                        let column = if auto_paused {
+                        let column = if auto_paused || is_transcribing {
                             // Empty column → no visible content, but the
                             // column still advances so the time axis
                             // keeps moving and the spectrogram "hole"
@@ -1477,9 +1651,13 @@ fn overlay_thread(
                         }
                     }
                     VizMode::Amplitude => {
-                        // 0.0 during pause so the amplitude history
-                        // also shows a visible gap.
-                        let val = if auto_paused { 0.0 } else { frame_rms };
+                        // 0.0 during pause / transcribing so the
+                        // history also shows a visible gap.
+                        let val = if auto_paused || is_transcribing {
+                            0.0
+                        } else {
+                            frame_rms
+                        };
                         amp_history.push(val);
                         if amp_history.len() > amp_max_frames {
                             amp_history.drain(..amp_history.len() - amp_max_frames);
@@ -1496,6 +1674,14 @@ fn overlay_thread(
             // overlay uses to space its vertical marks one per
             // wall-clock second.
             columns_pushed_total = columns_pushed_total.wrapping_add(1);
+
+            // Record the current phase colour alongside the
+            // spectrogram column so the phase overlay line stays
+            // perfectly aligned with the waterfall time axis.
+            phase_history.push(current_phase.color());
+            if phase_history.len() > SPEC_W {
+                phase_history.drain(..phase_history.len() - SPEC_W);
+            }
         }
 
         // ── Render badge ─────────────────────────────────────
@@ -1510,6 +1696,73 @@ fn overlay_thread(
             }
             clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
             draw_prohibit_icon(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX);
+        } else if is_transcribing {
+            // ── TRANSCRIBING mode: dimmed waterfall + phase ───
+            //
+            // Same visual treatment as auto-pause (dimmed waterfall
+            // keeps scrolling, empty columns create the "hole")
+            // but the phase colour layer on top now shows the HTTP
+            // lifecycle — connecting, uploading, waiting, receiving.
+            if let Some(mode) = viz {
+                use crate::config::VizMode;
+                match mode {
+                    VizMode::Waterfall => {
+                        render_spectrogram(
+                            &mut pb,
+                            &spectrogram_history,
+                            SPEC_LEFT,
+                            SPEC_TOP,
+                            SPEC_W,
+                            SPEC_H,
+                            spec_peak,
+                            mono_palette,
+                            DIM_FACTOR_PAUSED,
+                        );
+                    }
+                    VizMode::Amplitude => {
+                        render_amplitude_badge(
+                            &mut pb,
+                            &amp_history,
+                            amp_peak,
+                            SPEC_LEFT,
+                            SPEC_TOP,
+                            SPEC_W,
+                            SPEC_H,
+                            mono_palette,
+                            DIM_FACTOR_PAUSED,
+                        );
+                    }
+                    VizMode::Spectrum => {
+                        render_spectrum_badge(
+                            &mut pb,
+                            &magnitudes,
+                            spectrum_peak,
+                            SPEC_LEFT,
+                            SPEC_TOP,
+                            SPEC_W,
+                            SPEC_H,
+                            mono_palette,
+                            DIM_FACTOR_PAUSED,
+                        );
+                    }
+                }
+            }
+            render_time_grid(
+                &mut pb,
+                SPEC_LEFT,
+                SPEC_TOP,
+                SPEC_W,
+                SPEC_H,
+                columns_pushed_total.saturating_sub(spectrogram_history.len() as u64),
+                spectrogram_history.len(),
+                COLUMNS_PER_GRID_MARK,
+            );
+            render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            // "TRANSCRIBING" text over the dimmed waterfall (same
+            // pattern as "LISTENING" during auto-pause).
+            if let Some(ref f) = badge_font {
+                render_transcribing_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+            }
         } else if auto_paused {
             // ── AUTO-PAUSE mode: dimmed waterfall + LISTENING ─
             //
@@ -1576,6 +1829,7 @@ fn overlay_thread(
                 spectrogram_history.len(),
                 COLUMNS_PER_GRID_MARK,
             );
+            render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
             if let Some(ref f) = badge_font {
                 render_listening_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
             }
@@ -1641,6 +1895,7 @@ fn overlay_thread(
                 spectrogram_history.len(),
                 COLUMNS_PER_GRID_MARK,
             );
+            render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
 
             let vol_norm = if rms_peak > PEAK_FLOOR {
                 (frame_rms / rms_peak).clamp(0.0, 1.0)
