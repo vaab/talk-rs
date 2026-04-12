@@ -203,6 +203,14 @@ pub trait BatchTranscriber: Send + Sync {
         audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
         file_name: &str,
     ) -> Result<TranscriptionResult, TalkError>;
+
+    /// Inject a telemetry sink for event emission during HTTP calls.
+    ///
+    /// The default implementation is a no-op — override in concrete
+    /// types that support telemetry.  Called by the orchestrator
+    /// (`dictate/mod.rs`) right after construction, before any
+    /// `transcribe_*` method is invoked.
+    fn set_sink(&mut self, _sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) {}
 }
 
 // ── Realtime trait ───────────────────────────────────────────────────

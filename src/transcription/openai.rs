@@ -15,12 +15,14 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs::File;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::http::{build_client, parse_u64_field, proportional_timeout};
 use super::BatchTranscriber;
+use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
 
 /// Default API base URL for the OpenAI API.
 pub(crate) const API_BASE: &str = "https://api.openai.com";
@@ -143,6 +145,8 @@ pub struct OpenAIBatchTranscriber {
     config: OpenAIConfig,
     /// API endpoint URL (can be overridden for testing).
     endpoint: String,
+    /// Telemetry event sink for HTTP lifecycle reporting.
+    sink: Arc<dyn TelemetrySink>,
 }
 
 impl OpenAIBatchTranscriber {
@@ -162,6 +166,7 @@ impl OpenAIBatchTranscriber {
             client: build_client()?,
             config,
             endpoint,
+            sink: Arc::new(NoOpSink),
         })
     }
 
@@ -177,12 +182,17 @@ impl OpenAIBatchTranscriber {
             client: build_client()?,
             config,
             endpoint,
+            sink: Arc::new(NoOpSink),
         })
     }
 }
 
 #[async_trait]
 impl BatchTranscriber for OpenAIBatchTranscriber {
+    fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
+        self.sink = sink;
+    }
+
     async fn validate(&self) -> Result<(), TalkError> {
         // Derive the API base URL from the transcription endpoint.
         // Production: "https://api.openai.com/v1/audio/transcriptions" → "https://api.openai.com"
@@ -244,6 +254,11 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             file_len / 1024
         );
 
+        self.sink.emit(TranscriptionEvent::RequestStarted {
+            endpoint: self.endpoint.clone(),
+            t: Instant::now(),
+        });
+
         let started = Instant::now();
         let response = self
             .client
@@ -254,16 +269,28 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             .send()
             .await
             .map_err(|err| {
+                self.sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
                 TalkError::Transcription(format!("Failed to send request to OpenAI API: {:#}", err))
             })?;
 
         let request_latency_ms = started.elapsed().as_millis() as u64;
+        self.sink.emit(TranscriptionEvent::ResponseHeaders {
+            status: response.status().as_u16(),
+            t: Instant::now(),
+        });
         let headers = response.headers().clone();
 
         // Check response status
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            self.sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
             return Err(TalkError::Transcription(format!(
                 "OpenAI API error ({}): {}",
                 status, body
@@ -272,8 +299,17 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
 
         // Parse JSON response
         let openai_response: OpenAIResponse = response.json().await.map_err(|err| {
+            self.sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
             TalkError::Transcription(format!("Failed to parse OpenAI API response: {}", err))
         })?;
+
+        self.sink.emit(TranscriptionEvent::RequestCompleted {
+            success: true,
+            t: Instant::now(),
+        });
 
         let token_usage = openai_response
             .usage

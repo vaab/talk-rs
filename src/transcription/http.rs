@@ -125,11 +125,6 @@ pub(crate) fn proportional_timeout(audio_bytes: u64) -> Duration {
 /// in-memory buffer.  Large enough to amortize per-poll overhead but
 /// small enough to give responsive upload-progress updates to the
 /// telemetry sink.
-// `dead_code`: wired into mistral.rs / openai.rs in sub-phase 1C.
-// The unit tests below already exercise the full API, but tests
-// are a separate compile target, so the lib target still sees it
-// as unused until the production paths reach this module.
-#[allow(dead_code)]
 const PROGRESS_BODY_CHUNK_BYTES: usize = 8 * 1024;
 
 /// A [`futures::Stream`] that yields the contents of a `Vec<u8>` in
@@ -162,9 +157,6 @@ const PROGRESS_BODY_CHUNK_BYTES: usize = 8 * 1024;
 /// freely.  The sink is called from whatever thread polls the
 /// stream, which for reqwest 0.13 is the Tokio runtime's worker
 /// threads.  Implementations of [`TelemetrySink`] must be `Sync`.
-// `dead_code`: see note on `PROGRESS_BODY_CHUNK_BYTES` above —
-// removed when sub-phase 1C wires this into mistral.rs / openai.rs.
-#[allow(dead_code)]
 pub(crate) struct ProgressBody {
     /// Raw bytes to be streamed.  Owned so the stream has a stable
     /// lifetime independent of any external buffer.
@@ -186,8 +178,6 @@ pub(crate) struct ProgressBody {
     emitted_complete: bool,
 }
 
-// `dead_code`: see note on `PROGRESS_BODY_CHUNK_BYTES` above.
-#[allow(dead_code)]
 impl ProgressBody {
     /// Create a new stream that will yield `data` in chunks and
     /// report progress to `sink`.
