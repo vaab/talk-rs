@@ -328,6 +328,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // recording; the audio tee stops forwarding samples downstream.
     let pause_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Create the telemetry broadcast sink.  Transcription producers
+    // emit events into this channel; the overlay thread subscribes
+    // to receive them for the phase-colour layer.  The broker is
+    // created before the overlay so the receiver can be passed in.
+    let broker = std::sync::Arc::new(BroadcastSink::new(256));
+    let sink: std::sync::Arc<dyn TelemetrySink> = broker.clone();
+
     // Initialize overlay (visual indicator on X11).
     // Created here (after capture_rate is known) so we can pass
     // the shared ring buffer and sample rate.
@@ -335,6 +342,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         log::debug!("visual overlay disabled");
         None
     } else {
+        let telemetry_rx = broker.subscribe();
         match OverlayHandle::new(
             viz_mode,
             opts.mono,
@@ -343,6 +351,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             Some(silence_tx),
             pause_flag.clone(),
             !opts.no_auto_pause,
+            Some(telemetry_rx),
         ) {
             Ok(h) => {
                 log::debug!(
@@ -513,14 +522,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         result
     } else {
         // Batch mode (default): capture audio, encode, then transcribe.
-
-        // Create the telemetry broadcast: the transcriber emits
-        // events into this sink, and any consumer (overlay in sub-
-        // phase 1D) can subscribe to the broker to receive them.
-        // Until a consumer subscribes, events are silently dropped.
-        let _broker = std::sync::Arc::new(BroadcastSink::new(256));
-        let sink: std::sync::Arc<dyn TelemetrySink> = _broker.clone();
-
         let mut transcriber = transcription::create_batch_transcriber(
             &config,
             provider,
