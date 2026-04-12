@@ -46,6 +46,11 @@ pub struct TranscriptionResult {
     /// Speaker-diarized segments, when diarization was requested and
     /// supported by the provider.
     pub diarization: Option<Vec<DiarizationSegment>>,
+    /// Time-localized transcript segments, when the provider returned
+    /// them.  Independent of diarization — a diarized response may
+    /// populate both `diarization` and `segments`.  Used to reconstruct
+    /// timelines in downstream consumers such as `activity-memo`.
+    pub segments: Option<Vec<TranscriptSegment>>,
 }
 
 /// A single speaker-attributed segment from diarization.
@@ -62,6 +67,57 @@ pub struct DiarizationSegment {
     pub end: f64,
     /// Transcribed text for this segment.
     pub text: String,
+}
+
+/// A time-localized transcript segment without speaker attribution.
+///
+/// Provider-agnostic: each batch/realtime backend maps its native
+/// segment representation into this shape.  Unlike `DiarizationSegment`,
+/// a `TranscriptSegment` does not carry a speaker identifier — it is
+/// just a start/end window around a piece of text, suitable for
+/// timeline reconstruction and sub-minute granularity in consumers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptSegment {
+    /// Segment start time in seconds, from the beginning of the recording.
+    pub start: f64,
+    /// Segment end time in seconds, from the beginning of the recording.
+    pub end: f64,
+    /// Transcribed text for this segment.
+    pub text: String,
+}
+
+/// Extract generic transcript segments from a raw provider response.
+///
+/// Accepts a slice of `serde_json::Value` (as returned by both Mistral
+/// Voxtral and OpenAI Whisper under `verbose_json`) and pulls out
+/// `start`, `end`, and `text` from every segment that has them.
+/// Segments with missing timing or empty text are skipped.  Returns
+/// `None` when no usable segments survive the filter so that call
+/// sites can leave `TranscriptionResult.segments` as `None` rather
+/// than `Some(vec![])`.
+pub(crate) fn parse_transcript_segments(
+    segments: &[serde_json::Value],
+) -> Option<Vec<TranscriptSegment>> {
+    let mut result = Vec::new();
+    for seg in segments {
+        let start = seg.get("start").and_then(|v| v.as_f64());
+        let end = seg.get("end").and_then(|v| v.as_f64());
+        let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        if let (Some(start), Some(end)) = (start, end) {
+            if !text.is_empty() {
+                result.push(TranscriptSegment {
+                    start,
+                    end,
+                    text: text.to_string(),
+                });
+            }
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 /// Format transcription output, using diarized segments when available.
@@ -396,6 +452,7 @@ impl BatchTranscriber for MockBatchTranscriber {
             text: self.response_text.clone(),
             metadata: TranscriptionMetadata::default(),
             diarization: None,
+            segments: None,
         })
     }
 
@@ -410,6 +467,7 @@ impl BatchTranscriber for MockBatchTranscriber {
             text: self.response_text.clone(),
             metadata: TranscriptionMetadata::default(),
             diarization: None,
+            segments: None,
         })
     }
 }
@@ -473,6 +531,7 @@ mod tests {
             text: "Hello world.".to_string(),
             metadata: Default::default(),
             diarization: None,
+            segments: None,
         };
         assert_eq!(format_transcription_output(&result), "Hello world.");
     }
@@ -496,6 +555,7 @@ mod tests {
                     text: "I am fine.".to_string(),
                 },
             ]),
+            segments: None,
         };
         assert_eq!(
             format_transcription_output(&result),
@@ -528,6 +588,7 @@ mod tests {
                     text: "I am fine.".to_string(),
                 },
             ]),
+            segments: None,
         };
         assert_eq!(
             format_transcription_output(&result),
@@ -541,8 +602,109 @@ mod tests {
             text: "Hello world.".to_string(),
             metadata: Default::default(),
             diarization: Some(vec![]),
+            segments: None,
         };
         // Empty segments → fall back to plain text
         assert_eq!(format_transcription_output(&result), "Hello world.");
+    }
+
+    #[test]
+    fn test_parse_transcript_segments_voxtral_shape() {
+        // Real Voxtral response shape: segments with start/end/text
+        // and speaker_id: null when diarization is not requested.
+        let raw = serde_json::json!([
+            {
+                "text": "Du coup je viens de corriger.",
+                "start": 1.2,
+                "end": 10.7,
+                "type": "transcription_segment",
+                "speaker_id": null
+            },
+            {
+                "text": " Le premier c'était un bug.",
+                "start": 11.9,
+                "end": 24.5,
+                "type": "transcription_segment",
+                "speaker_id": null
+            }
+        ]);
+        let slice = raw.as_array().expect("array literal is array");
+        let parsed = parse_transcript_segments(slice).expect("some segments");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].start, 1.2);
+        assert_eq!(parsed[0].end, 10.7);
+        assert_eq!(parsed[0].text, "Du coup je viens de corriger.");
+        assert_eq!(parsed[1].start, 11.9);
+        assert_eq!(parsed[1].end, 24.5);
+    }
+
+    #[test]
+    fn test_parse_transcript_segments_whisper_verbose_json_shape() {
+        // Whisper verbose_json shape adds extra fields we ignore:
+        // `id`, `seek`, `tokens`, `temperature`, `avg_logprob`,
+        // `compression_ratio`, `no_speech_prob`.  Only start/end/text
+        // matter for us.
+        let raw = serde_json::json!([
+            {
+                "id": 0,
+                "seek": 0,
+                "start": 0.0,
+                "end": 3.2,
+                "text": " Hello world.",
+                "tokens": [50364, 2425, 1002, 13, 50524],
+                "temperature": 0.0,
+                "avg_logprob": -0.3,
+                "compression_ratio": 1.1,
+                "no_speech_prob": 0.01
+            }
+        ]);
+        let slice = raw.as_array().expect("array literal is array");
+        let parsed = parse_transcript_segments(slice).expect("some segments");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].start, 0.0);
+        assert_eq!(parsed[0].end, 3.2);
+        assert_eq!(parsed[0].text, " Hello world.");
+    }
+
+    #[test]
+    fn test_parse_transcript_segments_skips_malformed() {
+        // Segments without start/end, or with empty text, are skipped.
+        // Returns None when nothing usable survives.
+        let raw = serde_json::json!([
+            { "text": "no timing here" },
+            { "start": 0.0, "text": "no end here" },
+            { "start": 0.0, "end": 1.0, "text": "" },
+            { "start": 5.0, "end": 6.0 }
+        ]);
+        let slice = raw.as_array().expect("array literal is array");
+        assert!(parse_transcript_segments(slice).is_none());
+    }
+
+    #[test]
+    fn test_parse_transcript_segments_mixed_good_and_bad() {
+        // One good segment among several malformed ones survives.
+        let raw = serde_json::json!([
+            { "text": "no timing" },
+            { "start": 1.0, "end": 2.5, "text": "valid" },
+            { "start": 0.0, "end": 1.0, "text": "" }
+        ]);
+        let slice = raw.as_array().expect("array literal is array");
+        let parsed = parse_transcript_segments(slice).expect("some segments");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].text, "valid");
+    }
+
+    #[test]
+    fn test_parse_transcript_segments_empty_input() {
+        let parsed = parse_transcript_segments(&[]);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_transcription_result_default_has_no_segments() {
+        let result = TranscriptionResult::default();
+        assert!(result.segments.is_none());
+        assert!(result.diarization.is_none());
+        assert_eq!(result.text, "");
     }
 }

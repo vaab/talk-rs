@@ -395,10 +395,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         None
     } else {
         player.as_ref().map(|p| {
-            p.start_boop_loop(
-                std::time::Duration::from_millis(boop_interval_ms),
-                Some(suppress_boop.clone()),
-            )
+            let suppress = Some(suppress_boop.clone());
+            p.start_boop_loop(std::time::Duration::from_millis(boop_interval_ms), suppress)
         })
     };
 
@@ -799,6 +797,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     let text = crate::transcription::format_transcription_output(&result)
         .trim()
         .to_string();
+    let segments = result.segments;
     let metadata = result.metadata;
 
     // Write recording cache metadata and rotate old entries.
@@ -814,6 +813,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         &text,
         cache_filename,
         &metadata,
+        segments.as_deref(),
     );
     if let Err(ref e) = cache_meta_path {
         log::warn!("failed to write recording metadata: {}", e);

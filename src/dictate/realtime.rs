@@ -15,7 +15,8 @@ use crate::config::{AudioConfig, Config, Provider};
 use crate::error::TalkError;
 use crate::transcription::{
     self, MistralProviderMetadata, OpenAIProviderMetadata, OpenAIRealtimeMetadata,
-    ProviderSpecificMetadata, TranscriptionEvent, TranscriptionMetadata, TranscriptionResult,
+    ProviderSpecificMetadata, TranscriptSegment, TranscriptionEvent, TranscriptionMetadata,
+    TranscriptionResult,
 };
 use crate::x11::visualizer::VisualizerHandle;
 use std::path::PathBuf;
@@ -258,6 +259,7 @@ pub(crate) async fn dictate_realtime(
 
     // Completed sentences/phrases emitted so far.
     let mut segments: Vec<String> = Vec::new();
+    let mut timed_segments: Vec<TranscriptSegment> = Vec::new();
     // Buffer for the current in-progress phrase (live TextDelta).
     let mut current_line = String::new();
     let mut detected_language: Option<String> = None;
@@ -326,13 +328,20 @@ pub(crate) async fn dictate_realtime(
                             }
                         }
                     }
-                    Some(TranscriptionEvent::SegmentDelta { text, .. }) => {
+                    Some(TranscriptionEvent::SegmentDelta { text, start, end }) => {
                         bump("segment_delta", &mut event_counts);
                         api_segment_count += 1;
                         // If the API sends segment events, use them as
                         // authoritative sentence boundaries.
                         let segment_text = text.trim().to_string();
                         if !segment_text.is_empty() {
+                            if let (Some(start), Some(end)) = (start, end) {
+                                timed_segments.push(TranscriptSegment {
+                                    start,
+                                    end,
+                                    text: segment_text.clone(),
+                                });
+                            }
                             println!("{}", segment_text);
                             if let Some(ref tx) = segment_tx {
                                 let _ = tx.send(segment_text.clone()).await;
@@ -571,6 +580,11 @@ pub(crate) async fn dictate_realtime(
             provider_specific,
         },
         diarization: None,
+        segments: if timed_segments.is_empty() {
+            None
+        } else {
+            Some(timed_segments)
+        },
     })
 }
 

@@ -1,0 +1,27 @@
+{
+  "text": "Hello world. This is a test.",
+  "language": "en",
+  "model": "voxtral-mini-2507",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 1.5,
+      "text": "Hello world.",
+      "type": "transcription_segment",
+      "speaker_id": null
+    },
+    {
+      "start": 2.0,
+      "end": 3.8,
+      "text": " This is a test.",
+      "type": "transcription_segment",
+      "speaker_id": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 100,
+    "completion_tokens": 20,
+    "total_tokens": 120,
+    "prompt_audio_seconds": 3.8
+  }
+}

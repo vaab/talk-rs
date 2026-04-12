@@ -12,7 +12,9 @@ use crate::config::{Config, Provider};
 use crate::error::TalkError;
 use crate::paste::paste_text_to_target;
 use crate::recording_cache;
-use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber, TranscriptionMetadata};
+use crate::transcription::{
+    self, BatchTranscriber, RealtimeTranscriber, TranscriptSegment, TranscriptionMetadata,
+};
 use crate::x11::x11_centre_and_raise;
 use std::path::{Path, PathBuf};
 
@@ -44,6 +46,7 @@ pub(super) fn write_recording_metadata(
     model: &str,
     streaming: bool,
     text: &str,
+    segments: Option<&[TranscriptSegment]>,
 ) {
     let stem = audio_path
         .file_stem()
@@ -76,6 +79,7 @@ pub(super) fn write_recording_metadata(
             text,
             audio_filename,
             &TranscriptionMetadata::default(),
+            segments,
         ) {
             log::warn!("failed to write recording metadata from picker: {}", e);
         }
@@ -99,6 +103,7 @@ pub(super) fn write_recording_metadata(
             timestamp: stem.to_string(),
             metadata: None,
             provider_api: None,
+            segments: recording_cache::common_segments_from_result(segments),
         };
         let yaml = match serde_yaml::to_string(&meta) {
             Ok(y) => y,
@@ -357,6 +362,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         &selection.model,
         selection.streaming,
         &selection.text,
+        selection.segments.as_deref(),
     );
 
     // If the user selected the cached entry, nothing to do — the

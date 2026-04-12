@@ -6,7 +6,7 @@
 
 use crate::config::{Config, Provider};
 use crate::error::TalkError;
-use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber};
+use crate::transcription::{self, BatchTranscriber, RealtimeTranscriber, TranscriptSegment};
 use std::path::PathBuf;
 
 use super::backend::{run_realtime_transcription, spawn_transcription};
@@ -23,6 +23,7 @@ pub(super) struct PickerCandidate {
     provider: Provider,
     model: String,
     text: String,
+    segments: Option<Vec<TranscriptSegment>>,
     /// When set, the candidate failed and this is the error message.
     error: Option<String>,
     /// Whether this candidate came from a realtime (streaming) transcriber.
@@ -36,11 +37,13 @@ impl PickerCandidate {
         model: String,
         text: String,
         streaming: bool,
+        segments: Option<Vec<TranscriptSegment>>,
     ) -> Self {
         Self {
             provider,
             model,
             text,
+            segments,
             error: None,
             streaming,
         }
@@ -57,6 +60,7 @@ impl PickerCandidate {
             provider,
             model,
             text: String::new(),
+            segments: None,
             error: Some(message),
             streaming,
         }
@@ -87,6 +91,7 @@ pub(super) struct PickerSelection {
     pub(super) provider: Provider,
     pub(super) model: String,
     pub(super) text: String,
+    pub(super) segments: Option<Vec<TranscriptSegment>>,
     pub(super) is_cached: bool,
     pub(super) streaming: bool,
 }
@@ -228,6 +233,7 @@ pub(super) async fn pick_with_streaming_gtk(
         bool,
         bool,
         bool,
+        Option<Vec<TranscriptSegment>>,
     )>::new()));
     let results_for_gtk = results.clone();
 
@@ -715,7 +721,15 @@ pub(super) async fn pick_with_streaming_gtk(
         let main_loop = glib::MainLoop::new(None, false);
         let sel_sender: Rc<RefCell<Option<tokio::sync::oneshot::Sender<Option<usize>>>>> =
             Rc::new(RefCell::new(Some(sel_tx)));
-        type CandidateList = Vec<(Provider, String, String, bool, bool, bool)>;
+        type CandidateList = Vec<(
+            Provider,
+            String,
+            String,
+            bool,
+            bool,
+            bool,
+            Option<Vec<TranscriptSegment>>,
+        )>;
         let local_candidates: Rc<RefCell<CandidateList>> = Rc::new(RefCell::new(Vec::new()));
         // Transcript cells — used to swap spinner → label when results arrive.
         let transcript_cells: Rc<RefCell<Vec<gtk4::Box>>> = Rc::new(RefCell::new(Vec::new()));
@@ -775,7 +789,14 @@ pub(super) async fn pick_with_streaming_gtk(
                 return;
             }
             let (provider, ref model, streaming) = ctx.current;
-            super::write_recording_metadata(&ctx.audio_path, provider, model, streaming, &text);
+            super::write_recording_metadata(
+                &ctx.audio_path,
+                provider,
+                model,
+                streaming,
+                &text,
+                None,
+            );
         }
 
         /// Schedule a debounced save: cancel any pending timer, start a
@@ -895,6 +916,7 @@ pub(super) async fn pick_with_streaming_gtk(
                 *is_primary,
                 false,
                 *streaming,
+                None,
             ));
             transcript_cells.borrow_mut().push(cell);
             raw_texts.borrow_mut().push(text.clone());
@@ -919,6 +941,7 @@ pub(super) async fn pick_with_streaming_gtk(
                 false,
                 false,
                 false,
+                None,
             ));
             transcript_cells.borrow_mut().push(cell);
             raw_texts.borrow_mut().push(String::new());
@@ -943,6 +966,7 @@ pub(super) async fn pick_with_streaming_gtk(
                 false,
                 false,
                 true,
+                None,
             ));
             transcript_cells.borrow_mut().push(cell);
             raw_texts.borrow_mut().push(String::new());
@@ -970,7 +994,7 @@ pub(super) async fn pick_with_streaming_gtk(
                 transcribe_btn.connect_clicked(move |_| {
                     let idx = {
                         let cands = cands_ref.borrow();
-                        cands.iter().position(|(p, m, _, _, _, s)| {
+                        cands.iter().position(|(p, m, _, _, _, s, _)| {
                             *p == provider && *m == model && *s == streaming
                         })
                     };
@@ -1012,6 +1036,7 @@ pub(super) async fn pick_with_streaming_gtk(
                 false,
                 false,
                 *streaming,
+                None,
             ));
             deferred_indices.borrow_mut().insert(deferred_idx);
             transcript_cells.borrow_mut().push(cell);
@@ -1044,7 +1069,8 @@ pub(super) async fn pick_with_streaming_gtk(
                 if let Some(row) = row {
                     let idx = row.index() as usize;
                     let cands = cands_sel.borrow();
-                    if let Some((provider, model, text, _, is_error, streaming)) = cands.get(idx) {
+                    if let Some((provider, model, text, _, is_error, streaming, _)) = cands.get(idx)
+                    {
                         // Update current provider/model/streaming for metadata saves.
                         *ctx_ref.borrow_mut() = Some(MetaSaveCtx {
                             audio_path: audio_path_for_metadata.clone(),
@@ -1103,7 +1129,7 @@ pub(super) async fn pick_with_streaming_gtk(
         if let Some(row) = list.selected_row() {
             let idx = row.index() as usize;
             let cands = local_candidates.borrow();
-            if let Some((provider, model, text, _, is_error, streaming)) = cands.get(idx) {
+            if let Some((provider, model, text, _, is_error, streaming, _)) = cands.get(idx) {
                 if !text.is_empty() && !*is_error {
                     // Ensure metadata context is set before the first
                     // text-buffer write so the connect_changed handler
@@ -1148,7 +1174,7 @@ pub(super) async fn pick_with_streaming_gtk(
                 let ready = cands
                     .borrow()
                     .get(idx)
-                    .is_some_and(|(_, _, text, _, is_error, _)| !text.is_empty() && !is_error);
+                    .is_some_and(|(_, _, text, _, is_error, _, _)| !text.is_empty() && !is_error);
                 if ready {
                     // Use edited text-area content if available.
                     let edited = buf_confirm
@@ -1278,13 +1304,14 @@ pub(super) async fn pick_with_streaming_gtk(
                     let labels_ref = Rc::clone(&labels_for_err);
                     retry_btn.connect_clicked(move |_| {
                         let mut cands = cands_ref.borrow_mut();
-                        if let Some((provider, model, text, _, is_error, streaming)) =
+                        if let Some((provider, model, text, _, is_error, streaming, segments)) =
                             cands.get_mut(idx)
                         {
                             let _ = tx.send((*provider, model.clone(), *streaming));
                             // Reset row state.
                             text.clear();
                             *is_error = false;
+                            *segments = None;
                             // Replace error with spinner (batch) or
                             // empty label (realtime).
                             let is_streaming = *streaming;
@@ -1336,7 +1363,7 @@ pub(super) async fn pick_with_streaming_gtk(
                             // (provider, model, streaming).
                             let idx = {
                                 let cands = cands.borrow();
-                                cands.iter().position(|(p, m, _, _, _, s)| {
+                                cands.iter().position(|(p, m, _, _, _, s, _)| {
                                     *p == c.provider && *m == c.model && *s == c.streaming
                                 })
                             };
@@ -1357,6 +1384,7 @@ pub(super) async fn pick_with_streaming_gtk(
                                 } else {
                                     let mut cands = cands.borrow_mut();
                                     cands[idx].2 = c.text.clone();
+                                    cands[idx].6 = c.segments.clone();
                                     raw_poll.borrow_mut()[idx] = c.text.clone();
 
                                     // If this is the currently selected row and
@@ -1395,7 +1423,7 @@ pub(super) async fn pick_with_streaming_gtk(
                             // (provider, model, streaming=true).
                             let idx = {
                                 let cands = cands.borrow();
-                                cands.iter().position(|(p, m, _, _, _, s)| {
+                                cands.iter().position(|(p, m, _, _, _, s, _)| {
                                     *p == provider && *m == model && *s
                                 })
                             };
@@ -1445,7 +1473,7 @@ pub(super) async fn pick_with_streaming_gtk(
                                 let indices: Vec<usize> = cands
                                     .iter()
                                     .enumerate()
-                                    .filter(|(i, (_, _, text, _, is_error, streaming))| {
+                                    .filter(|(i, (_, _, text, _, is_error, streaming, _))| {
                                         text.is_empty()
                                             && !*is_error
                                             && !*streaming
@@ -1693,8 +1721,8 @@ pub(super) async fn pick_with_streaming_gtk(
             .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
         let to_cache: Vec<cache::CachedResult> = items
             .iter()
-            .filter(|(_, _, text, _, is_error, _)| !text.is_empty() && !*is_error)
-            .map(|(p, m, t, _, _, s)| cache::CachedResult {
+            .filter(|(_, _, text, _, is_error, _, _)| !text.is_empty() && !*is_error)
+            .map(|(p, m, t, _, _, s, _)| cache::CachedResult {
                 provider: p.to_string(),
                 model: m.clone(),
                 text: t.clone(),
@@ -1712,11 +1740,12 @@ pub(super) async fn pick_with_streaming_gtk(
                 .lock()
                 .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
             if idx < items.len() {
-                let (p, m, t, cached, _is_error, streaming) = items[idx].clone();
+                let (p, m, t, cached, _is_error, streaming, segments) = items[idx].clone();
                 Ok(Some(PickerSelection {
                     provider: p,
                     model: m,
                     text: t,
+                    segments,
                     is_cached: cached,
                     streaming,
                 }))
