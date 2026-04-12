@@ -822,15 +822,24 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Paste into focused application (batch mode only;
     // realtime mode pastes per-segment during recording)
     if !opts.realtime && !opts.no_paste {
-        // Hide transcribing overlay just before pasting.
-        if let Some(ref o) = overlay {
-            o.hide();
-        }
+        // Keep the overlay visible during paste so the phase layer
+        // continues to show.  Emit telemetry events so consumers
+        // can track the paste duration on the time axis.
+        sink.emit(TranscriptionEvent::PasteStarted {
+            t: std::time::Instant::now(),
+        });
         if let Some(t) = t_stop {
             log::info!("timing: stop +{}ms paste_start", t.elapsed().as_millis());
         }
         paste_text_to_target(target_window.as_ref(), &text, 0, paste_chunk_chars, t_stop).await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
+        sink.emit(TranscriptionEvent::PasteCompleted {
+            t: std::time::Instant::now(),
+        });
+        // Hide AFTER paste so the overlay stays visible throughout.
+        if let Some(ref o) = overlay {
+            o.hide();
+        }
     }
 
     // Print transcription to stdout (batch mode only;
