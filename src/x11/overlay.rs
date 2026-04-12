@@ -177,6 +177,10 @@ enum Command {
 pub struct OverlayHandle {
     tx: mpsc::Sender<Command>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Set to `true` by the overlay thread whenever it sees audio with
+    /// variance above the dead-signal threshold.  Stays `false` when
+    /// the recording was entirely dead signal (no live audio).
+    had_live_audio: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OverlayHandle {
@@ -221,6 +225,9 @@ impl OverlayHandle {
 
         let (tx, rx) = mpsc::channel();
 
+        let had_live_audio = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let had_live_audio_clone = Arc::clone(&had_live_audio);
+
         let thread = std::thread::Builder::new()
             .name("overlay".into())
             .spawn(move || {
@@ -235,6 +242,7 @@ impl OverlayHandle {
                     pause_flag,
                     auto_pause,
                     telemetry_rx,
+                    had_live_audio_clone,
                 ) {
                     log::error!("overlay thread error: {}", e);
                 }
@@ -244,6 +252,7 @@ impl OverlayHandle {
         Ok(Self {
             tx,
             thread: Some(thread),
+            had_live_audio,
         })
     }
 
@@ -255,6 +264,14 @@ impl OverlayHandle {
     /// Hide the indicator badge.
     pub fn hide(&self) {
         let _ = self.tx.send(Command::Hide);
+    }
+
+    /// Whether any frame with real audio variance was seen during the
+    /// current recording session.  Returns `false` when the mic was
+    /// dead the entire time (dead signal only).
+    pub fn had_live_audio(&self) -> bool {
+        self.had_live_audio
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1397,6 +1414,7 @@ fn overlay_thread(
     pause_flag: Arc<std::sync::atomic::AtomicBool>,
     auto_pause: bool,
     mut telemetry_rx: Option<tokio::sync::broadcast::Receiver<TranscriptionEvent>>,
+    had_live_audio: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), TalkError> {
     let (conn, screen_num) = x11rb::connect(None)
         .map_err(|e| TalkError::Config(format!("failed to connect to X11: {}", e)))?;
@@ -1649,6 +1667,7 @@ fn overlay_thread(
                     quiet_frames = 0;
                     auto_paused = false;
                     pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    had_live_audio.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 Command::Show(IndicatorKind::Transcribing) => {
@@ -1721,6 +1740,7 @@ fn overlay_thread(
                     quiet_frames = 0;
                     auto_paused = false;
                     pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    had_live_audio.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(Command::Show(IndicatorKind::Transcribing)) => {
                     // Keep the render loop running instead of
@@ -1853,10 +1873,14 @@ fn overlay_thread(
                 if let Some(ref tx) = silence_tx {
                     let _ = tx.send(false);
                 }
+                // Resume the recording pipeline — real audio is back.
+                pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             dead_signal_frames = 0;
             no_sound_active = false;
             silence_notified = false;
+            // We saw a frame with real audio variance.
+            had_live_audio.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         if dead_signal_frames >= DEAD_SIGNAL_TRIGGER_FRAMES {
             no_sound_active = true;
@@ -1864,6 +1888,9 @@ fn overlay_thread(
                 if let Some(ref tx) = silence_tx {
                     let _ = tx.send(true);
                 }
+                // Pause the recording pipeline so dead-signal frames
+                // are not forwarded to the OGG encoder / transcriber.
+                pause_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 silence_notified = true;
             }
         }
