@@ -87,6 +87,28 @@ const COLUMN_PERIOD_FRAMES: u32 = 2;
 /// pause icon on top at full brightness.
 const DIM_FACTOR_PAUSED: f32 = 0.3;
 
+/// Wall-clock interval between time-grid marks drawn over the
+/// waterfall.  One mark per second gives ~9 visible marks across the
+/// current `SPEC_W` at the slowed column rate — enough to read "how
+/// long ago did that happen" at a glance without crowding.
+///
+/// Grid marks behave just like any other event overlaid on the
+/// waterfall time axis: they appear at the right edge when emitted
+/// and scroll left with the audio columns they were emitted next to.
+const GRID_PERIOD_SECONDS: u64 = 1;
+
+/// Columns between two consecutive grid marks.  At 60 fps with
+/// `COLUMN_PERIOD_FRAMES = 2` the waterfall advances 30 cols/sec,
+/// so `GRID_PERIOD_SECONDS = 1` ⇒ one mark every 30 columns.
+const COLUMNS_PER_GRID_MARK: u64 = (FPS as u64 / COLUMN_PERIOD_FRAMES as u64) * GRID_PERIOD_SECONDS;
+
+/// Alpha-blend factor for time-grid dots.  Each drawn grid pixel is
+/// `(existing * (1 - GRID_BLEND_ALPHA) + yellow * GRID_BLEND_ALPHA)`,
+/// giving a visible time reference without washing out the waterfall
+/// content underneath.  Bumped to 0.6 after 0.3 proved too subtle to
+/// read at a glance against the full-brightness spectrogram.
+const GRID_BLEND_ALPHA: f32 = 0.6;
+
 /// Initial effective frequency ceiling; grows as higher harmonics appear.
 const FREQ_INITIAL_MAX: f32 = 320.0;
 
@@ -463,6 +485,103 @@ fn render_spectrum_badge(
 
         for dy in 0..bar_height {
             pb.set_pixel(bar_x, bar_y + dy, color);
+        }
+    }
+}
+
+/// Draw the time grid: vertical dotted yellow lines over the
+/// spectrogram area, one line per [`GRID_PERIOD_SECONDS`]
+/// wall-clock second, alpha-blended with the existing pixel
+/// contents so they remain visible through whatever's underneath.
+///
+/// # Model
+///
+/// Grid marks behave exactly like any other event on the waterfall
+/// time axis — when a new column is pushed whose absolute index
+/// (since the last history reset) is a multiple of
+/// [`COLUMNS_PER_GRID_MARK`], that column becomes a grid column.
+/// As the history scrolls left, the grid columns scroll with it
+/// automatically because their position in the visible window is
+/// determined by the absolute index rather than by a fixed screen
+/// coordinate.
+///
+/// # Arguments
+///
+/// * `first_visible_abs_idx` — the absolute column index of the
+///   oldest column currently in the spectrogram history
+///   (`columns_pushed_total - spectrogram_history.len() as u64`).
+///   Used so the caller does not need to know how to compute the
+///   right-alignment offset.
+/// * `num_visible_cols` — number of columns currently held in the
+///   spectrogram history (`spectrogram_history.len()`).  The grid
+///   function uses this to right-align the grid marks exactly the
+///   same way [`render_spectrogram`] right-aligns the waterfall.
+///
+/// # Drawing
+///
+/// Each grid mark is a column of 1-pixel yellow dots spaced by
+/// 1 pixel gaps (dot at y=0, empty at y=1, dot at y=2, …).  Each
+/// dot alpha-blends [`GRID_BLEND_ALPHA`] of pure yellow
+/// `(255, 255, 0)` with the existing pixel colour, preserving
+/// whatever waterfall content was there underneath at 70 % strength.
+#[allow(clippy::too_many_arguments)]
+fn render_time_grid(
+    pb: &mut PixelBuffer,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    first_visible_abs_idx: u64,
+    num_visible_cols: usize,
+    columns_per_mark: u64,
+) {
+    if num_visible_cols == 0 || columns_per_mark == 0 || w == 0 || h == 0 {
+        return;
+    }
+
+    let num = num_visible_cols.min(w);
+    let inv_alpha = 1.0 - GRID_BLEND_ALPHA;
+
+    // Pure yellow in BGRA byte order (little-endian ZPixmap): B=0,
+    // G=255, R=255, alpha doesn't participate in the blend because
+    // we always leave the destination alpha untouched.
+    const YELLOW_B: f32 = 0.0;
+    const YELLOW_G: f32 = 255.0;
+    const YELLOW_R: f32 = 255.0;
+
+    for col_idx in 0..num {
+        let abs_idx = first_visible_abs_idx + col_idx as u64;
+        if !abs_idx.is_multiple_of(columns_per_mark) {
+            continue;
+        }
+
+        // Right-align: the newest column of the history always sits
+        // at `x0 + w - 1`, the oldest at `x0 + w - num`.
+        let x = x0 + w - num + col_idx;
+        if x >= pb.width {
+            continue;
+        }
+
+        // 1 px dot, 1 px gap, starting at the top of the spec area.
+        let mut row = 0usize;
+        while row < h {
+            let y = y0 + row;
+            if y < pb.height {
+                let off = (y * pb.width + x) * 4;
+                // Read existing BGR, alpha-blend with yellow, write
+                // back.  Leave the destination alpha byte untouched
+                // so the pixel stays opaque relative to whatever
+                // shape mask the window uses.
+                let b = pb.data[off] as f32;
+                let g = pb.data[off + 1] as f32;
+                let r = pb.data[off + 2] as f32;
+                pb.data[off] = (b * inv_alpha + YELLOW_B * GRID_BLEND_ALPHA) as u8;
+                pb.data[off + 1] = (g * inv_alpha + YELLOW_G * GRID_BLEND_ALPHA) as u8;
+                pb.data[off + 2] = (r * inv_alpha + YELLOW_R * GRID_BLEND_ALPHA) as u8;
+            }
+            // Dot (row even) + skip (row odd): advance 2 rows per
+            // dot so we get the 1-on-1-off dotted pattern.
+            row += 2;
         }
     }
 }
@@ -1003,6 +1122,15 @@ fn overlay_thread(
     // waterfall's temporal resolution from the 60 fps render rate.
     let mut column_frame_counter: u32 = 0;
 
+    // Running total of columns ever pushed into the spectrogram
+    // history since the last reset (`spectrogram_history.clear()`).
+    // Used by the time-grid overlay to compute absolute column
+    // indices — grid marks land on columns where
+    // `index % COLUMNS_PER_GRID_MARK == 0`, so the counter must
+    // reset together with the history to keep the first grid mark
+    // aligned with the first visible column of each new session.
+    let mut columns_pushed_total: u64 = 0;
+
     // Amplitude history for amplitude viz mode: one RMS value per frame.
     let amp_window_secs: f32 = 5.0;
     let amp_max_frames = (FPS as f32 * amp_window_secs) as usize;
@@ -1065,6 +1193,7 @@ fn overlay_thread(
                     current_gc = Some(gc);
                     is_recording = true;
                     spectrogram_history.clear();
+                    columns_pushed_total = 0;
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
                     spectrum_peak = PEAK_FLOOR;
@@ -1117,6 +1246,7 @@ fn overlay_thread(
             match rx.try_recv() {
                 Ok(Command::Show(IndicatorKind::Recording)) => {
                     spectrogram_history.clear();
+                    columns_pushed_total = 0;
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
                     spectrum_peak = PEAK_FLOOR;
@@ -1361,6 +1491,11 @@ fn overlay_thread(
                     }
                 }
             }
+            // Every column push — even empty columns during pause —
+            // advances the absolute-column counter the time-grid
+            // overlay uses to space its vertical marks one per
+            // wall-clock second.
+            columns_pushed_total = columns_pushed_total.wrapping_add(1);
         }
 
         // ── Render badge ─────────────────────────────────────
@@ -1427,6 +1562,20 @@ fn overlay_thread(
                     }
                 }
             }
+            // Time grid is drawn after the waterfall so its alpha
+            // blend mixes visibly with whatever sits underneath.
+            // Still visible during auto-pause so the user can see
+            // how long the silent window has been growing.
+            render_time_grid(
+                &mut pb,
+                SPEC_LEFT,
+                SPEC_TOP,
+                SPEC_W,
+                SPEC_H,
+                columns_pushed_total.saturating_sub(spectrogram_history.len() as u64),
+                spectrogram_history.len(),
+                COLUMNS_PER_GRID_MARK,
+            );
             if let Some(ref f) = badge_font {
                 render_listening_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
             }
@@ -1478,6 +1627,20 @@ fn overlay_thread(
                     }
                 }
             }
+            // Time grid overlays the waterfall with one dotted
+            // yellow vertical mark per [`GRID_PERIOD_SECONDS`].
+            // Drawn after the waterfall so the alpha blend combines
+            // with the spectrogram colors beneath each dot.
+            render_time_grid(
+                &mut pb,
+                SPEC_LEFT,
+                SPEC_TOP,
+                SPEC_W,
+                SPEC_H,
+                columns_pushed_total.saturating_sub(spectrogram_history.len() as u64),
+                spectrogram_history.len(),
+                COLUMNS_PER_GRID_MARK,
+            );
 
             let vol_norm = if rms_peak > PEAK_FLOOR {
                 (frame_rms / rms_peak).clamp(0.0, 1.0)
@@ -1766,6 +1929,135 @@ mod tests {
             None,
             1.0,
         );
+    }
+
+    #[test]
+    fn render_time_grid_draws_dotted_yellow_at_first_mark_on_blank_buffer() {
+        // On a blank (black) buffer, 65 visible columns starting at
+        // absolute index 0 → grid marks at abs idx 0, 30, 60.
+        // Right-aligned: columns 0..64 land at x = SPEC_LEFT + SPEC_W
+        // - 65 + col_idx.  So:
+        //     abs_idx=0  → col_idx=0  → x = SPEC_LEFT + SPEC_W - 65
+        //     abs_idx=30 → col_idx=30 → x = SPEC_LEFT + SPEC_W - 35
+        //     abs_idx=60 → col_idx=60 → x = SPEC_LEFT + SPEC_W - 5
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear(BG_COLOR);
+
+        render_time_grid(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 0, 65, 30);
+
+        // Expected dot at (SPEC_LEFT + SPEC_W - 65, SPEC_TOP) — row 0 is
+        // the first dot in the 1-on-1-off pattern.
+        let first_x = SPEC_LEFT + SPEC_W - 65;
+        let off = (SPEC_TOP * pb.width + first_x) * 4;
+        // BG is opaque black → blend of 70 % black + 30 % pure yellow
+        // (BGRA [0, 255, 255, _]) ⇒ B stays 0, G ≈ 76, R ≈ 76.
+        assert_eq!(pb.data[off], 0, "grid blue channel unchanged by yellow");
+        assert!(
+            pb.data[off + 1] > 0 && pb.data[off + 1] < 200,
+            "grid green should show blended yellow, got {}",
+            pb.data[off + 1]
+        );
+        assert!(
+            pb.data[off + 2] > 0 && pb.data[off + 2] < 200,
+            "grid red should show blended yellow, got {}",
+            pb.data[off + 2]
+        );
+
+        // Row 1 of the same column must still be background (1-off
+        // in the 1-on-1-off pattern).
+        let off_gap = ((SPEC_TOP + 1) * pb.width + first_x) * 4;
+        assert_eq!(
+            &pb.data[off_gap..off_gap + 4],
+            &BG_COLOR,
+            "row 1 of grid column should be untouched (dot gap)"
+        );
+
+        // Row 2 of the same column should be another dot.
+        let off_dot2 = ((SPEC_TOP + 2) * pb.width + first_x) * 4;
+        assert!(
+            pb.data[off_dot2 + 1] > 0 && pb.data[off_dot2 + 2] > 0,
+            "row 2 of grid column should be another dot"
+        );
+
+        // A non-grid column (say col_idx=5) must still be background.
+        let non_grid_x = SPEC_LEFT + SPEC_W - 65 + 5;
+        let off_ng = (SPEC_TOP * pb.width + non_grid_x) * 4;
+        assert_eq!(
+            &pb.data[off_ng..off_ng + 4],
+            &BG_COLOR,
+            "non-grid column should remain background"
+        );
+    }
+
+    #[test]
+    fn render_time_grid_blends_with_existing_waterfall_pixels() {
+        // Start with a fully-white pixel buffer in the spec area.
+        // The grid blend should make those pixels slightly tinted
+        // toward yellow (green stays high, red stays high, blue
+        // drops because yellow's blue channel is 0).
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        // Fill the whole spec area with opaque white.
+        for y in SPEC_TOP..SPEC_BOTTOM {
+            for x in SPEC_LEFT..SPEC_RIGHT {
+                pb.set_pixel(x, y, [255, 255, 255, 255]);
+            }
+        }
+
+        render_time_grid(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 0, 1, 30);
+
+        // abs_idx=0 → col_idx=0 → x = SPEC_LEFT + SPEC_W - 1 (right edge).
+        let x = SPEC_LEFT + SPEC_W - 1;
+        let off = (SPEC_TOP * pb.width + x) * 4;
+        // White (255) blended with yellow (B=0, G=255, R=255) at 30 %:
+        //   B: 255*0.7 + 0*0.3   = 178
+        //   G: 255*0.7 + 255*0.3 = 255
+        //   R: 255*0.7 + 255*0.3 = 255
+        assert!(
+            pb.data[off] < 200,
+            "grid dot blue should drop below white (got {})",
+            pb.data[off]
+        );
+        assert!(pb.data[off + 1] >= 250, "green should stay high");
+        assert!(pb.data[off + 2] >= 250, "red should stay high");
+    }
+
+    #[test]
+    fn render_time_grid_no_marks_when_fewer_than_one_period_visible() {
+        // Only 5 visible columns → no abs_idx is a multiple of 30
+        // except idx 0 itself.  With first_visible_abs_idx=1, the
+        // visible range is 1..=5, none of which hit idx 0, 30, 60,...
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear(BG_COLOR);
+        render_time_grid(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1, 5, 30);
+
+        // Nothing drawn: whole spec area still BG.
+        for y in SPEC_TOP..SPEC_BOTTOM {
+            for x in SPEC_LEFT..SPEC_RIGHT {
+                let off = (y * pb.width + x) * 4;
+                assert_eq!(
+                    &pb.data[off..off + 4],
+                    &BG_COLOR,
+                    "no marks should have been drawn at ({},{})",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_time_grid_noop_for_zero_visible_columns() {
+        // Sanity: should not panic or modify the buffer.
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear(BG_COLOR);
+        render_time_grid(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 0, 0, 30);
+        // Buffer should still be entirely BG.
+        for y in SPEC_TOP..SPEC_BOTTOM {
+            for x in SPEC_LEFT..SPEC_RIGHT {
+                let off = (y * pb.width + x) * 4;
+                assert_eq!(&pb.data[off..off + 4], &BG_COLOR);
+            }
+        }
     }
 
     #[test]
