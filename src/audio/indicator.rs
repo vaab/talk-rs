@@ -52,6 +52,15 @@ const TONE_VOLUME: f32 = 0.05;
 /// Volume for boop tones (much quieter).
 const BOOP_VOLUME: f32 = 0.01;
 
+/// Frequency for alert tones (Hz) — higher pitch to stand out.
+const ALERT_FREQ: f32 = 550.0;
+/// Duration of a single alert pulse (seconds) — short staccato.
+const ALERT_DURATION: f32 = 0.08;
+/// Gap between alert pulses (seconds).
+const ALERT_GAP: f32 = 0.06;
+/// Volume for alert tones (louder than boop, softer than start/stop).
+const ALERT_VOLUME: f32 = 0.03;
+
 // ── Tone synthesis ───────────────────────────────────────────────────
 
 /// Generate a sine-wave tone with half-sine fade envelope.
@@ -93,6 +102,7 @@ pub struct IndicatorSounds {
     pub start: Vec<f32>,
     pub stop: Vec<f32>,
     pub boop: Vec<f32>,
+    pub alert: Vec<f32>,
 }
 
 impl IndicatorSounds {
@@ -101,7 +111,13 @@ impl IndicatorSounds {
         let start = Self::build_start(sample_rate);
         let stop = Self::build_stop(sample_rate);
         let boop = Self::build_boop(sample_rate);
-        Self { start, stop, boop }
+        let alert = Self::build_alert(sample_rate);
+        Self {
+            start,
+            stop,
+            boop,
+            alert,
+        }
     }
 
     /// Ascending major third: 364 Hz → 458 Hz.
@@ -125,6 +141,16 @@ impl IndicatorSounds {
         let mut samples = generate_tone(BASE_FREQ, TONE_DURATION, BOOP_VOLUME, sr);
         samples.extend(generate_silence(BOOP_GAP, sr));
         samples.extend(generate_tone(BASE_FREQ, TONE_DURATION, BOOP_VOLUME, sr));
+        samples
+    }
+
+    /// Triple-pulse alert at higher frequency (attention-grabbing).
+    fn build_alert(sr: u32) -> Vec<f32> {
+        let mut samples = generate_tone(ALERT_FREQ, ALERT_DURATION, ALERT_VOLUME, sr);
+        samples.extend(generate_silence(ALERT_GAP, sr));
+        samples.extend(generate_tone(ALERT_FREQ, ALERT_DURATION, ALERT_VOLUME, sr));
+        samples.extend(generate_silence(ALERT_GAP, sr));
+        samples.extend(generate_tone(ALERT_FREQ, ALERT_DURATION, ALERT_VOLUME, sr));
         samples
     }
 }
@@ -404,9 +430,16 @@ impl SoundPlayer {
     /// The boop plays every `interval` and is immediately preempted if a
     /// new sound (e.g., stop) is played on this player.
     ///
+    /// When `suppress` is provided, the boop is silently skipped
+    /// whenever the flag is `true` (e.g. during a no-sound alert).
+    ///
     /// The loop runs in a tokio task that only holds the shared playback
     /// state (not the cpal stream), keeping it `Send`.
-    pub fn start_boop_loop(&self, interval: std::time::Duration) -> CancellationToken {
+    pub fn start_boop_loop(
+        &self,
+        interval: std::time::Duration,
+        suppress: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> CancellationToken {
         let token = CancellationToken::new();
         let token_clone = token.clone();
         let state = Arc::clone(&self.state);
@@ -416,8 +449,13 @@ impl SoundPlayer {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        if let Ok(mut guard) = state.lock() {
-                            guard.replace(boop_samples.clone());
+                        let suppressed = suppress
+                            .as_ref()
+                            .is_some_and(|f| f.load(Ordering::Relaxed));
+                        if !suppressed {
+                            if let Ok(mut guard) = state.lock() {
+                                guard.replace(boop_samples.clone());
+                            }
                         }
                     }
                     _ = token_clone.cancelled() => {
@@ -428,6 +466,34 @@ impl SoundPlayer {
         });
 
         token
+    }
+
+    /// Create an [`AlertPlayer`] handle for playing alert sounds from
+    /// another thread.  The handle shares the playback state so alert
+    /// tones preempt (and are preempted by) other sounds on this player.
+    pub fn alert_player(&self) -> AlertPlayer {
+        AlertPlayer {
+            state: Arc::clone(&self.state),
+            samples: self.sounds.alert.clone(),
+        }
+    }
+}
+
+// ── AlertPlayer (thread-safe handle for alert tones) ─────────────────
+
+/// Lightweight, `Send`-able handle that can play alert tones on the
+/// shared output stream.  Obtained via [`SoundPlayer::alert_player`].
+pub struct AlertPlayer {
+    state: Arc<Mutex<PlaybackState>>,
+    samples: Vec<f32>,
+}
+
+impl AlertPlayer {
+    /// Play the alert sound, preempting any in-progress sound.
+    pub fn play(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.replace(self.samples.clone());
+        }
     }
 }
 
