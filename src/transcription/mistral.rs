@@ -13,11 +13,13 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs::File;
 
-use super::http::{build_client, parse_u64_field, proportional_timeout};
+use super::http::{build_client, parse_u64_field, proportional_timeout, ProgressBody};
 use super::BatchTranscriber;
+use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
 
 /// Default API base URL for the Mistral API.
 pub(crate) const API_BASE: &str = "https://api.mistral.ai";
@@ -153,6 +155,9 @@ pub struct MistralBatchTranscriber {
     endpoint: String,
     /// Whether to request speaker diarization (V2 models only).
     diarize: bool,
+    /// Telemetry event sink for HTTP lifecycle reporting.
+    /// Defaults to [`NoOpSink`] when no consumer is attached.
+    sink: Arc<dyn TelemetrySink>,
 }
 
 impl MistralBatchTranscriber {
@@ -174,6 +179,7 @@ impl MistralBatchTranscriber {
             config,
             endpoint,
             diarize,
+            sink: Arc::new(NoOpSink),
         })
     }
 
@@ -195,12 +201,17 @@ impl MistralBatchTranscriber {
             config,
             endpoint,
             diarize,
+            sink: Arc::new(NoOpSink),
         })
     }
 }
 
 #[async_trait]
 impl BatchTranscriber for MistralBatchTranscriber {
+    fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
+        self.sink = sink;
+    }
+
     async fn validate(&self) -> Result<(), TalkError> {
         let api_base = self
             .endpoint
@@ -273,6 +284,11 @@ impl BatchTranscriber for MistralBatchTranscriber {
             file_len / 1024
         );
 
+        self.sink.emit(TranscriptionEvent::RequestStarted {
+            endpoint: self.endpoint.clone(),
+            t: Instant::now(),
+        });
+
         let started = Instant::now();
         let response = self
             .client
@@ -283,6 +299,10 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .send()
             .await
             .map_err(|err| {
+                self.sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
                 TalkError::Transcription(format!(
                     "Failed to send request to Mistral API: {:#}",
                     err
@@ -290,12 +310,20 @@ impl BatchTranscriber for MistralBatchTranscriber {
             })?;
 
         let request_latency_ms = started.elapsed().as_millis() as u64;
+        self.sink.emit(TranscriptionEvent::ResponseHeaders {
+            status: response.status().as_u16(),
+            t: Instant::now(),
+        });
         let headers = response.headers().clone();
 
         // Check response status
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            self.sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
             return Err(TalkError::Transcription(format!(
                 "Mistral API error ({}): {}",
                 status, body
@@ -304,8 +332,17 @@ impl BatchTranscriber for MistralBatchTranscriber {
 
         // Parse JSON response
         let mistral_response: MistralResponse = response.json().await.map_err(|err| {
+            self.sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
             TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
         })?;
+
+        self.sink.emit(TranscriptionEvent::RequestCompleted {
+            success: true,
+            t: Instant::now(),
+        });
 
         let token_usage = mistral_response
             .usage
@@ -377,13 +414,22 @@ impl BatchTranscriber for MistralBatchTranscriber {
             collect_start.elapsed().as_millis()
         );
 
-        // Create multipart form with known-length audio
+        // Wrap the audio buffer in a ProgressBody so the telemetry
+        // sink receives ConnectionEstablished / UploadProgress /
+        // UploadComplete events as reqwest pulls bytes from the
+        // stream.  The Content-Length is set explicitly because the
+        // Mistral API rejects chunked Transfer-Encoding (411).
+        let progress_body = ProgressBody::new(audio_buf, self.sink.clone());
+        let body_len = progress_body.len();
         let mut form = reqwest::multipart::Form::new()
             .text("model", self.config.model.clone())
             .part(
                 "file",
-                reqwest::multipart::Part::stream_with_length(audio_buf, audio_len)
-                    .file_name(file_name.to_string()),
+                reqwest::multipart::Part::stream_with_length(
+                    reqwest::Body::wrap_stream(progress_body),
+                    body_len,
+                )
+                .file_name(file_name.to_string()),
             );
 
         // Add context bias if configured
@@ -410,6 +456,11 @@ impl BatchTranscriber for MistralBatchTranscriber {
             audio_len / 1024
         );
 
+        self.sink.emit(TranscriptionEvent::RequestStarted {
+            endpoint: self.endpoint.clone(),
+            t: Instant::now(),
+        });
+
         log::warn!("[DBG] mistral stream: POST {} beginning", self.endpoint);
         let started = Instant::now();
         let response = self
@@ -433,6 +484,10 @@ impl BatchTranscriber for MistralBatchTranscriber {
                     err.is_decode(),
                     err.status()
                 );
+                self.sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
                 TalkError::Transcription(format!(
                     "Failed to send streaming request to Mistral API: {:#}",
                     err
@@ -445,6 +500,10 @@ impl BatchTranscriber for MistralBatchTranscriber {
             request_latency_ms,
             response.status()
         );
+        self.sink.emit(TranscriptionEvent::ResponseHeaders {
+            status: response.status().as_u16(),
+            t: Instant::now(),
+        });
         let headers = response.headers().clone();
 
         // Check response status
@@ -461,6 +520,10 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 body.len(),
                 body_start.elapsed().as_millis()
             );
+            self.sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
             return Err(TalkError::Transcription(format!(
                 "Mistral API error ({}): {}",
                 status, body
@@ -480,6 +543,10 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 err.is_body(),
                 err.is_decode()
             );
+            self.sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
             TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
         })?;
         log::warn!(
@@ -487,6 +554,11 @@ impl BatchTranscriber for MistralBatchTranscriber {
             mistral_response.text.len(),
             body_start.elapsed().as_millis()
         );
+
+        self.sink.emit(TranscriptionEvent::RequestCompleted {
+            success: true,
+            t: Instant::now(),
+        });
 
         let token_usage = mistral_response
             .usage

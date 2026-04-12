@@ -24,6 +24,7 @@ use crate::paste::{
     focus_window, get_active_window, paste_text_to_target, simulate_paste, PASTE_CHUNK_CHARS,
 };
 use crate::recording_cache;
+use crate::telemetry::{BroadcastSink, TelemetrySink, TranscriptionEvent};
 use crate::transcription;
 use crate::x11::overlay::{IndicatorKind, OverlayHandle};
 use crate::x11::render_util::RingBuffer;
@@ -512,12 +513,21 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         result
     } else {
         // Batch mode (default): capture audio, encode, then transcribe.
-        let transcriber = transcription::create_batch_transcriber(
+
+        // Create the telemetry broadcast: the transcriber emits
+        // events into this sink, and any consumer (overlay in sub-
+        // phase 1D) can subscribe to the broker to receive them.
+        // Until a consumer subscribes, events are silently dropped.
+        let _broker = std::sync::Arc::new(BroadcastSink::new(256));
+        let sink: std::sync::Arc<dyn TelemetrySink> = _broker.clone();
+
+        let mut transcriber = transcription::create_batch_transcriber(
             &config,
             provider,
             opts.model.as_deref(),
             opts.diarize,
         )?;
+        transcriber.set_sink(sink.clone());
 
         let (stream_result, t_stop_val) = dictate_streaming(
             &mut *capture,
@@ -599,7 +609,14 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         viz.push_message(&msg);
                     }
 
-                    let retry_transcriber = match transcription::create_batch_transcriber(
+                    sink.emit(TranscriptionEvent::RetryScheduled {
+                        attempt,
+                        max: MAX_RETRIES,
+                        reason: last_err.to_string(),
+                        t: std::time::Instant::now(),
+                    });
+
+                    let mut retry_transcriber = match transcription::create_batch_transcriber(
                         &config,
                         provider,
                         opts.model.as_deref(),
@@ -616,6 +633,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                             continue;
                         }
                     };
+                    retry_transcriber.set_sink(sink.clone());
 
                     let upload_path = cache_path.clone();
                     log::warn!(
