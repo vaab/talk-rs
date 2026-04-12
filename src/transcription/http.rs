@@ -39,17 +39,20 @@ const TCP_KEEPALIVE_RETRIES: u32 = 3;
 /// Build an HTTP client tuned for VPN-hostile networks.
 ///
 /// The client uses aggressive idle and kernel-level timeouts to
-/// detect dead connections within a few seconds, rather than relying
-/// on large overall request timeouts.  Individual requests should
-/// **not** set their own `.timeout()` — the per-frame and kernel
-/// timeouts handle stalls automatically.
+/// detect dead connections within a few seconds.  Transcription
+/// request paths additionally wrap individual calls in a
+/// [`proportional_timeout`] so a server that accepts the connection
+/// and then hangs on the application layer (where TCP-level defences
+/// cannot help) is bounded by a payload-sized wall clock.
 pub(crate) fn build_client() -> Result<Client, TalkError> {
-    // NOTE: `read_timeout` is intentionally omitted.  In reqwest 0.13
-    // it acts as a non-resetting wall-clock timer during the
-    // upload + wait-for-headers phase, which would kill legitimate
-    // requests where upload + server processing exceeds the value.
-    // Dead connections are detected by `tcp_user_timeout` (during
-    // active transfer) and TCP keepalive (during idle phases).
+    // NOTE: The client-wide `read_timeout` is intentionally omitted.
+    // In reqwest 0.13 it acts as a non-resetting wall-clock timer
+    // during the upload + wait-for-headers phase, which would kill
+    // legitimate requests where upload + server processing exceeds
+    // the value.  Dead connections are detected by `tcp_user_timeout`
+    // (during active transfer) and TCP keepalive (during idle
+    // phases).  Per-request wall-clock caps for slow-but-alive
+    // servers are applied at each call site via [`proportional_timeout`].
     let builder = Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .tcp_keepalive(TCP_KEEPALIVE)
@@ -62,6 +65,55 @@ pub(crate) fn build_client() -> Result<Client, TalkError> {
     builder
         .build()
         .map_err(|e| TalkError::Config(format!("failed to build HTTP client: {}", e)))
+}
+
+/// Floor for [`proportional_timeout`].
+///
+/// Tiny audio payloads still need to withstand a couple of seconds of
+/// TLS handshake + server processing without tripping their own
+/// request timeout.
+const REQUEST_TIMEOUT_FLOOR_SECS: u64 = 3;
+
+/// Divisor for [`proportional_timeout`].
+///
+/// Controls how the per-KB timeout budget scales.  `KB_DIVISOR = 10`
+/// gives `1 s per 10 KB of audio`, which (for typical OGG Opus at
+/// ~4 KB/s of encoded audio) corresponds to roughly `2.5 ×` the
+/// recording duration — generous enough for legitimate server
+/// processing, tight enough to catch application-layer hangs within
+/// seconds for typical short dictations.
+const REQUEST_TIMEOUT_KB_DIVISOR: u64 = 10;
+
+/// Compute a per-request wall-clock timeout proportional to the audio
+/// payload size.
+///
+/// Formula: `max(REQUEST_TIMEOUT_FLOOR_SECS, audio_bytes / 1024 / REQUEST_TIMEOUT_KB_DIVISOR)`
+/// seconds.
+///
+/// # Rationale
+///
+/// Transcription latency loosely scales with audio duration, which
+/// itself scales with payload size for a fixed encoding.  A fixed
+/// wall-clock timeout either (a) kills legitimate long requests or
+/// (b) lets short requests hang for minutes when the server accepts
+/// the connection and then silently stalls (TCP-level defences cannot
+/// detect this).  A proportional cap gives small requests a generous
+/// fixed floor, large requests enough headroom, and bounds the
+/// worst-case user wait to something comfortably below the observed
+/// 168 s application-layer hang.
+///
+/// # Examples
+///
+/// | Audio size | Timeout |
+/// |------------|---------|
+/// | < 30 KB    | 3 s     |
+/// | 100 KB     | 10 s    |
+/// | 150 KB     | 15 s    |
+/// | 1 MB       | 102 s   |
+pub(crate) fn proportional_timeout(audio_bytes: u64) -> Duration {
+    let kb = audio_bytes / 1024;
+    let secs = std::cmp::max(REQUEST_TIMEOUT_FLOOR_SECS, kb / REQUEST_TIMEOUT_KB_DIVISOR);
+    Duration::from_secs(secs)
 }
 
 /// Extract an optional `u64` from a JSON object by key.
@@ -193,5 +245,56 @@ pub(crate) async fn enrich_model_error(
             log::warn!("could not fetch model suggestions: {}", e);
             error
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proportional_timeout_returns_floor_for_small_audio() {
+        assert_eq!(proportional_timeout(0), Duration::from_secs(3));
+        assert_eq!(proportional_timeout(1024), Duration::from_secs(3));
+        assert_eq!(proportional_timeout(10 * 1024), Duration::from_secs(3));
+        // 29 KB: 29 / 10 = 2 < floor(3), so floor applies.
+        assert_eq!(proportional_timeout(29 * 1024), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn proportional_timeout_transitions_above_floor_at_30kb() {
+        // 30 KB: 30 / 10 = 3 == floor; tied, returns 3.
+        assert_eq!(proportional_timeout(30 * 1024), Duration::from_secs(3));
+        // 31 KB: 31 / 10 = 3 == floor; still 3.
+        assert_eq!(proportional_timeout(31 * 1024), Duration::from_secs(3));
+        // 40 KB: 40 / 10 = 4 > floor; now scales with size.
+        assert_eq!(proportional_timeout(40 * 1024), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn proportional_timeout_scales_linearly_with_kb() {
+        // 100 KB → 10 s
+        assert_eq!(proportional_timeout(100 * 1024), Duration::from_secs(10));
+        // 147 KB → 14 s (the known 168s hang case gets bounded here)
+        assert_eq!(proportional_timeout(147 * 1024), Duration::from_secs(14));
+        // 500 KB → 50 s
+        assert_eq!(proportional_timeout(500 * 1024), Duration::from_secs(50));
+        // 1 MB → 102 s
+        assert_eq!(proportional_timeout(1024 * 1024), Duration::from_secs(102));
+    }
+
+    #[test]
+    fn proportional_timeout_handles_large_audio_without_overflow() {
+        // 16 MB should yield a sane (if generous) value.
+        let t = proportional_timeout(16 * 1024 * 1024);
+        assert_eq!(t, Duration::from_secs(1638));
+    }
+
+    #[test]
+    fn proportional_timeout_rounds_down_on_non_round_kb() {
+        // 1500 bytes = 1 KB (integer division), floor still applies.
+        assert_eq!(proportional_timeout(1500), Duration::from_secs(3));
+        // 45_678 bytes = 44 KB, 44 / 10 = 4 > floor.
+        assert_eq!(proportional_timeout(45_678), Duration::from_secs(4));
     }
 }
