@@ -214,18 +214,21 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             )));
         }
 
-        // Open the audio file and read its size so we can compute a
-        // payload-proportional wall-clock timeout below.
-        let file = File::open(audio_path).await.map_err(|err| {
+        // Read the audio file into memory and wrap in ProgressBody so
+        // the telemetry sink receives upload-progress events during
+        // retry attempts (same treatment as transcribe_stream).
+        use tokio::io::AsyncReadExt;
+        let mut file = File::open(audio_path).await.map_err(|err| {
             TalkError::Transcription(format!("Failed to open audio file: {}", err))
         })?;
-        let file_len = file
-            .metadata()
-            .await
-            .map_err(|err| {
-                TalkError::Transcription(format!("Failed to read audio file metadata: {}", err))
-            })?
-            .len();
+        let mut file_bytes = Vec::new();
+        file.read_to_end(&mut file_bytes).await.map_err(|err| {
+            TalkError::Transcription(format!("Failed to read audio file: {}", err))
+        })?;
+        let file_len = file_bytes.len() as u64;
+
+        let progress_body = super::http::ProgressBody::new(file_bytes, self.sink.clone());
+        let body_len = progress_body.len();
 
         // Get file name for multipart form
         let file_name = audio_path
@@ -240,7 +243,11 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             .text("response_format", "json")
             .part(
                 "file",
-                reqwest::multipart::Part::stream(file).file_name(file_name),
+                reqwest::multipart::Part::stream_with_length(
+                    reqwest::Body::wrap_stream(progress_body),
+                    body_len,
+                )
+                .file_name(file_name),
             );
 
         // Compute a payload-proportional wall-clock timeout for this

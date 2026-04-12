@@ -706,6 +706,79 @@ fn render_phase_line(
     }
 }
 
+/// Maximum height in pixels for a single throughput bar (Layer 3b).
+/// The tallest bar corresponds to the peak byte delta observed so far;
+/// all others are scaled relative to it.  Set to 48 so throughput
+/// bars can fill most of the spectrogram area's height (44 px usable)
+/// when the peak chunk arrives.
+const THROUGHPUT_BAR_MAX_HEIGHT: usize = 48;
+
+/// Render the byte-throughput bars (Layer 3b): vertical bars growing
+/// **downward** from the phase line, one per column, height
+/// proportional to how many bytes were uploaded during that column's
+/// time slice.
+///
+/// The bars use the same colour as the phase line at each column
+/// position (from `phase_history`), so upload bars are bright blue,
+/// waiting-phase columns have no bars (zero delta), and the visual
+/// naturally aligns with the phase colour strip above.
+///
+/// Bars are alpha-blended with the waterfall underneath at 60 % so
+/// the spectrogram remains partially visible through them.
+#[allow(clippy::too_many_arguments)]
+fn render_throughput_bars(
+    pb: &mut PixelBuffer,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    throughput_history: &[u64],
+    phase_history: &[Option<[u8; 4]>],
+    peak_delta: u64,
+) {
+    let n = throughput_history.len().min(phase_history.len());
+    if n == 0 || w == 0 || h == 0 || peak_delta == 0 {
+        return;
+    }
+
+    let num = n.min(w);
+    let bar_zone_top = y0 + PHASE_LINE_HEIGHT; // just below the phase line
+    let max_h = THROUGHPUT_BAR_MAX_HEIGHT.min(h.saturating_sub(PHASE_LINE_HEIGHT));
+
+    for col_idx in 0..num {
+        let delta = throughput_history[throughput_history.len() - num + col_idx];
+        if delta == 0 {
+            continue;
+        }
+
+        // Use the phase colour for this column.
+        let color = match phase_history[phase_history.len() - num + col_idx] {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Normalise: tallest bar = peak_delta.
+        let norm = (delta as f32 / peak_delta as f32).clamp(0.0, 1.0);
+        let bar_h = ((norm * max_h as f32) as usize).max(1);
+
+        // Right-align.
+        let x = x0 + w - num + col_idx;
+        if x >= pb.width {
+            continue;
+        }
+
+        // Draw bar growing downward from the phase line.
+        // Fully opaque, 1 px wide, phase-coloured.
+        for dy in 0..bar_h {
+            let y = bar_zone_top + dy;
+            if y >= pb.height || y >= y0 + h {
+                break;
+            }
+            pb.set_pixel(x, y, color);
+        }
+    }
+}
+
 /// Draw the red dot with brightness driven by current volume level.
 /// Clear a circle to `BG_COLOR` (transparent), creating a gap between
 /// the red dot and the spectrogram underneath.
@@ -1272,6 +1345,17 @@ fn overlay_thread(
     // colour layer shows the HTTP lifecycle on top.
     let mut is_transcribing: bool = false;
 
+    // ── Byte throughput state (Layer 3b) ─────────────────────────
+    //
+    // Tracks cumulative upload bytes from `UploadProgress` events.
+    // On each column push, we record how many bytes were uploaded
+    // since the last push, then render a bar proportional to that
+    // delta.  The bar grows downward from the phase line.
+    let mut current_upload_bytes: u64 = 0;
+    let mut prev_upload_bytes: u64 = 0;
+    let mut upload_peak_delta: u64 = 1; // avoid division by zero
+    let mut throughput_history: Vec<u64> = Vec::new();
+
     // Running total of columns ever pushed into the spectrogram
     // history since the last reset (`spectrogram_history.clear()`).
     // Used by the time-grid overlay to compute absolute column
@@ -1345,6 +1429,10 @@ fn overlay_thread(
                     is_transcribing = false;
                     spectrogram_history.clear();
                     phase_history.clear();
+                    throughput_history.clear();
+                    current_upload_bytes = 0;
+                    prev_upload_bytes = 0;
+                    upload_peak_delta = 1;
                     columns_pushed_total = 0;
                     current_phase = Phase::Idle;
                     rms_peak = PEAK_FLOOR;
@@ -1401,6 +1489,10 @@ fn overlay_thread(
                     is_transcribing = false;
                     spectrogram_history.clear();
                     phase_history.clear();
+                    throughput_history.clear();
+                    current_upload_bytes = 0;
+                    prev_upload_bytes = 0;
+                    upload_peak_delta = 1;
                     columns_pushed_total = 0;
                     current_phase = Phase::Idle;
                     rms_peak = PEAK_FLOOR;
@@ -1456,6 +1548,18 @@ fn overlay_thread(
             loop {
                 match trx.try_recv() {
                     Ok(event) => {
+                        // Track upload byte counter for Layer 3b bars.
+                        match &event {
+                            TranscriptionEvent::UploadProgress { bytes_sent, .. } => {
+                                current_upload_bytes = *bytes_sent;
+                            }
+                            TranscriptionEvent::RequestStarted { .. } => {
+                                // Reset upload tracking for a new request.
+                                current_upload_bytes = 0;
+                                prev_upload_bytes = 0;
+                            }
+                            _ => {}
+                        }
                         current_phase = current_phase.advance(&event);
                     }
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
@@ -1626,7 +1730,14 @@ fn overlay_thread(
         // normalization adapts smoothly even when the column rate
         // is slower.
         column_frame_counter = column_frame_counter.wrapping_add(1);
-        if column_frame_counter.is_multiple_of(COLUMN_PERIOD_FRAMES) && !no_sound_active {
+        // During transcription, the audio capture is stopped and the
+        // dead-signal detector will fire (stale samples → variance 0
+        // → no_sound_active = true).  We must keep pushing columns
+        // regardless so the phase line and throughput bars continue
+        // to advance on the time axis.
+        if column_frame_counter.is_multiple_of(COLUMN_PERIOD_FRAMES)
+            && (!no_sound_active || is_transcribing)
+        {
             if let Some(mode) = viz {
                 use crate::config::VizMode;
                 match mode {
@@ -1682,6 +1793,17 @@ fn overlay_thread(
             if phase_history.len() > SPEC_W {
                 phase_history.drain(..phase_history.len() - SPEC_W);
             }
+
+            // Record upload byte delta for throughput bars (Layer 3b).
+            let delta = current_upload_bytes.saturating_sub(prev_upload_bytes);
+            prev_upload_bytes = current_upload_bytes;
+            if delta > upload_peak_delta {
+                upload_peak_delta = delta;
+            }
+            throughput_history.push(delta);
+            if throughput_history.len() > SPEC_W {
+                throughput_history.drain(..throughput_history.len() - SPEC_W);
+            }
         }
 
         // ── Render badge ─────────────────────────────────────
@@ -1689,14 +1811,12 @@ fn overlay_thread(
         pb.clear(BG_COLOR);
         draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
 
-        if no_sound_active {
-            // ── NO SOUND mode: prohibit icon + red text ──────
-            if let Some(ref f) = badge_font {
-                render_no_sound_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
-            }
-            clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
-            draw_prohibit_icon(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX);
-        } else if is_transcribing {
+        // Transcribing takes priority over the dead-signal (NO SOUND)
+        // branch: after capture.stop() the audio ring buffer goes
+        // stale and the dead-signal detector fires, but we WANT to
+        // keep rendering the waterfall + phase line + throughput bars
+        // rather than showing the NO SOUND prohibit icon.
+        if is_transcribing {
             // ── TRANSCRIBING mode: dimmed waterfall + phase ───
             //
             // Same visual treatment as auto-pause (dimmed waterfall
@@ -1758,11 +1878,28 @@ fn overlay_thread(
                 COLUMNS_PER_GRID_MARK,
             );
             render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            render_throughput_bars(
+                &mut pb,
+                SPEC_LEFT,
+                SPEC_TOP,
+                SPEC_W,
+                SPEC_H,
+                &throughput_history,
+                &phase_history,
+                upload_peak_delta,
+            );
             // "TRANSCRIBING" text over the dimmed waterfall (same
             // pattern as "LISTENING" during auto-pause).
             if let Some(ref f) = badge_font {
                 render_transcribing_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
             }
+        } else if no_sound_active {
+            // ── NO SOUND mode: prohibit icon + red text ──────
+            if let Some(ref f) = badge_font {
+                render_no_sound_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+            }
+            clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
+            draw_prohibit_icon(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX);
         } else if auto_paused {
             // ── AUTO-PAUSE mode: dimmed waterfall + LISTENING ─
             //
@@ -1830,6 +1967,16 @@ fn overlay_thread(
                 COLUMNS_PER_GRID_MARK,
             );
             render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            render_throughput_bars(
+                &mut pb,
+                SPEC_LEFT,
+                SPEC_TOP,
+                SPEC_W,
+                SPEC_H,
+                &throughput_history,
+                &phase_history,
+                upload_peak_delta,
+            );
             if let Some(ref f) = badge_font {
                 render_listening_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
             }
@@ -1896,6 +2043,16 @@ fn overlay_thread(
                 COLUMNS_PER_GRID_MARK,
             );
             render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            render_throughput_bars(
+                &mut pb,
+                SPEC_LEFT,
+                SPEC_TOP,
+                SPEC_W,
+                SPEC_H,
+                &throughput_history,
+                &phase_history,
+                upload_peak_delta,
+            );
 
             let vol_norm = if rms_peak > PEAK_FLOOR {
                 (frame_rms / rms_peak).clamp(0.0, 1.0)
