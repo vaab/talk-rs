@@ -121,8 +121,10 @@ pub async fn paste_text_to_target(
     delete_chars_before_paste: usize,
     chunk_chars: usize,
     t_stop: Option<std::time::Instant>,
+    sink: &dyn crate::telemetry::TelemetrySink,
 ) -> Result<(), TalkError> {
     let clipboard = X11Clipboard::new();
+    let total_chars = text.len() as u64;
 
     if let Some(wid) = target_window {
         log::debug!("refocusing target window: {}", wid);
@@ -137,6 +139,7 @@ pub async fn paste_text_to_target(
 
     let saved_clipboard = clipboard.get_text().await.ok();
 
+    let mut chars_pasted: u64 = 0;
     let mut first_paste_logged = false;
     if chunk_chars == 0 {
         // No chunking: paste the entire text in one shot.
@@ -146,6 +149,12 @@ pub async fn paste_text_to_target(
             log::info!("timing: stop +{}ms first_paste", t.elapsed().as_millis());
         }
         simulate_paste().await?;
+        chars_pasted = total_chars;
+        sink.emit(crate::telemetry::TranscriptionEvent::PasteProgress {
+            chars_pasted,
+            total_chars,
+            t: std::time::Instant::now(),
+        });
         tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     } else {
         let chunks = split_into_char_chunks(text, chunk_chars);
@@ -159,6 +168,12 @@ pub async fn paste_text_to_target(
                 first_paste_logged = true;
             }
             simulate_paste().await?;
+            chars_pasted += chunk.len() as u64;
+            sink.emit(crate::telemetry::TranscriptionEvent::PasteProgress {
+                chars_pasted,
+                total_chars,
+                t: std::time::Instant::now(),
+            });
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         }
     }

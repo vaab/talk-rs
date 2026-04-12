@@ -831,7 +831,15 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         if let Some(t) = t_stop {
             log::info!("timing: stop +{}ms paste_start", t.elapsed().as_millis());
         }
-        paste_text_to_target(target_window.as_ref(), &text, 0, paste_chunk_chars, t_stop).await?;
+        paste_text_to_target(
+            target_window.as_ref(),
+            &text,
+            0,
+            paste_chunk_chars,
+            t_stop,
+            &*sink,
+        )
+        .await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
         sink.emit(TranscriptionEvent::PasteCompleted {
             t: std::time::Instant::now(),

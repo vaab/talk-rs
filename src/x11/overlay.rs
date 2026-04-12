@@ -713,75 +713,107 @@ fn render_phase_line(
     }
 }
 
-/// Maximum height in pixels for a single throughput bar (Layer 3b).
-/// The tallest bar corresponds to the peak byte delta observed so far;
-/// all others are scaled relative to it.  Set to 48 so throughput
-/// bars can fill most of the spectrogram area's height (44 px usable)
-/// when the peak chunk arrives.
-const THROUGHPUT_BAR_MAX_HEIGHT: usize = 48;
+/// Pixel budget for each individual throughput track.  Each of the
+/// three tracks (upload, download, paste) gets its own 16 px with
+/// its own independent scale — a 100 KB upload and a 1 KB download
+/// both fill their 16 px when they hit their respective peaks.
+const TRACK_HEIGHT_PX: usize = 16;
 
-/// Render the byte-throughput bars (Layer 3b): vertical bars growing
-/// **downward** from the phase line, one per column, height
-/// proportional to how many bytes were uploaded during that column's
-/// time slice.
+/// Render the three throughput tracks (Layer 3b).
 ///
-/// The bars use the same colour as the phase line at each column
-/// position (from `phase_history`), so upload bars are bright blue,
-/// waiting-phase columns have no bars (zero delta), and the visual
-/// naturally aligns with the phase colour strip above.
+/// Each track has its own 16 px budget and its own scale (normalised
+/// against its own peak delta).  This avoids the problem where a
+/// ~100 KB upload dwarfs a ~1 KB JSON response into invisibility.
 ///
-/// Bars are alpha-blended with the waterfall underneath at 60 % so
-/// the spectrogram remains partially visible through them.
+/// Layout (all right-aligned on the same column x positions):
+///   - **Upload**: grows DOWN from `y0 + PHASE_LINE_HEIGHT` (top)
+///   - **Download**: grows UP from `y0 + h - 1` (bottom)
+///   - **Paste**: centred at `y0 + h / 2` (middle)
 #[allow(clippy::too_many_arguments)]
-fn render_throughput_bars(
+fn render_throughput_tracks(
     pb: &mut PixelBuffer,
     x0: usize,
     y0: usize,
     w: usize,
     h: usize,
-    throughput_history: &[u64],
-    phase_history: &[Option<[u8; 4]>],
-    peak_delta: u64,
+    upload_history: &[u64],
+    download_history: &[u64],
+    paste_history: &[u64],
+    _phase_history: &[Option<[u8; 4]>],
+    upload_peak: u64,
+    download_peak: u64,
+    paste_peak: u64,
 ) {
-    let n = throughput_history.len().min(phase_history.len());
-    if n == 0 || w == 0 || h == 0 || peak_delta == 0 {
+    if w == 0 || h == 0 {
         return;
     }
 
-    let num = n.min(w);
-    let bar_zone_top = y0 + PHASE_LINE_HEIGHT; // just below the phase line
-    let max_h = THROUGHPUT_BAR_MAX_HEIGHT.min(h.saturating_sub(PHASE_LINE_HEIGHT));
+    let num = upload_history
+        .len()
+        .min(download_history.len())
+        .min(paste_history.len())
+        .min(w);
+    if num == 0 {
+        return;
+    }
+
+    let track_h = TRACK_HEIGHT_PX.min(h / 3) as f32;
+    let bar_zone_top = y0 + PHASE_LINE_HEIGHT;
+    let bar_zone_bottom = y0 + h - 1;
+    let bar_zone_center = y0 + h / 2;
+
+    let upload_color: [u8; 4] = Phase::Uploading.color().unwrap_or([255, 170, 60, 255]);
+    let download_color: [u8; 4] = Phase::Receiving.color().unwrap_or([180, 200, 60, 255]);
+    let paste_color: [u8; 4] = Phase::Done.color().unwrap_or([110, 255, 60, 255]);
 
     for col_idx in 0..num {
-        let delta = throughput_history[throughput_history.len() - num + col_idx];
-        if delta == 0 {
-            continue;
-        }
-
-        // Use the phase colour for this column.
-        let color = match phase_history[phase_history.len() - num + col_idx] {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // Normalise: tallest bar = peak_delta.
-        let norm = (delta as f32 / peak_delta as f32).clamp(0.0, 1.0);
-        let bar_h = ((norm * max_h as f32) as usize).max(1);
-
-        // Right-align.
         let x = x0 + w - num + col_idx;
         if x >= pb.width {
             continue;
         }
 
-        // Draw bar growing downward from the phase line.
-        // Fully opaque, 1 px wide, phase-coloured.
-        for dy in 0..bar_h {
-            let y = bar_zone_top + dy;
-            if y >= pb.height || y >= y0 + h {
-                break;
+        let ui = upload_history.len() - num + col_idx;
+        let di = download_history.len() - num + col_idx;
+        let pi = paste_history.len() - num + col_idx;
+
+        // ── Upload: own scale, grow DOWN from top ──
+        if upload_history[ui] > 0 && upload_peak > 0 {
+            let norm = (upload_history[ui] as f32 / upload_peak as f32).clamp(0.0, 1.0);
+            let bar_h = ((norm * track_h) as usize).max(1);
+            for dy in 0..bar_h {
+                let y = bar_zone_top + dy;
+                if y >= pb.height || y > bar_zone_bottom {
+                    break;
+                }
+                pb.set_pixel(x, y, upload_color);
             }
-            pb.set_pixel(x, y, color);
+        }
+
+        // ── Download: own scale, grow UP from bottom ──
+        if download_history[di] > 0 && download_peak > 0 {
+            let norm = (download_history[di] as f32 / download_peak as f32).clamp(0.0, 1.0);
+            let bar_h = ((norm * track_h) as usize).max(1);
+            for dy in 0..bar_h {
+                let y = bar_zone_bottom.saturating_sub(dy);
+                if y < y0 || y < bar_zone_top {
+                    break;
+                }
+                pb.set_pixel(x, y, download_color);
+            }
+        }
+
+        // ── Paste: own scale, centred in middle ──
+        if paste_history[pi] > 0 && paste_peak > 0 {
+            let norm = (paste_history[pi] as f32 / paste_peak as f32).clamp(0.0, 1.0);
+            let bar_h = ((norm * track_h) as usize).max(1);
+            let half = bar_h / 2;
+            for dy in 0..bar_h {
+                let y = bar_zone_center.saturating_sub(half) + dy;
+                if y >= pb.height || y > bar_zone_bottom || y < bar_zone_top {
+                    continue;
+                }
+                pb.set_pixel(x, y, paste_color);
+            }
         }
     }
 }
@@ -1354,14 +1386,27 @@ fn overlay_thread(
 
     // ── Byte throughput state (Layer 3b) ─────────────────────────
     //
-    // Tracks cumulative upload bytes from `UploadProgress` events.
-    // On each column push, we record how many bytes were uploaded
-    // since the last push, then render a bar proportional to that
-    // delta.  The bar grows downward from the phase line.
+    // Three independent tracks that can overlap in streaming mode:
+    //   upload   — grows DOWN from the phase line (top of spec)
+    //   download — grows UP from the bottom of the spec area
+    //   paste    — grows UP from the bottom alongside download
+    //
+    // Each track has its own cumulative counter, previous-value
+    // snapshot, peak delta, and ring-buffer history.
     let mut current_upload_bytes: u64 = 0;
     let mut prev_upload_bytes: u64 = 0;
-    let mut upload_peak_delta: u64 = 1; // avoid division by zero
-    let mut throughput_history: Vec<u64> = Vec::new();
+    let mut upload_peak_delta: u64 = 1;
+    let mut upload_history: Vec<u64> = Vec::new();
+
+    let mut current_download_bytes: u64 = 0;
+    let mut prev_download_bytes: u64 = 0;
+    let mut download_peak_delta: u64 = 1;
+    let mut download_history: Vec<u64> = Vec::new();
+
+    let mut current_paste_chars: u64 = 0;
+    let mut prev_paste_chars: u64 = 0;
+    let mut paste_peak_delta: u64 = 1;
+    let mut paste_history: Vec<u64> = Vec::new();
 
     // Running total of columns ever pushed into the spectrogram
     // history since the last reset (`spectrogram_history.clear()`).
@@ -1436,10 +1481,18 @@ fn overlay_thread(
                     is_transcribing = false;
                     spectrogram_history.clear();
                     phase_history.clear();
-                    throughput_history.clear();
+                    upload_history.clear();
+                    download_history.clear();
+                    paste_history.clear();
                     current_upload_bytes = 0;
                     prev_upload_bytes = 0;
                     upload_peak_delta = 1;
+                    current_download_bytes = 0;
+                    prev_download_bytes = 0;
+                    download_peak_delta = 1;
+                    current_paste_chars = 0;
+                    prev_paste_chars = 0;
+                    paste_peak_delta = 1;
                     columns_pushed_total = 0;
                     current_phase = Phase::Idle;
                     rms_peak = PEAK_FLOOR;
@@ -1496,10 +1549,18 @@ fn overlay_thread(
                     is_transcribing = false;
                     spectrogram_history.clear();
                     phase_history.clear();
-                    throughput_history.clear();
+                    upload_history.clear();
+                    download_history.clear();
+                    paste_history.clear();
                     current_upload_bytes = 0;
                     prev_upload_bytes = 0;
                     upload_peak_delta = 1;
+                    current_download_bytes = 0;
+                    prev_download_bytes = 0;
+                    download_peak_delta = 1;
+                    current_paste_chars = 0;
+                    prev_paste_chars = 0;
+                    paste_peak_delta = 1;
                     columns_pushed_total = 0;
                     current_phase = Phase::Idle;
                     rms_peak = PEAK_FLOOR;
@@ -1555,15 +1616,27 @@ fn overlay_thread(
             loop {
                 match trx.try_recv() {
                     Ok(event) => {
-                        // Track upload byte counter for Layer 3b bars.
+                        // Track counters for the three throughput tracks.
                         match &event {
                             TranscriptionEvent::UploadProgress { bytes_sent, .. } => {
                                 current_upload_bytes = *bytes_sent;
                             }
+                            TranscriptionEvent::DownloadProgress { bytes_received, .. } => {
+                                current_download_bytes = *bytes_received;
+                            }
+                            TranscriptionEvent::PasteProgress { chars_pasted, .. } => {
+                                current_paste_chars = *chars_pasted;
+                            }
                             TranscriptionEvent::RequestStarted { .. } => {
-                                // Reset upload tracking for a new request.
+                                // Reset upload + download for a new request.
                                 current_upload_bytes = 0;
                                 prev_upload_bytes = 0;
+                                current_download_bytes = 0;
+                                prev_download_bytes = 0;
+                            }
+                            TranscriptionEvent::PasteStarted { .. } => {
+                                current_paste_chars = 0;
+                                prev_paste_chars = 0;
                             }
                             _ => {}
                         }
@@ -1801,15 +1874,35 @@ fn overlay_thread(
                 phase_history.drain(..phase_history.len() - SPEC_W);
             }
 
-            // Record upload byte delta for throughput bars (Layer 3b).
-            let delta = current_upload_bytes.saturating_sub(prev_upload_bytes);
+            // Record per-column deltas for all three throughput tracks.
+            let up_delta = current_upload_bytes.saturating_sub(prev_upload_bytes);
             prev_upload_bytes = current_upload_bytes;
-            if delta > upload_peak_delta {
-                upload_peak_delta = delta;
+            if up_delta > upload_peak_delta {
+                upload_peak_delta = up_delta;
             }
-            throughput_history.push(delta);
-            if throughput_history.len() > SPEC_W {
-                throughput_history.drain(..throughput_history.len() - SPEC_W);
+            upload_history.push(up_delta);
+            if upload_history.len() > SPEC_W {
+                upload_history.drain(..upload_history.len() - SPEC_W);
+            }
+
+            let dl_delta = current_download_bytes.saturating_sub(prev_download_bytes);
+            prev_download_bytes = current_download_bytes;
+            if dl_delta > download_peak_delta {
+                download_peak_delta = dl_delta;
+            }
+            download_history.push(dl_delta);
+            if download_history.len() > SPEC_W {
+                download_history.drain(..download_history.len() - SPEC_W);
+            }
+
+            let paste_delta = current_paste_chars.saturating_sub(prev_paste_chars);
+            prev_paste_chars = current_paste_chars;
+            if paste_delta > paste_peak_delta {
+                paste_peak_delta = paste_delta;
+            }
+            paste_history.push(paste_delta);
+            if paste_history.len() > SPEC_W {
+                paste_history.drain(..paste_history.len() - SPEC_W);
             }
         }
 
@@ -1885,15 +1978,19 @@ fn overlay_thread(
                 COLUMNS_PER_GRID_MARK,
             );
             render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
-            render_throughput_bars(
+            render_throughput_tracks(
                 &mut pb,
                 SPEC_LEFT,
                 SPEC_TOP,
                 SPEC_W,
                 SPEC_H,
-                &throughput_history,
+                &upload_history,
+                &download_history,
+                &paste_history,
                 &phase_history,
                 upload_peak_delta,
+                download_peak_delta,
+                paste_peak_delta,
             );
             // "TRANSCRIBING" text over the dimmed waterfall (same
             // pattern as "LISTENING" during auto-pause).
@@ -1974,15 +2071,19 @@ fn overlay_thread(
                 COLUMNS_PER_GRID_MARK,
             );
             render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
-            render_throughput_bars(
+            render_throughput_tracks(
                 &mut pb,
                 SPEC_LEFT,
                 SPEC_TOP,
                 SPEC_W,
                 SPEC_H,
-                &throughput_history,
+                &upload_history,
+                &download_history,
+                &paste_history,
                 &phase_history,
                 upload_peak_delta,
+                download_peak_delta,
+                paste_peak_delta,
             );
             if let Some(ref f) = badge_font {
                 render_listening_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
@@ -2050,15 +2151,19 @@ fn overlay_thread(
                 COLUMNS_PER_GRID_MARK,
             );
             render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
-            render_throughput_bars(
+            render_throughput_tracks(
                 &mut pb,
                 SPEC_LEFT,
                 SPEC_TOP,
                 SPEC_W,
                 SPEC_H,
-                &throughput_history,
+                &upload_history,
+                &download_history,
+                &paste_history,
                 &phase_history,
                 upload_peak_delta,
+                download_peak_delta,
+                paste_peak_delta,
             );
 
             let vol_norm = if rms_peak > PEAK_FLOOR {

@@ -304,14 +304,41 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             )));
         }
 
-        // Parse JSON response
-        let openai_response: OpenAIResponse = response.json().await.map_err(|err| {
-            self.sink.emit(TranscriptionEvent::RequestCompleted {
-                success: false,
+        // Stream the response body chunk-by-chunk for download telemetry.
+        use futures::StreamExt;
+        let mut body_bytes: Vec<u8> = Vec::new();
+        let mut body_stream = response.bytes_stream();
+        while let Some(chunk_result) = body_stream.next().await {
+            let chunk = chunk_result.map_err(|err| {
+                self.sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                TalkError::Transcription(format!(
+                    "Failed to read OpenAI API response body: {}",
+                    err
+                ))
+            })?;
+            body_bytes.extend_from_slice(&chunk);
+            self.sink.emit(TranscriptionEvent::DownloadProgress {
+                bytes_received: body_bytes.len() as u64,
+                total: None,
                 t: Instant::now(),
             });
-            TalkError::Transcription(format!("Failed to parse OpenAI API response: {}", err))
-        })?;
+        }
+        self.sink.emit(TranscriptionEvent::ResponseComplete {
+            total: body_bytes.len() as u64,
+            t: Instant::now(),
+        });
+
+        let openai_response: OpenAIResponse =
+            serde_json::from_slice(&body_bytes).map_err(|err| {
+                self.sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                TalkError::Transcription(format!("Failed to parse OpenAI API response: {}", err))
+            })?;
 
         self.sink.emit(TranscriptionEvent::RequestCompleted {
             success: true,
