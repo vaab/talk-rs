@@ -380,6 +380,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         viz.show(crate::x11::overlay::BADGE_W);
     }
 
+    // Shared flag: suppresses the boop heartbeat while a no-sound
+    // alert is active so the two sounds don't collide.
+    let suppress_boop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Start boop loop (configurable interval, disabled by --no-boop or interval=0)
     let boop_interval_ms = config
         .indicators
@@ -390,9 +394,12 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         log::debug!("boop sounds disabled");
         None
     } else {
-        player
-            .as_ref()
-            .map(|p| p.start_boop_loop(std::time::Duration::from_millis(boop_interval_ms)))
+        player.as_ref().map(|p| {
+            p.start_boop_loop(
+                std::time::Duration::from_millis(boop_interval_ms),
+                Some(suppress_boop.clone()),
+            )
+        })
     };
 
     // Tee audio: split the raw capture stream so the overlay
@@ -402,15 +409,54 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         let teed =
             crate::audio::tee::spawn_audio_tee(raw_audio_rx, ring.clone(), pause_flag.clone());
         // Spawn silence notification thread: forwards silence events
-        // from the overlay to the visualizer text panel.
-        if let Some(ref viz) = visualizer {
-            let push = viz.message_pusher();
+        // from the overlay to the visualizer text panel and plays
+        // periodic alert sounds when no audio is detected.
+        let vis_push = visualizer.as_ref().map(|v| v.message_pusher());
+        let alert_player = player.as_ref().map(|p| p.alert_player());
+        if vis_push.is_some() || alert_player.is_some() {
+            let suppress = suppress_boop.clone();
             let _ = std::thread::Builder::new()
                 .name("silence-notifier".into())
                 .spawn(move || {
-                    while let Ok(is_silent) = silence_rx.recv() {
-                        if is_silent {
-                            push("No audio detected \u{2014} check your microphone".to_string());
+                    let mut alerting = false;
+                    loop {
+                        let event = if alerting {
+                            match silence_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                                Ok(val) => Some(val),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    // Still silent — replay alert sound.
+                                    if let Some(ref ap) = alert_player {
+                                        ap.play();
+                                    }
+                                    None
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        } else {
+                            match silence_rx.recv() {
+                                Ok(val) => Some(val),
+                                Err(_) => break,
+                            }
+                        };
+
+                        if let Some(is_silent) = event {
+                            if is_silent {
+                                alerting = true;
+                                suppress.store(true, std::sync::atomic::Ordering::Relaxed);
+                                if let Some(ref push) = vis_push {
+                                    push(
+                                        "No audio detected \u{2014} check your microphone"
+                                            .to_string(),
+                                    );
+                                }
+                                // Play alert immediately on first detection.
+                                if let Some(ref ap) = alert_player {
+                                    ap.play();
+                                }
+                            } else {
+                                alerting = false;
+                                suppress.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     }
                 });

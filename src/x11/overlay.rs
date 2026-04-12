@@ -55,6 +55,12 @@ const DOT_RADIUS_MIN: f32 = 6.0;
 /// height (diameter 43 inside the 44 px spec band) so the volume
 /// indicator is easy to read at a glance.
 const DOT_RADIUS_MAX: f32 = 16.0;
+/// Radius for the prohibit icon shown during dead-signal detection.
+///
+/// Deliberately smaller than [`DOT_RADIUS_MAX`] so the icon stays
+/// compact with a visibly thick stroke (stroke/radius ≈ 20%), matching
+/// the proportions before the dot was enlarged in commit 31d99f0.
+const PROHIBIT_ICON_RADIUS: f32 = 16.0;
 /// Minimum dot brightness — always visible.
 const DOT_MIN_BRIGHTNESS: f32 = 0.5;
 /// Transparent gap (pixels) between red dot edge and spectrogram.
@@ -88,6 +94,21 @@ const FPS: u32 = 60;
 /// 30 columns/sec, giving a visible window of roughly
 /// `SPEC_W / 30 ≈ 8.8` seconds across the 265-pixel spectrogram area.
 const COLUMN_PERIOD_FRAMES: u32 = 2;
+
+// ── Centered "no sound" overlay constants ────────────────────────────
+
+/// Height of the centered overlay as a fraction of monitor height (5%).
+const CENTERED_HEIGHT_FRACTION: f32 = 0.05;
+/// Minimum height for the centered overlay (pixels).
+const CENTERED_MIN_HEIGHT: u16 = 50;
+/// Aspect ratio (width / height) for the centered overlay.
+const CENTERED_ASPECT_RATIO: f32 = 5.0;
+/// Corner radius for the centered overlay (pixels).
+const CENTERED_CORNER_RADIUS: usize = 16;
+/// Background colour for the centered overlay with ARGB visual: 80% opaque black.
+const CENTERED_BG_ARGB: [u8; 4] = [0x00, 0x00, 0x00, 0xCC];
+/// Background colour for the centered overlay without ARGB visual: solid black.
+const CENTERED_BG_OPAQUE: [u8; 4] = [0x00, 0x00, 0x00, 0xFF];
 
 /// Opacity multiplier applied to the waterfall (and sibling visualizers)
 /// while auto-pause is active.  The graph keeps scrolling at the same
@@ -949,14 +970,19 @@ fn draw_rounded_border(pb: &mut PixelBuffer, color: [u8; 4], radius: f32, border
 
 // ── Silence warning rendering ────────────────────────────────────────
 
-/// Draw a prohibit icon (circle outline + diagonal bar) in bright red.
+/// Draw a prohibit icon (circle outline + diagonal bar) in bright red
+/// with the given `stroke` width.
 ///
-/// Replaces the pulsing red dot when silence is detected.  Anti-aliased
-/// like `draw_pulsing_dot()`, placed at the same centre coordinates.
-fn draw_prohibit_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32) {
-    // Bright red, BGRA
-    let color: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
-    let stroke = 2.0f32;
+/// Anti-aliased circle ring plus a 45° diagonal bar.  Used for both
+/// the badge (small) and the centered no-sound overlay (large).
+fn draw_prohibit_icon_with_stroke(
+    pb: &mut PixelBuffer,
+    cx: usize,
+    cy: usize,
+    radius: f32,
+    stroke: f32,
+) {
+    let color: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF]; // bright red BGRA
     let r_outer = radius;
     let r_inner = radius - stroke;
     let r_outer_sq = r_outer * r_outer;
@@ -1024,6 +1050,14 @@ fn draw_prohibit_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32) {
             }
         }
     }
+}
+
+/// Draw a prohibit icon at badge size (stroke = 2.0).
+///
+/// Wrapper around [`draw_prohibit_icon_with_stroke`] with the original
+/// stroke width that matches [`PROHIBIT_ICON_RADIUS`].
+fn draw_prohibit_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32) {
+    draw_prohibit_icon_with_stroke(pb, cx, cy, radius, 2.0);
 }
 
 /// Draw a pause icon (two vertical bars ⏸) in yellow.
@@ -1127,6 +1161,85 @@ fn render_transcribing_text(
 ) {
     let color: [u8; 4] = [0xFF, 0xCC, 0x66, 0xFF]; // light blue BGRA
     render_badge_text(pb, font, "TRANSCRIBING", color, x0, y0, w, h);
+}
+
+// ── Centered no-sound overlay rendering ──────────────────────────────
+
+/// Render the content of the large centered "no sound" overlay.
+///
+/// Layout (two rows):
+///   Row 1 (upper ~60%): prohibit icon + "NO SOUND" side by side, centred as a unit
+///   Row 2 (lower ~40%): subtitle text centred across full width
+fn render_centered_no_sound(pb: &mut PixelBuffer, font: &fontdue::Font, bg: [u8; 4]) {
+    let w = pb.width;
+    let h = pb.height;
+
+    // Fill background with rounded corners.
+    pb.clear_rounded(bg, CENTERED_CORNER_RADIUS);
+
+    // ── Row 1: icon + "NO SOUND" centred together ────────────
+    let row1_cy = (h as f32 * 0.36) as usize; // vertical centre of top row
+
+    let icon_radius = h as f32 * 0.22;
+    let icon_stroke = (icon_radius * 0.15).max(2.0);
+    let icon_diameter = (icon_radius * 2.0) as usize;
+
+    let title_color: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF]; // bright red BGRA
+    let title_size = h as f32 * 0.35;
+    let (title_glyphs, title_w) = rasterise_glyphs("NO SOUND", font, title_size);
+
+    // Gap between icon and text.
+    let gap = (h as f32 * 0.08) as usize;
+    let row1_total_w = icon_diameter + gap + title_w;
+    let row1_start_x = (w.saturating_sub(row1_total_w)) / 2;
+
+    // Icon centred vertically in row 1.
+    let icon_cx = row1_start_x + icon_radius as usize;
+    draw_prohibit_icon_with_stroke(pb, icon_cx, row1_cy, icon_radius, icon_stroke);
+
+    // Title text to the right of icon, baseline-aligned to row centre.
+    let title_x = (row1_start_x + icon_diameter + gap) as i32;
+    let title_baseline = row1_cy as i32 + (title_size * 0.30) as i32;
+
+    let mut cursor_x = title_x;
+    for (metrics, bitmap) in &title_glyphs {
+        blit_glyph_at(
+            pb,
+            metrics,
+            bitmap,
+            cursor_x,
+            title_baseline,
+            w,
+            h,
+            title_color,
+            1.0,
+        );
+        cursor_x += metrics.advance_width as i32;
+    }
+
+    // ── Row 2: subtitle centred across full width ────────────
+    let sub_color: [u8; 4] = [0xAA, 0xAA, 0xAA, 0xFF]; // light gray BGRA
+    let sub_size = h as f32 * 0.18;
+    let sub_text = "No audio detected \u{2014} check your microphone";
+    let (sub_glyphs, sub_w) = rasterise_glyphs(sub_text, font, sub_size);
+    let sub_x = (w as i32 - sub_w as i32) / 2;
+    let sub_baseline = (h as i32 * 82) / 100;
+
+    let mut cursor_x = sub_x;
+    for (metrics, bitmap) in &sub_glyphs {
+        blit_glyph_at(
+            pb,
+            metrics,
+            bitmap,
+            cursor_x,
+            sub_baseline,
+            w,
+            h,
+            sub_color,
+            1.0,
+        );
+        cursor_x += metrics.advance_width as i32;
+    }
 }
 
 // ── Static PNG window (transcribing) ─────────────────────────────────
@@ -1315,7 +1428,7 @@ fn overlay_thread(
     // Pre-decode the transcribing indicator image.
     let transcribing_img = decode_png(TRANSCRIBING_PNG)?;
 
-    let (mon_x, mon_y, mon_w, _mon_h) = geom;
+    let (mon_x, mon_y, mon_w, mon_h) = geom;
 
     // Audio ring buffer and sample rate are now provided externally
     // via the audio tee task (no independent CPAL capture).
@@ -1323,6 +1436,33 @@ fn overlay_thread(
 
     // Load a system font for rendering "NO SOUND" text on the badge.
     let badge_font = super::render_util::load_system_font(24.0);
+
+    // ── Centered "no sound" overlay ─────────────────────────────────
+    // Pre-compute dimensions and pre-render the content so the window
+    // can be shown/hidden instantly on no-sound state transitions.
+    let centered_h = (mon_h as f32 * CENTERED_HEIGHT_FRACTION) as u16;
+    let centered_h = centered_h.max(CENTERED_MIN_HEIGHT);
+    let centered_w = (centered_h as f32 * CENTERED_ASPECT_RATIO) as u16;
+    let centered_w = centered_w.min(mon_w); // don't exceed monitor width
+    let centered_font = super::render_util::load_system_font(centered_h as f32 * 0.55);
+    let centered_bg = if argb_ctx.is_some() {
+        CENTERED_BG_ARGB
+    } else {
+        CENTERED_BG_OPAQUE
+    };
+    // Pre-render the centered overlay content into a pixel buffer.
+    let centered_pb = if let Some(ref font) = centered_font {
+        let mut pb = PixelBuffer::new(centered_w as usize, centered_h as usize);
+        render_centered_no_sound(&mut pb, font, centered_bg);
+        Some(pb)
+    } else {
+        log::warn!("no font for centered no-sound overlay");
+        None
+    };
+    // Window/GC handles for the centered overlay (created/destroyed
+    // dynamically when no_sound_active transitions).
+    let mut centered_window: Option<u32> = None;
+    let mut centered_gc: Option<u32> = None;
 
     // ── Dead-signal detection state ─────────────────────────────────
     // Detect a dead/missing audio device by checking sample variance.
@@ -1441,6 +1581,7 @@ fn overlay_thread(
             match cmd {
                 Command::Show(IndicatorKind::Recording) => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
 
                     let badge_x = mon_x + (mon_w as i16 / 2) - (BADGE_W as i16 / 2);
                     let badge_y = mon_y + 4;
@@ -1512,6 +1653,7 @@ fn overlay_thread(
 
                 Command::Show(IndicatorKind::Transcribing) => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
                     show_transcribing(
                         &conn,
                         screen,
@@ -1526,10 +1668,12 @@ fn overlay_thread(
 
                 Command::Hide => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
                 }
 
                 Command::Quit => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
                     break;
                 }
             }
@@ -1547,6 +1691,7 @@ fn overlay_thread(
             match rx.try_recv() {
                 Ok(Command::Show(IndicatorKind::Recording)) => {
                     is_transcribing = false;
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
                     spectrogram_history.clear();
                     phase_history.clear();
                     upload_history.clear();
@@ -1584,14 +1729,17 @@ fn overlay_thread(
                     // recording has stopped), and the phase colour
                     // layer renders the HTTP lifecycle on top.
                     is_transcribing = true;
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
                 }
                 Ok(Command::Hide) => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
                     is_recording = false;
                     break;
                 }
                 Ok(Command::Quit) | Err(mpsc::TryRecvError::Disconnected) => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
                     is_recording = false;
                     quit = true;
                     break;
@@ -1697,6 +1845,7 @@ fn overlay_thread(
         // A dead or missing audio device produces perfectly uniform
         // samples (e.g. constant -1.0 or all zeros) with variance ≈ 0.
         // A real microphone always has random noise (variance > 1e-10).
+        let was_no_sound = no_sound_active;
         if frame_variance < DEAD_SIGNAL_VARIANCE_CEIL {
             dead_signal_frames = dead_signal_frames.saturating_add(1);
         } else {
@@ -1717,6 +1866,55 @@ fn overlay_thread(
                 }
                 silence_notified = true;
             }
+        }
+
+        // ── Centered no-sound overlay transitions ────────────
+        if no_sound_active && !was_no_sound {
+            // Transition to no-sound: show the centered overlay.
+            if let Some(ref cpb) = centered_pb {
+                if centered_window.is_none() {
+                    let cx = mon_x + (mon_w as i16 / 2) - (centered_w as i16 / 2);
+                    let cy = mon_y + (mon_h as i16 / 2) - (centered_h as i16 / 2);
+                    let win = if let Some(ref ctx) = argb_ctx {
+                        create_argb_overlay_window(&conn, root, ctx, cx, cy, centered_w, centered_h)
+                    } else {
+                        create_overlay_window(&conn, screen, root, cx, cy, centered_w, centered_h)
+                    };
+                    if let Ok(w) = win {
+                        let _ = apply_rounded_shape(
+                            &conn,
+                            w,
+                            centered_w,
+                            centered_h,
+                            CENTERED_CORNER_RADIUS,
+                        );
+                        let _ = conn.map_window(w);
+                        let _ = conn.sync();
+                        // Create GC and blit pre-rendered content.
+                        if let Ok(gc) = conn.generate_id() {
+                            let _ = conn.create_gc(gc, w, &CreateGCAux::new());
+                            let _ = conn.put_image(
+                                ImageFormat::Z_PIXMAP,
+                                w,
+                                gc,
+                                centered_w,
+                                centered_h,
+                                0,
+                                0,
+                                0,
+                                depth,
+                                &cpb.data,
+                            );
+                            let _ = conn.flush();
+                            centered_window = Some(w);
+                            centered_gc = Some(gc);
+                        }
+                    }
+                }
+            }
+        } else if !no_sound_active && was_no_sound {
+            // Transition from no-sound: hide the centered overlay.
+            destroy_current(&conn, &mut centered_window, &mut centered_gc);
         }
 
         // ── Auto-pause detection ─────────────────────────────
@@ -2003,7 +2201,7 @@ fn overlay_thread(
                 render_no_sound_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
             }
             clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
-            draw_prohibit_icon(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX);
+            draw_prohibit_icon(&mut pb, DOT_CX, DOT_CY, PROHIBIT_ICON_RADIUS);
         } else if auto_paused {
             // ── AUTO-PAUSE mode: dimmed waterfall + LISTENING ─
             //
