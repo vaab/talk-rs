@@ -19,7 +19,7 @@ use std::time::Instant;
 use tokio::fs::File;
 use tokio_stream::wrappers::ReceiverStream;
 
-use super::http::{build_client, parse_u64_field};
+use super::http::{build_client, parse_u64_field, proportional_timeout};
 use super::BatchTranscriber;
 
 /// Default API base URL for the OpenAI API.
@@ -204,10 +204,18 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             )));
         }
 
-        // Open the audio file
+        // Open the audio file and read its size so we can compute a
+        // payload-proportional wall-clock timeout below.
         let file = File::open(audio_path).await.map_err(|err| {
             TalkError::Transcription(format!("Failed to open audio file: {}", err))
         })?;
+        let file_len = file
+            .metadata()
+            .await
+            .map_err(|err| {
+                TalkError::Transcription(format!("Failed to read audio file metadata: {}", err))
+            })?
+            .len();
 
         // Get file name for multipart form
         let file_name = audio_path
@@ -225,12 +233,24 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                 reqwest::multipart::Part::stream(file).file_name(file_name),
             );
 
+        // Compute a payload-proportional wall-clock timeout for this
+        // request.  See `proportional_timeout` for the formula and
+        // rationale.  This bounds the tail when the server accepts
+        // the connection and then hangs at the application layer.
+        let request_timeout = proportional_timeout(file_len);
+        log::warn!(
+            "openai batch file: request timeout = {}s (audio = {} KB)",
+            request_timeout.as_secs(),
+            file_len / 1024
+        );
+
         let started = Instant::now();
         let response = self
             .client
             .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .multipart(form)
+            .timeout(request_timeout)
             .send()
             .await
             .map_err(|err| {

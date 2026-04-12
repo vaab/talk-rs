@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::Instant;
 use tokio::fs::File;
 
-use super::http::{build_client, parse_u64_field};
+use super::http::{build_client, parse_u64_field, proportional_timeout};
 use super::BatchTranscriber;
 
 /// Default API base URL for the Mistral API.
@@ -261,12 +261,25 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 .text("timestamp_granularities", "segment");
         }
 
+        // Compute a payload-proportional wall-clock timeout for this
+        // request.  See `proportional_timeout` for the formula and
+        // rationale.  This bounds the tail when the server accepts
+        // the connection and then hangs at the application layer
+        // (which TCP-level defences cannot detect).
+        let request_timeout = proportional_timeout(file_len);
+        log::warn!(
+            "mistral batch file: request timeout = {}s (audio = {} KB)",
+            request_timeout.as_secs(),
+            file_len / 1024
+        );
+
         let started = Instant::now();
         let response = self
             .client
             .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .multipart(form)
+            .timeout(request_timeout)
             .send()
             .await
             .map_err(|err| {
@@ -385,6 +398,18 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 .text("timestamp_granularities", "segment");
         }
 
+        // Compute a payload-proportional wall-clock timeout for this
+        // request.  See `proportional_timeout` for the formula and
+        // rationale.  This bounds the tail when the server accepts
+        // the connection and then hangs at the application layer
+        // (which TCP-level defences cannot detect).
+        let request_timeout = proportional_timeout(audio_len);
+        log::warn!(
+            "mistral stream: request timeout = {}s (audio = {} KB)",
+            request_timeout.as_secs(),
+            audio_len / 1024
+        );
+
         log::warn!("[DBG] mistral stream: POST {} beginning", self.endpoint);
         let started = Instant::now();
         let response = self
@@ -392,6 +417,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .multipart(form)
+            .timeout(request_timeout)
             .send()
             .await
             .map_err(|err| {
