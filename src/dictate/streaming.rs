@@ -330,6 +330,21 @@ pub(crate) async fn dictate_streaming(
         );
     }
 
+    // ── Empty / dead-signal recording guard ────────────────────────────
+    //
+    // Skip transcription when no usable audio was captured:
+    //  - buffer is empty (instant stop, or dead signal paused the pipeline)
+    //  - overlay reports no live audio was ever detected (entire session
+    //    was dead signal)
+    let skip = buffer.is_empty().await || overlay.is_some_and(|o| !o.had_live_audio());
+    if skip {
+        log::warn!("no usable audio recorded — skipping transcription");
+        feeder_handle.abort();
+        encode_handle.abort();
+        transcribe_handle.abort();
+        return (Ok(TranscriptionResult::default()), t_stop);
+    }
+
     // ── Wait for transcription result ───────────────────────────────
     //
     // No artificial timeout here — the HTTP client's `read_timeout`,

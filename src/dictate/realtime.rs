@@ -63,6 +63,11 @@ impl AudioBuffer {
         self.notify.notify_waiters();
     }
 
+    /// Return `true` if no audio chunks were pushed to this buffer.
+    pub(super) async fn is_empty(&self) -> bool {
+        self.chunks.lock().await.is_empty()
+    }
+
     /// Read new chunks starting at `cursor`.
     ///
     /// Returns `(chunks, new_cursor)`.  Blocks until data is available
