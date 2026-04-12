@@ -68,6 +68,25 @@ const SPEC_H: usize = SPEC_BOTTOM - SPEC_TOP;
 /// Target frames per second for the recording render loop.
 const FPS: u32 = 60;
 
+/// How many render frames elapse between two waterfall column pushes.
+///
+/// The render loop still runs at [`FPS`] — the red dot pulse, border,
+/// and text all update every frame — but the spectrogram history is
+/// only appended every `COLUMN_PERIOD_FRAMES` frames.  This decouples
+/// the waterfall's *temporal* resolution from the render rate without
+/// sacrificing animation smoothness.
+///
+/// At 60 fps with `COLUMN_PERIOD_FRAMES = 2` the waterfall advances
+/// 30 columns/sec, giving a visible window of roughly
+/// `SPEC_W / 30 ≈ 8.8` seconds across the 265-pixel spectrogram area.
+const COLUMN_PERIOD_FRAMES: u32 = 2;
+
+/// Opacity multiplier applied to the waterfall (and sibling visualizers)
+/// while auto-pause is active.  The graph keeps scrolling at the same
+/// rate but is rendered dimmer, leaving the `LISTENING` indicator and
+/// pause icon on top at full brightness.
+const DIM_FACTOR_PAUSED: f32 = 0.3;
+
 /// Initial effective frequency ceiling; grows as higher harmonics appear.
 const FREQ_INITIAL_MAX: f32 = 320.0;
 
@@ -248,6 +267,11 @@ fn decode_png(bytes: &[u8]) -> Result<RgbaImage, TalkError> {
 /// `Vec<f32>` of length `SPEC_H`).  Newer columns are at the end.
 /// The spectrogram is right-aligned: the newest column draws at the
 /// right edge of the area, oldest on the left.
+///
+/// `dim` scales each pixel's visible intensity.  Pass `1.0` for the
+/// normal render, `DIM_FACTOR_PAUSED` during auto-pause to render a
+/// dimmed (30 % brightness) waterfall behind the `LISTENING` indicator.
+/// Out-of-range values are clamped to `[0.0, 1.0]`.
 #[allow(clippy::too_many_arguments)]
 fn render_spectrogram(
     pb: &mut PixelBuffer,
@@ -258,10 +282,13 @@ fn render_spectrogram(
     h: usize,
     peak: f32,
     mono: Option<([u8; 4], [u8; 4])>,
+    dim: f32,
 ) {
     if history.is_empty() || peak < PEAK_FLOOR {
         return;
     }
+
+    let dim = dim.clamp(0.0, 1.0);
 
     let n = history.len();
     let start = n.saturating_sub(w);
@@ -287,11 +314,17 @@ fn render_spectrogram(
             };
 
             let mut color = if mono.is_some() {
-                // Premultiplied alpha: white × brightness.
-                let alpha = (brightness * 255.0) as u8;
+                // Premultiplied alpha: white × brightness × dim.
+                let alpha = (brightness * 255.0 * dim) as u8;
                 [alpha, alpha, alpha, alpha]
             } else {
-                super::render_util::heat_map_color(norm, brightness)
+                let c = super::render_util::heat_map_color(norm, brightness);
+                [
+                    (c[0] as f32 * dim) as u8,
+                    (c[1] as f32 * dim) as u8,
+                    (c[2] as f32 * dim) as u8,
+                    c[3],
+                ]
             };
             // Keep pixel fully opaque over the black background.
             color[3] = 0xFF;
@@ -305,6 +338,9 @@ fn render_spectrogram(
 /// Draws symmetric bars around the vertical centre, scrolling left
 /// (newest at right edge).  Uses premultiplied alpha white (like the
 /// waterfall), or monochrome palette if provided.
+///
+/// `dim` scales each pixel's visible intensity (see
+/// [`render_spectrogram`] for the rationale).
 #[allow(clippy::too_many_arguments)]
 fn render_amplitude_badge(
     pb: &mut PixelBuffer,
@@ -315,10 +351,13 @@ fn render_amplitude_badge(
     w: usize,
     h: usize,
     mono: Option<([u8; 4], [u8; 4])>,
+    dim: f32,
 ) {
     if history.is_empty() || max_rms < PEAK_FLOOR {
         return;
     }
+
+    let dim = dim.clamp(0.0, 1.0);
 
     let n = history.len();
     let center_y = y0 + h / 2;
@@ -339,11 +378,17 @@ fn render_amplitude_badge(
         let norm = (avg_rms / max_rms).clamp(0.0, 1.0);
         let half_height = (norm * max_half as f32) as usize;
 
-        let color = if let Some((fg, bg)) = mono {
+        let base = if let Some((fg, bg)) = mono {
             super::render_util::lerp_color(bg, fg, norm)
         } else {
             super::render_util::level_color(norm)
         };
+        let color = [
+            (base[0] as f32 * dim) as u8,
+            (base[1] as f32 * dim) as u8,
+            (base[2] as f32 * dim) as u8,
+            base[3],
+        ];
 
         let top = center_y.saturating_sub(half_height);
         let bottom = center_y + half_height;
@@ -357,6 +402,9 @@ fn render_amplitude_badge(
 ///
 /// Bars grow upward from the bottom edge.  Uses premultiplied alpha
 /// white (like the waterfall), or monochrome palette if provided.
+///
+/// `dim` scales each pixel's visible intensity (see
+/// [`render_spectrogram`] for the rationale).
 #[allow(clippy::too_many_arguments)]
 fn render_spectrum_badge(
     pb: &mut PixelBuffer,
@@ -367,10 +415,13 @@ fn render_spectrum_badge(
     w: usize,
     h: usize,
     mono: Option<([u8; 4], [u8; 4])>,
+    dim: f32,
 ) {
     if magnitudes.is_empty() || peak < PEAK_FLOOR {
         return;
     }
+
+    let dim = dim.clamp(0.0, 1.0);
 
     // Use lower quarter of spectrum (voice content).
     let useful = &magnitudes[..magnitudes.len() / 4];
@@ -398,11 +449,17 @@ fn render_spectrum_badge(
         let bar_x = x0 + bar;
         let bar_y = y0 + h - 2 - bar_height;
 
-        let color = if let Some((fg, bg)) = mono {
+        let base = if let Some((fg, bg)) = mono {
             super::render_util::lerp_color(bg, fg, log_norm)
         } else {
             super::render_util::level_color(log_norm)
         };
+        let color = [
+            (base[0] as f32 * dim) as u8,
+            (base[1] as f32 * dim) as u8,
+            (base[2] as f32 * dim) as u8,
+            base[3],
+        ];
 
         for dy in 0..bar_height {
             pb.set_pixel(bar_x, bar_y + dy, color);
@@ -939,6 +996,13 @@ fn overlay_thread(
     let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
     let mut rms_peak: f32 = PEAK_FLOOR;
 
+    // Waterfall column advance counter.  Incremented every render
+    // frame; a new column is pushed to [`spectrogram_history`] (and
+    // amplitude/spectrum equivalents) only when the counter is a
+    // multiple of [`COLUMN_PERIOD_FRAMES`].  This decouples the
+    // waterfall's temporal resolution from the 60 fps render rate.
+    let mut column_frame_counter: u32 = 0;
+
     // Amplitude history for amplitude viz mode: one RMS value per frame.
     let amp_window_secs: f32 = 5.0;
     let amp_max_frames = (FPS as f32 * amp_window_secs) as usize;
@@ -1197,8 +1261,10 @@ fn overlay_thread(
             }
         }
 
-        // Per-viz-mode data updates (freeze during auto-pause / no-sound
-        // so silence gaps don't appear in the visualization).
+        // Per-viz-mode peak tracking and frequency scaling — updated
+        // every render frame (regardless of the slower column-push
+        // cadence) so normalization stays smooth.  Peaks are still
+        // frozen while the device is dead or auto-pause is active.
         if !auto_paused && !no_sound_active {
             if let Some(mode) = viz {
                 use crate::config::VizMode;
@@ -1216,16 +1282,6 @@ fn overlay_thread(
                                 break;
                             }
                         }
-                        let column = map_spectrum_to_column(
-                            &magnitudes,
-                            SPEC_H,
-                            sample_rate,
-                            effective_freq_max,
-                        );
-                        spectrogram_history.push(column);
-                        if spectrogram_history.len() > SPEC_W {
-                            spectrogram_history.drain(..spectrogram_history.len() - SPEC_W);
-                        }
                         // All-time peak for opacity normalization.
                         let frame_spec_max = magnitudes.iter().copied().fold(0.0f32, f32::max);
                         if frame_spec_max > spec_peak {
@@ -1236,10 +1292,6 @@ fn overlay_thread(
                         if frame_rms > amp_peak {
                             amp_peak = frame_rms;
                         }
-                        amp_history.push(frame_rms);
-                        if amp_history.len() > amp_max_frames {
-                            amp_history.drain(..amp_history.len() - amp_max_frames);
-                        }
                     }
                     VizMode::Spectrum => {
                         spectrum_peak *= PEAK_DECAY;
@@ -1248,6 +1300,64 @@ fn overlay_thread(
                             spectrum_peak = frame_peak;
                         }
                         spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
+                    }
+                }
+            }
+        }
+
+        // ── Waterfall column advance ─────────────────────────
+        //
+        // The waterfall scrolls at a *constant* wall-clock rate
+        // (one column every [`COLUMN_PERIOD_FRAMES`] render frames),
+        // regardless of whether the user is currently speaking.
+        //
+        // During auto-pause, an *empty* column is pushed instead of
+        // skipping the push entirely.  This keeps the scroll going
+        // forward on the time axis so the growing "hole" in the
+        // spectrogram visually represents the duration of the pause.
+        // When speech resumes, the hole stops growing and real audio
+        // columns fill in again.
+        //
+        // Peak tracking above is still frame-rate-driven so
+        // normalization adapts smoothly even when the column rate
+        // is slower.
+        column_frame_counter = column_frame_counter.wrapping_add(1);
+        if column_frame_counter.is_multiple_of(COLUMN_PERIOD_FRAMES) && !no_sound_active {
+            if let Some(mode) = viz {
+                use crate::config::VizMode;
+                match mode {
+                    VizMode::Waterfall => {
+                        let column = if auto_paused {
+                            // Empty column → no visible content, but the
+                            // column still advances so the time axis
+                            // keeps moving and the spectrogram "hole"
+                            // grows with real elapsed time.
+                            vec![0.0f32; SPEC_H]
+                        } else {
+                            map_spectrum_to_column(
+                                &magnitudes,
+                                SPEC_H,
+                                sample_rate,
+                                effective_freq_max,
+                            )
+                        };
+                        spectrogram_history.push(column);
+                        if spectrogram_history.len() > SPEC_W {
+                            spectrogram_history.drain(..spectrogram_history.len() - SPEC_W);
+                        }
+                    }
+                    VizMode::Amplitude => {
+                        // 0.0 during pause so the amplitude history
+                        // also shows a visible gap.
+                        let val = if auto_paused { 0.0 } else { frame_rms };
+                        amp_history.push(val);
+                        if amp_history.len() > amp_max_frames {
+                            amp_history.drain(..amp_history.len() - amp_max_frames);
+                        }
+                    }
+                    VizMode::Spectrum => {
+                        // Spectrum viz has no history; it renders a
+                        // live snapshot of `magnitudes` each frame.
                     }
                 }
             }
@@ -1266,7 +1376,57 @@ fn overlay_thread(
             clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
             draw_prohibit_icon(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX);
         } else if auto_paused {
-            // ── AUTO-PAUSE mode: pause bars + yellow text ────
+            // ── AUTO-PAUSE mode: dimmed waterfall + LISTENING ─
+            //
+            // The waterfall keeps scrolling at constant time and the
+            // growing "hole" (empty columns pushed above) shows how
+            // long we've been listening.  We render it at reduced
+            // opacity so the `LISTENING` indicator and pause icon
+            // remain the dominant foreground.
+            if let Some(mode) = viz {
+                use crate::config::VizMode;
+                match mode {
+                    VizMode::Waterfall => {
+                        render_spectrogram(
+                            &mut pb,
+                            &spectrogram_history,
+                            SPEC_LEFT,
+                            SPEC_TOP,
+                            SPEC_W,
+                            SPEC_H,
+                            spec_peak,
+                            mono_palette,
+                            DIM_FACTOR_PAUSED,
+                        );
+                    }
+                    VizMode::Amplitude => {
+                        render_amplitude_badge(
+                            &mut pb,
+                            &amp_history,
+                            amp_peak,
+                            SPEC_LEFT,
+                            SPEC_TOP,
+                            SPEC_W,
+                            SPEC_H,
+                            mono_palette,
+                            DIM_FACTOR_PAUSED,
+                        );
+                    }
+                    VizMode::Spectrum => {
+                        render_spectrum_badge(
+                            &mut pb,
+                            &magnitudes,
+                            spectrum_peak,
+                            SPEC_LEFT,
+                            SPEC_TOP,
+                            SPEC_W,
+                            SPEC_H,
+                            mono_palette,
+                            DIM_FACTOR_PAUSED,
+                        );
+                    }
+                }
+            }
             if let Some(ref f) = badge_font {
                 render_listening_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
             }
@@ -1287,6 +1447,7 @@ fn overlay_thread(
                             SPEC_H,
                             spec_peak,
                             mono_palette,
+                            1.0,
                         );
                     }
                     VizMode::Amplitude => {
@@ -1299,6 +1460,7 @@ fn overlay_thread(
                             SPEC_W,
                             SPEC_H,
                             mono_palette,
+                            1.0,
                         );
                     }
                     VizMode::Spectrum => {
@@ -1311,6 +1473,7 @@ fn overlay_thread(
                             SPEC_W,
                             SPEC_H,
                             mono_palette,
+                            1.0,
                         );
                     }
                 }
@@ -1573,7 +1736,7 @@ mod tests {
             .map(|i| vec![(i as f32 * 0.01).sin().abs(); SPEC_H])
             .collect();
         render_spectrogram(
-            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None,
+            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None, 1.0,
         );
 
         let mut non_bg = 0;
@@ -1592,7 +1755,105 @@ mod tests {
     fn render_spectrogram_empty_history_no_panic() {
         let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
         pb.clear(BG_COLOR);
-        render_spectrogram(&mut pb, &[], SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None);
+        render_spectrogram(
+            &mut pb,
+            &[],
+            SPEC_LEFT,
+            SPEC_TOP,
+            SPEC_W,
+            SPEC_H,
+            1.0,
+            None,
+            1.0,
+        );
+    }
+
+    #[test]
+    fn render_spectrogram_dim_produces_darker_pixels_than_full() {
+        // Same history, two different dim factors: the dim render
+        // should produce strictly lower channel intensities at the
+        // same pixel coordinates.  This validates the Phase 0
+        // auto-pause dimming layer.
+        let history: Vec<Vec<f32>> = (0..SPEC_W).map(|_| vec![1.0; SPEC_H]).collect();
+
+        let mut pb_full = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb_full.clear(BG_COLOR);
+        render_spectrogram(
+            &mut pb_full,
+            &history,
+            SPEC_LEFT,
+            SPEC_TOP,
+            SPEC_W,
+            SPEC_H,
+            1.0,
+            None,
+            1.0,
+        );
+
+        let mut pb_dim = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb_dim.clear(BG_COLOR);
+        render_spectrogram(
+            &mut pb_dim,
+            &history,
+            SPEC_LEFT,
+            SPEC_TOP,
+            SPEC_W,
+            SPEC_H,
+            1.0,
+            None,
+            DIM_FACTOR_PAUSED,
+        );
+
+        // Sample the middle column, middle row.
+        let sample_x = SPEC_LEFT + SPEC_W / 2;
+        let sample_y = SPEC_TOP + SPEC_H / 2;
+        let off = (sample_y * pb_full.width + sample_x) * 4;
+
+        let full_intensity =
+            pb_full.data[off] as u32 + pb_full.data[off + 1] as u32 + pb_full.data[off + 2] as u32;
+        let dim_intensity =
+            pb_dim.data[off] as u32 + pb_dim.data[off + 1] as u32 + pb_dim.data[off + 2] as u32;
+
+        assert!(
+            full_intensity > 0,
+            "full-bright spectrogram pixel should have non-zero intensity"
+        );
+        assert!(
+            dim_intensity < full_intensity,
+            "dim ({}) must be strictly less than full ({})",
+            dim_intensity,
+            full_intensity
+        );
+    }
+
+    #[test]
+    fn render_spectrogram_zero_column_produces_no_pixels() {
+        // A column of all zeros (as pushed during auto-pause) should
+        // render no visible content at that column's x position.
+        // This validates the Phase 0 "empty column / hole" behaviour.
+        let history: Vec<Vec<f32>> = vec![vec![0.0f32; SPEC_H]; SPEC_W];
+        let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
+        pb.clear(BG_COLOR);
+        render_spectrogram(
+            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None, 1.0,
+        );
+
+        // No pixel in the spec area should have been modified from
+        // the background color.
+        let mut non_bg = 0;
+        for y in SPEC_TOP..SPEC_BOTTOM {
+            for x in SPEC_LEFT..SPEC_RIGHT {
+                let off = (y * pb.width + x) * 4;
+                if pb.data[off..off + 4] != BG_COLOR {
+                    non_bg += 1;
+                }
+            }
+        }
+        assert_eq!(
+            non_bg, 0,
+            "all-zero columns should produce no non-background pixels (got {})",
+            non_bg
+        );
     }
 
     #[test]
@@ -1603,7 +1864,7 @@ mod tests {
         // Only 5 columns of history — should right-align.
         let history: Vec<Vec<f32>> = (0..5).map(|_| vec![1.0; SPEC_H]).collect();
         render_spectrogram(
-            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None,
+            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None, 1.0,
         );
 
         // Leftmost columns of spectrogram area should still be BG.
@@ -1765,7 +2026,7 @@ mod tests {
             .map(|i| vec![(i as f32 * 0.05).sin().abs(); SPEC_H])
             .collect();
         render_spectrogram(
-            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None,
+            &mut pb, &history, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H, 1.0, None, 1.0,
         );
 
         // Count pixels with non-zero alpha (visible content).
