@@ -46,6 +46,8 @@ pub struct RecordingMetadata {
     /// Provider-specific metadata payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_api: Option<ProviderApiMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<CommonSegment>>,
 }
 
 /// Minimal metadata used for retry/replacement flows.
@@ -98,6 +100,13 @@ pub struct CommonTokenUsage {
     pub output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommonSegment {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,6 +274,24 @@ fn provider_api_metadata_from_transcription(
     }
 }
 
+pub(crate) fn common_segments_from_result(
+    segments: Option<&[crate::transcription::TranscriptSegment]>,
+) -> Option<Vec<CommonSegment>> {
+    let segs = segments?;
+    if segs.is_empty() {
+        return None;
+    }
+    Some(
+        segs.iter()
+            .map(|s| CommonSegment {
+                start: s.start,
+                end: s.end,
+                text: s.text.clone(),
+            })
+            .collect(),
+    )
+}
+
 /// Get the recordings cache directory (`~/.cache/talk-rs/recordings/`).
 pub fn recordings_dir() -> Result<PathBuf, TalkError> {
     Ok(cache_dir()?.join("recordings"))
@@ -314,6 +341,7 @@ fn metadata_filename(timestamp: &str, provider: Provider, model: &str, realtime:
 }
 
 /// Write a metadata YAML file for a cached recording.
+#[allow(clippy::too_many_arguments)]
 pub fn write_metadata(
     timestamp: &str,
     provider: Provider,
@@ -322,6 +350,7 @@ pub fn write_metadata(
     transcript: &str,
     audio_filename: &str,
     transcription_metadata: &TranscriptionMetadata,
+    segments: Option<&[crate::transcription::TranscriptSegment]>,
 ) -> Result<PathBuf, TalkError> {
     let dir = ensure_recordings_dir()?;
 
@@ -334,6 +363,7 @@ pub fn write_metadata(
         timestamp: timestamp.to_string(),
         metadata: common_metadata_from_transcription(transcription_metadata),
         provider_api: provider_api_metadata_from_transcription(transcription_metadata),
+        segments: common_segments_from_result(segments),
     };
 
     let yaml = serde_yaml::to_string(&meta)
@@ -682,6 +712,7 @@ mod tests {
             timestamp: "2026-02-18T12-33-45".to_string(),
             metadata: None,
             provider_api: None,
+            segments: None,
         };
         let yaml = serde_yaml::to_string(&meta).expect("serialise");
         assert!(yaml.contains("recording: 2026-02-18T12-33-45.ogg"));
@@ -726,6 +757,7 @@ mod tests {
                 }),
                 mistral: None,
             }),
+            segments: None,
         };
 
         let yaml = serde_yaml::to_string(&meta).expect("serialise");
@@ -734,6 +766,46 @@ mod tests {
         assert!(yaml.contains("provider_api:"));
         assert!(yaml.contains("openai:"));
         assert!(yaml.contains("request_id: req_123"));
+    }
+
+    #[test]
+    fn test_recording_metadata_serialize_with_segments() {
+        let meta = RecordingMetadata {
+            recording: "2026-02-18T12-33-45.ogg".to_string(),
+            provider: "openai".to_string(),
+            model: "whisper-1".to_string(),
+            realtime: false,
+            transcript: "Hello world.".to_string(),
+            timestamp: "2026-02-18T12-33-45".to_string(),
+            metadata: None,
+            provider_api: None,
+            segments: Some(vec![CommonSegment {
+                start: 1.2,
+                end: 10.7,
+                text: "Hello world.".to_string(),
+            }]),
+        };
+
+        let yaml = serde_yaml::to_string(&meta).expect("serialise");
+        assert!(yaml.contains("segments:\n- start: 1.2\n  end: 10.7\n  text:"));
+    }
+
+    #[test]
+    fn test_recording_metadata_serialize_without_segments() {
+        let meta = RecordingMetadata {
+            recording: "2026-02-18T12-33-45.ogg".to_string(),
+            provider: "openai".to_string(),
+            model: "whisper-1".to_string(),
+            realtime: false,
+            transcript: "Hello world.".to_string(),
+            timestamp: "2026-02-18T12-33-45".to_string(),
+            metadata: None,
+            provider_api: None,
+            segments: None,
+        };
+
+        let yaml = serde_yaml::to_string(&meta).expect("serialise");
+        assert!(!yaml.contains("segments"));
     }
 
     #[test]

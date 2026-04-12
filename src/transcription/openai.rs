@@ -6,8 +6,8 @@
 use crate::config::OpenAIConfig;
 use crate::error::TalkError;
 use crate::transcription::{
-    OpenAIProviderMetadata, ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata,
-    TranscriptionResult,
+    parse_transcript_segments, OpenAIProviderMetadata, ProviderSpecificMetadata, TokenUsage,
+    TranscriptionMetadata, TranscriptionResult,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -237,10 +237,18 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             .unwrap_or("audio.ogg")
             .to_string();
 
-        // Create multipart form with audio file, model, and response format
+        // Create multipart form with audio file, model, and response format.
+        // Whisper models support `verbose_json` which includes per-segment
+        // timing — request it when available so we can persist segments in
+        // the YAML sidecar.  GPT-4o transcribe models only accept `json`.
+        let response_format = if self.config.model.starts_with("whisper") {
+            "verbose_json"
+        } else {
+            "json"
+        };
         let form = reqwest::multipart::Form::new()
             .text("model", self.config.model.clone())
-            .text("response_format", "json")
+            .text("response_format", response_format)
             .part(
                 "file",
                 reqwest::multipart::Part::stream_with_length(
@@ -356,6 +364,10 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                 .and_then(parse_openai_audio_seconds)
         });
         let segment_count = openai_response.segments.as_ref().map(std::vec::Vec::len);
+        let segments = openai_response
+            .segments
+            .as_deref()
+            .and_then(parse_transcript_segments);
         let word_count = openai_response.words.as_ref().map(std::vec::Vec::len);
         let request_id = headers
             .get("x-request-id")
@@ -389,6 +401,7 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                 })),
             },
             diarization: None,
+            segments,
         })
     }
 
@@ -403,10 +416,17 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
         // Wrap the stream into a reqwest body for streaming upload
         let body = reqwest::Body::wrap_stream(byte_stream);
 
-        // Create multipart form with streaming audio, model, and response format
+        // Create multipart form with streaming audio, model, and response format.
+        // Same `verbose_json` conditional as `transcribe_file`: whisper
+        // models get segment timing, GPT-4o models stay on plain `json`.
+        let response_format = if self.config.model.starts_with("whisper") {
+            "verbose_json"
+        } else {
+            "json"
+        };
         let form = reqwest::multipart::Form::new()
             .text("model", self.config.model.clone())
-            .text("response_format", "json")
+            .text("response_format", response_format)
             .part(
                 "file",
                 reqwest::multipart::Part::stream(body).file_name(file_name.to_string()),
@@ -456,6 +476,10 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                 .and_then(parse_openai_audio_seconds)
         });
         let segment_count = openai_response.segments.as_ref().map(std::vec::Vec::len);
+        let segments = openai_response
+            .segments
+            .as_deref()
+            .and_then(parse_transcript_segments);
         let word_count = openai_response.words.as_ref().map(std::vec::Vec::len);
         let request_id = headers
             .get("x-request-id")
@@ -489,6 +513,7 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                 })),
             },
             diarization: None,
+            segments,
         })
     }
 }
@@ -616,6 +641,61 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text, "Streamed OpenAI transcription");
+    }
+
+    #[tokio::test]
+    async fn test_openai_transcriber_extracts_transcript_segments() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(header("authorization", "Bearer sk-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "Hello world. This is a test.",
+                "language": "en",
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.5,
+                        "text": "Hello world."
+                    },
+                    {
+                        "start": 2.0,
+                        "end": 3.8,
+                        "text": " This is a test."
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"fake audio data").unwrap();
+        temp_file.flush().unwrap();
+
+        let config = OpenAIConfig {
+            api_key: "sk-test-key".to_string(),
+            url: None,
+            model: "whisper-1".to_string(),
+            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+        };
+        let transcriber = OpenAIBatchTranscriber::with_endpoint(
+            config,
+            format!("{}/v1/audio/transcriptions", mock_server.uri()),
+        )
+        .expect("build client");
+
+        let result = transcriber.transcribe_file(temp_file.path()).await.unwrap();
+
+        assert_eq!(result.text, "Hello world. This is a test.");
+        let segments = result.segments.expect("transcript segments present");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].start, 0.0);
+        assert_eq!(segments[0].end, 1.5);
+        assert_eq!(segments[0].text, "Hello world.");
+        assert_eq!(segments[1].start, 2.0);
+        assert_eq!(segments[1].end, 3.8);
+        assert_eq!(segments[1].text, " This is a test.");
     }
 
     #[tokio::test]

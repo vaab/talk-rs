@@ -6,7 +6,9 @@
 
 use super::ui::{PickerCandidate, PickerMessage};
 use crate::config::Provider;
-use crate::transcription::{BatchTranscriber, RealtimeTranscriber, TranscriptionEvent};
+use crate::transcription::{
+    BatchTranscriber, RealtimeTranscriber, TranscriptSegment, TranscriptionEvent,
+};
 use std::path::PathBuf;
 
 /// PCM chunk size for realtime WAV feeding (480 samples = 30 ms at
@@ -64,6 +66,7 @@ pub(super) async fn run_realtime_transcription(
     // Listen for events and forward to GTK.
     let mut event_rx = event_rx;
     let mut accumulated = String::new();
+    let mut timed_segments: Vec<TranscriptSegment> = Vec::new();
     loop {
         match event_rx.recv().await {
             Some(TranscriptionEvent::TextDelta { text }) => {
@@ -74,12 +77,20 @@ pub(super) async fn run_realtime_transcription(
                     accumulated_text: accumulated.clone(),
                 });
             }
-            Some(TranscriptionEvent::SegmentDelta { text, .. }) => {
+            Some(TranscriptionEvent::SegmentDelta { text, start, end }) => {
                 if !text.is_empty() {
+                    let trimmed = text.trim().to_string();
+                    if let (Some(start), Some(end)) = (start, end) {
+                        timed_segments.push(TranscriptSegment {
+                            start,
+                            end,
+                            text: trimmed.clone(),
+                        });
+                    }
                     if !accumulated.is_empty() {
                         accumulated.push(' ');
                     }
-                    accumulated.push_str(text.trim());
+                    accumulated.push_str(&trimmed);
                     let _ = tx.send(PickerMessage::StreamUpdate {
                         provider,
                         model: model.clone(),
@@ -90,7 +101,15 @@ pub(super) async fn run_realtime_transcription(
             Some(TranscriptionEvent::Done) => {
                 let final_text = accumulated.trim().to_string();
                 let _ = tx.send(PickerMessage::Candidate(PickerCandidate::success(
-                    provider, model, final_text, true,
+                    provider,
+                    model,
+                    final_text,
+                    true,
+                    if timed_segments.is_empty() {
+                        None
+                    } else {
+                        Some(timed_segments)
+                    },
                 )));
                 return;
             }
@@ -104,7 +123,15 @@ pub(super) async fn run_realtime_transcription(
                 // Channel closed without Done — use what we have.
                 let final_text = accumulated.trim().to_string();
                 let _ = tx.send(PickerMessage::Candidate(PickerCandidate::success(
-                    provider, model, final_text, true,
+                    provider,
+                    model,
+                    final_text,
+                    true,
+                    if timed_segments.is_empty() {
+                        None
+                    } else {
+                        Some(timed_segments)
+                    },
                 )));
                 return;
             }
@@ -137,7 +164,13 @@ pub(super) fn spawn_transcription(
                 if text.is_empty() {
                     return;
                 }
-                PickerMessage::Candidate(PickerCandidate::success(provider, model, text, false))
+                PickerMessage::Candidate(PickerCandidate::success(
+                    provider,
+                    model,
+                    text,
+                    false,
+                    res.segments,
+                ))
             }
             Err(e) => {
                 log::warn!("candidate {}:{} failed: {}", provider, model, e);

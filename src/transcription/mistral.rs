@@ -6,8 +6,8 @@
 use crate::config::MistralConfig;
 use crate::error::TalkError;
 use crate::transcription::{
-    DiarizationSegment, MistralProviderMetadata, ProviderSpecificMetadata, TokenUsage,
-    TranscriptionMetadata, TranscriptionResult,
+    parse_transcript_segments, DiarizationSegment, MistralProviderMetadata,
+    ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata, TranscriptionResult,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -393,6 +393,11 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
 
+        let segments = mistral_response
+            .segments
+            .as_deref()
+            .and_then(parse_transcript_segments);
+
         let diarization = mistral_response
             .segments
             .as_deref()
@@ -420,6 +425,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 )),
             },
             diarization,
+            segments,
         })
     }
 
@@ -632,6 +638,11 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
 
+        let segments = mistral_response
+            .segments
+            .as_deref()
+            .and_then(parse_transcript_segments);
+
         let diarization = mistral_response
             .segments
             .as_deref()
@@ -659,6 +670,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 )),
             },
             diarization,
+            segments,
         })
     }
 }
@@ -800,6 +812,50 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text, "Streamed transcription result");
+    }
+
+    #[tokio::test]
+    async fn test_mistral_transcriber_extracts_transcript_segments() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(header("authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                include_str!("../../tests/fixtures/voxtral-response.json"),
+                "application/json",
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"fake audio data").unwrap();
+        temp_file.flush().unwrap();
+
+        let config = MistralConfig {
+            api_key: "test-api-key".to_string(),
+            url: None,
+            model: "voxtral-mini-latest".to_string(),
+            context_bias: None,
+        };
+        let transcriber = MistralBatchTranscriber::with_endpoint(
+            config,
+            format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            false,
+        )
+        .expect("build client");
+
+        let result = transcriber.transcribe_file(temp_file.path()).await.unwrap();
+
+        assert_eq!(result.text, "Hello world. This is a test.");
+        let segments = result.segments.expect("transcript segments present");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].start, 0.0);
+        assert_eq!(segments[0].end, 1.5);
+        assert_eq!(segments[0].text, "Hello world.");
+        assert_eq!(segments[1].start, 2.0);
+        assert_eq!(segments[1].end, 3.8);
+        assert_eq!(segments[1].text, " This is a test.");
     }
 
     #[tokio::test]
