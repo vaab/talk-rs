@@ -118,6 +118,16 @@ pub enum TranscriptionEvent {
     /// target application).
     PasteStarted { t: Instant },
 
+    /// Another chunk of text was pasted into the target window.
+    /// `chars_pasted` is cumulative; `total_chars` is the full
+    /// transcription length.  In streaming mode, paste chunks can
+    /// overlap with upload / download activity.
+    PasteProgress {
+        chars_pasted: u64,
+        total_chars: u64,
+        t: Instant,
+    },
+
     /// Paste phase completed.
     PasteCompleted { t: Instant },
 
@@ -372,6 +382,11 @@ mod tests {
                 t: Instant::now(),
             },
             TranscriptionEvent::PasteStarted { t: Instant::now() },
+            TranscriptionEvent::PasteProgress {
+                chars_pasted: 50,
+                total_chars: 100,
+                t: Instant::now(),
+            },
             TranscriptionEvent::PasteCompleted { t: Instant::now() },
             TranscriptionEvent::Done { t: Instant::now() },
             TranscriptionEvent::Failed {

@@ -335,14 +335,44 @@ impl BatchTranscriber for MistralBatchTranscriber {
             )));
         }
 
-        // Parse JSON response
-        let mistral_response: MistralResponse = response.json().await.map_err(|err| {
-            self.sink.emit(TranscriptionEvent::RequestCompleted {
-                success: false,
+        // Stream the response body chunk-by-chunk so the telemetry
+        // sink receives per-chunk DownloadProgress events.  This is
+        // agnostic of batch vs streaming — the same code path works
+        // for both.
+        use futures::StreamExt;
+        let mut body_bytes: Vec<u8> = Vec::new();
+        let mut body_stream = response.bytes_stream();
+        while let Some(chunk_result) = body_stream.next().await {
+            let chunk = chunk_result.map_err(|err| {
+                self.sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                TalkError::Transcription(format!(
+                    "Failed to read Mistral API response body: {}",
+                    err
+                ))
+            })?;
+            body_bytes.extend_from_slice(&chunk);
+            self.sink.emit(TranscriptionEvent::DownloadProgress {
+                bytes_received: body_bytes.len() as u64,
+                total: None,
                 t: Instant::now(),
             });
-            TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
-        })?;
+        }
+        self.sink.emit(TranscriptionEvent::ResponseComplete {
+            total: body_bytes.len() as u64,
+            t: Instant::now(),
+        });
+
+        let mistral_response: MistralResponse =
+            serde_json::from_slice(&body_bytes).map_err(|err| {
+                self.sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
+            })?;
 
         self.sink.emit(TranscriptionEvent::RequestCompleted {
             success: true,
@@ -535,25 +565,48 @@ impl BatchTranscriber for MistralBatchTranscriber {
             )));
         }
 
-        // Parse JSON response
-        log::warn!("[DBG] mistral stream: reading JSON body");
+        // Stream the response body chunk-by-chunk so the telemetry
+        // sink receives per-chunk DownloadProgress events.
+        log::warn!("[DBG] mistral stream: reading response body (streaming)");
         let body_start = Instant::now();
-        let mistral_response: MistralResponse = response.json().await.map_err(|err| {
-            log::warn!(
-                "[DBG] mistral stream: JSON parse failed after {}ms: \
-                 is_connect={}, is_timeout={}, is_body={}, is_decode={}",
-                body_start.elapsed().as_millis(),
-                err.is_connect(),
-                err.is_timeout(),
-                err.is_body(),
-                err.is_decode()
-            );
-            self.sink.emit(TranscriptionEvent::RequestCompleted {
-                success: false,
+        use futures::StreamExt;
+        let mut body_bytes: Vec<u8> = Vec::new();
+        let mut body_stream = response.bytes_stream();
+        while let Some(chunk_result) = body_stream.next().await {
+            let chunk = chunk_result.map_err(|err| {
+                self.sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                TalkError::Transcription(format!(
+                    "Failed to read Mistral API response body: {}",
+                    err
+                ))
+            })?;
+            body_bytes.extend_from_slice(&chunk);
+            self.sink.emit(TranscriptionEvent::DownloadProgress {
+                bytes_received: body_bytes.len() as u64,
+                total: None,
                 t: Instant::now(),
             });
-            TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
-        })?;
+        }
+        self.sink.emit(TranscriptionEvent::ResponseComplete {
+            total: body_bytes.len() as u64,
+            t: Instant::now(),
+        });
+
+        let mistral_response: MistralResponse =
+            serde_json::from_slice(&body_bytes).map_err(|err| {
+                log::warn!(
+                    "[DBG] mistral stream: JSON parse failed after {}ms",
+                    body_start.elapsed().as_millis(),
+                );
+                self.sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
+            })?;
         log::warn!(
             "[DBG] mistral stream: JSON parsed ({} chars text) after {}ms body read",
             mistral_response.text.len(),
