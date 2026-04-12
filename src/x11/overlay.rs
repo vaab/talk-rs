@@ -40,14 +40,21 @@ const BADGE_H: u16 = 52;
 /// Corner radius for the rounded rectangle background.
 const CORNER_RADIUS: usize = 13;
 
-/// X coordinate of the red dot centre (near left edge, over spectrogram).
-const DOT_CX: usize = 20;
-/// Y coordinate of the red dot centre (vertically centred).
+/// X coordinate of the red dot centre.  Moved right from the original
+/// `20` so the larger dot (radius 21 + gap 2) fits inside the border
+/// without clipping the rounded corners.
+const DOT_CX: usize = 26;
+/// Y coordinate of the red dot centre (vertically centred in the spec
+/// area: spec rows 4..48 → centre at 26, and with an odd-pixel
+/// diameter the dot is perfectly symmetric top/bottom).
 const DOT_CY: usize = 26;
-/// Minimum red dot radius (quiet).
-const DOT_RADIUS_MIN: f32 = 3.0;
-/// Maximum red dot radius (loud).
-const DOT_RADIUS_MAX: f32 = 10.0;
+/// Minimum red dot radius (quiet).  Scaled up proportionally from the
+/// original `3.0` to remain visible at the new badge scale.
+const DOT_RADIUS_MIN: f32 = 6.0;
+/// Maximum red dot radius (loud).  Fills almost the entire spec area
+/// height (diameter 43 inside the 44 px spec band) so the volume
+/// indicator is easy to read at a glance.
+const DOT_RADIUS_MAX: f32 = 16.0;
 /// Minimum dot brightness — always visible.
 const DOT_MIN_BRIGHTNESS: f32 = 0.5;
 /// Transparent gap (pixels) between red dot edge and spectrogram.
