@@ -265,16 +265,20 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 .file_name(file_name),
             );
 
+        // Always request segment-level timestamps so the YAML sidecar
+        // carries per-segment timing.  Older Voxtral models returned
+        // segments by default; newer ones (voxtral-mini-2602+) require
+        // the explicit parameter.
+        form = form.text("timestamp_granularities", "segment");
+
         // Add context bias if configured
         if let Some(ref bias) = self.config.context_bias {
             form = form.text("context_bias", bias.clone());
         }
 
-        // Add diarization parameters (V2 models only)
+        // Add diarization flag (V2 models only)
         if self.diarize {
-            form = form
-                .text("diarize", "true")
-                .text("timestamp_granularities", "segment");
+            form = form.text("diarize", "true");
         }
 
         // Compute a payload-proportional wall-clock timeout for this
@@ -473,16 +477,17 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 .file_name(file_name.to_string()),
             );
 
+        // Always request segment-level timestamps (see transcribe_file).
+        form = form.text("timestamp_granularities", "segment");
+
         // Add context bias if configured
         if let Some(ref bias) = self.config.context_bias {
             form = form.text("context_bias", bias.clone());
         }
 
-        // Add diarization parameters (V2 models only)
+        // Add diarization flag (V2 models only)
         if self.diarize {
-            form = form
-                .text("diarize", "true")
-                .text("timestamp_granularities", "segment");
+            form = form.text("diarize", "true");
         }
 
         // Compute a payload-proportional wall-clock timeout for this

@@ -5,9 +5,9 @@
 //! streaming, and WAV PCM reading.
 
 use super::ui::{PickerCandidate, PickerMessage};
-use crate::config::Provider;
+use crate::config::{Config, Provider};
 use crate::transcription::{
-    BatchTranscriber, RealtimeTranscriber, TranscriptSegment, TranscriptionEvent,
+    RealtimeTranscriber, TranscriptSegment, TranscriptionEvent, TranscriptionMetadata,
 };
 use std::path::PathBuf;
 
@@ -110,6 +110,7 @@ pub(super) async fn run_realtime_transcription(
                     } else {
                         Some(timed_segments)
                     },
+                    TranscriptionMetadata::default(),
                 )));
                 return;
             }
@@ -132,6 +133,7 @@ pub(super) async fn run_realtime_transcription(
                     } else {
                         Some(timed_segments)
                     },
+                    TranscriptionMetadata::default(),
                 )));
                 return;
             }
@@ -155,10 +157,18 @@ pub(super) fn spawn_transcription(
     audio: PathBuf,
     provider: Provider,
     model: String,
-    transcriber: Box<dyn BatchTranscriber>,
+    config: std::sync::Arc<Config>,
 ) {
     tasks.spawn(async move {
-        let msg = match transcriber.transcribe_file(&audio).await {
+        let msg = match crate::transcription::transcribe_audio(
+            &audio,
+            config.as_ref(),
+            provider,
+            Some(&model),
+            false,
+        )
+        .await
+        {
             Ok(res) => {
                 let text = res.text.trim().to_string();
                 if text.is_empty() {
@@ -170,6 +180,7 @@ pub(super) fn spawn_transcription(
                     text,
                     false,
                     res.segments,
+                    res.metadata,
                 ))
             }
             Err(e) => {
