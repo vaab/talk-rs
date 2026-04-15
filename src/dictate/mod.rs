@@ -218,7 +218,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     };
 
     // Generate cache recording path (always, even without --save)
-    let (cache_path, cache_timestamp) = recording_cache::generate_recording_path()?;
+    let (cache_path, _cache_timestamp) = recording_cache::generate_recording_path()?;
     log::info!("cache recording: {}", cache_path.display());
 
     let provider = resolve_provider(opts.provider, &config);
@@ -661,25 +661,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         t: std::time::Instant::now(),
                     });
 
-                    let mut retry_transcriber = match transcription::create_batch_transcriber(
-                        &config,
-                        provider,
-                        opts.model.as_deref(),
-                        opts.diarize,
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            log::warn!(
-                                "[DBG] retry loop: transcriber creation failed on attempt {}: {}",
-                                attempt,
-                                e
-                            );
-                            last_err = e;
-                            continue;
-                        }
-                    };
-                    retry_transcriber.set_sink(sink.clone());
-
                     let upload_path = cache_path.clone();
                     log::warn!(
                         "[DBG] retry loop: transcribe_file {} starting (attempt {}/{})",
@@ -688,8 +669,18 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         MAX_RETRIES
                     );
                     let attempt_start = std::time::Instant::now();
+                    let config_for_retry = config.clone();
+                    let model_for_retry = opts.model.clone();
+                    let diarize = opts.diarize;
                     let task = tokio::spawn(async move {
-                        retry_transcriber.transcribe_file(&upload_path).await
+                        transcription::transcribe_audio(
+                            &upload_path,
+                            &config_for_retry,
+                            provider,
+                            model_for_retry.as_deref(),
+                            diarize,
+                        )
+                        .await
                     });
 
                     let outcome = match task.await {
@@ -801,22 +792,26 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     let metadata = result.metadata;
 
     // Write recording cache metadata and rotate old entries.
-    let cache_filename = cache_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("recording.ogg");
-    let cache_meta_path = recording_cache::write_metadata(
-        &cache_timestamp,
+    let result_for_cache = transcription::TranscriptionResult {
+        text: text.clone(),
+        metadata: metadata.clone(),
+        diarization: None,
+        segments: segments.clone(),
+    };
+    let cache_meta_path = recording_cache::TranscriptionCache::store(
+        &cache_path,
         provider,
         &effective_model,
         opts.realtime,
-        &text,
-        cache_filename,
-        &metadata,
-        segments.as_deref(),
+        &result_for_cache,
     );
     if let Err(ref e) = cache_meta_path {
         log::warn!("failed to write recording metadata: {}", e);
+    }
+    if let Ok(ref meta_path) = cache_meta_path {
+        if let Err(e) = recording_cache::write_last_pointers(&cache_path, meta_path) {
+            log::warn!("failed to update last recording pointers: {}", e);
+        }
     }
     if let Err(e) = recording_cache::rotate_cache() {
         log::warn!("failed to rotate recording cache: {}", e);

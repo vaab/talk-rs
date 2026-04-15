@@ -380,6 +380,75 @@ pub fn create_batch_transcriber(
     }
 }
 
+/// Transcribe an audio file.
+///
+/// THE single transcription entry point for batch-from-file
+/// transcription. Checks the sidecar cache first; on miss, calls
+/// the provider API and caches the result. Callers never see the
+/// cache.
+pub async fn transcribe_audio(
+    audio_path: &Path,
+    config: &Config,
+    provider: Provider,
+    model: Option<&str>,
+    diarize: bool,
+) -> Result<TranscriptionResult, TalkError> {
+    use crate::recording_cache::TranscriptionCache;
+
+    let effective_model = resolve_effective_model(config, provider, model);
+
+    if !diarize {
+        if let Some(cached) = TranscriptionCache::get(audio_path, provider, &effective_model) {
+            log::info!(
+                "transcription cache hit for {}:{} on {}",
+                provider,
+                effective_model,
+                audio_path.display()
+            );
+            return Ok(cached);
+        }
+    }
+
+    log::info!(
+        "transcription cache miss for {}:{} on {} — calling API",
+        provider,
+        effective_model,
+        audio_path.display()
+    );
+    let transcriber = create_batch_transcriber(config, provider, model, diarize)?;
+    transcriber.validate().await?;
+    let result = transcriber.transcribe_file(audio_path).await?;
+
+    if let Err(e) =
+        TranscriptionCache::store(audio_path, provider, &effective_model, false, &result)
+    {
+        log::warn!("failed to cache transcription result: {}", e);
+    }
+
+    Ok(result)
+}
+
+/// Resolve the effective model name from CLI override or config default.
+fn resolve_effective_model(config: &Config, provider: Provider, model: Option<&str>) -> String {
+    if let Some(m) = model {
+        return m.to_string();
+    }
+    match provider {
+        Provider::Mistral => config
+            .providers
+            .mistral
+            .as_ref()
+            .map(|c| c.model.clone())
+            .unwrap_or_else(|| "voxtral-mini-latest".to_string()),
+        Provider::OpenAI => config
+            .providers
+            .openai
+            .as_ref()
+            .map(|c| c.model.clone())
+            .unwrap_or_else(|| "whisper-1".to_string()),
+    }
+}
+
 /// Create a realtime transcriber for the given provider.
 ///
 /// When `model` is `Some`, it overrides the config default for that

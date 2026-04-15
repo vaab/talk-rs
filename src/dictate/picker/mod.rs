@@ -12,11 +12,9 @@ use crate::config::{Config, Provider};
 use crate::error::TalkError;
 use crate::paste::paste_text_to_target;
 use crate::recording_cache;
-use crate::transcription::{
-    self, BatchTranscriber, RealtimeTranscriber, TranscriptSegment, TranscriptionMetadata,
-};
+use crate::transcription::{self, RealtimeTranscriber};
 use crate::x11::x11_centre_and_raise;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::models::{build_retry_candidates, resolve_model, resolve_provider};
 use ui::{pick_with_streaming_gtk, PICKER_TITLE};
@@ -31,96 +29,6 @@ pub(crate) struct PickParams {
     pub model: Option<String>,
     pub target_window: Option<String>,
     pub paste_chunk_chars: usize,
-}
-
-/// Write (or overwrite) a companion recording metadata YAML alongside
-/// the WAV so the record UI can display the transcript preview.
-///
-/// Called on every meaningful text change in the picker (debounced for
-/// keyboard input, immediate for programmatic updates and on exit).
-/// Uses an empty [`TranscriptionMetadata`] since the picker does not
-/// carry API-level detail.
-pub(super) fn write_recording_metadata(
-    audio_path: &Path,
-    provider: Provider,
-    model: &str,
-    streaming: bool,
-    text: &str,
-    segments: Option<&[TranscriptSegment]>,
-) {
-    let stem = audio_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    let audio_filename = audio_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if stem.is_empty() || audio_filename.is_empty() {
-        return;
-    }
-
-    // Determine where to write the YAML: next to the audio file if
-    // it lives outside the recordings cache, otherwise in the cache.
-    let cache_dir = recording_cache::recordings_dir().ok();
-    let audio_dir = audio_path.parent();
-    let in_cache = cache_dir
-        .as_ref()
-        .zip(audio_dir)
-        .is_some_and(|(c, d)| c == d);
-
-    if in_cache {
-        // Audio is in the recordings cache — use the standard path.
-        if let Err(e) = recording_cache::write_metadata(
-            stem,
-            provider,
-            model,
-            streaming,
-            text,
-            audio_filename,
-            &TranscriptionMetadata::default(),
-            segments,
-        ) {
-            log::warn!("failed to write recording metadata from picker: {}", e);
-        }
-    } else if let Some(dir) = audio_dir {
-        // Audio lives elsewhere (e.g. OGG recordings dir) — write
-        // the YAML next to the audio file.
-        let mode = if streaming { "realtime" } else { "batch" };
-        let filename = format!(
-            "{}_{}_{}_{}.yml",
-            stem,
-            provider.to_string().to_lowercase(),
-            model.replace('/', "-"),
-            mode,
-        );
-        let meta = recording_cache::RecordingMetadata {
-            recording: audio_filename.to_string(),
-            provider: provider.to_string(),
-            model: model.to_string(),
-            realtime: streaming,
-            transcript: text.to_string(),
-            timestamp: stem.to_string(),
-            metadata: None,
-            provider_api: None,
-            segments: recording_cache::common_segments_from_result(segments),
-        };
-        let yaml = match serde_yaml::to_string(&meta) {
-            Ok(y) => y,
-            Err(e) => {
-                log::warn!("failed to serialise recording metadata: {}", e);
-                return;
-            }
-        };
-        let meta_path = dir.join(filename);
-        if let Err(e) = std::fs::write(&meta_path, yaml) {
-            log::warn!(
-                "failed to write recording metadata {}: {}",
-                meta_path.display(),
-                e
-            );
-        }
-    }
 }
 
 /// Run pick mode: show a GTK picker with cached and live transcriptions.
@@ -231,7 +139,10 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         );
     }
 
-    let candidates = build_retry_candidates(&config, params.provider, params.model.as_deref());
+    let config = std::sync::Arc::new(config);
+
+    let candidates =
+        build_retry_candidates(config.as_ref(), params.provider, params.model.as_deref());
     log::debug!("picker candidates: {} total", candidates.len());
     for (p, m, s) in &candidates {
         log::debug!("  candidate: {}:{} (streaming={})", p, m, s);
@@ -262,8 +173,13 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
     // Resolve the default model so only it is transcribed immediately.
     // All other candidates are deferred — shown in the UI with a
     // "transcribe" button that the user can click on demand.
-    let default_provider = resolve_provider(params.provider, &config);
-    let default_model = resolve_model(params.model.as_deref(), &config, default_provider, false);
+    let default_provider = resolve_provider(params.provider, config.as_ref());
+    let default_model = resolve_model(
+        params.model.as_deref(),
+        config.as_ref(),
+        default_provider,
+        false,
+    );
     log::debug!(
         "picker default model: {}:{} (batch)",
         default_provider,
@@ -300,25 +216,16 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         .map(|(p, m, _)| (*p, m.clone()))
         .collect();
 
-    // Create batch transcribers for the default model only.
-    let mut transcribers: Vec<(Provider, String, Box<dyn BatchTranscriber>)> = Vec::new();
-    for (provider, model) in batch_filtered {
-        match transcription::create_batch_transcriber(&config, provider, Some(&model), false) {
-            Ok(t) => transcribers.push((provider, model, t)),
-            Err(e) => log::warn!("skipping batch {}:{}: {}", provider, model, e),
-        }
-    }
-
     // Create realtime transcribers for the default model only.
     let mut rt_transcribers: Vec<(Provider, String, Box<dyn RealtimeTranscriber>)> = Vec::new();
     for (provider, model) in realtime_filtered {
-        match transcription::create_realtime_transcriber(&config, provider, Some(&model)) {
+        match transcription::create_realtime_transcriber(config.as_ref(), provider, Some(&model)) {
             Ok(t) => rt_transcribers.push((provider, model, t)),
             Err(e) => log::warn!("skipping realtime {}:{}: {}", provider, model, e),
         }
     }
 
-    if transcribers.is_empty()
+    if batch_filtered.is_empty()
         && cached_entries.is_empty()
         && rt_transcribers.is_empty()
         && deferred.is_empty()
@@ -330,10 +237,10 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
 
     let audio_path_for_selection = audio_path.clone();
     let selected = pick_with_streaming_gtk(
-        transcribers,
+        batch_filtered,
         audio_path,
         cached_entries,
-        config,
+        config.clone(),
         rt_transcribers,
         deferred,
     )
@@ -353,17 +260,6 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
     ) {
         log::warn!("failed to update picker selection: {}", e);
     }
-
-    // Write companion recording metadata YAML so the record UI
-    // can display the transcript preview.
-    write_recording_metadata(
-        &audio_path_for_selection,
-        selection.provider,
-        &selection.model,
-        selection.streaming,
-        &selection.text,
-        selection.segments.as_deref(),
-    );
 
     // If the user selected the cached entry, nothing to do — the
     // text is already in the target window.

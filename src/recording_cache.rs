@@ -11,13 +11,13 @@ use crate::daemon::cache_dir;
 use crate::error::TalkError;
 use crate::transcription::{
     MistralProviderMetadata, OpenAIProviderMetadata, OpenAIRealtimeMetadata,
-    ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata,
+    ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata, TranscriptionResult,
 };
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Maximum number of recordings to keep in the cache.
 const MAX_CACHED_RECORDINGS: usize = 10;
@@ -26,7 +26,7 @@ const LAST_METADATA_POINTER: &str = "last_metadata.yml";
 const LAST_PASTE_STATE_FILE: &str = "last_paste.yml";
 
 /// Metadata associated with a cached recording.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RecordingMetadata {
     /// Filename of the cached audio recording (basename only).
     pub recording: String,
@@ -41,12 +41,12 @@ pub struct RecordingMetadata {
     /// ISO-8601 timestamp of when the recording was made.
     pub timestamp: String,
     /// Optional API metadata captured during transcription.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<CommonMetadata>,
     /// Provider-specific metadata payload.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_api: Option<ProviderApiMetadata>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<CommonSegment>>,
 }
 
@@ -70,89 +70,204 @@ pub struct LastPasteState {
     pub text: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CommonMetadata {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_latency_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_elapsed_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_processing_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_language: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_seconds: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub word_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<CommonTokenUsage>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CommonTokenUsage {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CommonSegment {
     pub start: f64,
     pub end: f64,
     pub text: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProviderApiMetadata {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai: Option<OpenAIApiMetadata>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mistral: Option<MistralApiMetadata>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct OpenAIApiMetadata {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub rate_limit_headers: std::collections::BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown_event_types: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realtime: Option<OpenAIRealtimeApiMetadata>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct OpenAIRealtimeApiMetadata {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub event_counts: std::collections::BTreeMap<String, u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_rate_limits: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub ws_upgrade_headers: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MistralApiMetadata {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown_event_types: Vec<String>,
+}
+
+impl RecordingMetadata {
+    /// Convert to a TranscriptionResult (for cache reads).
+    pub fn into_transcription_result(self) -> TranscriptionResult {
+        let segments = self.segments.map(|segs| {
+            segs.into_iter()
+                .map(|s| crate::transcription::TranscriptSegment {
+                    start: s.start,
+                    end: s.end,
+                    text: s.text,
+                })
+                .collect()
+        });
+
+        let metadata = self
+            .metadata
+            .map(|cm| TranscriptionMetadata {
+                request_latency_ms: cm.request_latency_ms,
+                session_elapsed_ms: cm.session_elapsed_ms,
+                request_id: cm.request_id,
+                provider_processing_ms: cm.provider_processing_ms,
+                detected_language: cm.detected_language,
+                audio_seconds: cm.audio_seconds,
+                segment_count: cm.segment_count,
+                word_count: cm.word_count,
+                token_usage: cm.token_usage.map(|tu| TokenUsage {
+                    input_tokens: tu.input_tokens,
+                    output_tokens: tu.output_tokens,
+                    total_tokens: tu.total_tokens,
+                }),
+                provider_specific: None,
+            })
+            .unwrap_or_default();
+
+        TranscriptionResult {
+            text: self.transcript,
+            metadata,
+            diarization: None,
+            segments,
+        }
+    }
+}
+
+/// Transcription sidecar cache.
+///
+/// Abstract cache for transcription results. The storage mechanism
+/// (currently YAML files next to the audio) is an implementation
+/// detail hidden behind this API.
+pub struct TranscriptionCache;
+
+impl TranscriptionCache {
+    /// Look up a cached transcription for the given audio file,
+    /// provider, and model.
+    pub fn get(audio_path: &Path, provider: Provider, model: &str) -> Option<TranscriptionResult> {
+        let dir = audio_path.parent()?;
+        let stem = audio_path.file_stem()?.to_str()?;
+        for mode in &["batch", "realtime"] {
+            let safe_model = model.replace(['/', ' '], "-");
+            let filename = format!("{}_{}_{}_{}.yml", stem, provider, safe_model, mode);
+            let path = dir.join(&filename);
+            if path.exists() {
+                match Self::read_sidecar(&path) {
+                    Ok(result) => return Some(result),
+                    Err(e) => {
+                        log::warn!("failed to read cached sidecar {}: {}", path.display(), e);
+                        continue;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Store a transcription result next to the audio file.
+    pub fn store(
+        audio_path: &Path,
+        provider: Provider,
+        model: &str,
+        realtime: bool,
+        result: &TranscriptionResult,
+    ) -> Result<PathBuf, TalkError> {
+        let dir = audio_path
+            .parent()
+            .ok_or_else(|| TalkError::Config("audio path has no parent directory".to_string()))?;
+        let stem = audio_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| TalkError::Config("audio path has no file stem".to_string()))?;
+        let audio_filename = audio_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| TalkError::Config("audio path has no filename".to_string()))?;
+        let text = crate::transcription::format_transcription_output(result);
+        write_metadata_to_dir(
+            dir,
+            stem,
+            provider,
+            model,
+            realtime,
+            &text,
+            audio_filename,
+            &result.metadata,
+            result.segments.as_deref(),
+        )
+    }
+
+    /// Read a YAML sidecar file and convert to TranscriptionResult.
+    fn read_sidecar(path: &Path) -> Result<TranscriptionResult, TalkError> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| TalkError::Config(format!("failed to read {}: {}", path.display(), e)))?;
+        let meta: RecordingMetadata = serde_yaml::from_str(&content)
+            .map_err(|e| TalkError::Config(format!("failed to parse {}: {}", path.display(), e)))?;
+        Ok(meta.into_transcription_result())
+    }
 }
 
 fn is_token_usage_empty(v: &TokenUsage) -> bool {
@@ -342,7 +457,8 @@ fn metadata_filename(timestamp: &str, provider: Provider, model: &str, realtime:
 
 /// Write a metadata YAML file for a cached recording.
 #[allow(clippy::too_many_arguments)]
-pub fn write_metadata(
+pub fn write_metadata_to_dir(
+    dir: &Path,
     timestamp: &str,
     provider: Provider,
     model: &str,
@@ -352,8 +468,6 @@ pub fn write_metadata(
     transcription_metadata: &TranscriptionMetadata,
     segments: Option<&[crate::transcription::TranscriptSegment]>,
 ) -> Result<PathBuf, TalkError> {
-    let dir = ensure_recordings_dir()?;
-
     let meta = RecordingMetadata {
         recording: audio_filename.to_string(),
         provider: provider.to_string(),
@@ -380,16 +494,44 @@ pub fn write_metadata(
         ))
     })?;
 
+    log::debug!("wrote recording metadata: {}", meta_path.display());
+    Ok(meta_path)
+}
+
+/// Write a metadata YAML file for a cached recording.
+#[allow(clippy::too_many_arguments)]
+pub fn write_metadata(
+    timestamp: &str,
+    provider: Provider,
+    model: &str,
+    realtime: bool,
+    transcript: &str,
+    audio_filename: &str,
+    transcription_metadata: &TranscriptionMetadata,
+    segments: Option<&[crate::transcription::TranscriptSegment]>,
+) -> Result<PathBuf, TalkError> {
+    let dir = ensure_recordings_dir()?;
+    let meta_path = write_metadata_to_dir(
+        &dir,
+        timestamp,
+        provider,
+        model,
+        realtime,
+        transcript,
+        audio_filename,
+        transcription_metadata,
+        segments,
+    )?;
+
     let audio_path = dir.join(audio_filename);
     if let Err(e) = write_last_pointers(&audio_path, &meta_path) {
         log::warn!("failed to update last recording pointers: {}", e);
     }
 
-    log::debug!("wrote recording metadata: {}", meta_path.display());
     Ok(meta_path)
 }
 
-fn write_last_pointers(
+pub(crate) fn write_last_pointers(
     audio_path: &std::path::Path,
     meta_path: &std::path::Path,
 ) -> Result<(), TalkError> {
@@ -658,6 +800,50 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn sample_result() -> TranscriptionResult {
+        TranscriptionResult {
+            text: "hello world".to_string(),
+            metadata: TranscriptionMetadata {
+                request_latency_ms: Some(123),
+                session_elapsed_ms: Some(456),
+                request_id: Some("req_123".to_string()),
+                provider_processing_ms: Some(78),
+                detected_language: Some("en".to_string()),
+                audio_seconds: Some(2.5),
+                segment_count: Some(2),
+                word_count: Some(2),
+                token_usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(20),
+                    total_tokens: Some(30),
+                }),
+                provider_specific: Some(ProviderSpecificMetadata::OpenAI(OpenAIProviderMetadata {
+                    model: Some("whisper-1".to_string()),
+                    usage_raw: Some(serde_json::json!({"total_tokens": 30})),
+                    rate_limit_headers: std::collections::BTreeMap::from([(
+                        "x-ratelimit-limit-requests".to_string(),
+                        "5000".to_string(),
+                    )]),
+                    unknown_event_types: vec!["mystery".to_string()],
+                    realtime: None,
+                })),
+            },
+            diarization: None,
+            segments: Some(vec![
+                crate::transcription::TranscriptSegment {
+                    start: 0.0,
+                    end: 1.0,
+                    text: "hello".to_string(),
+                },
+                crate::transcription::TranscriptSegment {
+                    start: 1.0,
+                    end: 2.0,
+                    text: "world".to_string(),
+                },
+            ]),
+        }
+    }
+
     /// Override the recordings directory for testing by creating files
     /// directly in a temp directory and testing rotation logic.
 
@@ -806,6 +992,66 @@ mod tests {
 
         let yaml = serde_yaml::to_string(&meta).expect("serialise");
         assert!(!yaml.contains("segments"));
+    }
+
+    #[test]
+    fn test_transcription_cache_round_trip() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("sample.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        let result = sample_result();
+
+        let path =
+            TranscriptionCache::store(&audio_path, Provider::OpenAI, "whisper-1", false, &result)
+                .expect("store sidecar");
+
+        assert!(path.exists());
+
+        let cached = TranscriptionCache::get(&audio_path, Provider::OpenAI, "whisper-1")
+            .expect("read cached sidecar");
+
+        assert_eq!(cached.text, result.text);
+        assert_eq!(cached.segments, result.segments);
+        assert_eq!(
+            cached.metadata.request_latency_ms,
+            result.metadata.request_latency_ms
+        );
+        assert_eq!(
+            cached.metadata.session_elapsed_ms,
+            result.metadata.session_elapsed_ms
+        );
+        assert_eq!(cached.metadata.request_id, result.metadata.request_id);
+        assert_eq!(
+            cached.metadata.provider_processing_ms,
+            result.metadata.provider_processing_ms
+        );
+        assert_eq!(
+            cached.metadata.detected_language,
+            result.metadata.detected_language
+        );
+        assert_eq!(cached.metadata.audio_seconds, result.metadata.audio_seconds);
+        assert_eq!(cached.metadata.segment_count, result.metadata.segment_count);
+        assert_eq!(cached.metadata.word_count, result.metadata.word_count);
+        assert!(cached.metadata.token_usage.is_some());
+        let token_usage = cached
+            .metadata
+            .token_usage
+            .expect("token usage survives round-trip");
+        assert_eq!(token_usage.input_tokens, Some(10));
+        assert_eq!(token_usage.output_tokens, Some(20));
+        assert_eq!(token_usage.total_tokens, Some(30));
+        assert!(cached.metadata.provider_specific.is_none());
+    }
+
+    #[test]
+    fn test_transcription_cache_get_miss_returns_none() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("missing.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+
+        let cached = TranscriptionCache::get(&audio_path, Provider::Mistral, "voxtral-mini-latest");
+
+        assert!(cached.is_none());
     }
 
     #[test]

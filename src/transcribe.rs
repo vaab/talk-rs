@@ -5,7 +5,7 @@
 
 use crate::config::{Config, Provider};
 use crate::error::TalkError;
-use crate::transcription::{self, format_transcription_output};
+use crate::transcription;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -49,43 +49,30 @@ pub async fn transcribe(
     cli_model: Option<String>,
     diarize: bool,
 ) -> Result<(), TalkError> {
-    // Parse arguments
     let (input_path, output_path) = parse_args(&args)?;
-
-    // Verify input file exists
     if !input_path.exists() {
         return Err(TalkError::Audio(format!(
             "Input file not found: {}",
             input_path.display()
         )));
     }
-
-    // Load configuration
     let config = Config::load(None)?;
-
-    // Resolve provider from CLI override or config default
     let provider = cli_provider
         .or_else(|| config.transcription.as_ref().map(|t| t.default_provider))
         .unwrap_or(Provider::Mistral);
 
-    // Create transcriber via factory
-    let transcriber =
-        transcription::create_batch_transcriber(&config, provider, cli_model.as_deref(), diarize)?;
+    let result = transcription::transcribe_audio(
+        &input_path,
+        &config,
+        provider,
+        cli_model.as_deref(),
+        diarize,
+    )
+    .await?;
+    let output_text = transcription::format_transcription_output(&result);
 
-    // Pre-flight: verify provider connectivity and model validity.
-    log::info!("validating {} provider configuration", provider);
-    transcriber.validate().await?;
-
-    // Transcribe the file
-    let transcription = transcriber.transcribe_file(&input_path).await?;
-
-    // Format output: use diarized segments when available, plain text otherwise
-    let output_text = format_transcription_output(&transcription);
-
-    // Write output
     match output_path {
         Some(output_file) => {
-            // Write to file
             let mut file = tokio::fs::File::create(&output_file)
                 .await
                 .map_err(TalkError::Io)?;
@@ -95,10 +82,7 @@ pub async fn transcribe(
             file.sync_all().await.map_err(TalkError::Io)?;
             println!("Transcription saved to: {}", output_file.display());
         }
-        None => {
-            // Write to stdout
-            println!("{}", output_text);
-        }
+        None => println!("{}", output_text),
     }
 
     Ok(())
@@ -168,6 +152,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_transcribe_pipeline_with_mock_transcriber() {
+        use crate::config::Provider;
+        use crate::recording_cache;
         use crate::transcription::{BatchTranscriber, MockBatchTranscriber};
         use std::fs;
         use tempfile::TempDir;
@@ -191,11 +177,25 @@ mod tests {
             .await
             .expect("transcribe should succeed");
 
+        let output_text = transcription::format_transcription_output(&transcription);
+        let sidecar_path = recording_cache::write_metadata_to_dir(
+            temp_dir.path(),
+            "test-audio",
+            Provider::Mistral,
+            "mock-model",
+            false,
+            &output_text,
+            "test-audio.ogg",
+            &transcription.metadata,
+            transcription.segments.as_deref(),
+        )
+        .expect("write sidecar metadata");
+
         // Write output (simulating what transcribe() does)
         let mut file = tokio::fs::File::create(&output_path)
             .await
             .expect("create output file");
-        file.write_all(transcription.text.as_bytes())
+        file.write_all(output_text.as_bytes())
             .await
             .expect("write to file");
         file.sync_all().await.expect("sync file");
@@ -203,5 +203,11 @@ mod tests {
         // Verify output file was created and has correct content
         let content = fs::read_to_string(&output_path).expect("read output file");
         assert_eq!(content, "This is a test transcription");
+
+        let sidecar = fs::read_to_string(&sidecar_path).expect("read sidecar file");
+        assert!(sidecar.contains("recording: test-audio.ogg"));
+        assert!(sidecar.contains("provider: mistral"));
+        assert!(sidecar.contains("model: mock-model"));
+        assert!(sidecar.contains("transcript: This is a test transcription"));
     }
 }
