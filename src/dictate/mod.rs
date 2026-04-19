@@ -127,24 +127,27 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     if opts.retry_last {
         let last_audio = recording_cache::last_recording_path()
             .or_else(|_| recording_cache::latest_recording_path())?;
-        let last_meta = recording_cache::last_metadata_path()
-            .ok()
-            .or(recording_cache::metadata_path_for_recording(&last_audio)?);
-        if let Some(meta) = last_meta {
-            if let Ok(previous) = recording_cache::read_metadata_brief(&meta) {
-                replace_char_count = Some(previous.transcript.chars().count());
-                cached_brief = Some(previous);
-            }
-        }
         input_audio_file = Some(last_audio);
-    } else if let Some(ref audio) = input_audio_file {
-        // Load existing recording metadata so the picker can show
-        // the cached transcript instead of re-transcribing.
-        if let Ok(Some(meta)) = recording_cache::metadata_path_for_recording(audio) {
-            if let Ok(previous) = recording_cache::read_metadata_brief(&meta) {
-                replace_char_count = Some(previous.transcript.chars().count());
-                cached_brief = Some(previous);
-            }
+    }
+
+    // Load existing pick so the picker can seed its initial state.
+    // Source of truth: the pick file (Layer 1).  Sidecars are
+    // Layer 3 internals and never consulted here.
+    if let Some(ref audio) = input_audio_file {
+        if let Some((provider, model, _streaming, text)) = recording_cache::read_pick(audio) {
+            cached_brief = Some(recording_cache::RecordingMetadataBrief {
+                transcript: text,
+                provider: Some(provider.to_string()),
+                model: Some(model),
+            });
+        }
+    }
+
+    // Character count for --replace-last-paste comes from the paste
+    // state file, not from any transcript source.
+    if opts.replace_last_paste {
+        if let Ok(Some(state)) = recording_cache::read_last_paste_state() {
+            replace_char_count = Some(state.char_count);
         }
     }
 
@@ -163,6 +166,36 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             },
         )
         .await;
+    }
+
+    // Mode C: file input + default options -> consult the pick file
+    // directly.  If it exists, paste its text without running any
+    // capture/transcription pipeline.  Matches the `transcribe`
+    // command's default branch.
+    let specific_options = opts.provider.is_some() || opts.model.is_some() || opts.diarize;
+    if let Some(ref audio) = input_audio_file {
+        if !specific_options {
+            if let crate::recording_cache::TranscriptStatus::Available(text) =
+                crate::recording_cache::get_transcript(audio)
+            {
+                log::info!(
+                    "pick file present for {} — pasting without new transcription",
+                    audio.display()
+                );
+                paste_text_to_target(
+                    target_window.as_ref(),
+                    &text,
+                    replace_char_count.unwrap_or(0),
+                    paste_chunk_chars,
+                    None,
+                    &crate::telemetry::NoOpSink,
+                )
+                .await?;
+                let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
+                println!("{}", text);
+                return Ok(());
+            }
+        }
     }
 
     // Initialize sound player (single-channel with preemption)
@@ -594,141 +627,46 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         .await;
         t_stop = t_stop_val;
 
-        // If the initial streaming transcription failed (timeout,
-        // API error, network issue), retry up to 5 times using the
-        // saved OGG file.  Each retry creates a fresh transcriber.
-        // Dead connections are caught by the HTTP client's
-        // `tcp_user_timeout` / `read_timeout` / keepalive settings —
-        // no artificial per-retry timeout is needed.
-        const MAX_RETRIES: u32 = 5;
-
+        // If the streaming transcription failed, fall back to a
+        // single call to `transcribe_audio` using the saved OGG
+        // file.  Retry lives inside `transcribe_audio` (see
+        // `transcription::transport::retry`) — no loop here.
         match stream_result {
             Ok(r) => r,
             Err(first_err) => {
-                log::warn!("initial transcription failed: {}", first_err);
+                log::warn!("streaming transcription failed: {}", first_err);
 
-                // Model-not-found is a permanent error — retrying will
-                // not help.  Enrich with available models and bail.
-                if transcription::is_model_error(provider, &first_err) {
-                    let enriched = transcription::enrich_model_error(
-                        &config,
-                        provider,
-                        opts.model.as_deref(),
-                        first_err,
-                    )
-                    .await;
-                    let final_msg = format!("{}", enriched);
-                    log::error!("{}", final_msg);
-                    if let Some(ref viz) = visualizer {
-                        viz.push_message(&format!("Error: {}", final_msg));
-                    }
-                    if let Some(ref o) = overlay {
-                        o.hide();
-                    }
-                    // Clean up PID before returning so a new daemon can
-                    // start while the visualizer drains its messages.
-                    if opts.daemon {
-                        if let Ok(pid_file) = daemon::pid_path() {
-                            let _ = daemon::remove_pid_file_if_owner(std::process::id(), &pid_file);
-                        }
-                    }
-                    return Ok(());
-                }
+                // Fall back to file-based transcription.  Retry is
+                // already handled by Layer 3.
+                let result = transcription::transcribe_audio(
+                    &cache_path,
+                    &config,
+                    provider,
+                    opts.model.as_deref(),
+                    opts.diarize,
+                    true,
+                    &sink,
+                )
+                .await;
 
-                let mut last_err = first_err;
-                let mut succeeded = None;
-
-                for attempt in 1..=MAX_RETRIES {
-                    log::warn!(
-                        "[DBG] retry loop: attempt {}/{} starting",
-                        attempt,
-                        MAX_RETRIES
-                    );
-                    let reason = last_err.to_string();
-                    let msg = format!(
-                        "Transcription failed: {}. Retrying ({}/{})...",
-                        reason, attempt, MAX_RETRIES,
-                    );
-                    log::warn!("{}", msg);
-                    if let Some(ref viz) = visualizer {
-                        viz.push_message(&msg);
-                    }
-
-                    sink.emit(TranscriptionEvent::RetryScheduled {
-                        attempt,
-                        max: MAX_RETRIES,
-                        reason: last_err.to_string(),
-                        t: std::time::Instant::now(),
-                    });
-
-                    let upload_path = cache_path.clone();
-                    log::warn!(
-                        "[DBG] retry loop: transcribe_file {} starting (attempt {}/{})",
-                        upload_path.display(),
-                        attempt,
-                        MAX_RETRIES
-                    );
-                    let attempt_start = std::time::Instant::now();
-                    let config_for_retry = config.clone();
-                    let model_for_retry = opts.model.clone();
-                    let diarize = opts.diarize;
-                    let task = tokio::spawn(async move {
-                        transcription::transcribe_audio(
-                            &upload_path,
-                            &config_for_retry,
-                            provider,
-                            model_for_retry.as_deref(),
-                            diarize,
-                        )
-                        .await
-                    });
-
-                    let outcome = match task.await {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => Err(e),
-                        Err(e) => Err(TalkError::Transcription(format!(
-                            "retry task panicked: {}",
-                            e,
-                        ))),
-                    };
-
-                    match outcome {
-                        Ok(r) => {
-                            log::info!("transcription succeeded on retry {}", attempt);
-                            log::warn!(
-                                "[DBG] retry loop: attempt {}/{} SUCCEEDED after {}ms",
-                                attempt,
-                                MAX_RETRIES,
-                                attempt_start.elapsed().as_millis()
-                            );
-                            if let Some(ref viz) = visualizer {
-                                viz.set_text("");
-                            }
-                            succeeded = Some(r);
-                            break;
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[DBG] retry loop: attempt {}/{} FAILED after {}ms: {}",
-                                attempt,
-                                MAX_RETRIES,
-                                attempt_start.elapsed().as_millis(),
-                                e
-                            );
-                            last_err = e;
-                        }
-                    }
-                }
-
-                match succeeded {
-                    Some(r) => r,
-                    None => {
-                        // All retries exhausted — show error, skip YAML/paste,
-                        // preserve OGG for the picker.
-                        let final_msg = format!(
-                            "Transcription failed after {} attempts: {}",
-                            MAX_RETRIES, last_err,
-                        );
+                match result {
+                    Ok(r) => r,
+                    Err(final_err) => {
+                        // Model errors get enriched with available
+                        // models (display concern).  Other errors are
+                        // already after-retry permanent failures.
+                        let final_err = if transcription::is_model_error(provider, &final_err) {
+                            transcription::enrich_model_error(
+                                &config,
+                                provider,
+                                opts.model.as_deref(),
+                                final_err,
+                            )
+                            .await
+                        } else {
+                            final_err
+                        };
+                        let final_msg = format!("{}", final_err);
                         log::error!("{}", final_msg);
                         if let Some(ref viz) = visualizer {
                             viz.push_message(&format!("Error: {}", final_msg));
@@ -736,9 +674,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         if let Some(ref o) = overlay {
                             o.hide();
                         }
-                        // Clean up PID before returning so a new daemon
-                        // can start while the visualizer drains its
-                        // messages.
+                        // Clean up PID so a new daemon can start
+                        // while the visualizer drains its messages.
                         if opts.daemon {
                             if let Ok(pid_file) = daemon::pid_path() {
                                 let _ =
@@ -790,6 +727,24 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         .to_string();
     let segments = result.segments;
     let metadata = result.metadata;
+
+    // Write the authoritative pick file UNLESS the user asked for a
+    // specific model/provider/diarize — those are "give me a
+    // one-off transcription", not "produce the authoritative
+    // transcript for this recording".  Never overwrites an
+    // existing pick (user may have edited it).
+    let specific_options = opts.provider.is_some() || opts.model.is_some() || opts.diarize;
+    if !specific_options {
+        if let Err(e) = recording_cache::write_pick_if_absent(
+            &cache_path,
+            &provider.to_string(),
+            &effective_model,
+            opts.realtime,
+            &text,
+        ) {
+            log::warn!("failed to write pick file: {}", e);
+        }
+    }
 
     // Write recording cache metadata and rotate old entries.
     let result_for_cache = transcription::TranscriptionResult {
@@ -920,7 +875,7 @@ mod tests {
         use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
         use crate::clipboard::MockClipboard;
         use crate::config::AudioConfig;
-        use crate::transcription::{BatchTranscriber, MockBatchTranscriber};
+        use crate::transcription::{BatchTranscriber, MockBatchTranscriber, TranscriptionBody};
 
         let audio_config = AudioConfig::new();
 
@@ -963,10 +918,14 @@ mod tests {
 
         // Spawn transcription with mock
         let transcriber = MockBatchTranscriber::new("Hello world from dictation");
-        let transcribe_task =
-            tokio::spawn(
-                async move { transcriber.transcribe_stream(stream_rx, "audio.ogg").await },
-            );
+        let transcribe_task = tokio::spawn(async move {
+            transcriber
+                .fetch_transcription(TranscriptionBody::Stream {
+                    chunks: stream_rx,
+                    file_name: "audio.ogg".to_string(),
+                })
+                .await
+        });
 
         // Wait for encode to finish
         encode_task.await.expect("encode task");

@@ -34,15 +34,17 @@ pub fn parse_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), TalkErr
 
 /// Transcribe an audio file to text.
 ///
-/// # Arguments
-/// * `args` - Command-line arguments (input file, optional output file)
+/// Follows the waterfall architecture from `doc/plan/plan.md`:
 ///
-/// # Flow
-/// 1. Parse arguments to get input and optional output file paths
-/// 2. Load configuration (Mistral API key)
-/// 3. Initialize MistralTranscriber
-/// 4. Call transcribe_file() on the input audio
-/// 5. Write result to stdout (if no output file) or to output file
+/// - **Specific options on CLI** (`--provider`, `--model`, or
+///   `--diarize`): call Layer 3 (`transcribe_audio`) directly.  No
+///   pick I/O -- the user asked for a specific transcription, not
+///   the authoritative one.
+/// - **No specific options**: call Layer 2 (`produce_transcript`),
+///   which checks the pick file first, transcribes via the default
+///   model on miss, and writes the pick file.  On
+///   `TranscriptInProgress`, polls `get_transcript()` every 1 s for
+///   up to 5 s.
 pub async fn transcribe(
     args: Vec<String>,
     cli_provider: Option<Provider>,
@@ -61,15 +63,27 @@ pub async fn transcribe(
         .or_else(|| config.transcription.as_ref().map(|t| t.default_provider))
         .unwrap_or(Provider::Mistral);
 
-    let result = transcription::transcribe_audio(
-        &input_path,
-        &config,
-        provider,
-        cli_model.as_deref(),
-        diarize,
-    )
-    .await?;
-    let output_text = transcription::format_transcription_output(&result);
+    let specific_options = cli_provider.is_some() || cli_model.is_some() || diarize;
+    let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+        std::sync::Arc::new(crate::telemetry::NoOpSink);
+
+    let output_text = if specific_options {
+        // Specific options -> Layer 3 directly, no pick I/O.
+        let result = transcription::transcribe_audio(
+            &input_path,
+            &config,
+            provider,
+            cli_model.as_deref(),
+            diarize,
+            true,
+            &sink,
+        )
+        .await?;
+        transcription::format_transcription_output(&result)
+    } else {
+        // Default options -> Layer 2 (uses pick file as cache).
+        produce_or_wait(&input_path, &config, provider, &sink).await?
+    };
 
     match output_path {
         Some(output_file) => {
@@ -86,6 +100,38 @@ pub async fn transcribe(
     }
 
     Ok(())
+}
+
+/// Call [`transcription::produce_transcript`] and, on
+/// [`TalkError::TranscriptInProgress`], poll
+/// [`recording_cache::get_transcript`] every 1 s for up to 5 s.
+async fn produce_or_wait(
+    input_path: &std::path::Path,
+    config: &Config,
+    provider: Provider,
+    sink: &std::sync::Arc<dyn crate::telemetry::TelemetrySink>,
+) -> Result<String, TalkError> {
+    use crate::recording_cache::{self, TranscriptStatus};
+
+    match transcription::produce_transcript(input_path, config, provider, None, sink).await {
+        Ok(text) => return Ok(text),
+        Err(TalkError::TranscriptInProgress) => {}
+        Err(e) => return Err(e),
+    }
+
+    // Poll up to 5 times with 1 s interval.
+    for _ in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match recording_cache::get_transcript(input_path) {
+            TranscriptStatus::Available(text) => return Ok(text),
+            TranscriptStatus::NotAvailable => {
+                // Lock was released without producing a pick — retry.
+                return Box::pin(produce_or_wait(input_path, config, provider, sink)).await;
+            }
+            TranscriptStatus::InProgress => continue,
+        }
+    }
+    Err(TalkError::TranscriptInProgress)
 }
 
 #[cfg(test)]
@@ -154,7 +200,7 @@ mod tests {
     async fn test_transcribe_pipeline_with_mock_transcriber() {
         use crate::config::Provider;
         use crate::recording_cache;
-        use crate::transcription::{BatchTranscriber, MockBatchTranscriber};
+        use crate::transcription::{BatchTranscriber, MockBatchTranscriber, TranscriptionBody};
         use std::fs;
         use tempfile::TempDir;
 
@@ -173,7 +219,7 @@ mod tests {
 
         // Transcribe using mock
         let transcription = mock
-            .transcribe_file(&input_path)
+            .fetch_transcription(TranscriptionBody::File(input_path.clone()))
             .await
             .expect("transcribe should succeed");
 

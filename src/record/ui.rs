@@ -267,28 +267,52 @@ fn show_recordings_window() -> Result<(), TalkError> {
             size_label.add_css_class("meta");
             hbox.append(&size_label);
 
-            // Transcript preview or interactive player bar
-            if recording.transcript_preview.is_empty() {
-                // No transcript — show the shared audio player bar
-                // with waterfall spectrogram, cursor, drag-to-seek,
-                // and play/pause/rewind controls.
-                let player_bar = crate::widgets::audio_player_bar::build_audio_player_bar(
-                    &recording.path,
-                    player,
-                    active_play_btn,
-                    None, // waterfall computed in background by the widget
-                    28,
-                );
-                hbox.append(&player_bar);
-            } else {
-                let transcript = gtk4::Label::new(Some(&recording.transcript_preview));
-                transcript.set_xalign(0.0);
-                transcript.set_hexpand(true);
-                transcript.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                transcript.set_max_width_chars(80);
-                transcript.set_selectable(false);
-                transcript.add_css_class("transcript");
-                hbox.append(&transcript);
+            // Transcript preview, in-progress indicator, or audio
+            // player bar — driven by the pick-file status.
+            use crate::recording_cache::TranscriptStatus;
+            match &recording.status {
+                TranscriptStatus::NotAvailable => {
+                    // No pick yet — show the shared audio player bar
+                    // with waterfall spectrogram, cursor, drag-to-seek,
+                    // and play/pause/rewind controls.
+                    let player_bar = crate::widgets::audio_player_bar::build_audio_player_bar(
+                        &recording.path,
+                        player,
+                        active_play_btn,
+                        None, // waterfall computed in background by the widget
+                        28,
+                    );
+                    hbox.append(&player_bar);
+                }
+                TranscriptStatus::InProgress => {
+                    let label = gtk4::Label::new(None);
+                    label.set_markup("<i>(transcription ongoing)</i>");
+                    label.set_opacity(0.35);
+                    label.set_xalign(0.0);
+                    label.set_hexpand(true);
+                    label.set_selectable(false);
+                    label.add_css_class("transcript");
+                    hbox.append(&label);
+                }
+                TranscriptStatus::Available(_) => {
+                    let transcript = gtk4::Label::new(None);
+                    if recording.transcript_preview.is_empty() {
+                        // Empty pick text — valid result for silent
+                        // recordings.  Record-UI display (not the
+                        // picker's "(no speech detected)").
+                        transcript.set_markup("<i>(no text)</i>");
+                        transcript.set_opacity(0.35);
+                    } else {
+                        transcript.set_text(&recording.transcript_preview);
+                    }
+                    transcript.set_xalign(0.0);
+                    transcript.set_hexpand(true);
+                    transcript.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                    transcript.set_max_width_chars(80);
+                    transcript.set_selectable(false);
+                    transcript.add_css_class("transcript");
+                    hbox.append(&transcript);
+                }
             }
 
             // Dictate button — open the picker to (re-)transcribe this recording
@@ -316,9 +340,13 @@ fn show_recordings_window() -> Result<(), TalkError> {
             }
             hbox.append(&dictate_btn);
 
-            // Play button (simple toggle for entries with transcripts;
-            // entries without transcripts use the full audio_player_bar).
-            if !recording.transcript_preview.is_empty() {
+            // Play button (simple toggle for entries that already
+            // have a transcript row; entries without a transcript
+            // row use the full audio_player_bar above).
+            if !matches!(
+                recording.status,
+                crate::recording_cache::TranscriptStatus::NotAvailable
+            ) {
                 let play_btn = gtk4::Button::with_label("▶");
                 play_btn.set_tooltip_text(Some("Play recording"));
                 play_btn.add_css_class("play-btn");
@@ -693,9 +721,17 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     ) {
                         use gtk4::prelude::*;
 
-                        // Extract stem (timestamp part before the first
-                        // underscore) — it matches the audio file's stem.
-                        let yml_stem = yml_name.split('_').next().unwrap_or("");
+                        // Extract stem — matches the audio file's stem.
+                        // Sidecars: `<stem>_<provider>_<model>_<mode>.yml`
+                        // Pick file: `<stem>.pick.yml`
+                        // Pick lock: `<stem>.pick-lock.yml`
+                        let yml_stem = if let Some(s) = yml_name.strip_suffix(".pick-lock.yml") {
+                            s
+                        } else if let Some(s) = yml_name.strip_suffix(".pick.yml") {
+                            s
+                        } else {
+                            yml_name.split('_').next().unwrap_or("")
+                        };
                         if yml_stem.is_empty() {
                             return;
                         }

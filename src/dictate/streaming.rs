@@ -10,7 +10,7 @@ use crate::audio::indicator::SoundPlayer;
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::{AudioConfig, Config, Provider};
 use crate::error::TalkError;
-use crate::transcription::{self, BatchTranscriber, TranscriptionResult};
+use crate::transcription::{self, BatchTranscriber, TranscriptionBody, TranscriptionResult};
 use crate::x11::overlay::{IndicatorKind, OverlayHandle};
 use crate::x11::visualizer::VisualizerHandle;
 use std::sync::Arc;
@@ -77,8 +77,14 @@ fn spawn_encode_pipeline(
     });
 
     // Transcribe: stream_rx → API
-    let transcribe_handle =
-        tokio::spawn(async move { transcriber.transcribe_stream(stream_rx, "audio.ogg").await });
+    let transcribe_handle = tokio::spawn(async move {
+        transcriber
+            .fetch_transcription(TranscriptionBody::Stream {
+                chunks: stream_rx,
+                file_name: "audio.ogg".to_string(),
+            })
+            .await
+    });
 
     (
         feeder_handle,

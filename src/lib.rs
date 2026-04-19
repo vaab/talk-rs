@@ -17,6 +17,6 @@ pub mod x11;
 
 pub use clipboard::{Clipboard, MockClipboard, X11Clipboard};
 pub use transcription::{
-    BatchTranscriber, MistralBatchTranscriber, MockBatchTranscriber, OpenAIBatchTranscriber,
+    MistralBatchTranscriber, MockBatchTranscriber, OpenAIBatchTranscriber,
     OpenAIRealtimeTranscriber,
 };

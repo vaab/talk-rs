@@ -359,7 +359,7 @@ pub(crate) async fn enrich_model_error(
     if !is_model_error(&error) {
         return error;
     }
-    match super::model_suggestions::fetch_transcription_models(
+    match super::super::model_suggestions::fetch_transcription_models(
         api_key,
         api_base,
         is_transcription_model,

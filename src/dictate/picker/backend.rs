@@ -35,12 +35,12 @@ pub(super) async fn run_realtime_transcription(
         Ok(rx) => rx,
         Err(e) => {
             log::warn!("realtime {}:{} connect failed: {}", provider, model, e);
-            let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
+            let _ = tx.send(PickerMessage::Candidate(Box::new(PickerCandidate::error(
                 provider,
                 model,
                 format!("{e}"),
                 true,
-            )));
+            ))));
             return;
         }
     };
@@ -100,40 +100,44 @@ pub(super) async fn run_realtime_transcription(
             }
             Some(TranscriptionEvent::Done) => {
                 let final_text = accumulated.trim().to_string();
-                let _ = tx.send(PickerMessage::Candidate(PickerCandidate::success(
-                    provider,
-                    model,
-                    final_text,
-                    true,
-                    if timed_segments.is_empty() {
-                        None
-                    } else {
-                        Some(timed_segments)
-                    },
-                    TranscriptionMetadata::default(),
+                let _ = tx.send(PickerMessage::Candidate(Box::new(
+                    PickerCandidate::success(
+                        provider,
+                        model,
+                        final_text,
+                        true,
+                        if timed_segments.is_empty() {
+                            None
+                        } else {
+                            Some(timed_segments)
+                        },
+                        TranscriptionMetadata::default(),
+                    ),
                 )));
                 return;
             }
             Some(TranscriptionEvent::Error { message }) => {
-                let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
+                let _ = tx.send(PickerMessage::Candidate(Box::new(PickerCandidate::error(
                     provider, model, message, true,
-                )));
+                ))));
                 return;
             }
             None => {
                 // Channel closed without Done — use what we have.
                 let final_text = accumulated.trim().to_string();
-                let _ = tx.send(PickerMessage::Candidate(PickerCandidate::success(
-                    provider,
-                    model,
-                    final_text,
-                    true,
-                    if timed_segments.is_empty() {
-                        None
-                    } else {
-                        Some(timed_segments)
-                    },
-                    TranscriptionMetadata::default(),
+                let _ = tx.send(PickerMessage::Candidate(Box::new(
+                    PickerCandidate::success(
+                        provider,
+                        model,
+                        final_text,
+                        true,
+                        if timed_segments.is_empty() {
+                            None
+                        } else {
+                            Some(timed_segments)
+                        },
+                        TranscriptionMetadata::default(),
+                    ),
                 )));
                 return;
             }
@@ -159,6 +163,8 @@ pub(super) fn spawn_transcription(
     model: String,
     config: std::sync::Arc<Config>,
 ) {
+    let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+        std::sync::Arc::new(crate::telemetry::NoOpSink);
     tasks.spawn(async move {
         let msg = match crate::transcription::transcribe_audio(
             &audio,
@@ -166,31 +172,30 @@ pub(super) fn spawn_transcription(
             provider,
             Some(&model),
             false,
+            true,
+            &sink,
         )
         .await
         {
             Ok(res) => {
                 let text = res.text.trim().to_string();
-                if text.is_empty() {
-                    return;
-                }
-                PickerMessage::Candidate(PickerCandidate::success(
+                PickerMessage::Candidate(Box::new(PickerCandidate::success(
                     provider,
                     model,
                     text,
                     false,
                     res.segments,
                     res.metadata,
-                ))
+                )))
             }
             Err(e) => {
                 log::warn!("candidate {}:{} failed: {}", provider, model, e);
-                PickerMessage::Candidate(PickerCandidate::error(
+                PickerMessage::Candidate(Box::new(PickerCandidate::error(
                     provider,
                     model,
                     format!("{e}"),
                     false,
-                ))
+                )))
             }
         };
         let _ = tx.send(msg);

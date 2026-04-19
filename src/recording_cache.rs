@@ -15,6 +15,7 @@ use crate::transcription::{
 };
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,18 @@ pub struct LastPasteState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_id: Option<String>,
     pub text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PickerSelectionMetadata {
+    provider: String,
+    model: String,
+    streaming: bool,
+    /// The final transcription text chosen by the user (may have been
+    /// edited in the text area).  This is the authoritative text for
+    /// the recording — takes priority over provider sidecars.
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -455,6 +468,330 @@ fn metadata_filename(timestamp: &str, provider: Provider, model: &str, realtime:
     format!("{}_{}_{}_{}.yml", timestamp, provider, safe_model, mode)
 }
 
+/// Per-model lock filename.
+///
+/// Format: `{stem}_{provider}_{model}_{mode}_lock.yml`.
+fn model_lock_filename(stem: &str, provider: Provider, model: &str, realtime: bool) -> String {
+    let mode = if realtime { "realtime" } else { "batch" };
+    let safe_model = model.replace(['/', ' '], "-");
+    format!("{}_{}_{}_{}-lock.yml", stem, provider, safe_model, mode)
+}
+
+fn model_lock_path(
+    audio_path: &Path,
+    provider: Provider,
+    model: &str,
+    realtime: bool,
+) -> Result<PathBuf, TalkError> {
+    let dir = audio_path
+        .parent()
+        .ok_or_else(|| TalkError::Config("audio path has no parent directory".to_string()))?;
+    let stem = audio_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| TalkError::Config("audio path has no file stem".to_string()))?;
+    Ok(dir.join(model_lock_filename(stem, provider, model, realtime)))
+}
+
+/// Acquire the per-model lock for a (recording, provider, model, mode)
+/// tuple.  Returns `Err(TalkError::ModelInProgress)` if the lock is
+/// already held by another process.
+pub fn acquire_model_lock(
+    audio_path: &Path,
+    provider: Provider,
+    model: &str,
+    realtime: bool,
+) -> Result<(), TalkError> {
+    let path = model_lock_path(audio_path, provider, model, realtime)?;
+    if path.exists() {
+        return Err(TalkError::ModelInProgress);
+    }
+    fs::write(&path, b"")
+        .map_err(|e| TalkError::Config(format!("failed to write {}: {}", path.display(), e)))
+}
+
+/// Release the per-model lock.  Idempotent: missing lock is not an
+/// error.
+pub fn release_model_lock(
+    audio_path: &Path,
+    provider: Provider,
+    model: &str,
+    realtime: bool,
+) -> Result<(), TalkError> {
+    let path = model_lock_path(audio_path, provider, model, realtime)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(TalkError::Config(format!(
+            "failed to remove {}: {}",
+            path.display(),
+            e
+        ))),
+    }
+}
+
+/// Check whether a per-model lock currently exists without acquiring
+/// it.  Used by probe logic.
+pub fn is_model_locked(audio_path: &Path, provider: Provider, model: &str, realtime: bool) -> bool {
+    model_lock_path(audio_path, provider, model, realtime)
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+fn pick_filename(stem: &str) -> String {
+    format!("{stem}.pick.yml")
+}
+
+fn pick_lock_filename(stem: &str) -> String {
+    format!("{stem}.pick-lock.yml")
+}
+
+fn pick_path(audio_path: &Path) -> Result<PathBuf, TalkError> {
+    let dir = audio_path
+        .parent()
+        .ok_or_else(|| TalkError::Config("audio path has no parent directory".to_string()))?;
+    let stem = audio_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| TalkError::Config("audio path has no file stem".to_string()))?;
+    Ok(dir.join(pick_filename(stem)))
+}
+
+fn pick_lock_path(audio_path: &Path) -> Result<PathBuf, TalkError> {
+    let dir = audio_path
+        .parent()
+        .ok_or_else(|| TalkError::Config("audio path has no parent directory".to_string()))?;
+    let stem = audio_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| TalkError::Config("audio path has no file stem".to_string()))?;
+    Ok(dir.join(pick_lock_filename(stem)))
+}
+
+fn recording_sidecar_dirs(audio_path: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(audio_dir) = audio_path.parent() {
+        dirs.push(audio_dir.to_path_buf());
+    }
+    if let Ok(cache_dir) = recordings_dir() {
+        if !dirs.iter().any(|dir| dir == &cache_dir) {
+            dirs.push(cache_dir);
+        }
+    }
+    dirs
+}
+
+pub fn list_sidecars_for_audio(audio_path: &Path) -> Vec<(Provider, String, String, bool)> {
+    let stem = match audio_path.file_stem().and_then(|s| s.to_str()) {
+        Some(stem) if !stem.is_empty() => stem,
+        _ => return Vec::new(),
+    };
+
+    let sidecar_prefix = format!("{stem}_");
+    let selection_name = pick_filename(stem);
+    let mut seen: HashSet<(String, String, bool)> = HashSet::new();
+    let mut entries = Vec::new();
+
+    for dir in recording_sidecar_dirs(audio_path) {
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(read_dir) => read_dir,
+            Err(err) => {
+                log::debug!("failed to scan sidecars in {}: {}", dir.display(), err);
+                continue;
+            }
+        };
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+            if name == selection_name
+                || !name.starts_with(&sidecar_prefix)
+                || path.extension().and_then(|ext| ext.to_str()) != Some("yml")
+            {
+                continue;
+            }
+
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(err) => {
+                    log::debug!("failed to read sidecar {}: {}", path.display(), err);
+                    continue;
+                }
+            };
+            let metadata = match serde_yaml::from_str::<RecordingMetadata>(&content) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    log::debug!("skipping non-recording sidecar {}: {}", path.display(), err);
+                    continue;
+                }
+            };
+            let provider = match metadata.provider.parse::<Provider>() {
+                Ok(provider) => provider,
+                Err(err) => {
+                    log::debug!(
+                        "skipping sidecar with invalid provider {}: {}",
+                        path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            let key = (
+                provider.to_string(),
+                metadata.model.clone(),
+                metadata.realtime,
+            );
+            if seen.insert(key) {
+                entries.push((
+                    provider,
+                    metadata.model,
+                    metadata.transcript,
+                    metadata.realtime,
+                ));
+            }
+        }
+    }
+
+    entries
+}
+
+/// Status of a recording's authoritative transcription.
+///
+/// This is the return type of [`get_transcript`] and encapsulates
+/// the three possible states the pick file system can be in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptStatus {
+    /// Pick file exists.  Text may be empty (valid result for silent
+    /// recordings).
+    Available(String),
+    /// Pick lock file exists.  Another process is currently
+    /// producing the authoritative transcript.
+    InProgress,
+    /// Neither pick file nor lock file exists.  No transcript.
+    NotAvailable,
+}
+
+/// Check the authoritative transcript status for a recording.
+///
+/// Checks the pick lock first (`<stem>.pick-lock.yml`) then the pick
+/// file (`<stem>.pick.yml`).  If a lock is present the returned
+/// status is [`TranscriptStatus::InProgress`] regardless of whether
+/// a pick file also exists -- the production is overwriting.
+///
+/// This is the single source of truth for "does this recording have
+/// a transcript?".  No sidecar fallback.  No API call.
+pub fn get_transcript(audio_path: &Path) -> TranscriptStatus {
+    // Lock takes priority over pick: if a lock is present, a
+    // producer is mid-flight and any pick on disk is stale.
+    if let Ok(lock) = pick_lock_path(audio_path) {
+        if lock.exists() {
+            return TranscriptStatus::InProgress;
+        }
+    }
+    match read_pick(audio_path) {
+        Some((_, _, _, text)) => TranscriptStatus::Available(text),
+        None => TranscriptStatus::NotAvailable,
+    }
+}
+
+/// Write the pick file for a recording.
+///
+/// The pick file is the authoritative transcription -- possibly
+/// user-edited.  Overwrites any existing pick file.
+pub fn write_pick(
+    audio_path: &Path,
+    provider: &str,
+    model: &str,
+    streaming: bool,
+    text: &str,
+) -> Result<(), TalkError> {
+    let path = pick_path(audio_path)?;
+    let selection = PickerSelectionMetadata {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        streaming,
+        text: text.to_string(),
+    };
+    let yaml = serde_yaml::to_string(&selection)
+        .map_err(|e| TalkError::Config(format!("failed to serialise pick: {}", e)))?;
+    fs::write(&path, yaml)
+        .map_err(|e| TalkError::Config(format!("failed to write {}: {}", path.display(), e)))
+}
+
+/// Write the pick file for a recording only when no pick already
+/// exists.
+///
+/// Used by the `dictate` command after a successful streaming
+/// transcription: the streaming result becomes the authoritative
+/// transcript unless the user already edited one.  Produces no
+/// error if a pick is already present; the existing pick is
+/// preserved.
+pub fn write_pick_if_absent(
+    audio_path: &Path,
+    provider: &str,
+    model: &str,
+    streaming: bool,
+    text: &str,
+) -> Result<(), TalkError> {
+    if read_pick(audio_path).is_some() {
+        return Ok(());
+    }
+    write_pick(audio_path, provider, model, streaming, text)
+}
+
+/// Read the full pick metadata for a recording.
+///
+/// Returns `(provider, model, streaming, text)` when the pick file
+/// exists and parses correctly.  `None` if the file is missing or
+/// malformed.
+pub fn read_pick(audio_path: &Path) -> Option<(Provider, String, bool, String)> {
+    let path = pick_path(audio_path).ok()?;
+    let content = fs::read_to_string(&path).ok()?;
+    let selection = serde_yaml::from_str::<PickerSelectionMetadata>(&content).ok()?;
+    let provider = selection.provider.parse::<Provider>().ok()?;
+    Some((
+        provider,
+        selection.model,
+        selection.streaming,
+        selection.text,
+    ))
+}
+
+/// Acquire the pick-level lock for a recording.
+///
+/// Writes `<stem>.pick-lock.yml` with empty contents.  Returns an
+/// error if the lock already exists (another producer is in
+/// progress).
+pub fn acquire_pick_lock(audio_path: &Path) -> Result<(), TalkError> {
+    let path = pick_lock_path(audio_path)?;
+    if path.exists() {
+        return Err(TalkError::TranscriptInProgress);
+    }
+    fs::write(&path, b"")
+        .map_err(|e| TalkError::Config(format!("failed to write {}: {}", path.display(), e)))
+}
+
+/// Release the pick-level lock for a recording.
+///
+/// Removes `<stem>.pick-lock.yml` if it exists.  Idempotent: missing
+/// lock is not an error.
+pub fn release_pick_lock(audio_path: &Path) -> Result<(), TalkError> {
+    let path = pick_lock_path(audio_path)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(TalkError::Config(format!(
+            "failed to remove {}: {}",
+            path.display(),
+            e
+        ))),
+    }
+}
+
 /// Write a metadata YAML file for a cached recording.
 #[allow(clippy::too_many_arguments)]
 pub fn write_metadata_to_dir(
@@ -769,12 +1106,11 @@ pub fn rotate_cache() -> Result<(), TalkError> {
 
         // Delete all matching YAML files (same timestamp prefix)
         if !stem.is_empty() {
-            let yml_prefix = format!("{}_", stem);
             if let Ok(entries) = fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name.starts_with(&yml_prefix)
+                    if name.starts_with(stem)
                         && path.extension().and_then(|e| e.to_str()) == Some("yml")
                     {
                         if let Err(e) = fs::remove_file(&path) {
@@ -799,6 +1135,21 @@ pub fn rotate_cache() -> Result<(), TalkError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn sample_metadata(transcript: &str, provider: &str, model: &str, realtime: bool) -> String {
+        serde_yaml::to_string(&RecordingMetadata {
+            recording: "sample.ogg".to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            realtime,
+            transcript: transcript.to_string(),
+            timestamp: "2026-02-18T12-33-45".to_string(),
+            metadata: None,
+            provider_api: None,
+            segments: None,
+        })
+        .expect("serialise metadata")
+    }
 
     fn sample_result() -> TranscriptionResult {
         TranscriptionResult {
@@ -1098,6 +1449,28 @@ mod tests {
     }
 
     #[test]
+    fn test_rotate_cache_removes_pick_selection_sidecar() {
+        let dir = TempDir::new().expect("create temp dir");
+        let rec_dir = dir.path();
+
+        for i in 0..12 {
+            let ts = format!("2026-02-{:02}T12-00-00", i + 1);
+            fs::write(rec_dir.join(format!("{ts}.ogg")), "fake ogg").expect("write ogg");
+            fs::write(
+                rec_dir.join(format!("{ts}.pick.yml")),
+                "provider: openai\nmodel: whisper-1\nstreaming: false\n",
+            )
+            .expect("write selection");
+        }
+
+        rotate_in_dir(rec_dir, MAX_CACHED_RECORDINGS).expect("rotate");
+
+        assert!(!rec_dir.join("2026-02-01T12-00-00.pick.yml").exists());
+        assert!(!rec_dir.join("2026-02-02T12-00-00.pick.yml").exists());
+        assert!(rec_dir.join("2026-02-12T12-00-00.pick.yml").exists());
+    }
+
+    #[test]
     fn test_rotate_cache_under_limit_is_noop() {
         let dir = TempDir::new().expect("create temp dir");
         let rec_dir = dir.path();
@@ -1151,6 +1524,221 @@ mod tests {
         assert_eq!(brief.model, None);
     }
 
+    #[test]
+    fn test_list_sidecars_for_audio_reads_audio_dir_and_skips_pick_file() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("sample.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        fs::write(
+            dir.path().join("sample_openai_whisper-1_batch.yml"),
+            sample_metadata("hello", "openai", "whisper-1", false),
+        )
+        .expect("write sidecar");
+        fs::write(
+            dir.path().join("sample.pick.yml"),
+            "provider: mistral\nmodel: voxtral-mini-2507\nstreaming: false\n",
+        )
+        .expect("write selection");
+
+        let sidecars = list_sidecars_for_audio(&audio_path);
+
+        assert_eq!(sidecars.len(), 1);
+        assert_eq!(
+            sidecars[0],
+            (
+                Provider::OpenAI,
+                "whisper-1".to_string(),
+                "hello".to_string(),
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn test_list_sidecars_for_audio_uses_recordings_dir_as_fallback() {
+        let dir = TempDir::new().expect("create temp dir");
+        let recordings = recordings_dir().expect("recordings dir");
+        fs::create_dir_all(&recordings).expect("create recordings dir");
+        let audio_path = dir.path().join("fallback.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        let fallback_sidecar = recordings.join("fallback_mistral_voxtral-mini-2507_batch.yml");
+        fs::write(
+            &fallback_sidecar,
+            sample_metadata("bonjour", "mistral", "voxtral-mini-2507", false),
+        )
+        .expect("write fallback sidecar");
+
+        let sidecars = list_sidecars_for_audio(&audio_path);
+
+        assert_eq!(sidecars.len(), 1);
+        assert_eq!(
+            sidecars[0],
+            (
+                Provider::Mistral,
+                "voxtral-mini-2507".to_string(),
+                "bonjour".to_string(),
+                false
+            )
+        );
+
+        let _ = fs::remove_file(fallback_sidecar);
+    }
+
+    #[test]
+    fn test_list_sidecars_for_audio_deduplicates_provider_model_mode() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("dup.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        fs::write(
+            dir.path().join("dup_openai_whisper-1_batch.yml"),
+            sample_metadata("first", "openai", "whisper-1", false),
+        )
+        .expect("write first sidecar");
+        fs::write(
+            dir.path().join("dup_openai_whisper-1_realtime.yml"),
+            sample_metadata("stream", "openai", "whisper-1", true),
+        )
+        .expect("write realtime sidecar");
+        fs::write(
+            dir.path().join("dup_openai_whisper-1_batch-copy.yml"),
+            sample_metadata("second", "openai", "whisper-1", false),
+        )
+        .expect("write duplicate sidecar");
+
+        let sidecars = list_sidecars_for_audio(&audio_path);
+
+        assert_eq!(sidecars.len(), 2);
+        assert!(
+            sidecars.contains(&(
+                Provider::OpenAI,
+                "whisper-1".to_string(),
+                "first".to_string(),
+                false
+            )) || sidecars.contains(&(
+                Provider::OpenAI,
+                "whisper-1".to_string(),
+                "second".to_string(),
+                false
+            ))
+        );
+        assert!(sidecars.contains(&(
+            Provider::OpenAI,
+            "whisper-1".to_string(),
+            "stream".to_string(),
+            true
+        )));
+    }
+
+    #[test]
+    fn test_pick_round_trip() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("select.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+
+        write_pick(&audio_path, "openai", "whisper-1", true, "hello world").expect("write pick");
+
+        assert_eq!(
+            read_pick(&audio_path),
+            Some((
+                Provider::OpenAI,
+                "whisper-1".to_string(),
+                true,
+                "hello world".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_get_transcript_not_available_when_no_files() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("nothing.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+
+        assert_eq!(get_transcript(&audio_path), TranscriptStatus::NotAvailable);
+    }
+
+    #[test]
+    fn test_get_transcript_available_when_pick_exists() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("has-pick.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        write_pick(&audio_path, "openai", "whisper-1", false, "hello").expect("write pick");
+
+        assert_eq!(
+            get_transcript(&audio_path),
+            TranscriptStatus::Available("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_transcript_available_with_empty_text() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("silent.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        write_pick(&audio_path, "openai", "whisper-1", false, "").expect("write pick");
+
+        assert_eq!(
+            get_transcript(&audio_path),
+            TranscriptStatus::Available(String::new())
+        );
+    }
+
+    #[test]
+    fn test_get_transcript_in_progress_when_lock_exists() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("locked.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        acquire_pick_lock(&audio_path).expect("acquire lock");
+
+        assert_eq!(get_transcript(&audio_path), TranscriptStatus::InProgress);
+    }
+
+    #[test]
+    fn test_get_transcript_lock_takes_priority_over_pick() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("both.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        // Production is overwriting: pick exists from previous run,
+        // lock means a new producer is mid-flight.
+        write_pick(&audio_path, "openai", "whisper-1", false, "stale").expect("write pick");
+        acquire_pick_lock(&audio_path).expect("acquire lock");
+
+        assert_eq!(get_transcript(&audio_path), TranscriptStatus::InProgress);
+    }
+
+    #[test]
+    fn test_acquire_pick_lock_fails_when_already_held() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("lock-test.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        acquire_pick_lock(&audio_path).expect("first acquire");
+
+        let result = acquire_pick_lock(&audio_path);
+        assert!(matches!(result, Err(TalkError::TranscriptInProgress)));
+    }
+
+    #[test]
+    fn test_release_pick_lock_removes_file() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("release-test.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+        acquire_pick_lock(&audio_path).expect("acquire");
+        assert_eq!(get_transcript(&audio_path), TranscriptStatus::InProgress);
+
+        release_pick_lock(&audio_path).expect("release");
+        assert_eq!(get_transcript(&audio_path), TranscriptStatus::NotAvailable);
+    }
+
+    #[test]
+    fn test_release_pick_lock_is_idempotent() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("no-lock.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+
+        // No lock to begin with — should not error.
+        release_pick_lock(&audio_path).expect("release missing lock");
+    }
+
     /// Testable rotation function that operates on an arbitrary directory.
     fn rotate_in_dir(dir: &std::path::Path, max: usize) -> Result<(), TalkError> {
         let mut oggs: Vec<PathBuf> = Vec::new();
@@ -1184,12 +1772,11 @@ mod tests {
             let _ = fs::remove_file(ogg_path);
 
             if !stem.is_empty() {
-                let yml_prefix = format!("{}_", stem);
                 if let Ok(entries) = fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if name.starts_with(&yml_prefix)
+                        if name.starts_with(stem)
                             && path.extension().and_then(|e| e.to_str()) == Some("yml")
                         {
                             let _ = fs::remove_file(&path);
@@ -1200,5 +1787,70 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_acquire_model_lock_fails_when_already_held() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("mlock.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+
+        acquire_model_lock(&audio_path, Provider::OpenAI, "whisper-1", false)
+            .expect("first acquire");
+        let result = acquire_model_lock(&audio_path, Provider::OpenAI, "whisper-1", false);
+        assert!(matches!(result, Err(TalkError::ModelInProgress)));
+    }
+
+    #[test]
+    fn test_acquire_model_lock_independent_per_model() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("independent.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+
+        acquire_model_lock(&audio_path, Provider::OpenAI, "whisper-1", false)
+            .expect("lock whisper");
+        // Different model — should succeed.
+        acquire_model_lock(&audio_path, Provider::OpenAI, "gpt-4o", false).expect("lock gpt-4o");
+        // Same model but realtime mode — different lock.
+        acquire_model_lock(&audio_path, Provider::OpenAI, "whisper-1", true)
+            .expect("lock whisper realtime");
+    }
+
+    #[test]
+    fn test_release_model_lock_is_idempotent() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("rel.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+
+        release_model_lock(&audio_path, Provider::OpenAI, "whisper-1", false)
+            .expect("release missing lock");
+    }
+
+    #[test]
+    fn test_is_model_locked() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("check.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+
+        assert!(!is_model_locked(
+            &audio_path,
+            Provider::OpenAI,
+            "whisper-1",
+            false
+        ));
+        acquire_model_lock(&audio_path, Provider::OpenAI, "whisper-1", false).expect("acquire");
+        assert!(is_model_locked(
+            &audio_path,
+            Provider::OpenAI,
+            "whisper-1",
+            false
+        ));
+        release_model_lock(&audio_path, Provider::OpenAI, "whisper-1", false).expect("release");
+        assert!(!is_model_locked(
+            &audio_path,
+            Provider::OpenAI,
+            "whisper-1",
+            false
+        ));
     }
 }

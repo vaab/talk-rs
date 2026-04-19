@@ -5,7 +5,6 @@
 //! when available.
 
 mod backend;
-pub(super) mod cache;
 mod ui;
 
 use crate::config::{Config, Provider};
@@ -52,24 +51,14 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         )));
     }
 
-    // Load previously cached picker results for this audio file
-    // so that reopening the picker skips API calls entirely.
-    let picker_cache_data = cache::read(&audio_path);
-
-    // Determine the "already pasted" (provider, model, streaming) triple.
-    // The picker cache's `selected` field takes precedence
-    // (the user may have picked a different model last time).
-    // Fall back to the recording metadata otherwise.
-    let selected_key: Option<(Provider, String, bool)> = picker_cache_data
-        .selected
+    // Read the authoritative pick (user-confirmed selection + edited text).
+    // This is the ONLY cross-provider source of truth for the picker's
+    // selection state.  Sidecars are per-model internals probed below
+    // via `transcribe_audio(allow_api=false)`.
+    let pick = recording_cache::read_pick(&audio_path);
+    let selected_key: Option<(Provider, String, bool)> = pick
         .as_ref()
-        .and_then(|s| {
-            Some((
-                s.provider.parse::<Provider>().ok()?,
-                s.model.clone(),
-                s.streaming,
-            ))
-        })
+        .map(|(p, m, s, _)| (*p, m.clone(), *s))
         .or_else(|| {
             params.cached_brief.as_ref().and_then(|b| {
                 Some((
@@ -80,27 +69,60 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
             })
         });
 
-    // Collect all available cached transcriptions.
-    // Tuple: (provider, model, text, streaming)
     let mut all_entries: Vec<(Provider, String, String, bool)> = Vec::new();
 
-    // From recording metadata (always batch / streaming=false).
-    if let Some(ref brief) = params.cached_brief {
-        if let (Some(ps), Some(m)) = (brief.provider.as_deref(), brief.model.as_deref()) {
-            if let Ok(p) = ps.parse::<Provider>() {
-                all_entries.push((p, m.to_string(), brief.transcript.clone(), false));
-            }
-        }
+    // Seed entry for the pick itself: the user's authoritative choice
+    // goes first so it can be pre-selected.
+    if let Some((p, m, s, t)) = pick.as_ref() {
+        all_entries.push((*p, m.clone(), t.clone(), *s));
     }
 
-    // From picker cache results (skip duplicates).
-    for cr in &picker_cache_data.results {
-        if let Ok(p) = cr.provider.parse::<Provider>() {
-            if !all_entries
-                .iter()
-                .any(|(ep, em, _, es)| *ep == p && *em == cr.model && *es == cr.streaming)
-            {
-                all_entries.push((p, cr.model.clone(), cr.text.clone(), cr.streaming));
+    let config = std::sync::Arc::new(config);
+
+    let candidates =
+        build_retry_candidates(config.as_ref(), params.provider, params.model.as_deref());
+    log::debug!("picker candidates: {} total", candidates.len());
+    for (p, m, s) in &candidates {
+        log::debug!("  candidate: {}:{} (streaming={})", p, m, s);
+    }
+
+    // Probe the per-model sidecar cache for each batch candidate via
+    // Layer 3 with `allow_api=false`.  Hits populate `all_entries`
+    // (no spinner needed).  Misses return `CacheOnly` — those models
+    // remain uncached and will be shown as deferred buttons or the
+    // default model's auto-firing row.
+    for (p, m, streaming) in &candidates {
+        if *streaming {
+            continue; // realtime models have no sidecar cache
+        }
+        // Skip if we already have it (e.g. from the pick file).
+        if all_entries
+            .iter()
+            .any(|(ep, em, _, es)| ep == p && em == m && !*es)
+        {
+            continue;
+        }
+        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+            std::sync::Arc::new(crate::telemetry::NoOpSink);
+        match transcription::transcribe_audio(
+            &audio_path,
+            config.as_ref(),
+            *p,
+            Some(m),
+            false,
+            false,
+            &sink,
+        )
+        .await
+        {
+            Ok(result) => {
+                all_entries.push((*p, m.clone(), result.text, false));
+            }
+            Err(TalkError::CacheOnly) => {
+                log::debug!("  sidecar cache miss: {}:{}", p, m);
+            }
+            Err(e) => {
+                log::debug!("  sidecar probe failed: {}:{} — {}", p, m, e);
             }
         }
     }
@@ -124,10 +146,9 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
     }
 
     log::debug!(
-        "picker cache: {} cached entries (primary={}, from_cache={})",
+        "picker cache: {} cached entries (primary={})",
         cached_entries.len(),
         cached_entries.iter().filter(|(_, _, _, p, _)| *p).count(),
-        picker_cache_data.results.len(),
     );
     for (p, m, _, is_primary, streaming) in &cached_entries {
         log::debug!(
@@ -137,15 +158,6 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
             is_primary,
             streaming,
         );
-    }
-
-    let config = std::sync::Arc::new(config);
-
-    let candidates =
-        build_retry_candidates(config.as_ref(), params.provider, params.model.as_deref());
-    log::debug!("picker candidates: {} total", candidates.len());
-    for (p, m, s) in &candidates {
-        log::debug!("  candidate: {}:{} (streaming={})", p, m, s);
     }
 
     // Filter out every (provider, model, streaming) triple that
@@ -235,7 +247,6 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         ));
     }
 
-    let audio_path_for_selection = audio_path.clone();
     let selected = pick_with_streaming_gtk(
         batch_filtered,
         audio_path,
@@ -250,16 +261,8 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         None => return Ok(()),
     };
 
-    // Record which entry the user selected so it appears
-    // pre-selected the next time the picker opens.
-    if let Err(e) = cache::write_selected(
-        &audio_path_for_selection,
-        &selection.provider.to_string(),
-        &selection.model,
-        selection.streaming,
-    ) {
-        log::warn!("failed to update picker selection: {}", e);
-    }
+    // Selection is auto-saved by the picker UI (on first result,
+    // debounced on row change, and on close).
 
     // If the user selected the cached entry, nothing to do — the
     // text is already in the target window.

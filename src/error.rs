@@ -31,6 +31,21 @@ pub enum TalkError {
     /// Session management errors.
     #[error("Session error: {0}")]
     Session(String),
+
+    /// Pick-level lock present: another process is producing the
+    /// authoritative transcript for this recording.
+    #[error("Transcription already in progress")]
+    TranscriptInProgress,
+
+    /// Caller requested cache-only lookup but the per-model sidecar
+    /// cache was empty.  Signals that an API call would be required.
+    #[error("Transcription not cached (API call forbidden)")]
+    CacheOnly,
+
+    /// Per-model lock present: another process is calling the API
+    /// for this specific (recording, provider, model) triple.
+    #[error("Transcription for this model already in progress")]
+    ModelInProgress,
 }
 
 #[cfg(test)]

@@ -7,8 +7,8 @@
 
 use std::fs;
 use std::path::Path;
-use talk_rs::config::MistralConfig;
-use talk_rs::transcription::{BatchTranscriber, MistralBatchTranscriber, MockBatchTranscriber};
+use talk_rs::config::{Config, MistralConfig, Provider, ProvidersConfig};
+use talk_rs::transcription::transcribe_audio;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 
@@ -59,12 +59,11 @@ fn create_test_wav_file(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Test transcription with MockTranscriber and file output.
+/// Test transcription output writing with a synthetic result.
 ///
 /// This test verifies that:
-/// 1. MockTranscriber can transcribe a file
-/// 2. Output is correctly written to a file
-/// 3. File content matches the transcribed text
+/// 1. Output is correctly written to a file
+/// 2. File content matches the transcribed text
 #[tokio::test]
 async fn test_transcribe_with_mock_writes_to_file() {
     // Create temporary directory for test files
@@ -77,14 +76,12 @@ async fn test_transcribe_with_mock_writes_to_file() {
     // Create output path
     let output_path = temp_dir.path().join("transcript.txt");
 
-    // Create mock transcriber with test text
-    let mock = MockBatchTranscriber::new("This is a test transcription from mock");
-
-    // Transcribe using mock
-    let transcription = mock
-        .transcribe_file(&input_path)
-        .await
-        .expect("transcribe should succeed");
+    let transcription = talk_rs::transcription::TranscriptionResult {
+        text: "This is a test transcription from mock".to_string(),
+        metadata: Default::default(),
+        diarization: None,
+        segments: None,
+    };
 
     // Write output (simulating what transcribe() does)
     let mut file = tokio::fs::File::create(&output_path)
@@ -100,32 +97,46 @@ async fn test_transcribe_with_mock_writes_to_file() {
     assert_eq!(content, "This is a test transcription from mock");
 }
 
-/// Test that transcribe errors when input file doesn't exist.
+/// Test that public transcribe entry point reports cache-only misses.
 ///
 /// This test verifies that:
-/// 1. MistralTranscriber returns an error for non-existent files
-/// 2. Error message contains "not found"
+/// 1. `transcribe_audio` can be called on a missing cache entry
+/// 2. `allow_api = false` returns `CacheOnly` without touching the network
 #[tokio::test]
-async fn test_transcribe_nonexistent_file_errors() {
+async fn test_transcribe_audio_cache_only_on_missing_entry() {
     let config = MistralConfig {
         api_key: "test-api-key".to_string(),
         url: None,
         model: "voxtral-mini-latest".to_string(),
         context_bias: None,
     };
-    let transcriber = MistralBatchTranscriber::new(config, false).expect("build client");
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let audio_path = temp_dir.path().join("missing.wav");
+    let config = Config {
+        output_dir: temp_dir.path().to_path_buf(),
+        providers: ProvidersConfig {
+            mistral: Some(config),
+            openai: None,
+        },
+        indicators: None,
+        transcription: None,
+        paste: None,
+    };
 
-    let result = transcriber
-        .transcribe_file(Path::new("/nonexistent/path/to/audio.wav"))
-        .await;
+    let sink: std::sync::Arc<dyn talk_rs::telemetry::TelemetrySink> =
+        std::sync::Arc::new(talk_rs::telemetry::NoOpSink);
+    let result = transcribe_audio(
+        &audio_path,
+        &config,
+        Provider::Mistral,
+        None,
+        false,
+        false,
+        &sink,
+    )
+    .await;
 
-    assert!(result.is_err(), "should return error for non-existent file");
-    let error_msg = result.unwrap_err().to_string();
-    assert!(
-        error_msg.contains("not found"),
-        "error message should contain 'not found', got: {}",
-        error_msg
-    );
+    assert!(matches!(result, Err(talk_rs::error::TalkError::CacheOnly)));
 }
 
 /// Test real Mistral API transcription with synthetic audio.
@@ -171,15 +182,34 @@ async fn test_mistral_transcriber_real_api() {
     let file_size = fs::metadata(&audio_path).expect("get file metadata").len();
     assert!(file_size > 0, "test WAV file should have content");
 
-    // Create transcriber with real API key
     let mistral_config = config
         .providers
         .mistral
         .expect("mistral provider must be configured for this test");
-    let transcriber = MistralBatchTranscriber::new(mistral_config, false).expect("build client");
+    let runtime_config = Config {
+        output_dir: temp_dir.path().to_path_buf(),
+        providers: ProvidersConfig {
+            mistral: Some(mistral_config),
+            openai: None,
+        },
+        indicators: None,
+        transcription: None,
+        paste: None,
+    };
 
     // Transcribe the file
-    let result = transcriber.transcribe_file(&audio_path).await;
+    let sink: std::sync::Arc<dyn talk_rs::telemetry::TelemetrySink> =
+        std::sync::Arc::new(talk_rs::telemetry::NoOpSink);
+    let result = transcribe_audio(
+        &audio_path,
+        &runtime_config,
+        Provider::Mistral,
+        None,
+        false,
+        true,
+        &sink,
+    )
+    .await;
 
     // Verify result
     assert!(

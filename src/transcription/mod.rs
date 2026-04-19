@@ -12,7 +12,7 @@ use crate::config::{Config, Provider};
 use crate::error::TalkError;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Audio format for batch uploads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -24,12 +24,24 @@ pub enum UploadFormat {
     Ogg,
 }
 
-pub(crate) mod http;
+/// Body source for a batch transcription request.
+pub(crate) enum TranscriptionBody {
+    /// Full audio file on disk. The transport reads it.
+    File(PathBuf),
+    /// Chunks arriving through a channel — used during
+    /// record-while-upload streaming. The transport collects them.
+    Stream {
+        chunks: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        file_name: String,
+    },
+}
+
 pub mod mistral;
 pub mod model_suggestions;
 pub mod openai;
 pub mod openai_realtime;
 pub mod realtime;
+pub(crate) mod transport;
 
 pub use mistral::MistralBatchTranscriber;
 pub use openai::OpenAIBatchTranscriber;
@@ -236,7 +248,7 @@ pub struct MistralProviderMetadata {
 /// handling.  All implementations must be `Send + Sync` for use in async
 /// contexts.
 #[async_trait]
-pub trait BatchTranscriber: Send + Sync {
+pub(crate) trait BatchTranscriber: Send + Sync {
     /// Pre-flight check: verify API connectivity and model validity.
     ///
     /// Called before starting audio capture so the user gets immediate
@@ -246,18 +258,10 @@ pub trait BatchTranscriber: Send + Sync {
     /// available alternatives on failure.
     async fn validate(&self) -> Result<(), TalkError>;
 
-    /// Transcribe an audio file and return the text.
-    async fn transcribe_file(&self, audio_path: &Path) -> Result<TranscriptionResult, TalkError>;
-
-    /// Transcribe audio from a streaming channel and return the text.
-    ///
-    /// The channel carries chunks of encoded audio bytes (e.g. OGG Opus).
-    /// The HTTP connection is opened immediately and chunks are streamed
-    /// as they arrive — this is *not* a record-then-upload flow.
-    async fn transcribe_stream(
+    /// Fetch a transcription from either a file or an encoded stream.
+    async fn fetch_transcription(
         &self,
-        audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        file_name: &str,
+        body: TranscriptionBody,
     ) -> Result<TranscriptionResult, TalkError>;
 
     /// Inject a telemetry sink for event emission during HTTP calls.
@@ -265,7 +269,7 @@ pub trait BatchTranscriber: Send + Sync {
     /// The default implementation is a no-op — override in concrete
     /// types that support telemetry.  Called by the orchestrator
     /// (`dictate/mod.rs`) right after construction, before any
-    /// `transcribe_*` method is invoked.
+    /// `fetch_transcription` is invoked.
     fn set_sink(&mut self, _sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) {}
 }
 
@@ -273,11 +277,12 @@ pub trait BatchTranscriber: Send + Sync {
 
 /// Realtime transcription: raw PCM stream in, incremental events out.
 #[async_trait]
-pub trait RealtimeTranscriber: Send + Sync {
+pub(crate) trait RealtimeTranscriber: Send + Sync {
     /// Pre-flight check: verify API connectivity and model validity.
     ///
     /// Same purpose as [`BatchTranscriber::validate`] — called before
     /// starting audio capture to give the user immediate feedback.
+    #[allow(dead_code)]
     async fn validate(&self) -> Result<(), TalkError>;
 
     /// Connect and start streaming.  Returns a channel of events.
@@ -338,7 +343,7 @@ pub async fn enrich_model_error(
 /// provider (the `--model` CLI flag).  When `diarize` is `true`, the
 /// transcriber will request speaker diarization (if supported by the
 /// provider).
-pub fn create_batch_transcriber(
+pub(crate) fn create_batch_transcriber(
     config: &Config,
     provider: Provider,
     model: Option<&str>,
@@ -380,20 +385,88 @@ pub fn create_batch_transcriber(
     }
 }
 
+/// Produce the authoritative transcript for a recording (Layer 2).
+///
+/// 1. Calls [`recording_cache::get_transcript`]:
+///    - [`TranscriptStatus::Available`] -> returns the text.
+///    - [`TranscriptStatus::InProgress`] -> returns
+///      [`TalkError::TranscriptInProgress`].
+///    - [`TranscriptStatus::NotAvailable`] -> continues.
+/// 2. Acquires the pick lock.
+/// 3. Calls [`transcribe_audio`] with `allow_api = true`.
+/// 4. Writes the pick file with the resulting text.
+/// 5. Releases the pick lock.
+///
+/// The pick lock is always released even on error paths.
+pub async fn produce_transcript(
+    audio_path: &std::path::Path,
+    config: &Config,
+    provider: Provider,
+    model: Option<&str>,
+    sink: &std::sync::Arc<dyn crate::telemetry::TelemetrySink>,
+) -> Result<String, TalkError> {
+    use crate::recording_cache::{self, TranscriptStatus};
+
+    match recording_cache::get_transcript(audio_path) {
+        TranscriptStatus::Available(text) => return Ok(text),
+        TranscriptStatus::InProgress => return Err(TalkError::TranscriptInProgress),
+        TranscriptStatus::NotAvailable => {}
+    }
+
+    recording_cache::acquire_pick_lock(audio_path)?;
+
+    let effective_model = resolve_effective_model(config, provider, model);
+
+    let result = transcribe_audio(audio_path, config, provider, model, false, true, sink).await;
+
+    let final_result = match result {
+        Ok(r) => {
+            let text = r.text.trim().to_string();
+            if let Err(e) = recording_cache::write_pick(
+                audio_path,
+                &provider.to_string(),
+                &effective_model,
+                false,
+                &text,
+            ) {
+                log::warn!("failed to write pick file: {}", e);
+            }
+            Ok(text)
+        }
+        Err(e) => Err(e),
+    };
+
+    if let Err(e) = recording_cache::release_pick_lock(audio_path) {
+        log::warn!("failed to release pick lock: {}", e);
+    }
+
+    final_result
+}
+
 /// Transcribe an audio file.
 ///
 /// THE single transcription entry point for batch-from-file
-/// transcription. Checks the sidecar cache first; on miss, calls
-/// the provider API and caches the result. Callers never see the
-/// cache.
+/// transcription (Layer 3).  Checks the sidecar cache first; on
+/// miss and when `allow_api` is true, acquires a per-model lock,
+/// calls the provider API, stores the sidecar, releases the lock.
+///
+/// Callers never see cache or lock files.
+///
+/// # Errors
+///
+/// - [`TalkError::CacheOnly`]: sidecar miss and `allow_api = false`.
+/// - [`TalkError::ModelInProgress`]: per-model lock already held by
+///   another producer.
 pub async fn transcribe_audio(
     audio_path: &Path,
     config: &Config,
     provider: Provider,
     model: Option<&str>,
     diarize: bool,
+    allow_api: bool,
+    sink: &std::sync::Arc<dyn crate::telemetry::TelemetrySink>,
 ) -> Result<TranscriptionResult, TalkError> {
-    use crate::recording_cache::TranscriptionCache;
+    use crate::recording_cache::{self, TranscriptionCache};
 
     let effective_model = resolve_effective_model(config, provider, model);
 
@@ -409,23 +482,60 @@ pub async fn transcribe_audio(
         }
     }
 
+    if !allow_api {
+        log::debug!(
+            "transcription cache miss for {}:{} on {} — API call forbidden",
+            provider,
+            effective_model,
+            audio_path.display()
+        );
+        return Err(TalkError::CacheOnly);
+    }
+
+    // Acquire per-model lock before calling the API.
+    recording_cache::acquire_model_lock(audio_path, provider, &effective_model, false)?;
+
     log::info!(
         "transcription cache miss for {}:{} on {} — calling API",
         provider,
         effective_model,
         audio_path.display()
     );
-    let transcriber = create_batch_transcriber(config, provider, model, diarize)?;
-    transcriber.validate().await?;
-    let result = transcriber.transcribe_file(audio_path).await?;
 
-    if let Err(e) =
-        TranscriptionCache::store(audio_path, provider, &effective_model, false, &result)
-    {
-        log::warn!("failed to cache transcription result: {}", e);
+    // Wrap API call in a closure so we can always release the lock.
+    let api_result = async {
+        let mut transcriber = create_batch_transcriber(config, provider, model, diarize)?;
+        transcriber.set_sink(sink.clone());
+        transcriber.validate().await?;
+        transcriber
+            .fetch_transcription(TranscriptionBody::File(audio_path.to_path_buf()))
+            .await
     }
+    .await;
 
-    Ok(result)
+    match api_result {
+        Ok(result) => {
+            if let Err(e) =
+                TranscriptionCache::store(audio_path, provider, &effective_model, false, &result)
+            {
+                log::warn!("failed to cache transcription result: {}", e);
+            }
+            if let Err(e) =
+                recording_cache::release_model_lock(audio_path, provider, &effective_model, false)
+            {
+                log::warn!("failed to release model lock: {}", e);
+            }
+            Ok(result)
+        }
+        Err(e) => {
+            if let Err(rel_err) =
+                recording_cache::release_model_lock(audio_path, provider, &effective_model, false)
+            {
+                log::warn!("failed to release model lock after error: {}", rel_err);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Resolve the effective model name from CLI override or config default.
@@ -453,7 +563,7 @@ fn resolve_effective_model(config: &Config, provider: Provider, model: Option<&s
 ///
 /// When `model` is `Some`, it overrides the config default for that
 /// provider's realtime model (the `--model` CLI flag).
-pub fn create_realtime_transcriber(
+pub(crate) fn create_realtime_transcriber(
     config: &Config,
     provider: Provider,
     model: Option<&str>,
@@ -516,22 +626,14 @@ impl BatchTranscriber for MockBatchTranscriber {
         Ok(())
     }
 
-    async fn transcribe_file(&self, _audio_path: &Path) -> Result<TranscriptionResult, TalkError> {
-        Ok(TranscriptionResult {
-            text: self.response_text.clone(),
-            metadata: TranscriptionMetadata::default(),
-            diarization: None,
-            segments: None,
-        })
-    }
-
-    async fn transcribe_stream(
+    async fn fetch_transcription(
         &self,
-        mut audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        _file_name: &str,
+        body: TranscriptionBody,
     ) -> Result<TranscriptionResult, TalkError> {
-        // Drain the stream
-        while audio_stream.recv().await.is_some() {}
+        if let TranscriptionBody::Stream { mut chunks, .. } = body {
+            while chunks.recv().await.is_some() {}
+        }
+
         Ok(TranscriptionResult {
             text: self.response_text.clone(),
             metadata: TranscriptionMetadata::default(),
@@ -548,7 +650,9 @@ mod tests {
     #[tokio::test]
     async fn test_mock_transcriber_returns_text() {
         let mock = MockBatchTranscriber::new("Hello, world!");
-        let result = mock.transcribe_file(Path::new("/tmp/test.wav")).await;
+        let result = mock
+            .fetch_transcription(TranscriptionBody::File(PathBuf::from("/tmp/test.wav")))
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text, "Hello, world!");
@@ -564,7 +668,12 @@ mod tests {
         tx.send(vec![1u8; 200]).await.unwrap();
         drop(tx); // Close the channel
 
-        let result = mock.transcribe_stream(rx, "test.wav").await;
+        let result = mock
+            .fetch_transcription(TranscriptionBody::Stream {
+                chunks: rx,
+                file_name: "test.wav".to_string(),
+            })
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text, "Streamed transcription");
@@ -573,8 +682,12 @@ mod tests {
     #[tokio::test]
     async fn test_mock_transcriber_ignores_path() {
         let mock = MockBatchTranscriber::new("Fixed response");
-        let result1 = mock.transcribe_file(Path::new("/path/one.wav")).await;
-        let result2 = mock.transcribe_file(Path::new("/path/two.wav")).await;
+        let result1 = mock
+            .fetch_transcription(TranscriptionBody::File(PathBuf::from("/path/one.wav")))
+            .await;
+        let result2 = mock
+            .fetch_transcription(TranscriptionBody::File(PathBuf::from("/path/two.wav")))
+            .await;
 
         assert_eq!(result1.unwrap().text, "Fixed response");
         assert_eq!(result2.unwrap().text, "Fixed response");
@@ -775,5 +888,88 @@ mod tests {
         assert!(result.segments.is_none());
         assert!(result.diarization.is_none());
         assert_eq!(result.text, "");
+    }
+
+    fn minimal_config() -> Config {
+        use tempfile::NamedTempFile;
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test
+"#;
+        let mut file = NamedTempFile::new().expect("tmp file");
+        std::io::Write::write_all(&mut file, yaml.as_bytes()).expect("write");
+        Config::load(Some(file.path())).expect("load")
+    }
+
+    #[tokio::test]
+    async fn test_produce_transcript_returns_existing_pick() {
+        let dir = tempfile::TempDir::new().expect("tmp dir");
+        let audio_path = dir.path().join("has-pick.ogg");
+        std::fs::write(&audio_path, b"fake").expect("write audio");
+        crate::recording_cache::write_pick(
+            &audio_path,
+            "openai",
+            "whisper-1",
+            false,
+            "cached text",
+        )
+        .expect("write pick");
+
+        let config = minimal_config();
+        let result = produce_transcript(
+            &audio_path,
+            &config,
+            Provider::OpenAI,
+            None,
+            &(std::sync::Arc::new(crate::telemetry::NoOpSink)
+                as std::sync::Arc<dyn crate::telemetry::TelemetrySink>),
+        )
+        .await;
+        assert_eq!(result.unwrap(), "cached text");
+    }
+
+    #[tokio::test]
+    async fn test_produce_transcript_returns_in_progress_when_locked() {
+        let dir = tempfile::TempDir::new().expect("tmp dir");
+        let audio_path = dir.path().join("locked.ogg");
+        std::fs::write(&audio_path, b"fake").expect("write audio");
+        crate::recording_cache::acquire_pick_lock(&audio_path).expect("lock");
+
+        let config = minimal_config();
+        let result = produce_transcript(
+            &audio_path,
+            &config,
+            Provider::OpenAI,
+            None,
+            &(std::sync::Arc::new(crate::telemetry::NoOpSink)
+                as std::sync::Arc<dyn crate::telemetry::TelemetrySink>),
+        )
+        .await;
+        assert!(matches!(result, Err(TalkError::TranscriptInProgress)));
+    }
+
+    #[tokio::test]
+    async fn test_produce_transcript_prefers_pick_over_lock_only_when_lock_absent() {
+        // When both pick and lock exist, lock wins -> InProgress.
+        // When only pick exists, pick wins -> return text.
+        let dir = tempfile::TempDir::new().expect("tmp dir");
+        let audio_path = dir.path().join("pick-only.ogg");
+        std::fs::write(&audio_path, b"fake").expect("write audio");
+        crate::recording_cache::write_pick(&audio_path, "openai", "whisper-1", false, "x")
+            .expect("write pick");
+
+        let config = minimal_config();
+        let result = produce_transcript(
+            &audio_path,
+            &config,
+            Provider::OpenAI,
+            None,
+            &(std::sync::Arc::new(crate::telemetry::NoOpSink)
+                as std::sync::Arc<dyn crate::telemetry::TelemetrySink>),
+        )
+        .await;
+        assert_eq!(result.unwrap(), "x");
     }
 }

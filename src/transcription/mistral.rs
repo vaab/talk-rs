@@ -7,17 +7,16 @@ use crate::config::MistralConfig;
 use crate::error::TalkError;
 use crate::transcription::{
     parse_transcript_segments, DiarizationSegment, MistralProviderMetadata,
-    ProviderSpecificMetadata, TokenUsage, TranscriptionMetadata, TranscriptionResult,
+    ProviderSpecificMetadata, TokenUsage, TranscriptionBody, TranscriptionMetadata,
+    TranscriptionResult,
 };
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::fs::File;
 
-use super::http::{build_client, parse_u64_field, proportional_timeout, ProgressBody};
+use super::transport::http::{build_client, parse_u64_field, proportional_timeout, ProgressBody};
 use super::BatchTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
 
@@ -119,7 +118,7 @@ pub(crate) async fn enrich_model_error(
     model: &str,
     api_base: &str,
 ) -> TalkError {
-    super::http::enrich_model_error(
+    super::transport::http::enrich_model_error(
         error,
         api_key,
         model,
@@ -139,7 +138,14 @@ pub(crate) async fn validate_mistral_model(
     model: &str,
     api_base: &str,
 ) -> Result<(), TalkError> {
-    super::http::validate_model("Mistral", api_key, model, api_base, is_transcription_model).await
+    super::transport::http::validate_model(
+        "Mistral",
+        api_key,
+        model,
+        api_base,
+        is_transcription_model,
+    )
+    .await
 }
 
 /// Transcriber implementation using the Mistral API.
@@ -204,56 +210,21 @@ impl MistralBatchTranscriber {
             sink: Arc::new(NoOpSink),
         })
     }
-}
 
-#[async_trait]
-impl BatchTranscriber for MistralBatchTranscriber {
-    fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
-        self.sink = sink;
-    }
-
-    async fn validate(&self) -> Result<(), TalkError> {
-        let api_base = self
-            .endpoint
-            .find("/v1/")
-            .map(|pos| &self.endpoint[..pos])
-            .unwrap_or(&self.endpoint);
-        validate_mistral_model(&self.config.api_key, &self.config.model, api_base).await
-    }
-
-    async fn transcribe_file(&self, audio_path: &Path) -> Result<TranscriptionResult, TalkError> {
-        // Verify file exists
-        if !audio_path.exists() {
-            return Err(TalkError::Transcription(format!(
-                "Audio file not found: {}",
-                audio_path.display()
-            )));
-        }
-
-        // Read the audio file into memory and wrap in ProgressBody so
-        // the telemetry sink receives upload-progress events during
-        // retry attempts (same treatment as transcribe_stream).
-        use tokio::io::AsyncReadExt;
-        let mut file = File::open(audio_path).await.map_err(|err| {
-            TalkError::Transcription(format!("Failed to open audio file: {}", err))
-        })?;
-        let mut file_bytes = Vec::new();
-        file.read_to_end(&mut file_bytes).await.map_err(|err| {
-            TalkError::Transcription(format!("Failed to read audio file: {}", err))
-        })?;
-        let file_len = file_bytes.len() as u64;
-
-        let progress_body = ProgressBody::new(file_bytes, self.sink.clone());
+    /// Send one HTTP attempt to the Mistral transcription endpoint.
+    ///
+    /// This is a single, non-retrying primitive.  It is wrapped by
+    /// [`Self::send_request`] in [`super::transport::retry::with_retry`]
+    /// so every caller gets transparent retry.
+    async fn send_once(
+        &self,
+        audio_bytes: Vec<u8>,
+        file_name: &str,
+    ) -> Result<TranscriptionResult, TalkError> {
+        let file_len = audio_bytes.len() as u64;
+        let progress_body = ProgressBody::new(audio_bytes, self.sink.clone());
         let body_len = progress_body.len();
 
-        // Get file name for multipart form
-        let file_name = audio_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("audio.wav")
-            .to_string();
-
-        // Create multipart form with audio file and model
         let mut form = reqwest::multipart::Form::new()
             .text("model", self.config.model.clone())
             .part(
@@ -262,30 +233,19 @@ impl BatchTranscriber for MistralBatchTranscriber {
                     reqwest::Body::wrap_stream(progress_body),
                     body_len,
                 )
-                .file_name(file_name),
+                .file_name(file_name.to_string()),
             );
 
-        // Always request segment-level timestamps so the YAML sidecar
-        // carries per-segment timing.  Older Voxtral models returned
-        // segments by default; newer ones (voxtral-mini-2602+) require
-        // the explicit parameter.
         form = form.text("timestamp_granularities", "segment");
 
-        // Add context bias if configured
         if let Some(ref bias) = self.config.context_bias {
             form = form.text("context_bias", bias.clone());
         }
 
-        // Add diarization flag (V2 models only)
         if self.diarize {
             form = form.text("diarize", "true");
         }
 
-        // Compute a payload-proportional wall-clock timeout for this
-        // request.  See `proportional_timeout` for the formula and
-        // rationale.  This bounds the tail when the server accepts
-        // the connection and then hangs at the application layer
-        // (which TCP-level defences cannot detect).
         let request_timeout = proportional_timeout(file_len);
         log::warn!(
             "mistral batch file: request timeout = {}s (audio = {} KB)",
@@ -325,7 +285,6 @@ impl BatchTranscriber for MistralBatchTranscriber {
         });
         let headers = response.headers().clone();
 
-        // Check response status
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -339,10 +298,6 @@ impl BatchTranscriber for MistralBatchTranscriber {
             )));
         }
 
-        // Stream the response body chunk-by-chunk so the telemetry
-        // sink receives per-chunk DownloadProgress events.  This is
-        // agnostic of batch vs streaming — the same code path works
-        // for both.
         use futures::StreamExt;
         let mut body_bytes: Vec<u8> = Vec::new();
         let mut body_stream = response.bytes_stream();
@@ -433,250 +388,93 @@ impl BatchTranscriber for MistralBatchTranscriber {
         })
     }
 
-    async fn transcribe_stream(
+    /// Send a transcription request with shared retry semantics.
+    ///
+    /// Every batch HTTP call goes through this path.  Retry lives
+    /// inside [`super::transport::retry::with_retry`] — there is no
+    /// "no-retry" code path for HTTP transcription.
+    async fn send_request(
         &self,
-        audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        audio_bytes: Vec<u8>,
         file_name: &str,
     ) -> Result<TranscriptionResult, TalkError> {
-        // Collect all audio chunks into a single buffer so we can
-        // provide an explicit Content-Length.  The Mistral API rejects
-        // chunked Transfer-Encoding with 411 Length Required.
-        log::warn!("[DBG] mistral stream: awaiting audio chunks from encoder");
-        let collect_start = Instant::now();
-        let mut audio_buf = Vec::new();
-        let mut rx = audio_stream;
-        while let Some(chunk) = rx.recv().await {
-            audio_buf.extend_from_slice(&chunk);
-        }
-        let audio_len = audio_buf.len() as u64;
-        log::info!(
-            "streaming upload: collected {} bytes for Mistral batch request",
-            audio_len
-        );
-        log::warn!(
-            "[DBG] mistral stream: audio collected ({} bytes in {}ms), building request",
-            audio_len,
-            collect_start.elapsed().as_millis()
-        );
-
-        // Wrap the audio buffer in a ProgressBody so the telemetry
-        // sink receives ConnectionEstablished / UploadProgress /
-        // UploadComplete events as reqwest pulls bytes from the
-        // stream.  The Content-Length is set explicitly because the
-        // Mistral API rejects chunked Transfer-Encoding (411).
-        let progress_body = ProgressBody::new(audio_buf, self.sink.clone());
-        let body_len = progress_body.len();
-        let mut form = reqwest::multipart::Form::new()
-            .text("model", self.config.model.clone())
-            .part(
-                "file",
-                reqwest::multipart::Part::stream_with_length(
-                    reqwest::Body::wrap_stream(progress_body),
-                    body_len,
-                )
-                .file_name(file_name.to_string()),
-            );
-
-        // Always request segment-level timestamps (see transcribe_file).
-        form = form.text("timestamp_granularities", "segment");
-
-        // Add context bias if configured
-        if let Some(ref bias) = self.config.context_bias {
-            form = form.text("context_bias", bias.clone());
-        }
-
-        // Add diarization flag (V2 models only)
-        if self.diarize {
-            form = form.text("diarize", "true");
-        }
-
-        // Compute a payload-proportional wall-clock timeout for this
-        // request.  See `proportional_timeout` for the formula and
-        // rationale.  This bounds the tail when the server accepts
-        // the connection and then hangs at the application layer
-        // (which TCP-level defences cannot detect).
-        let request_timeout = proportional_timeout(audio_len);
-        log::warn!(
-            "mistral stream: request timeout = {}s (audio = {} KB)",
-            request_timeout.as_secs(),
-            audio_len / 1024
-        );
-
-        self.sink.emit(TranscriptionEvent::RequestStarted {
-            endpoint: self.endpoint.clone(),
-            t: Instant::now(),
-        });
-
-        log::warn!("[DBG] mistral stream: POST {} beginning", self.endpoint);
-        let started = Instant::now();
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .multipart(form)
-            .timeout(request_timeout)
-            .send()
-            .await
-            .map_err(|err| {
-                log::warn!(
-                    "[DBG] mistral stream: send failed after {}ms: \
-                     is_connect={}, is_timeout={}, is_request={}, \
-                     is_body={}, is_decode={}, status={:?}",
-                    started.elapsed().as_millis(),
-                    err.is_connect(),
-                    err.is_timeout(),
-                    err.is_request(),
-                    err.is_body(),
-                    err.is_decode(),
-                    err.status()
-                );
-                self.sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
-                TalkError::Transcription(format!(
-                    "Failed to send streaming request to Mistral API: {:#}",
-                    err
-                ))
-            })?;
-
-        let request_latency_ms = started.elapsed().as_millis() as u64;
-        log::warn!(
-            "[DBG] mistral stream: response headers received after {}ms, status={}",
-            request_latency_ms,
-            response.status()
-        );
-        self.sink.emit(TranscriptionEvent::ResponseHeaders {
-            status: response.status().as_u16(),
-            t: Instant::now(),
-        });
-        let headers = response.headers().clone();
-
-        // Check response status
-        if !response.status().is_success() {
-            let status = response.status();
-            log::warn!(
-                "[DBG] mistral stream: non-success status={}, reading error body",
-                status
-            );
-            let body_start = Instant::now();
-            let body = response.text().await.unwrap_or_default();
-            log::warn!(
-                "[DBG] mistral stream: error body read ({} bytes in {}ms)",
-                body.len(),
-                body_start.elapsed().as_millis()
-            );
-            self.sink.emit(TranscriptionEvent::RequestCompleted {
-                success: false,
-                t: Instant::now(),
-            });
-            return Err(TalkError::Transcription(format!(
-                "Mistral API error ({}): {}",
-                status, body
-            )));
-        }
-
-        // Stream the response body chunk-by-chunk so the telemetry
-        // sink receives per-chunk DownloadProgress events.
-        log::warn!("[DBG] mistral stream: reading response body (streaming)");
-        let body_start = Instant::now();
-        use futures::StreamExt;
-        let mut body_bytes: Vec<u8> = Vec::new();
-        let mut body_stream = response.bytes_stream();
-        while let Some(chunk_result) = body_stream.next().await {
-            let chunk = chunk_result.map_err(|err| {
-                self.sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
-                TalkError::Transcription(format!(
-                    "Failed to read Mistral API response body: {}",
-                    err
-                ))
-            })?;
-            body_bytes.extend_from_slice(&chunk);
-            self.sink.emit(TranscriptionEvent::DownloadProgress {
-                bytes_received: body_bytes.len() as u64,
-                total: None,
-                t: Instant::now(),
-            });
-        }
-        self.sink.emit(TranscriptionEvent::ResponseComplete {
-            total: body_bytes.len() as u64,
-            t: Instant::now(),
-        });
-
-        let mistral_response: MistralResponse =
-            serde_json::from_slice(&body_bytes).map_err(|err| {
-                log::warn!(
-                    "[DBG] mistral stream: JSON parse failed after {}ms",
-                    body_start.elapsed().as_millis(),
-                );
-                self.sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
-                TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
-            })?;
-        log::warn!(
-            "[DBG] mistral stream: JSON parsed ({} chars text) after {}ms body read",
-            mistral_response.text.len(),
-            body_start.elapsed().as_millis()
-        );
-
-        self.sink.emit(TranscriptionEvent::RequestCompleted {
-            success: true,
-            t: Instant::now(),
-        });
-
-        let token_usage = mistral_response
-            .usage
-            .as_ref()
-            .and_then(parse_mistral_token_usage);
-        let audio_seconds = mistral_response
-            .usage
-            .as_ref()
-            .and_then(parse_mistral_audio_seconds);
-        let segment_count = mistral_response.segments.as_ref().map(std::vec::Vec::len);
-        let request_id = headers
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(ToString::to_string);
-
-        let segments = mistral_response
-            .segments
-            .as_deref()
-            .and_then(parse_transcript_segments);
-
-        let diarization = mistral_response
-            .segments
-            .as_deref()
-            .and_then(parse_diarization_segments);
-
-        let text = mistral_response.text;
-        Ok(TranscriptionResult {
-            text,
-            metadata: TranscriptionMetadata {
-                request_latency_ms: Some(request_latency_ms),
-                session_elapsed_ms: None,
-                request_id,
-                provider_processing_ms: None,
-                detected_language: mistral_response.language,
-                audio_seconds,
-                segment_count,
-                word_count: None,
-                token_usage,
-                provider_specific: Some(ProviderSpecificMetadata::Mistral(
-                    MistralProviderMetadata {
-                        model: mistral_response.model,
-                        usage_raw: mistral_response.usage,
-                        unknown_event_types: Vec::new(),
-                    },
-                )),
-            },
-            diarization,
-            segments,
+        let sink = self.sink.clone();
+        super::transport::retry::with_retry(crate::config::Provider::Mistral, &sink, || async {
+            self.send_once(audio_bytes.clone(), file_name).await
         })
+        .await
+    }
+}
+
+#[async_trait]
+impl BatchTranscriber for MistralBatchTranscriber {
+    fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
+        self.sink = sink;
+    }
+
+    async fn validate(&self) -> Result<(), TalkError> {
+        let api_base = self
+            .endpoint
+            .find("/v1/")
+            .map(|pos| &self.endpoint[..pos])
+            .unwrap_or(&self.endpoint);
+        validate_mistral_model(&self.config.api_key, &self.config.model, api_base).await
+    }
+
+    async fn fetch_transcription(
+        &self,
+        body: TranscriptionBody,
+    ) -> Result<TranscriptionResult, TalkError> {
+        let (audio_bytes, file_name) = match body {
+            TranscriptionBody::File(path) => {
+                if !path.exists() {
+                    return Err(TalkError::Transcription(format!(
+                        "Audio file not found: {}",
+                        path.display()
+                    )));
+                }
+
+                use tokio::io::AsyncReadExt;
+
+                let mut file = tokio::fs::File::open(&path).await.map_err(|err| {
+                    TalkError::Transcription(format!("Failed to open audio file: {}", err))
+                })?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await.map_err(|err| {
+                    TalkError::Transcription(format!("Failed to read audio file: {}", err))
+                })?;
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("audio.wav")
+                    .to_string();
+                (bytes, file_name)
+            }
+            TranscriptionBody::Stream {
+                mut chunks,
+                file_name,
+            } => {
+                log::warn!("[DBG] mistral stream: awaiting audio chunks from encoder");
+                let collect_start = Instant::now();
+                let mut bytes = Vec::new();
+                while let Some(chunk) = chunks.recv().await {
+                    bytes.extend_from_slice(&chunk);
+                }
+                let audio_len = bytes.len() as u64;
+                log::info!(
+                    "streaming upload: collected {} bytes for Mistral batch request",
+                    audio_len
+                );
+                log::warn!(
+                    "[DBG] mistral stream: audio collected ({} bytes in {}ms), building request",
+                    audio_len,
+                    collect_start.elapsed().as_millis()
+                );
+                (bytes, file_name)
+            }
+        };
+
+        self.send_request(audio_bytes, &file_name).await
     }
 }
 
@@ -769,7 +567,9 @@ mod tests {
         .expect("build client");
 
         // Transcribe the file
-        let result = transcriber.transcribe_file(temp_file.path()).await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text, "This is a test transcription");
@@ -813,7 +613,12 @@ mod tests {
         });
 
         // Transcribe from the stream
-        let result = transcriber.transcribe_stream(rx, "test.wav").await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::Stream {
+                chunks: rx,
+                file_name: "test.wav".to_string(),
+            })
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text, "Streamed transcription result");
@@ -850,7 +655,10 @@ mod tests {
         )
         .expect("build client");
 
-        let result = transcriber.transcribe_file(temp_file.path()).await.unwrap();
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await
+            .unwrap();
 
         assert_eq!(result.text, "Hello world. This is a test.");
         let segments = result.segments.expect("transcript segments present");
@@ -895,7 +703,9 @@ mod tests {
         .expect("build client");
 
         // Transcribe the file
-        let result = transcriber.transcribe_file(temp_file.path()).await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("401"));
@@ -912,7 +722,9 @@ mod tests {
         let transcriber = MistralBatchTranscriber::new(config, false).expect("build client");
 
         let result = transcriber
-            .transcribe_file(Path::new("/nonexistent/file.wav"))
+            .fetch_transcription(TranscriptionBody::File(std::path::PathBuf::from(
+                "/nonexistent/file.wav",
+            )))
             .await;
 
         assert!(result.is_err());
@@ -951,7 +763,9 @@ mod tests {
         .expect("build client");
 
         // Transcribe the file
-        let result = transcriber.transcribe_file(temp_file.path()).await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("parse"));
@@ -1001,7 +815,9 @@ mod tests {
         )
         .expect("build client");
 
-        let result = transcriber.transcribe_file(temp_file.path()).await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await;
 
         assert!(result.is_ok());
         let result = result.unwrap();
@@ -1100,7 +916,9 @@ mod tests {
         )
         .expect("build client");
 
-        let result = transcriber.transcribe_file(temp_file.path()).await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await;
 
         assert!(result.is_ok());
         let result = result.unwrap();
