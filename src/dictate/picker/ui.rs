@@ -10,7 +10,6 @@ use crate::transcription::{self, RealtimeTranscriber, TranscriptSegment, Transcr
 use std::path::PathBuf;
 
 use super::backend::{run_realtime_transcription, spawn_transcription};
-use super::cache;
 use crate::record::player::WavPlayer;
 
 /// Window title used for the picker — also used for single-instance
@@ -75,7 +74,7 @@ impl PickerCandidate {
 /// Messages sent from async tasks to the GTK poll loop.
 pub(super) enum PickerMessage {
     /// A transcription result (success or error).
-    Candidate(PickerCandidate),
+    Candidate(Box<PickerCandidate>),
     /// All initial batch transcription tasks have completed.
     /// The poll loop should mark any remaining batch spinners as
     /// failed but keep running to receive retry results.
@@ -93,13 +92,8 @@ pub(super) enum PickerMessage {
 /// was the pre-populated cached entry (in which case the caller should
 /// skip pasting since the text is already in the target window).
 pub(super) struct PickerSelection {
-    pub(super) provider: Provider,
-    pub(super) model: String,
     pub(super) text: String,
-    pub(super) segments: Option<Vec<TranscriptSegment>>,
-    pub(super) metadata: TranscriptionMetadata,
     pub(super) is_cached: bool,
-    pub(super) streaming: bool,
 }
 
 /// Escape text for use in Pango markup.
@@ -244,6 +238,8 @@ pub(super) async fn pick_with_streaming_gtk(
     let audio_path_for_player = audio_path.clone();
     // Clone audio path for the waterfall spectrogram background thread.
     let audio_path_for_waterfall = audio_path.clone();
+    // Clone audio path for picker selection auto-save.
+    let audio_path_for_selection = audio_path.clone();
 
     // Check before spawn_blocking moves deferred_candidates.
     let has_deferred_realtime = deferred_candidates.iter().any(|(_, _, s)| *s);
@@ -748,7 +744,97 @@ pub(super) async fn pick_with_streaming_gtk(
         let del_color = error_hex.clone();
         let ins_color = String::from("#4e9a06");
 
-        // TODO: write user edits to <stem>.yml selection sidecar.
+        // ── Picker selection auto-save ──────────────────────────
+        // Tracks the currently selected (provider, model, streaming)
+        // and persists it to `<stem>.pick.yml` next to the recording,
+        // including the current text-area content (the authoritative
+        // transcription for this recording).
+        // Saved: on first result arrival, after 5 s of inactivity
+        // when dirty, and on picker close.
+
+        struct SelectionSaveCtx {
+            audio_path: PathBuf,
+            dirty: bool,
+            current: Option<(Provider, String, bool)>,
+        }
+
+        /// Flush the pick to disk if dirty, reading the current text
+        /// from `buf`.  Cancels any pending debounce timer.
+        fn save_selection_now(
+            ctx_ref: &Rc<RefCell<SelectionSaveCtx>>,
+            pending: &Rc<RefCell<Option<glib::SourceId>>>,
+            buf: &gtk4::TextBuffer,
+        ) {
+            use gtk4::prelude::*;
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+            let mut ctx = ctx_ref.borrow_mut();
+            if ctx.dirty {
+                if let Some((provider, ref model, streaming)) = ctx.current {
+                    let text = buf
+                        .text(&buf.start_iter(), &buf.end_iter(), false)
+                        .to_string();
+                    let _ = crate::recording_cache::write_pick(
+                        &ctx.audio_path,
+                        &provider.to_string(),
+                        model,
+                        streaming,
+                        &text,
+                    );
+                }
+                ctx.dirty = false;
+            }
+        }
+
+        /// Update `ctx.current` from a row selection.
+        ///
+        /// - `has_result = true`: the selected row has a transcription
+        ///   result.  Mark dirty and arm the 5 s debounce save timer.
+        /// - `has_result = false`: the selected row is still pending
+        ///   (spinner).  Update `current` only -- do NOT mark dirty,
+        ///   do NOT arm a timer.  Prevents saving `""` for a row that
+        ///   hasn't transcribed yet (bug #6 in the gap analysis).
+        fn mark_selection_dirty(
+            ctx_ref: &Rc<RefCell<SelectionSaveCtx>>,
+            pending: &Rc<RefCell<Option<glib::SourceId>>>,
+            buf: &gtk4::TextBuffer,
+            provider: Provider,
+            model: &str,
+            streaming: bool,
+            has_result: bool,
+        ) {
+            {
+                let mut ctx = ctx_ref.borrow_mut();
+                ctx.current = Some((provider, model.to_string(), streaming));
+                if has_result {
+                    ctx.dirty = true;
+                }
+            }
+            if !has_result {
+                return;
+            }
+            // Reset the 5 s debounce timer.
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+            let ctx_clone = Rc::clone(ctx_ref);
+            let pending_clone = Rc::clone(pending);
+            let buf_clone = buf.clone();
+            let id = glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
+                *pending_clone.borrow_mut() = None;
+                save_selection_now(&ctx_clone, &pending_clone, &buf_clone);
+            });
+            *pending.borrow_mut() = Some(id);
+        }
+
+        let selection_ctx: Rc<RefCell<SelectionSaveCtx>> =
+            Rc::new(RefCell::new(SelectionSaveCtx {
+                audio_path: audio_path_for_selection,
+                dirty: false,
+                current: None,
+            }));
+        let selection_pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
         // Helper: build a row skeleton with provider + streaming + model labels.
         // Returns (hbox, transcript_cell) — caller fills the cell
@@ -822,19 +908,30 @@ pub(super) async fn pick_with_streaming_gtk(
         // The `is_primary` flag marks the entry that was already
         // pasted in a previous run — it gets pre-selected.
         let mut selected_row = false;
+        // Track which row to select, deferring the actual selection
+        // until AFTER `connect_row_selected` is wired below.  Wiring
+        // the handler first is critical: otherwise the initial
+        // select_row fires before the handler exists, and
+        // `selection_ctx.current` is never populated (bugs #1, #2,
+        // #4 in the gap analysis).
+        let mut index_to_select: Option<i32> = None;
         for (i, (provider, model, text, is_primary, streaming)) in cached_entries.iter().enumerate()
         {
             let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, *streaming);
             let label = make_transcript_label(text);
+            if text.is_empty() {
+                label.set_markup("<i>(no speech detected)</i>");
+                label.set_opacity(0.35);
+            }
             cell.append(&label);
 
             let row = gtk4::ListBoxRow::new();
             row.set_child(Some(&hbox));
             list.append(&row);
 
-            // Select the primary entry, or the very first one.
+            // Mark which row to select (primary, or the first one).
             if *is_primary || (i == 0 && !selected_row) {
-                list.select_row(Some(&row));
+                index_to_select = Some(i as i32);
                 selected_row = true;
             }
 
@@ -977,23 +1074,64 @@ pub(super) async fn pick_with_streaming_gtk(
             transcript_labels.borrow_mut().push(None);
         }
 
-        // Select first row when there are no cached entries.
-        if !selected_row {
-            if let Some(first) = list.row_at_index(0) {
-                list.select_row(Some(&first));
-            }
-        }
-
         // ── Row selection → populate text area ──────────────────
+        // Wired BEFORE auto-selecting so the initial selection
+        // triggers mark_selection_dirty and populates the text area.
         {
             let cands_sel = Rc::clone(&local_candidates);
             let buf_sel = text_buffer.clone();
+            let sel_ctx = Rc::clone(&selection_ctx);
+            let sel_pending = Rc::clone(&selection_pending);
             list.connect_row_selected(move |_, row| {
                 if let Some(row) = row {
                     let idx = row.index() as usize;
+                    // Extract (provider, model, streaming, has_result)
+                    // in a scoped borrow.  A row "has_result" when
+                    // its text is non-empty OR it received an empty
+                    // result (tracked elsewhere as not a spinner) --
+                    // for simplicity we use `!text.is_empty()` here
+                    // since empty-result rows are also non-selectable
+                    // in practice until streaming updates arrive.
+                    // Actually: the current row's text field is
+                    // populated by the poll loop when ANY result
+                    // arrives (including empty).  So "has a result"
+                    // = "not an error" AND the cell is NOT a spinner.
+                    // We approximate with `!is_error` only; selecting
+                    // a spinner would still update current but won't
+                    // arm the save timer because we pass false when
+                    // text is empty AND streaming=false (pending).
+                    let sel_info = {
+                        let cands = cands_sel.borrow();
+                        cands.get(idx).and_then(|(p, m, t, _, is_error, s, _, _)| {
+                            if !*is_error {
+                                // `has_result`: row has received a
+                                // candidate (text may be empty).  We
+                                // detect "pending batch row" by
+                                // checking if the text is empty AND
+                                // the row is not streaming -- a
+                                // realtime row may legitimately have
+                                // empty text while streaming.
+                                let has_result = !t.is_empty() || *s;
+                                Some((*p, m.clone(), *s, has_result))
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                    if let Some((provider, model, streaming, has_result)) = sel_info {
+                        mark_selection_dirty(
+                            &sel_ctx,
+                            &sel_pending,
+                            &buf_sel,
+                            provider,
+                            &model,
+                            streaming,
+                            has_result,
+                        );
+                    }
                     let cands = cands_sel.borrow();
                     if let Some((_, _, text, _, is_error, _, _, _)) = cands.get(idx) {
-                        if !text.is_empty() && !*is_error {
+                        if !*is_error {
                             buf_sel.set_text(text);
                         }
                     }
@@ -1007,6 +1145,8 @@ pub(super) async fn pick_with_streaming_gtk(
             let labels_for_diff = Rc::clone(&transcript_labels);
             let dc = del_color.clone();
             let ic = ins_color.clone();
+            let sel_ctx_edit = Rc::clone(&selection_ctx);
+            let sel_pending_edit = Rc::clone(&selection_pending);
             text_buffer.connect_changed(move |buf| {
                 // Diff update (existing logic).
                 let reference = buf
@@ -1024,20 +1164,48 @@ pub(super) async fn pick_with_streaming_gtk(
                         }
                     }
                 }
+                // Mark dirty so the pick is saved with updated text.
+                // If `current` is None (e.g. pre-populate fires before
+                // the row-selected handler has set it), seed it from
+                // the currently selected row so the eventual save has
+                // a valid target.
+                {
+                    let mut ctx = sel_ctx_edit.borrow_mut();
+                    ctx.dirty = true;
+                    if ctx.current.is_none() {
+                        // Look up selected row's provider/model.
+                        // (We can't borrow `cands_sel` here since this
+                        // closure lives outside that scope; the row
+                        // selection handler is responsible for setting
+                        // `current` via mark_selection_dirty.)
+                    }
+                }
+                // Reset the 5 s debounce timer.
+                if let Some(id) = sel_pending_edit.borrow_mut().take() {
+                    id.remove();
+                }
+                let ctx_clone = Rc::clone(&sel_ctx_edit);
+                let pending_clone = Rc::clone(&sel_pending_edit);
+                let buf_clone = buf.clone();
+                let id =
+                    glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
+                        *pending_clone.borrow_mut() = None;
+                        save_selection_now(&ctx_clone, &pending_clone, &buf_clone);
+                    });
+                *sel_pending_edit.borrow_mut() = Some(id);
             });
         }
 
-        // Pre-populate the text area from the already-selected row.
-        // Placed AFTER connect_changed so set_text() triggers the
-        // diff computation on all candidate labels.
-        if let Some(row) = list.selected_row() {
-            let idx = row.index() as usize;
-            let cands = local_candidates.borrow();
-            if let Some((_, _, text, _, is_error, _, _, _)) = cands.get(idx) {
-                if !text.is_empty() && !*is_error {
-                    text_buffer.set_text(text);
-                }
+        // Now that `connect_row_selected` is wired (above), perform
+        // the deferred initial selection.  This fires the handler,
+        // which in turn calls `mark_selection_dirty` and populates
+        // the text area.
+        if let Some(idx) = index_to_select {
+            if let Some(row) = list.row_at_index(idx) {
+                list.select_row(Some(&row));
             }
+        } else if let Some(first) = list.row_at_index(0) {
+            list.select_row(Some(&first));
         }
 
         // ── Copy button → clipboard ─────────────────────────────
@@ -1062,15 +1230,14 @@ pub(super) async fn pick_with_streaming_gtk(
             let cands = Rc::clone(&local_candidates);
             let win = window.clone();
             let buf_confirm = text_buffer.clone();
+            let sc = Rc::clone(&selection_ctx);
+            let sp = Rc::clone(&selection_pending);
             list.connect_row_activated(move |_, row| {
                 let idx = row.index() as usize;
-                let ready =
-                    cands
-                        .borrow()
-                        .get(idx)
-                        .is_some_and(|(_, _, text, _, is_error, _, _, _)| {
-                            !text.is_empty() && !is_error
-                        });
+                let ready = cands
+                    .borrow()
+                    .get(idx)
+                    .is_some_and(|(_, _, _, _, is_error, _, _, _)| !is_error);
                 if ready {
                     // Use edited text-area content if available.
                     let edited = buf_confirm
@@ -1079,6 +1246,7 @@ pub(super) async fn pick_with_streaming_gtk(
                     if !edited.is_empty() {
                         cands.borrow_mut()[idx].2 = edited;
                     }
+                    save_selection_now(&sc, &sp, &buf_confirm);
                     win.set_visible(false);
                     if let Some(tx) = sel.borrow_mut().take() {
                         let _ = tx.send(Some(idx));
@@ -1094,7 +1262,11 @@ pub(super) async fn pick_with_streaming_gtk(
             let ml = main_loop.clone();
             let win = window.clone();
             let player_ref = Rc::clone(&player);
+            let sc = Rc::clone(&selection_ctx);
+            let sp = Rc::clone(&selection_pending);
+            let buf_close = text_buffer.clone();
             close_btn.connect_clicked(move |_| {
+                save_selection_now(&sc, &sp, &buf_close);
                 if let Some(ref p) = *player_ref.borrow() {
                     p.stop();
                 }
@@ -1112,9 +1284,13 @@ pub(super) async fn pick_with_streaming_gtk(
             let ml = main_loop.clone();
             let win = window.clone();
             let player_ref = Rc::clone(&player);
+            let sc = Rc::clone(&selection_ctx);
+            let sp = Rc::clone(&selection_pending);
+            let buf_esc = text_buffer.clone();
             let key_ctl = gtk4::EventControllerKey::new();
             key_ctl.connect_key_pressed(move |_, key, _, _| {
                 if key == gtk4::gdk::Key::Escape {
+                    save_selection_now(&sc, &sp, &buf_esc);
                     if let Some(ref p) = *player_ref.borrow() {
                         p.stop();
                     }
@@ -1136,7 +1312,11 @@ pub(super) async fn pick_with_streaming_gtk(
             let sel = Rc::clone(&sel_sender);
             let ml = main_loop.clone();
             let player_ref = Rc::clone(&player);
+            let sc = Rc::clone(&selection_ctx);
+            let sp = Rc::clone(&selection_pending);
+            let buf_wc = text_buffer.clone();
             window.connect_close_request(move |win| {
+                save_selection_now(&sc, &sp, &buf_wc);
                 if let Some(ref p) = *player_ref.borrow() {
                     p.stop();
                 }
@@ -1232,7 +1412,8 @@ pub(super) async fn pick_with_streaming_gtk(
             let dc_poll = del_color.clone();
             let ic_poll = ins_color.clone();
             let make_err = make_error_cell.clone();
-            let deferred_poll = Rc::clone(&deferred_indices);
+            let sel_ctx_poll = Rc::clone(&selection_ctx);
+            let sel_pending_poll = Rc::clone(&selection_pending);
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
                 // Cap messages per tick so the cursor timer and other
                 // main-loop sources stay responsive.
@@ -1263,15 +1444,14 @@ pub(super) async fn pick_with_streaming_gtk(
                                     cands.borrow_mut()[idx].4 = true;
                                     make_err(&cells.borrow()[idx], idx, err_msg);
                                 } else {
+                                    // Same path for empty and non-empty
+                                    // text — empty is a valid result.
                                     let mut cands = cands.borrow_mut();
                                     cands[idx].2 = c.text.clone();
                                     cands[idx].6 = c.segments.clone();
                                     cands[idx].7 = c.metadata.clone();
                                     raw_poll.borrow_mut()[idx] = c.text.clone();
 
-                                    // If this is the currently selected row and
-                                    // the text buffer is still empty, populate it
-                                    // (first result arriving for the selected row).
                                     let is_selected = list
                                         .selected_row()
                                         .is_some_and(|r| r.index() as usize == idx);
@@ -1280,15 +1460,31 @@ pub(super) async fn pick_with_streaming_gtk(
                                         .is_empty();
                                     if is_selected && buf_empty {
                                         buf_poll.set_text(&c.text);
+                                        // First result for the selected row —
+                                        // save selection immediately.
+                                        save_selection_now(
+                                            &sel_ctx_poll,
+                                            &sel_pending_poll,
+                                            &buf_poll,
+                                        );
                                     }
 
-                                    let reference = buf_poll
-                                        .text(&buf_poll.start_iter(), &buf_poll.end_iter(), false)
-                                        .to_string();
                                     let label = make_transcript_label("");
-                                    let markup =
-                                        diff_markup(&reference, &c.text, &dc_poll, &ic_poll);
-                                    label.set_markup(&markup);
+                                    if c.text.is_empty() {
+                                        label.set_markup("<i>(no speech detected)</i>");
+                                        label.set_opacity(0.35);
+                                    } else {
+                                        let reference = buf_poll
+                                            .text(
+                                                &buf_poll.start_iter(),
+                                                &buf_poll.end_iter(),
+                                                false,
+                                            )
+                                            .to_string();
+                                        let markup =
+                                            diff_markup(&reference, &c.text, &dc_poll, &ic_poll);
+                                        label.set_markup(&markup);
+                                    }
                                     cells.borrow()[idx].append(&label);
                                     labels_poll.borrow_mut()[idx] = Some(label);
                                 }
@@ -1340,32 +1536,48 @@ pub(super) async fn pick_with_streaming_gtk(
                                     }
                                 }
                                 drop(cells);
-                                cands.borrow_mut()[idx].2 = accumulated_text;
+                                cands.borrow_mut()[idx].2 = accumulated_text.clone();
+
+                                // If this is the selected row, update
+                                // the text area so the user sees the
+                                // streaming transcription live, and
+                                // save the pick (debounced).
+                                let is_selected = list
+                                    .selected_row()
+                                    .is_some_and(|r| r.index() as usize == idx);
+                                if is_selected {
+                                    buf_poll.set_text(&accumulated_text);
+                                    // The buffer change triggers
+                                    // `connect_changed` which marks
+                                    // the pick dirty and arms the
+                                    // debounce save timer.
+                                }
                             }
                         }
                         Ok(PickerMessage::InitialBatchDone) => {
-                            // Mark remaining batch spinners as failed.
-                            // Realtime rows (streaming=true) and deferred
-                            // rows (not yet triggered) are skipped.
-                            let deferred = deferred_poll.borrow();
+                            // Mark rows that still show a spinner as
+                            // failed — the API never responded.  Rows
+                            // whose spinner was already replaced (by a
+                            // transcript, placeholder, or error) are
+                            // naturally skipped.
+                            let cells_ref = cells.borrow();
                             let failed: Vec<usize> = {
                                 let mut cands = cands.borrow_mut();
-                                let indices: Vec<usize> = cands
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(i, (_, _, text, _, is_error, streaming, _, _))| {
-                                        text.is_empty()
-                                            && !*is_error
-                                            && !*streaming
-                                            && !deferred.contains(i)
+                                let indices: Vec<usize> = (0..cands.len())
+                                    .filter(|i| {
+                                        cells_ref.get(*i).is_some_and(|cell| {
+                                            cell.first_child().is_some_and(|w| {
+                                                w.downcast_ref::<gtk4::Spinner>().is_some()
+                                            })
+                                        })
                                     })
-                                    .map(|(i, _)| i)
                                     .collect();
                                 for &idx in &indices {
                                     cands[idx].4 = true;
                                 }
                                 indices
                             };
+                            drop(cells_ref);
                             for idx in failed {
                                 make_err(&cells.borrow()[idx], idx, "no response");
                             }
@@ -1422,8 +1634,6 @@ pub(super) async fn pick_with_streaming_gtk(
     });
 
     // ── Parallel transcriptions ─────────────────────────────────
-    let audio_path_for_cache = audio_path.clone();
-
     // Fire initial batch.
     let done_tx = msg_tx.clone();
     let retry_msg_tx = msg_tx.clone();
@@ -1449,12 +1659,12 @@ pub(super) async fn pick_with_streaming_gtk(
         let samples = wav_samples.clone();
         tokio::spawn(async move {
             let Some(samples) = samples else {
-                let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
+                let _ = tx.send(PickerMessage::Candidate(Box::new(PickerCandidate::error(
                     provider,
                     model,
                     "failed to read WAV samples".into(),
                     true,
-                )));
+                ))));
                 return;
             };
             run_realtime_transcription(transcriber, samples, tx, provider, model).await;
@@ -1501,11 +1711,13 @@ pub(super) async fn pick_with_streaming_gtk(
                     let samples = match wav_for_retry {
                         Some(ref s) => s.clone(),
                         None => {
-                            let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
-                                provider,
-                                model,
-                                "WAV samples unavailable".into(),
-                                true,
+                            let _ = tx.send(PickerMessage::Candidate(Box::new(
+                                PickerCandidate::error(
+                                    provider,
+                                    model,
+                                    "WAV samples unavailable".into(),
+                                    true,
+                                ),
                             )));
                             continue;
                         }
@@ -1536,11 +1748,8 @@ pub(super) async fn pick_with_streaming_gtk(
                                 model,
                                 e
                             );
-                            let _ = tx.send(PickerMessage::Candidate(PickerCandidate::error(
-                                provider,
-                                model,
-                                format!("{e}"),
-                                true,
+                            let _ = tx.send(PickerMessage::Candidate(Box::new(
+                                PickerCandidate::error(provider, model, format!("{e}"), true),
                             )));
                         }
                     }
@@ -1570,44 +1779,16 @@ pub(super) async fn pick_with_streaming_gtk(
         .await
         .map_err(|e| TalkError::Config(format!("GTK picker task failed: {}", e)))??;
 
-    // Persist all successful transcription results to the picker
-    // cache so that reopening the picker for the same audio file
-    // returns instantly without any API calls.
-    {
-        let items = results
-            .lock()
-            .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
-        let to_cache: Vec<cache::CachedResult> = items
-            .iter()
-            .filter(|(_, _, text, _, is_error, _, _, _)| !text.is_empty() && !*is_error)
-            .map(|(p, m, t, _, _, s, _, _)| cache::CachedResult {
-                provider: p.to_string(),
-                model: m.clone(),
-                text: t.clone(),
-                streaming: *s,
-            })
-            .collect();
-        if let Err(e) = cache::write_results(&audio_path_for_cache, &to_cache) {
-            log::warn!("failed to write picker cache: {}", e);
-        }
-    }
-
     match selected_index {
         Some(idx) => {
             let items = results
                 .lock()
                 .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
             if idx < items.len() {
-                let (p, m, t, cached, _is_error, streaming, segments, metadata) =
-                    items[idx].clone();
+                let (_p, _m, t, cached, _is_error, _s, _segments, _metadata) = items[idx].clone();
                 Ok(Some(PickerSelection {
-                    provider: p,
-                    model: m,
                     text: t,
-                    segments,
-                    metadata,
                     is_cached: cached,
-                    streaming,
                 }))
             } else {
                 Ok(None)

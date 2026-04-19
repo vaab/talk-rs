@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use super::http::build_client;
+use super::transport::http::build_client;
 
 /// Cache TTL — model lists rarely change.
 const CACHE_TTL: Duration = Duration::from_secs(3600);

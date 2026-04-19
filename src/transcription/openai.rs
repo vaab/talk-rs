@@ -7,20 +7,17 @@ use crate::config::OpenAIConfig;
 use crate::error::TalkError;
 use crate::transcription::{
     parse_transcript_segments, OpenAIProviderMetadata, ProviderSpecificMetadata, TokenUsage,
-    TranscriptionMetadata, TranscriptionResult,
+    TranscriptionBody, TranscriptionMetadata, TranscriptionResult,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::fs::File;
-use tokio_stream::wrappers::ReceiverStream;
 
-use super::http::{build_client, parse_u64_field, proportional_timeout};
+use super::transport::http::{build_client, parse_u64_field, proportional_timeout, ProgressBody};
 use super::BatchTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
 
@@ -109,7 +106,7 @@ pub(crate) async fn enrich_model_error(
     model: &str,
     api_base: &str,
 ) -> TalkError {
-    super::http::enrich_model_error(
+    super::transport::http::enrich_model_error(
         error,
         api_key,
         model,
@@ -131,7 +128,14 @@ pub(crate) async fn validate_openai_model(
     model: &str,
     api_base: &str,
 ) -> Result<(), TalkError> {
-    super::http::validate_model("OpenAI", api_key, model, api_base, is_transcription_model).await
+    super::transport::http::validate_model(
+        "OpenAI",
+        api_key,
+        model,
+        api_base,
+        is_transcription_model,
+    )
+    .await
 }
 
 /// Batch transcriber implementation using the OpenAI API.
@@ -185,62 +189,22 @@ impl OpenAIBatchTranscriber {
             sink: Arc::new(NoOpSink),
         })
     }
-}
 
-#[async_trait]
-impl BatchTranscriber for OpenAIBatchTranscriber {
-    fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
-        self.sink = sink;
-    }
-
-    async fn validate(&self) -> Result<(), TalkError> {
-        // Derive the API base URL from the transcription endpoint.
-        // Production: "https://api.openai.com/v1/audio/transcriptions" → "https://api.openai.com"
-        // Test:       "http://127.0.0.1:PORT/v1/audio/transcriptions" → "http://127.0.0.1:PORT"
-        let api_base = self
-            .endpoint
-            .find("/v1/")
-            .map(|pos| &self.endpoint[..pos])
-            .unwrap_or(&self.endpoint);
-        validate_openai_model(&self.config.api_key, &self.config.model, api_base).await
-    }
-
-    async fn transcribe_file(&self, audio_path: &Path) -> Result<TranscriptionResult, TalkError> {
-        // Verify file exists
-        if !audio_path.exists() {
-            return Err(TalkError::Transcription(format!(
-                "Audio file not found: {}",
-                audio_path.display()
-            )));
-        }
-
-        // Read the audio file into memory and wrap in ProgressBody so
-        // the telemetry sink receives upload-progress events during
-        // retry attempts (same treatment as transcribe_stream).
-        use tokio::io::AsyncReadExt;
-        let mut file = File::open(audio_path).await.map_err(|err| {
-            TalkError::Transcription(format!("Failed to open audio file: {}", err))
-        })?;
-        let mut file_bytes = Vec::new();
-        file.read_to_end(&mut file_bytes).await.map_err(|err| {
-            TalkError::Transcription(format!("Failed to read audio file: {}", err))
-        })?;
-        let file_len = file_bytes.len() as u64;
-
-        let progress_body = super::http::ProgressBody::new(file_bytes, self.sink.clone());
+    /// Send one HTTP attempt to the OpenAI transcription endpoint.
+    ///
+    /// This is a single, non-retrying primitive.  It is wrapped by
+    /// [`Self::send_request`] in
+    /// [`super::transport::retry::with_retry`] so every caller gets
+    /// transparent retry.
+    async fn send_once(
+        &self,
+        audio_bytes: Vec<u8>,
+        file_name: &str,
+    ) -> Result<TranscriptionResult, TalkError> {
+        let file_len = audio_bytes.len() as u64;
+        let progress_body = ProgressBody::new(audio_bytes, self.sink.clone());
         let body_len = progress_body.len();
 
-        // Get file name for multipart form
-        let file_name = audio_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("audio.ogg")
-            .to_string();
-
-        // Create multipart form with audio file, model, and response format.
-        // Whisper models support `verbose_json` which includes per-segment
-        // timing — request it when available so we can persist segments in
-        // the YAML sidecar.  GPT-4o transcribe models only accept `json`.
         let response_format = if self.config.model.starts_with("whisper") {
             "verbose_json"
         } else {
@@ -255,13 +219,9 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                     reqwest::Body::wrap_stream(progress_body),
                     body_len,
                 )
-                .file_name(file_name),
+                .file_name(file_name.to_string()),
             );
 
-        // Compute a payload-proportional wall-clock timeout for this
-        // request.  See `proportional_timeout` for the formula and
-        // rationale.  This bounds the tail when the server accepts
-        // the connection and then hangs at the application layer.
         let request_timeout = proportional_timeout(file_len);
         log::warn!(
             "openai batch file: request timeout = {}s (audio = {} KB)",
@@ -298,7 +258,6 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
         });
         let headers = response.headers().clone();
 
-        // Check response status
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -312,8 +271,6 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             )));
         }
 
-        // Stream the response body chunk-by-chunk for download telemetry.
-        use futures::StreamExt;
         let mut body_bytes: Vec<u8> = Vec::new();
         let mut body_stream = response.bytes_stream();
         while let Some(chunk_result) = body_stream.next().await {
@@ -405,116 +362,84 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
         })
     }
 
-    async fn transcribe_stream(
+    /// Send a transcription request with shared retry semantics.
+    ///
+    /// Every batch HTTP call goes through this path.  Retry lives
+    /// inside [`super::transport::retry::with_retry`] — there is no
+    /// "no-retry" code path for HTTP transcription.
+    async fn send_request(
         &self,
-        audio_stream: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        audio_bytes: Vec<u8>,
         file_name: &str,
     ) -> Result<TranscriptionResult, TalkError> {
-        // Convert the mpsc::Receiver into a Stream of Result<Vec<u8>, io::Error>
-        let byte_stream = ReceiverStream::new(audio_stream).map(Ok::<Vec<u8>, std::io::Error>);
-
-        // Wrap the stream into a reqwest body for streaming upload
-        let body = reqwest::Body::wrap_stream(byte_stream);
-
-        // Create multipart form with streaming audio, model, and response format.
-        // Same `verbose_json` conditional as `transcribe_file`: whisper
-        // models get segment timing, GPT-4o models stay on plain `json`.
-        let response_format = if self.config.model.starts_with("whisper") {
-            "verbose_json"
-        } else {
-            "json"
-        };
-        let form = reqwest::multipart::Form::new()
-            .text("model", self.config.model.clone())
-            .text("response_format", response_format)
-            .part(
-                "file",
-                reqwest::multipart::Part::stream(body).file_name(file_name.to_string()),
-            );
-
-        let started = Instant::now();
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|err| {
-                TalkError::Transcription(format!(
-                    "Failed to send streaming request to OpenAI API: {:#}",
-                    err
-                ))
-            })?;
-
-        let request_latency_ms = started.elapsed().as_millis() as u64;
-        let headers = response.headers().clone();
-
-        // Check response status
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(TalkError::Transcription(format!(
-                "OpenAI API error ({}): {}",
-                status, body
-            )));
-        }
-
-        // Parse JSON response
-        let openai_response: OpenAIResponse = response.json().await.map_err(|err| {
-            TalkError::Transcription(format!("Failed to parse OpenAI API response: {}", err))
-        })?;
-
-        let token_usage = openai_response
-            .usage
-            .as_ref()
-            .and_then(parse_openai_token_usage);
-        let audio_seconds = openai_response.duration.or_else(|| {
-            openai_response
-                .usage
-                .as_ref()
-                .and_then(parse_openai_audio_seconds)
-        });
-        let segment_count = openai_response.segments.as_ref().map(std::vec::Vec::len);
-        let segments = openai_response
-            .segments
-            .as_deref()
-            .and_then(parse_transcript_segments);
-        let word_count = openai_response.words.as_ref().map(std::vec::Vec::len);
-        let request_id = headers
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(ToString::to_string);
-        let provider_processing_ms = headers
-            .get("openai-processing-ms")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        let rate_limit_headers = extract_rate_limit_headers(&headers);
-
-        let text = openai_response.text;
-        Ok(TranscriptionResult {
-            text,
-            metadata: TranscriptionMetadata {
-                request_latency_ms: Some(request_latency_ms),
-                session_elapsed_ms: None,
-                request_id,
-                provider_processing_ms,
-                detected_language: openai_response.language,
-                audio_seconds,
-                segment_count,
-                word_count,
-                token_usage,
-                provider_specific: Some(ProviderSpecificMetadata::OpenAI(OpenAIProviderMetadata {
-                    model: openai_response.model,
-                    usage_raw: openai_response.usage,
-                    rate_limit_headers,
-                    unknown_event_types: Vec::new(),
-                    realtime: None,
-                })),
-            },
-            diarization: None,
-            segments,
+        let sink = self.sink.clone();
+        super::transport::retry::with_retry(crate::config::Provider::OpenAI, &sink, || async {
+            self.send_once(audio_bytes.clone(), file_name).await
         })
+        .await
+    }
+}
+
+#[async_trait]
+impl BatchTranscriber for OpenAIBatchTranscriber {
+    fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
+        self.sink = sink;
+    }
+
+    async fn validate(&self) -> Result<(), TalkError> {
+        // Derive the API base URL from the transcription endpoint.
+        // Production: "https://api.openai.com/v1/audio/transcriptions" → "https://api.openai.com"
+        // Test:       "http://127.0.0.1:PORT/v1/audio/transcriptions" → "http://127.0.0.1:PORT"
+        let api_base = self
+            .endpoint
+            .find("/v1/")
+            .map(|pos| &self.endpoint[..pos])
+            .unwrap_or(&self.endpoint);
+        validate_openai_model(&self.config.api_key, &self.config.model, api_base).await
+    }
+
+    async fn fetch_transcription(
+        &self,
+        body: TranscriptionBody,
+    ) -> Result<TranscriptionResult, TalkError> {
+        let (audio_bytes, file_name) = match body {
+            TranscriptionBody::File(path) => {
+                if !path.exists() {
+                    return Err(TalkError::Transcription(format!(
+                        "Audio file not found: {}",
+                        path.display()
+                    )));
+                }
+
+                use tokio::io::AsyncReadExt;
+
+                let mut file = tokio::fs::File::open(&path).await.map_err(|err| {
+                    TalkError::Transcription(format!("Failed to open audio file: {}", err))
+                })?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await.map_err(|err| {
+                    TalkError::Transcription(format!("Failed to read audio file: {}", err))
+                })?;
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("audio.wav")
+                    .to_string();
+                (bytes, file_name)
+            }
+            TranscriptionBody::Stream {
+                mut chunks,
+                file_name,
+            } => {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = chunks.recv().await {
+                    bytes.extend_from_slice(&chunk);
+                }
+                (bytes, file_name)
+            }
+        };
+
+        self.send_request(audio_bytes, &file_name).await
     }
 }
 
@@ -600,7 +525,9 @@ mod tests {
         )
         .expect("build client");
 
-        let result = transcriber.transcribe_file(temp_file.path()).await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text, "This is an OpenAI transcription");
@@ -637,7 +564,12 @@ mod tests {
             tx.send(vec![1u8; 200]).await.unwrap();
         });
 
-        let result = transcriber.transcribe_stream(rx, "test.ogg").await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::Stream {
+                chunks: rx,
+                file_name: "test.ogg".to_string(),
+            })
+            .await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().text, "Streamed OpenAI transcription");
@@ -685,7 +617,10 @@ mod tests {
         )
         .expect("build client");
 
-        let result = transcriber.transcribe_file(temp_file.path()).await.unwrap();
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await
+            .unwrap();
 
         assert_eq!(result.text, "Hello world. This is a test.");
         let segments = result.segments.expect("transcript segments present");
@@ -724,7 +659,9 @@ mod tests {
         )
         .expect("build client");
 
-        let result = transcriber.transcribe_file(temp_file.path()).await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("401"));
@@ -741,7 +678,9 @@ mod tests {
         let transcriber = OpenAIBatchTranscriber::new(config).expect("build client");
 
         let result = transcriber
-            .transcribe_file(Path::new("/nonexistent/file.ogg"))
+            .fetch_transcription(TranscriptionBody::File(std::path::PathBuf::from(
+                "/nonexistent/file.ogg",
+            )))
             .await;
 
         assert!(result.is_err());
@@ -819,7 +758,9 @@ mod tests {
         )
         .expect("build client");
 
-        let result = transcriber.transcribe_file(temp_file.path()).await;
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf()))
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("parse"));

@@ -20,6 +20,10 @@ pub(super) struct RecordingEntry {
     /// `transcript_full` when short, otherwise truncated to
     /// `TRANSCRIPT_PREVIEW_CHARS` chars with a trailing ellipsis.
     pub(super) transcript_preview: String,
+    /// Pick-file status for this recording.  Drives the UI: show
+    /// transcript text, "(no text)" placeholder, "transcription
+    /// ongoing" indicator, or audio player bar.
+    pub(super) status: crate::recording_cache::TranscriptStatus,
 }
 
 /// Maximum number of characters shown in the transcript preview label
@@ -167,14 +171,14 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
-        // Try to read transcript from companion metadata YAML
-        let (transcript_full, transcript_preview) =
-            match crate::recording_cache::metadata_path_for_recording(&ogg_path) {
-                Ok(Some(meta_path)) => crate::recording_cache::read_metadata_brief(&meta_path)
-                    .map(|b| transcript_variants(&b.transcript))
-                    .unwrap_or_default(),
-                _ => (String::new(), String::new()),
-            };
+        // Read transcript status from pick file ONLY (Layer 1).
+        // Sidecars are per-model cache — not a source of truth for
+        // the authoritative transcript.
+        let status = crate::recording_cache::get_transcript(&ogg_path);
+        let (transcript_full, transcript_preview) = match &status {
+            crate::recording_cache::TranscriptStatus::Available(text) => transcript_variants(text),
+            _ => (String::new(), String::new()),
+        };
 
         result.push(RecordingEntry {
             path: ogg_path,
@@ -183,6 +187,7 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
             size_label,
             transcript_full,
             transcript_preview,
+            status,
         });
     }
 
@@ -243,14 +248,12 @@ pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> 
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
-        // Try to read transcript from companion metadata YAML
-        let (transcript_full, transcript_preview) =
-            match recording_cache::metadata_path_for_recording(&ogg_path) {
-                Ok(Some(meta_path)) => recording_cache::read_metadata_brief(&meta_path)
-                    .map(|b| transcript_variants(&b.transcript))
-                    .unwrap_or_default(),
-                _ => (String::new(), String::new()),
-            };
+        // Read transcript status from pick file ONLY (Layer 1).
+        let status = recording_cache::get_transcript(&ogg_path);
+        let (transcript_full, transcript_preview) = match &status {
+            recording_cache::TranscriptStatus::Available(text) => transcript_variants(text),
+            _ => (String::new(), String::new()),
+        };
 
         result.push(RecordingEntry {
             path: ogg_path,
@@ -259,6 +262,7 @@ pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> 
             size_label,
             transcript_full,
             transcript_preview,
+            status,
         });
     }
 
@@ -288,13 +292,12 @@ pub(super) fn delete_recording(file_path: &std::path::Path) -> Result<(), TalkEr
     // Keep `wav` for backward compatibility with older cache entries.
     if (ext == "wav" || ext == "ogg") && !stem.is_empty() {
         if let Ok(dir) = recording_cache::recordings_dir() {
-            // Remove companion YAML files (<stem>_<model>.yml).
-            let yml_prefix = format!("{}_", stem);
+            // Remove companion YAML files (<stem>_*.yml and <stem>.pick.yml).
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name.starts_with(&yml_prefix)
+                    if name.starts_with(stem)
                         && path.extension().and_then(|e| e.to_str()) == Some("yml")
                     {
                         if let Err(e) = std::fs::remove_file(&path) {

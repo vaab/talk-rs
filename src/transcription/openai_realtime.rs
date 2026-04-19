@@ -295,6 +295,7 @@ impl OpenAIRealtimeTranscriber {
     /// Returns `Ok(())` if the API accepts the session configuration,
     /// or an error with the API's message (e.g. "model X is not
     /// supported in realtime mode").
+    #[allow(dead_code)]
     async fn validate_realtime_session(&self) -> Result<(), TalkError> {
         let ws_url = build_ws_url(&self.endpoint);
 
@@ -427,39 +428,61 @@ impl OpenAIRealtimeTranscriber {
             .ok_or_else(|| TalkError::Transcription("No host in WebSocket URL".to_string()))?
             .to_string();
 
-        // Build the WebSocket upgrade request with auth header.
-        let request = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri(&ws_url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("OpenAI-Beta", "realtime=v1")
-            .header("Host", &host)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header(
-                "Sec-WebSocket-Key",
-                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
-            .map_err(|e| {
-                TalkError::Transcription(format!("Failed to build WebSocket request: {}", e))
-            })?;
-
         log::debug!("connecting to OpenAI Realtime WebSocket: {}", ws_url);
 
-        // Connect with timeout.
-        let (ws_stream, response) = tokio::time::timeout(
-            WS_CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(request),
-        )
-        .await
-        .map_err(|_| {
-            TalkError::Transcription(format!(
-                "WebSocket connection timed out after {}s",
-                WS_CONNECT_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(|e| TalkError::Transcription(format!("WebSocket connection failed: {}", e)))?;
+        // Open the WebSocket upgrade handshake with shared retry
+        // semantics.  Each retry rebuilds a fresh request (consumed
+        // by `connect_async`).
+        //
+        // TODO: thread a telemetry sink through realtime transcribers
+        // so `RetryScheduled` events are observable; for now use a
+        // no-op sink to preserve the existing behaviour.
+        let api_key = self.config.api_key.clone();
+        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+            std::sync::Arc::new(crate::telemetry::NoOpSink);
+        let (ws_stream, response) =
+            super::transport::retry::with_retry(crate::config::Provider::OpenAI, &sink, || {
+                let api_key = api_key.clone();
+                let ws_url = ws_url.clone();
+                let host = host.clone();
+                async move {
+                    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+                        .uri(&ws_url)
+                        .header("Authorization", format!("Bearer {}", api_key))
+                        .header("OpenAI-Beta", "realtime=v1")
+                        .header("Host", &host)
+                        .header("Connection", "Upgrade")
+                        .header("Upgrade", "websocket")
+                        .header("Sec-WebSocket-Version", "13")
+                        .header(
+                            "Sec-WebSocket-Key",
+                            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+                        )
+                        .body(())
+                        .map_err(|e| {
+                            TalkError::Transcription(format!(
+                                "Failed to build WebSocket request: {}",
+                                e
+                            ))
+                        })?;
+
+                    tokio::time::timeout(
+                        WS_CONNECT_TIMEOUT,
+                        tokio_tungstenite::connect_async(request),
+                    )
+                    .await
+                    .map_err(|_| {
+                        TalkError::Transcription(format!(
+                            "WebSocket connection timed out after {}s",
+                            WS_CONNECT_TIMEOUT.as_secs()
+                        ))
+                    })?
+                    .map_err(|e| {
+                        TalkError::Transcription(format!("WebSocket connection failed: {}", e))
+                    })
+                }
+            })
+            .await?;
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
