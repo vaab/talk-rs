@@ -23,11 +23,20 @@ happening.
   parallel and choose the best transcription from a GTK picker window.
   A waterfall spectrogram of the recording is shown above the
   candidate list; it loads asynchronously and adapts to window width.
+  Non-default models are transcribed on demand via a per-candidate
+  button to avoid unnecessary API calls.
 - *Visual overlay* -- non-intrusive X11 badge at the top of the screen
   (works without a compositor).
+- *Live transcription overlay* -- a dynamic phase-coloured waterfall
+  replaces the static "transcribing" badge; three independent
+  throughput tracks (upload bytes, download bytes, paste characters)
+  show progress through the pipeline, with a time-grid layer over the
+  spectrogram.
 - *Dead audio detection* -- overlay badge shows a red prohibit icon
   and "NO SOUND" warning when no real microphone is detected (e.g.
-  headset unplugged); a notification also appears on the text panel.
+  headset unplugged); a centered full-screen overlay and repeating
+  alert tone reinforce the signal, and a notification also appears on
+  the text panel.
 - *Auto-pause* -- automatically pauses audio forwarding during
   silence, trimming dead air from transcription input.  Resumes
   instantly with a 300 ms lookback buffer to preserve speech onset.
@@ -40,14 +49,23 @@ happening.
   recording; fully configurable or disabled.
 - *Context bias* -- supply domain-specific vocabulary to improve
   transcription accuracy.
-- *Daemon toggle mode* -- first invocation starts recording, second
-  stops and transcribes; ideal for global shortcuts.
+- *Daemon toggle mode* -- first invocation spawns a short-lived daemon
+  that records; second invocation signals it to stop, transcribe,
+  paste, and exit.  Ideal for global shortcuts.
+- *No idle daemon* -- between dictations, zero ~talk-rs~ processes
+  stay resident.  The toggle daemon spawns on press, records, and
+  exits after pasting.  No memory footprint when idle.
 - *Retry last* -- re-transcribe the last cached recording without
   speaking again (~--retry-last~).
 - *Recordings browser* -- ~record --ui~ opens a GTK4 window listing
-all recordings (OGG from ~output_dir~) and dictation cache (OGG).
-  Play, delete, or open in the file manager; sections auto-refresh
-  via inotify when files change externally.
+  all recordings (OGG from ~output_dir~) and dictation cache (OGG).
+  Play, delete, open in the file manager, or transcribe on demand.
+  A waterfall spectrogram is shown for every recording, even those
+  without transcripts; sections auto-refresh via inotify when files
+  change externally.
+- *Per-segment timing export* -- ~--output-yaml~ includes per-segment
+  start/end timestamps in the metadata sidecar, suitable for
+  subtitles and post-processing.
 - *Standalone commands* -- ~record~ and ~transcribe~ can be used
   independently for scripting.
 - *Environment overrides* -- every config value can be set via
@@ -159,9 +177,10 @@ See ~config.example.yaml~ for the full list.
 
 *** Global options
 
-| Flag | Effect                                              |
-|------+-----------------------------------------------------|
-| ~-v~ | Increase logging verbosity (~-vv~ debug, ~-vvv~ trace) |
+| Flag                | Effect                                                                                                |
+|---------------------+-------------------------------------------------------------------------------------------------------|
+| ~-v~                | Increase logging verbosity (~-vv~ debug, ~-vvv~ trace)                                                |
+| ~--log-file <PATH>~ | Write logs to a file in addition to stderr (env ~TALK_RS_LOG_FILE~); propagated to the toggle daemon |
 
 *** Dictate (main workflow)
 
@@ -201,6 +220,8 @@ Options:
 | ~--no-chunk-paste~          | Paste all text in one shot (disable chunking)    |
 | ~--no-overlay~              | Disable visual overlay                          |
 | ~--no-auto-pause~           | Disable auto-pause during silence (forward all audio) |
+| ~--no-paste~                | Skip pasting transcription into the focused application |
+| ~--upload-format <FORMAT>~  | Audio format for batch uploads: ~wav~ (default) or ~ogg~ |
 | ~--viz <MODE>~              | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ |
 | ~--mono~                    | Monochrome visualizer (theme-aware)             |
 
@@ -209,7 +230,7 @@ Options:
 Capture audio to an OGG/Opus file:
 
 #+begin_src sh
-talk-rs record                       # auto-named memo-YYYY-MM-DD-HH-MM-SS.ogg
+talk-rs record                       # auto-named <output_dir>/YYYY/MM/YYYY-MM-DDTHH-MM-SS±ZZZZ.ogg
 talk-rs record meeting-notes.ogg     # custom filename
 #+end_src
 
