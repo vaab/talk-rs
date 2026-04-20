@@ -385,6 +385,46 @@ pub(crate) fn create_batch_transcriber(
     }
 }
 
+/// Read the transcript for a recording from the cache, falling
+/// through all layers without making any API call.
+///
+/// Waterfall (in priority order):
+///
+/// 1. **Pick file** (``<stem>.pick.yml``) -- the authoritative
+///    transcript, possibly user-edited.  Returned if present.
+/// 2. **Default-provider / default-model sidecar** -- the
+///    batch-mode cache for the default transcription model.
+///    Read synchronously, no API call.
+/// 3. **None** -- no transcript cached.
+///
+/// Used by consumers that want to display a transcript if one is
+/// cheaply available but MUST NOT trigger network I/O.  The record
+/// UI, for example, uses this to decide between "show transcript"
+/// and "show audio player".
+///
+/// This function is synchronous because every step is a local
+/// filesystem read.  It never calls the transcription API.
+pub fn read_cached_transcript(audio_path: &std::path::Path, config: &Config) -> Option<String> {
+    use crate::recording_cache::{get_transcript, TranscriptStatus, TranscriptionCache};
+
+    // Layer 1: pick file (authoritative).
+    match get_transcript(audio_path) {
+        TranscriptStatus::Available(text) => return Some(text),
+        // In-progress or unavailable: fall through to sidecar probe.
+        TranscriptStatus::InProgress | TranscriptStatus::NotAvailable => {}
+    }
+
+    // Layer 3: per-model sidecar cache for the default
+    // provider/model.  Synchronous file read, no API call.
+    let provider = config
+        .transcription
+        .as_ref()
+        .map(|t| t.default_provider)
+        .unwrap_or(Provider::Mistral);
+    let effective_model = resolve_effective_model(config, provider, None);
+    TranscriptionCache::get(audio_path, provider, &effective_model).map(|r| r.text)
+}
+
 /// Produce the authoritative transcript for a recording (Layer 2).
 ///
 /// 1. Calls [`recording_cache::get_transcript`]:
