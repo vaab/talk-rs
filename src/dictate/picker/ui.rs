@@ -10,6 +10,7 @@ use crate::transcription::{self, RealtimeTranscriber, TranscriptSegment, Transcr
 use std::path::PathBuf;
 
 use super::backend::{run_realtime_transcription, spawn_transcription};
+use crate::dictate::models::resolve_provider;
 use crate::record::player::WavPlayer;
 
 /// Window title used for the picker — also used for single-instance
@@ -182,19 +183,41 @@ pub(super) async fn pick_with_streaming_gtk(
     }
 
     // Stable display order: sort by (provider, model, streaming) so
-    // the list looks identical every time the picker opens.
+    // the list looks identical every time the picker opens, regardless
+    // of which rows happen to have cached results.  The primary key
+    // puts the config default provider first (rank 0) ahead of the
+    // others (alphabetical among rank 1).
+    let default_provider = resolve_provider(None, config.as_ref());
+    // Rank providers: config default first (rank 0), others alphabetical
+    // (rank 1 + name).  Factored out so the same ordering is applied by
+    // both the per-source sorts below and the unified sort inside the
+    // GTK thread.
+    fn provider_rank(p: Provider, default_provider: Provider) -> (u8, String) {
+        if p == default_provider {
+            (0, String::new())
+        } else {
+            (1, p.to_string())
+        }
+    }
     cached_entries.sort_by(|(pa, ma, _, _, sa), (pb, mb, _, _, sb)| {
-        pa.to_string()
-            .cmp(&pb.to_string())
+        provider_rank(*pa, default_provider)
+            .cmp(&provider_rank(*pb, default_provider))
             .then(ma.cmp(mb))
             .then(sa.cmp(sb))
     });
-    transcribers.sort_by(|(pa, ma), (pb, mb)| pa.to_string().cmp(&pb.to_string()).then(ma.cmp(mb)));
-    realtime_transcribers
-        .sort_by(|(pa, ma, _), (pb, mb, _)| pa.to_string().cmp(&pb.to_string()).then(ma.cmp(mb)));
+    transcribers.sort_by(|(pa, ma), (pb, mb)| {
+        provider_rank(*pa, default_provider)
+            .cmp(&provider_rank(*pb, default_provider))
+            .then(ma.cmp(mb))
+    });
+    realtime_transcribers.sort_by(|(pa, ma, _), (pb, mb, _)| {
+        provider_rank(*pa, default_provider)
+            .cmp(&provider_rank(*pb, default_provider))
+            .then(ma.cmp(mb))
+    });
     deferred_candidates.sort_by(|(pa, ma, sa), (pb, mb, sb)| {
-        pa.to_string()
-            .cmp(&pb.to_string())
+        provider_rank(*pa, default_provider)
+            .cmp(&provider_rank(*pb, default_provider))
             .then(ma.cmp(mb))
             .then(sa.cmp(sb))
     });
@@ -275,6 +298,11 @@ pub(super) async fn pick_with_streaming_gtk(
             ".transcript {{ font-family: monospace; }} \
              .error {{ font-style: italic; color: alpha({err}, 0.8); }} \
              .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }} \
+             .action-btn {{ \
+                min-width: 28px; min-height: 28px; \
+                padding: 0; margin: 0; \
+                font-family: monospace; font-weight: bold; font-size: 14px; \
+             }} \
              .play-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
              .waterfall {{ background-color: black; border-radius: 0.25em; }} \
              .copy-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
@@ -740,6 +768,12 @@ pub(super) async fn pick_with_streaming_gtk(
         // from the InitialBatchDone "no response" sweep.
         let deferred_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
+        // Per-row "has-transcription" flag — true once the row has
+        // received a non-empty transcript (cached or live).  Used to
+        // prevent selecting a non-transcribed row (spinner, deferred,
+        // error, "no speech detected") from wiping whatever the user
+        // is currently viewing/editing in the text area.
+        let has_transcription: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
         // Diff colours: deletion (red) from theme, insertion green (Tango palette).
         let del_color = error_hex.clone();
         let ins_color = String::from("#4e9a06");
@@ -903,6 +937,193 @@ pub(super) async fn pick_with_streaming_gtk(
         }
 
         // ── Pre-create all rows ─────────────────────────────────
+        //
+        // Unified row construction: every (provider, model, streaming)
+        // triple that should appear in the picker is gathered into a
+        // single list, sorted once, then rendered in one pass.  Each
+        // row falls into one of four kinds based on its current state
+        // (already cached, batch pending, realtime pending, or
+        // user-deferred) — but its *position* is determined solely by
+        // (provider, model, streaming), so the visual order never
+        // depends on which rows happen to have cached results.
+        //
+        // Every row also receives the unified "T" action button in the
+        // trailing slot; clicking it always re-runs the transcription
+        // for that row (first-time or retry — same behavior, same
+        // button).
+
+        /// Kind of row to render, chosen once at picker open time.
+        enum RowKind<'a> {
+            /// Cached result — render the transcript text directly.
+            /// Fields: text, is_primary.
+            Cached { text: &'a str, is_primary: bool },
+            /// Auto-firing batch model — render a spinner, result
+            /// arrives via the poll loop.
+            PendingBatch,
+            /// Auto-firing realtime model — render an empty label,
+            /// text fills in incrementally.
+            PendingRealtime,
+            /// User-deferred — render an empty placeholder.  The
+            /// unified action button triggers the first transcription.
+            Deferred,
+        }
+
+        // Build the unified row list.  Preserve primary flag for cached
+        // entries (it drives initial selection below).
+        let mut all_rows: Vec<(Provider, String, bool, RowKind)> = Vec::new();
+        for (p, m, t, is_primary, s) in &cached_entries {
+            all_rows.push((
+                *p,
+                m.clone(),
+                *s,
+                RowKind::Cached {
+                    text: t.as_str(),
+                    is_primary: *is_primary,
+                },
+            ));
+        }
+        for (p, m) in &pending_info {
+            all_rows.push((*p, m.clone(), false, RowKind::PendingBatch));
+        }
+        for (p, m) in &realtime_pending_info {
+            all_rows.push((*p, m.clone(), true, RowKind::PendingRealtime));
+        }
+        for (p, m, s) in &deferred_candidates {
+            all_rows.push((*p, m.clone(), *s, RowKind::Deferred));
+        }
+        // Single sort drives the visible order; matches the
+        // per-source sorts done above so the order is identical
+        // regardless of which bucket a row came from.
+        all_rows.sort_by(|(pa, ma, sa, _), (pb, mb, sb, _)| {
+            provider_rank(*pa, default_provider)
+                .cmp(&provider_rank(*pb, default_provider))
+                .then(ma.cmp(mb))
+                .then(sa.cmp(sb))
+        });
+
+        // Unified action-button storage — one per row (same order as
+        // `local_candidates`).  The poll loop enables the button when
+        // a result/error arrives and disables it while a transcription
+        // is in flight, and flips the icon between "T" (no
+        // transcription yet) and "↻" (re-run an existing one).
+        let action_buttons: Rc<RefCell<Vec<gtk4::Button>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Flip the action button's icon + tooltip based on whether the
+        // row currently holds a (non-empty) transcript.  "T" means
+        // "transcribe this (first time)"; "↻" means "retry / re-run
+        // the existing transcription".
+        fn set_action_icon(btn: &gtk4::Button, has_transcript: bool) {
+            use gtk4::prelude::*;
+            if has_transcript {
+                btn.set_label("↻");
+                btn.set_tooltip_text(Some("Re-transcribe with this model"));
+            } else {
+                btn.set_label("T");
+                btn.set_tooltip_text(Some("Transcribe with this model"));
+            }
+        }
+
+        // Helper: build the unified action button for a given row.
+        // Wires a click handler that resets the row to pending and
+        // sends a (provider, model, streaming) on the retry channel.
+        // Placed in the leading slot of the row's hbox — same
+        // position on every row; icon toggles between "T" (no
+        // transcription yet) and "↻" (retry existing result).
+        let make_action_button = {
+            let retry_tx = retry_tx.clone();
+            let cells_for_btn = Rc::clone(&transcript_cells);
+            let labels_for_btn = Rc::clone(&transcript_labels);
+            let raw_for_btn = Rc::clone(&raw_texts);
+            let cands_for_btn = Rc::clone(&local_candidates);
+            let deferred_for_btn = Rc::clone(&deferred_indices);
+            let buttons_for_btn = Rc::clone(&action_buttons);
+            let has_tx_for_btn = Rc::clone(&has_transcription);
+            move |provider: Provider, model: String, streaming: bool| -> gtk4::Button {
+                let btn = gtk4::Button::with_label("T");
+                btn.set_tooltip_text(Some("Transcribe with this model"));
+                btn.add_css_class("action-btn");
+                btn.set_valign(gtk4::Align::Center);
+                {
+                    let tx = retry_tx.clone();
+                    let cells_ref = Rc::clone(&cells_for_btn);
+                    let labels_ref = Rc::clone(&labels_for_btn);
+                    let raw_ref = Rc::clone(&raw_for_btn);
+                    let cands_ref = Rc::clone(&cands_for_btn);
+                    let deferred_ref = Rc::clone(&deferred_for_btn);
+                    let buttons_ref = Rc::clone(&buttons_for_btn);
+                    let has_tx_ref = Rc::clone(&has_tx_for_btn);
+                    btn.connect_clicked(move |clicked| {
+                        let idx = {
+                            let cands = cands_ref.borrow();
+                            cands.iter().position(|(p, m, _, _, _, s, _, _)| {
+                                *p == provider && *m == model && *s == streaming
+                            })
+                        };
+                        let Some(idx) = idx else {
+                            return;
+                        };
+                        // Reset row state: clear text, errors, segments,
+                        // diff baseline, and the deferred flag.
+                        {
+                            let mut cands = cands_ref.borrow_mut();
+                            if let Some((_, _, text, _, is_error, _, segments, meta)) =
+                                cands.get_mut(idx)
+                            {
+                                text.clear();
+                                *is_error = false;
+                                *segments = None;
+                                *meta = TranscriptionMetadata::default();
+                            }
+                        }
+                        raw_ref.borrow_mut()[idx] = String::new();
+                        deferred_ref.borrow_mut().remove(&idx);
+                        // Row no longer holds a transcription until a
+                        // new result arrives.
+                        if let Some(flag) = has_tx_ref.borrow_mut().get_mut(idx) {
+                            *flag = false;
+                        }
+
+                        // Swap the transcript cell to a spinner (batch)
+                        // or empty streaming label (realtime).
+                        {
+                            let cells = cells_ref.borrow();
+                            if let Some(cell) = cells.get(idx) {
+                                while let Some(child) = cell.first_child() {
+                                    cell.remove(&child);
+                                }
+                                if streaming {
+                                    let label = make_transcript_label("");
+                                    cell.append(&label);
+                                    labels_ref.borrow_mut()[idx] = Some(label);
+                                } else {
+                                    let spinner = gtk4::Spinner::new();
+                                    spinner.start();
+                                    cell.append(&spinner);
+                                    labels_ref.borrow_mut()[idx] = None;
+                                }
+                            }
+                        }
+
+                        // Disable the clicked button while in flight
+                        // and flip the icon back to "T" — the row no
+                        // longer has a transcript.  The poll loop
+                        // re-enables + re-flips it when the result
+                        // (or error) arrives.  Also keep `buttons_ref`
+                        // consistent so spinner-to-result transitions
+                        // find the right handle.
+                        clicked.set_sensitive(false);
+                        set_action_icon(clicked, false);
+                        if let Some(btn) = buttons_ref.borrow().get(idx) {
+                            btn.set_sensitive(false);
+                            set_action_icon(btn, false);
+                        }
+
+                        let _ = tx.send((provider, model.clone(), streaming));
+                    });
+                }
+                btn
+            }
+        };
 
         // Cached entries: rows with transcript already filled.
         // The `is_primary` flag marks the entry that was already
@@ -915,163 +1136,101 @@ pub(super) async fn pick_with_streaming_gtk(
         // `selection_ctx.current` is never populated (bugs #1, #2,
         // #4 in the gap analysis).
         let mut index_to_select: Option<i32> = None;
-        for (i, (provider, model, text, is_primary, streaming)) in cached_entries.iter().enumerate()
-        {
+        for (row_idx, (provider, model, streaming, kind)) in all_rows.iter().enumerate() {
             let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, *streaming);
-            let label = make_transcript_label(text);
-            if text.is_empty() {
-                label.set_markup("<i>(no speech detected)</i>");
-                label.set_opacity(0.35);
+
+            // Per-row transcript cell population and `local_candidates`
+            // bookkeeping.  `label_opt` is set when the cell hosts a
+            // diff-capable label (cached result or realtime stream);
+            // `None` means spinner or placeholder.
+            let (initial_text, is_primary, is_deferred, label_opt): (
+                String,
+                bool,
+                bool,
+                Option<gtk4::Label>,
+            ) = match kind {
+                RowKind::Cached { text, is_primary } => {
+                    let label = make_transcript_label(text);
+                    if text.is_empty() {
+                        label.set_markup("<i>(no speech detected)</i>");
+                        label.set_opacity(0.35);
+                    }
+                    cell.append(&label);
+                    ((*text).to_string(), *is_primary, false, Some(label))
+                }
+                RowKind::PendingBatch => {
+                    let spinner = gtk4::Spinner::new();
+                    spinner.start();
+                    cell.append(&spinner);
+                    (String::new(), false, false, None)
+                }
+                RowKind::PendingRealtime => {
+                    let label = make_transcript_label("");
+                    cell.append(&label);
+                    (String::new(), false, false, Some(label))
+                }
+                RowKind::Deferred => (String::new(), false, true, None),
+            };
+
+            // Unified action button: always present, same position
+            // (leftmost), icon toggles between "T" (no transcript)
+            // and "↻" (retry an existing one).  Sensitive only when
+            // idle (not in flight).
+            let action_btn = make_action_button(*provider, model.clone(), *streaming);
+            match kind {
+                RowKind::PendingBatch | RowKind::PendingRealtime => {
+                    action_btn.set_sensitive(false);
+                    set_action_icon(&action_btn, false);
+                }
+                RowKind::Cached { text, .. } => {
+                    action_btn.set_sensitive(true);
+                    set_action_icon(&action_btn, !text.is_empty());
+                }
+                RowKind::Deferred => {
+                    action_btn.set_sensitive(true);
+                    set_action_icon(&action_btn, false);
+                }
             }
-            cell.append(&label);
+            // Prepend: the action button occupies the leftmost column,
+            // ahead of the transcript cell.
+            hbox.prepend(&action_btn);
 
             let row = gtk4::ListBoxRow::new();
             row.set_child(Some(&hbox));
             list.append(&row);
 
-            // Mark which row to select (primary, or the first one).
-            if *is_primary || (i == 0 && !selected_row) {
-                index_to_select = Some(i as i32);
+            // Initial selection: primary cached row wins; otherwise
+            // the first row in visual order.
+            if is_primary || (row_idx == 0 && !selected_row) {
+                index_to_select = Some(row_idx as i32);
                 selected_row = true;
             }
 
+            // Only cached rows with non-empty text start as "has
+            // transcription".  Spinners, deferred rows, realtime-
+            // pending rows, and "no speech detected" cached rows all
+            // start false, so selecting them won't wipe the text area.
+            let initial_has_transcript =
+                matches!(kind, RowKind::Cached { .. }) && !initial_text.is_empty();
+
             local_candidates.borrow_mut().push((
                 *provider,
                 model.clone(),
-                text.clone(),
-                *is_primary,
+                initial_text.clone(),
+                is_primary,
                 false,
                 *streaming,
                 None,
                 TranscriptionMetadata::default(),
             ));
             transcript_cells.borrow_mut().push(cell);
-            raw_texts.borrow_mut().push(text.clone());
-            transcript_labels.borrow_mut().push(Some(label));
-        }
-
-        // Pending batch entries: row with spinner in transcript cell.
-        for (provider, model) in &pending_info {
-            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, false);
-            let spinner = gtk4::Spinner::new();
-            spinner.start();
-            cell.append(&spinner);
-
-            let row = gtk4::ListBoxRow::new();
-            row.set_child(Some(&hbox));
-            list.append(&row);
-
-            local_candidates.borrow_mut().push((
-                *provider,
-                model.clone(),
-                String::new(),
-                false,
-                false,
-                false,
-                None,
-                TranscriptionMetadata::default(),
-            ));
-            transcript_cells.borrow_mut().push(cell);
-            raw_texts.borrow_mut().push(String::new());
-            transcript_labels.borrow_mut().push(None);
-        }
-
-        // Pending realtime entries: row with empty transcript label
-        // (text fills incrementally, no spinner).
-        for (provider, model) in &realtime_pending_info {
-            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, true);
-            let label = make_transcript_label("");
-            cell.append(&label);
-
-            let row = gtk4::ListBoxRow::new();
-            row.set_child(Some(&hbox));
-            list.append(&row);
-
-            local_candidates.borrow_mut().push((
-                *provider,
-                model.clone(),
-                String::new(),
-                false,
-                false,
-                true,
-                None,
-                TranscriptionMetadata::default(),
-            ));
-            transcript_cells.borrow_mut().push(cell);
-            raw_texts.borrow_mut().push(String::new());
-            transcript_labels.borrow_mut().push(Some(label));
-        }
-
-        // Deferred entries: row with a "▶" (transcribe) button.
-        // These models are not auto-transcribed — the user clicks to
-        // start transcription on demand via the retry channel.
-        for (provider, model, streaming) in &deferred_candidates {
-            let (hbox, cell) = make_row_skeleton(&provider.to_string(), model, *streaming);
-
-            let transcribe_btn = gtk4::Button::with_label("\u{25B6}");
-            transcribe_btn.set_tooltip_text(Some("Transcribe with this model"));
-            transcribe_btn.add_css_class("retry-btn");
-            {
-                let tx = retry_tx.clone();
-                let provider = *provider;
-                let model = model.clone();
-                let streaming = *streaming;
-                let cells_ref = Rc::clone(&transcript_cells);
-                let labels_ref = Rc::clone(&transcript_labels);
-                let cands_ref = Rc::clone(&local_candidates);
-                let deferred_ref = Rc::clone(&deferred_indices);
-                transcribe_btn.connect_clicked(move |_| {
-                    let idx = {
-                        let cands = cands_ref.borrow();
-                        cands.iter().position(|(p, m, _, _, _, s, _, _)| {
-                            *p == provider && *m == model && *s == streaming
-                        })
-                    };
-                    if let Some(idx) = idx {
-                        deferred_ref.borrow_mut().remove(&idx);
-                        let _ = tx.send((provider, model.clone(), streaming));
-                        // Replace button with spinner (batch) or
-                        // empty label (realtime).
-                        let cells = cells_ref.borrow();
-                        if let Some(cell) = cells.get(idx) {
-                            while let Some(child) = cell.first_child() {
-                                cell.remove(&child);
-                            }
-                            if streaming {
-                                let label = make_transcript_label("");
-                                cell.append(&label);
-                                labels_ref.borrow_mut()[idx] = Some(label);
-                            } else {
-                                let spinner = gtk4::Spinner::new();
-                                spinner.start();
-                                cell.append(&spinner);
-                                labels_ref.borrow_mut()[idx] = None;
-                            }
-                        }
-                    }
-                });
+            raw_texts.borrow_mut().push(initial_text);
+            transcript_labels.borrow_mut().push(label_opt);
+            action_buttons.borrow_mut().push(action_btn);
+            has_transcription.borrow_mut().push(initial_has_transcript);
+            if is_deferred {
+                deferred_indices.borrow_mut().insert(row_idx);
             }
-            cell.append(&transcribe_btn);
-
-            let row = gtk4::ListBoxRow::new();
-            row.set_child(Some(&hbox));
-            list.append(&row);
-
-            let deferred_idx = local_candidates.borrow().len();
-            local_candidates.borrow_mut().push((
-                *provider,
-                model.clone(),
-                String::new(),
-                false,
-                false,
-                *streaming,
-                None,
-                TranscriptionMetadata::default(),
-            ));
-            deferred_indices.borrow_mut().insert(deferred_idx);
-            transcript_cells.borrow_mut().push(cell);
-            raw_texts.borrow_mut().push(String::new());
-            transcript_labels.borrow_mut().push(None);
         }
 
         // ── Row selection → populate text area ──────────────────
@@ -1082,6 +1241,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let buf_sel = text_buffer.clone();
             let sel_ctx = Rc::clone(&selection_ctx);
             let sel_pending = Rc::clone(&selection_pending);
+            let has_tx_sel = Rc::clone(&has_transcription);
             list.connect_row_selected(move |_, row| {
                 if let Some(row) = row {
                     let idx = row.index() as usize;
@@ -1129,10 +1289,19 @@ pub(super) async fn pick_with_streaming_gtk(
                             has_result,
                         );
                     }
-                    let cands = cands_sel.borrow();
-                    if let Some((_, _, text, _, is_error, _, _, _)) = cands.get(idx) {
-                        if !*is_error {
-                            buf_sel.set_text(text);
+                    // Only overwrite the text area when this row
+                    // actually holds a transcription.  Selecting a
+                    // non-transcribed row (spinner, deferred, error,
+                    // "no speech detected") leaves the text area
+                    // untouched — the user can keep viewing/editing
+                    // whatever is currently there.
+                    let row_has_transcript = has_tx_sel.borrow().get(idx).copied().unwrap_or(false);
+                    if row_has_transcript {
+                        let cands = cands_sel.borrow();
+                        if let Some((_, _, text, _, is_error, _, _, _)) = cands.get(idx) {
+                            if !*is_error {
+                                buf_sel.set_text(text);
+                            }
                         }
                     }
                 }
@@ -1329,14 +1498,12 @@ pub(super) async fn pick_with_streaming_gtk(
             });
         }
 
-        // Build an error cell with a retry button (↻).
+        // Build an error cell containing just the error message.
         //
-        // Clicking the button replaces the error with a spinner and
-        // sends a retry request through `retry_tx`.
+        // Retry is handled by the unified "T" action button in the
+        // trailing slot of the row (same button that starts the
+        // first-time transcription) — no per-error retry icon here.
         let make_error_cell = {
-            let retry_tx = retry_tx.clone();
-            let cands_for_err = Rc::clone(&local_candidates);
-            let cells_for_err = Rc::clone(&transcript_cells);
             let raw_for_err = Rc::clone(&raw_texts);
             let labels_for_err = Rc::clone(&transcript_labels);
             move |cell: &gtk4::Box, idx: usize, msg: &str| {
@@ -1346,7 +1513,6 @@ pub(super) async fn pick_with_streaming_gtk(
                 // Clear diff state for this row.
                 raw_for_err.borrow_mut()[idx] = String::new();
                 labels_for_err.borrow_mut()[idx] = None;
-                let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
 
                 let err = gtk4::Label::new(Some(msg));
                 err.set_xalign(0.0);
@@ -1354,50 +1520,7 @@ pub(super) async fn pick_with_streaming_gtk(
                 err.set_wrap(true);
                 err.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
                 err.add_css_class("error");
-                hbox.append(&err);
-
-                let retry_btn = gtk4::Button::with_label("↻");
-                retry_btn.set_tooltip_text(Some("Retry transcription"));
-                retry_btn.add_css_class("retry-btn");
-                {
-                    let tx = retry_tx.clone();
-                    let cands_ref = Rc::clone(&cands_for_err);
-                    let cells_ref = Rc::clone(&cells_for_err);
-                    let labels_ref = Rc::clone(&labels_for_err);
-                    retry_btn.connect_clicked(move |_| {
-                        let mut cands = cands_ref.borrow_mut();
-                        if let Some((provider, model, text, _, is_error, streaming, segments, _)) =
-                            cands.get_mut(idx)
-                        {
-                            let _ = tx.send((*provider, model.clone(), *streaming));
-                            // Reset row state.
-                            text.clear();
-                            *is_error = false;
-                            *segments = None;
-                            // Replace error with spinner (batch) or
-                            // empty label (realtime).
-                            let is_streaming = *streaming;
-                            let cells = cells_ref.borrow();
-                            if let Some(cell) = cells.get(idx) {
-                                while let Some(child) = cell.first_child() {
-                                    cell.remove(&child);
-                                }
-                                if is_streaming {
-                                    let label = make_transcript_label("");
-                                    cell.append(&label);
-                                    labels_ref.borrow_mut()[idx] = Some(label);
-                                } else {
-                                    let spinner = gtk4::Spinner::new();
-                                    spinner.start();
-                                    cell.append(&spinner);
-                                    labels_ref.borrow_mut()[idx] = None;
-                                }
-                            }
-                        }
-                    });
-                }
-                hbox.append(&retry_btn);
-                cell.append(&hbox);
+                cell.append(&err);
             }
         };
 
@@ -1408,6 +1531,8 @@ pub(super) async fn pick_with_streaming_gtk(
             let cells = Rc::clone(&transcript_cells);
             let raw_poll = Rc::clone(&raw_texts);
             let labels_poll = Rc::clone(&transcript_labels);
+            let buttons_poll = Rc::clone(&action_buttons);
+            let has_tx_poll = Rc::clone(&has_transcription);
             let buf_poll = text_buffer.clone();
             let dc_poll = del_color.clone();
             let ic_poll = ins_color.clone();
@@ -1443,6 +1568,18 @@ pub(super) async fn pick_with_streaming_gtk(
                                 if let Some(ref err_msg) = c.error {
                                     cands.borrow_mut()[idx].4 = true;
                                     make_err(&cells.borrow()[idx], idx, err_msg);
+                                    // Re-enable "T" so the user can
+                                    // retry the failed transcription
+                                    // (no transcript → "T", not "↻").
+                                    if let Some(btn) = buttons_poll.borrow().get(idx) {
+                                        btn.set_sensitive(true);
+                                        set_action_icon(btn, false);
+                                    }
+                                    // Clear the transcription flag —
+                                    // the error wiped the row.
+                                    if let Some(flag) = has_tx_poll.borrow_mut().get_mut(idx) {
+                                        *flag = false;
+                                    }
                                 } else {
                                     // Same path for empty and non-empty
                                     // text — empty is a valid result.
@@ -1487,6 +1624,24 @@ pub(super) async fn pick_with_streaming_gtk(
                                     }
                                     cells.borrow()[idx].append(&label);
                                     labels_poll.borrow_mut()[idx] = Some(label);
+                                    // Result arrived — re-enable the
+                                    // button.  Flip to "↻" only when
+                                    // there is actually a transcript
+                                    // to re-run (empty result keeps
+                                    // "T" so the user can try again).
+                                    let has_text = !c.text.is_empty();
+                                    if let Some(btn) = buttons_poll.borrow().get(idx) {
+                                        btn.set_sensitive(true);
+                                        set_action_icon(btn, has_text);
+                                    }
+                                    // Track whether this row now holds
+                                    // a transcription, so selecting it
+                                    // populates the text area (and
+                                    // selecting an empty-result row
+                                    // does not wipe it).
+                                    if let Some(flag) = has_tx_poll.borrow_mut().get_mut(idx) {
+                                        *flag = has_text;
+                                    }
                                 }
                             }
                         }
@@ -1552,6 +1707,17 @@ pub(super) async fn pick_with_streaming_gtk(
                                     // the pick dirty and arms the
                                     // debounce save timer.
                                 }
+                                // First stream update acts as "result
+                                // arrived" — re-enable the button and
+                                // flip to "↻" once text exists.
+                                let has_text = !accumulated_text.is_empty();
+                                if let Some(btn) = buttons_poll.borrow().get(idx) {
+                                    btn.set_sensitive(true);
+                                    set_action_icon(btn, has_text);
+                                }
+                                if let Some(flag) = has_tx_poll.borrow_mut().get_mut(idx) {
+                                    *flag = has_text;
+                                }
                             }
                         }
                         Ok(PickerMessage::InitialBatchDone) => {
@@ -1580,6 +1746,16 @@ pub(super) async fn pick_with_streaming_gtk(
                             drop(cells_ref);
                             for idx in failed {
                                 make_err(&cells.borrow()[idx], idx, "no response");
+                                // Re-enable "T" so the user can retry
+                                // the non-responsive model.
+                                if let Some(btn) = buttons_poll.borrow().get(idx) {
+                                    btn.set_sensitive(true);
+                                    set_action_icon(btn, false);
+                                }
+                                // No response means no transcription.
+                                if let Some(flag) = has_tx_poll.borrow_mut().get_mut(idx) {
+                                    *flag = false;
+                                }
                             }
                             list.grab_focus();
                             // Keep polling — retries and realtime
