@@ -140,7 +140,7 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     let t = std::time::Instant::now();
     let config = Config::load(None)?;
     log::debug!("list_ogg: config load {:.0?}", t.elapsed());
-    let dir = config.output_dir;
+    let dir = config.output_dir.clone();
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -171,10 +171,17 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
-        // Read transcript status from pick file ONLY (Layer 1).
-        // Sidecars are per-model cache — not a source of truth for
-        // the authoritative transcript.
-        let status = crate::recording_cache::get_transcript(&ogg_path);
+        // Read transcript via the waterfall: pick file first, then
+        // default-provider/model sidecar (no API call).  Keeps the
+        // pick-lock state visible separately so the UI can still
+        // show "transcription ongoing".
+        let status = match crate::recording_cache::get_transcript(&ogg_path) {
+            status @ crate::recording_cache::TranscriptStatus::InProgress => status,
+            _ => match crate::transcription::read_cached_transcript(&ogg_path, &config) {
+                Some(text) => crate::recording_cache::TranscriptStatus::Available(text),
+                None => crate::recording_cache::TranscriptStatus::NotAvailable,
+            },
+        };
         let (transcript_full, transcript_preview) = match &status {
             crate::recording_cache::TranscriptStatus::Available(text) => transcript_variants(text),
             _ => (String::new(), String::new()),
@@ -202,6 +209,7 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
 /// Gather dictation cache entries (with companion YML), sorted newest-first.
 pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     let t = std::time::Instant::now();
+    let config = Config::load(None)?;
     let dir = recording_cache::recordings_dir()?;
     if !dir.exists() {
         return Ok(Vec::new());
@@ -248,8 +256,15 @@ pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> 
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
-        // Read transcript status from pick file ONLY (Layer 1).
-        let status = recording_cache::get_transcript(&ogg_path);
+        // Read transcript via the waterfall: pick → default-model
+        // sidecar (no API call).
+        let status = match recording_cache::get_transcript(&ogg_path) {
+            status @ recording_cache::TranscriptStatus::InProgress => status,
+            _ => match crate::transcription::read_cached_transcript(&ogg_path, &config) {
+                Some(text) => recording_cache::TranscriptStatus::Available(text),
+                None => recording_cache::TranscriptStatus::NotAvailable,
+            },
+        };
         let (transcript_full, transcript_preview) = match &status {
             recording_cache::TranscriptStatus::Available(text) => transcript_variants(text),
             _ => (String::new(), String::new()),
