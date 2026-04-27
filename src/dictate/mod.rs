@@ -480,8 +480,24 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         None
     } else {
         player.as_ref().map(|p| {
+            // Gate the heartbeat on the LISTENING (auto-pause) state:
+            // boops only fire while the overlay's `pause_flag` is set,
+            // so the user hears the chirp during silence but not while
+            // actively speaking.  When `--no-auto-pause` is in effect,
+            // `pause_flag` never flips on and the boop stays silent —
+            // matching the user's mental model that boops belong to
+            // the "LISTENING" badge.
+            //
+            // Independently, `suppress_boop` silences the heartbeat
+            // while a no-sound alert is active so the two tones don't
+            // collide.
+            let play_when = Some(pause_flag.clone());
             let suppress = Some(suppress_boop.clone());
-            p.start_boop_loop(std::time::Duration::from_millis(boop_interval_ms), suppress)
+            p.start_boop_loop(
+                std::time::Duration::from_millis(boop_interval_ms),
+                play_when,
+                suppress,
+            )
         })
     };
 

@@ -57,8 +57,10 @@ happening.
 - *Audio visualizers* -- optional in-badge visualization during
   recording (~--viz waterfall~, ~--viz amplitude~, ~--viz spectrum~);
   monochrome mode with ~--mono~.
-- *Audio feedback* -- start/stop tones and periodic boop during
-  recording; fully configurable or disabled.
+- *Audio feedback* -- start/stop tones plus a periodic boop while
+  the badge shows ~LISTENING~ (i.e. during auto-pause silence); the
+  boop is silent while you are actively speaking, and is never heard
+  when ~--no-auto-pause~ is used.  Fully configurable or disabled.
 - *Bluetooth headset auto-switch* -- when a Bluetooth headset is
   connected in A2DP mode (high-quality stereo, no microphone),
   ~talk-rs~ automatically switches it to its Hands-Free Profile (HFP)
