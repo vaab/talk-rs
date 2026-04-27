@@ -10,6 +10,7 @@ mod streaming;
 mod text;
 mod toggle;
 
+use crate::audio::bt_profile;
 use crate::audio::file_source::{OggFileSource, WavFileSource};
 use crate::audio::indicator::SoundPlayer;
 use crate::audio::monitor_capture::MonitorCapture;
@@ -60,6 +61,7 @@ pub struct DictateOpts {
     pub viz: Option<crate::config::VizMode>,
     pub mono: bool,
     pub upload_format: crate::transcription::UploadFormat,
+    pub no_bt_auto_switch: bool,
     pub daemon: bool,
     pub target_window: Option<String>,
     pub verbose: u8,
@@ -83,6 +85,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             opts.viz,
             opts.mono,
             opts.upload_format,
+            opts.no_bt_auto_switch,
             opts.save.as_deref(),
             opts.verbose,
         )
@@ -337,6 +340,51 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         if opts.realtime { "realtime" } else { "batch" },
         if from_file { " (from file)" } else { "" }
     );
+
+    // Bluetooth headset profile auto-switching.
+    //
+    // Only meaningful when we are about to capture live audio — file
+    // inputs read from disk and never touch the microphone.  Resolution
+    // order: CLI flag `--no-bt-auto-switch` wins; otherwise config
+    // `audio.bt_auto_switch` (default `true`).  When enabled we:
+    //
+    // 1. Recover any stale profile from a prior unclean termination
+    //    (the state file at $XDG_RUNTIME_DIR/talk-rs/card-profile.json
+    //    is left behind by SIGKILL/crash).  This must run BEFORE
+    //    activate_headset so we are restoring to the user's TRUE
+    //    original profile, not to whatever HFP profile was active when
+    //    the previous run died.
+    // 2. Switch any connected BT headset to its best HFP profile so
+    //    the headset microphone is enabled.  The returned guard
+    //    restores the original profile on Drop — works on normal
+    //    return, ?-propagation, panic, and SIGINT-driven exits.
+    //
+    // Failures are logged but never fatal; the dictation proceeds on
+    // whatever input device is currently active.
+    let bt_auto_switch_enabled = !opts.no_bt_auto_switch
+        && config
+            .audio
+            .as_ref()
+            .map(|a| a.bt_auto_switch_enabled())
+            .unwrap_or(true);
+    let _bt_guard = if from_file || !bt_auto_switch_enabled {
+        if !bt_auto_switch_enabled {
+            log::debug!("bt_profile: auto-switching disabled by config/flag");
+        }
+        bt_profile::HeadsetGuard::new(None)
+    } else {
+        if let Err(err) = bt_profile::recover_stale_profile() {
+            log::warn!("bt_profile: stale-recovery failed (non-fatal): {}", err);
+        }
+        let saved = match bt_profile::activate_headset() {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!("bt_profile: activate_headset failed (non-fatal): {}", err);
+                None
+            }
+        };
+        bt_profile::HeadsetGuard::new(saved)
+    };
 
     // Play start sound BEFORE starting capture so that the tone is
     // never captured in the recording.

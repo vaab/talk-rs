@@ -30,6 +30,36 @@ pub struct Config {
     /// Optional paste behaviour settings.
     #[serde(default)]
     pub paste: Option<PasteConfig>,
+
+    /// Optional runtime audio settings (Bluetooth profile switching, …).
+    ///
+    /// Distinct from [`AudioConfig`] which is the internal codec /
+    /// sample-rate / bitrate config (hardcoded, not user-facing).
+    /// This section holds the user-facing audio toggles that have to
+    /// be read from `config.yaml`.
+    #[serde(default)]
+    pub audio: Option<AudioSettings>,
+}
+
+/// User-facing audio settings (loaded from `config.yaml`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AudioSettings {
+    /// Auto-switch a connected Bluetooth headset to its Hands-Free
+    /// Profile (HFP) for the duration of a recording, then restore
+    /// the original profile (typically A2DP) afterwards.
+    ///
+    /// Default: `true`.  Override per-invocation with
+    /// `--no-bt-auto-switch`, or globally via the
+    /// `TALK_RS_AUDIO_BT_AUTO_SWITCH` environment variable.
+    #[serde(default)]
+    pub bt_auto_switch: Option<bool>,
+}
+
+impl AudioSettings {
+    /// Resolved value of `bt_auto_switch`: `true` if unset (default-on).
+    pub fn bt_auto_switch_enabled(&self) -> bool {
+        self.bt_auto_switch.unwrap_or(true)
+    }
 }
 
 /// Transcription provider identifier.
@@ -319,6 +349,18 @@ impl Config {
             }
         }
 
+        // Audio settings env var overrides.
+        if let Some(value) = env_var_string("TALK_RS_AUDIO_BT_AUTO_SWITCH")? {
+            let parsed = parse_bool_env(&value).ok_or_else(|| {
+                TalkError::Config(format!(
+                    "TALK_RS_AUDIO_BT_AUTO_SWITCH must be true/false/1/0/yes/no, got '{}'",
+                    value
+                ))
+            })?;
+            let audio = config.audio.get_or_insert_with(AudioSettings::default);
+            audio.bt_auto_switch = Some(parsed);
+        }
+
         // Mistral env var overrides (only when the section exists).
         if let Some(ref mut mistral) = config.providers.mistral {
             if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
@@ -387,6 +429,17 @@ fn env_var_string(key: &str) -> Result<Option<String>, TalkError> {
         Err(env::VarError::NotUnicode(_)) => {
             Err(TalkError::Config(format!("{} must be valid UTF-8", key)))
         }
+    }
+}
+
+/// Parse a boolean-ish env var value.  Accepts `true`/`false`,
+/// `yes`/`no`, `1`/`0`, `on`/`off` (case-insensitive).  Returns
+/// `None` for any other value (caller turns that into an error).
+fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" | "on" => Some(true),
+        "false" | "no" | "0" | "off" => Some(false),
+        _ => None,
     }
 }
 

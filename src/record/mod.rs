@@ -8,6 +8,7 @@ mod entries;
 pub(crate) mod player;
 pub(crate) mod ui;
 
+use crate::audio::bt_profile;
 use crate::audio::cpal_capture::CpalCapture;
 use crate::audio::monitor_capture::MonitorCapture;
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
@@ -86,9 +87,44 @@ fn create_writer(path: &Path, config: AudioConfig) -> Result<Box<dyn AudioWriter
 /// 4. Spawn async task to read from capture channel, encode, and write to file
 /// 5. Wait for SIGINT (Ctrl+C) to gracefully shutdown
 /// 6. Flush encoder and close file
-pub async fn record(args: Vec<String>, monitor: bool) -> Result<(), TalkError> {
+pub async fn record(
+    args: Vec<String>,
+    monitor: bool,
+    no_bt_auto_switch: bool,
+) -> Result<(), TalkError> {
     // Parse arguments
     let output_path = parse_args(&args)?;
+
+    // Bluetooth headset profile auto-switching.  Resolution order:
+    // CLI flag `--no-bt-auto-switch` wins; otherwise config
+    // `audio.bt_auto_switch` (default `true`).  When enabled we
+    // recover any stale profile from a prior unclean termination,
+    // then switch the headset to HFP for microphone capture.  The
+    // returned guard restores the original profile on Drop (normal
+    // return, panic, SIGINT).  Failures are logged but non-fatal.
+    let config_for_bt = Config::load(None).ok();
+    let bt_auto_switch_enabled = !no_bt_auto_switch
+        && config_for_bt
+            .as_ref()
+            .and_then(|c| c.audio.as_ref())
+            .map(|a| a.bt_auto_switch_enabled())
+            .unwrap_or(true);
+    let _bt_guard = if !bt_auto_switch_enabled {
+        log::debug!("bt_profile: auto-switching disabled by config/flag");
+        bt_profile::HeadsetGuard::new(None)
+    } else {
+        if let Err(err) = bt_profile::recover_stale_profile() {
+            log::warn!("bt_profile: stale-recovery failed (non-fatal): {}", err);
+        }
+        let saved = match bt_profile::activate_headset() {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!("bt_profile: activate_headset failed (non-fatal): {}", err);
+                None
+            }
+        };
+        bt_profile::HeadsetGuard::new(saved)
+    };
 
     // Initialize audio capture
     let mut capture: Box<dyn AudioCapture> = if monitor {

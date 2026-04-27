@@ -74,3 +74,13 @@ indicators:
 #   # paste-summary behaviour.  Set to 0 to disable chunking (paste in
 #   # one shot).  Also overridden by --no-chunk-paste (which forces 0).
 #   chunk_chars: 150
+
+# Optional: Runtime Audio Settings
+# audio:
+#   # Auto-switch a connected Bluetooth headset to its Hands-Free
+#   # Profile (HFP) for the duration of a recording so the headset
+#   # microphone is enabled, then restore the original profile
+#   # (typically A2DP) on stop.  Default: true.  Override per-invocation
+#   # with --no-bt-auto-switch, or globally via the
+#   # TALK_RS_AUDIO_BT_AUTO_SWITCH env var (true/false/yes/no/1/0/on/off).
+#   bt_auto_switch: true

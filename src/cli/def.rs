@@ -29,6 +29,11 @@ pub enum Commands {
         /// Open GTK recordings browser to manage cached recordings
         #[arg(long)]
         ui: bool,
+        /// Disable auto-switching of a Bluetooth headset to HFP for
+        /// the duration of the recording (overrides config
+        /// `audio.bt_auto_switch`)
+        #[arg(long)]
+        no_bt_auto_switch: bool,
     },
     /// Transcribe an audio file to text
     Transcribe {
@@ -113,6 +118,11 @@ pub enum Commands {
         /// Audio format for batch uploads (wav or ogg)
         #[arg(long, value_enum, default_value_t)]
         upload_format: crate::transcription::UploadFormat,
+        /// Disable auto-switching of a Bluetooth headset to HFP for
+        /// the duration of the recording (overrides config
+        /// `audio.bt_auto_switch`)
+        #[arg(long)]
+        no_bt_auto_switch: bool,
         /// Run as daemon process (internal, used by --toggle)
         #[arg(long, hide = true)]
         daemon: bool,

@@ -3,6 +3,7 @@
 use crate::error::TalkError;
 use tokio::sync::mpsc;
 
+pub mod bt_profile;
 pub mod cpal_capture;
 pub mod encoder;
 pub mod file_source;

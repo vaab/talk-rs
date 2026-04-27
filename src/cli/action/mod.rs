@@ -8,12 +8,17 @@ pub use crate::transcribe::transcribe;
 
 pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Commands::Record { file, monitor, ui } => {
+        Commands::Record {
+            file,
+            monitor,
+            ui,
+            no_bt_auto_switch,
+        } => {
             if ui {
                 record_ui().await?;
             } else {
                 let args = file.map(|f| vec![f]).unwrap_or_default();
-                record(args, monitor).await?;
+                record(args, monitor, no_bt_auto_switch).await?;
             }
         }
         Commands::Transcribe {
@@ -51,6 +56,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             viz,
             mono,
             upload_format,
+            no_bt_auto_switch,
             daemon,
             target_window,
         } => {
@@ -76,6 +82,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
                 viz,
                 mono,
                 upload_format,
+                no_bt_auto_switch,
                 daemon,
                 target_window,
                 verbose,
