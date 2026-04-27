@@ -9,6 +9,7 @@
 //! truncates the cached recording.
 
 use super::text::flush_sentences;
+use crate::audio::bt_profile;
 use crate::audio::indicator::SoundPlayer;
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::{AudioConfig, Config, Provider};
@@ -219,6 +220,7 @@ pub(crate) async fn dictate_realtime(
     segment_tx: Option<tokio::sync::mpsc::Sender<String>>,
     visualizer: Option<&VisualizerHandle>,
     shutdown: &CancellationToken,
+    mut bt_guard: bt_profile::HeadsetGuard,
 ) -> Result<TranscriptionResult, TalkError> {
     // Always record audio to the cache OGG independently of transcription.
     log::info!("caching audio to: {}", cache_ogg_path.display());
@@ -295,6 +297,12 @@ pub(crate) async fn dictate_realtime(
             }
 
             capture.stop()?;
+            // Restore the Bluetooth headset to its high-quality
+            // profile (typically A2DP) the instant the microphone
+            // capture stops, in parallel with the WebSocket finishing
+            // and the paste pipeline.  Drop on the empty guard at
+            // function exit is then a no-op.
+            bt_guard.restore_now_async();
             // Reset so we don't stop again
             capture_stop.store(false, std::sync::atomic::Ordering::Release);
         }

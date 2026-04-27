@@ -6,6 +6,7 @@
 //! transcription failure never truncates the recording.
 
 use super::realtime::{buffer_feeder, ogg_recording_task, AudioBuffer};
+use crate::audio::bt_profile;
 use crate::audio::indicator::SoundPlayer;
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::{AudioConfig, Config, Provider};
@@ -131,6 +132,7 @@ pub(crate) async fn dictate_streaming(
     provider: Provider,
     model: Option<&str>,
     diarize: bool,
+    mut bt_guard: bt_profile::HeadsetGuard,
 ) -> (
     Result<TranscriptionResult, TalkError>,
     Option<std::time::Instant>,
@@ -295,6 +297,15 @@ pub(crate) async fn dictate_streaming(
                 }
             }
         }
+
+        // Restore the Bluetooth headset to its high-quality profile
+        // (typically A2DP) the instant the microphone capture stops,
+        // in parallel with transcription + paste.  The user hears
+        // their music / system audio in stereo again within ~1 s of
+        // pressing the toggle, instead of waiting for the entire
+        // dictation pipeline to finish.  Drop on the empty guard at
+        // function exit is then a no-op.
+        bt_guard.restore_now_async();
 
         // Immediate audible + visual feedback: the user hears the
         // stop sound and sees the "transcribing" badge the instant
