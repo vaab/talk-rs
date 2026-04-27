@@ -282,6 +282,44 @@ impl HeadsetGuard {
     pub fn new(saved: Option<SavedProfile>) -> Self {
         Self { saved }
     }
+
+    /// Explicitly restore the saved profile NOW, off the current
+    /// thread.
+    ///
+    /// Use this when you want the headset to flip back to its high-
+    /// quality profile (typically A2DP) the moment microphone capture
+    /// stops, without waiting for the rest of the `dictate()` pipeline
+    /// (transcription, paste) to finish.  The restore runs on
+    /// [`tokio::task::spawn_blocking`] so the calling task does not
+    /// block on libpulse I/O — typical restore latency on a real BT
+    /// headset is on the order of ~1 s, dominated by the BlueZ
+    /// profile renegotiation.
+    ///
+    /// After this returns the guard is empty and its `Drop` is a
+    /// no-op.  Errors during the spawned restore are logged inside
+    /// [`restore_profile`] and not surfaced — callers cannot do
+    /// anything useful with them anyway.
+    ///
+    /// Calling this on a guard that holds `None` (no headset, or auto-
+    /// switch disabled) is a cheap no-op.
+    pub fn restore_now_async(&mut self) {
+        let Some(saved) = self.saved.take() else {
+            return;
+        };
+        // Run libpulse interaction off the async runtime: the
+        // mainloop driver in `restore_profile` is synchronous and
+        // can briefly block.  The transcription and paste pipeline
+        // continues in parallel on the runtime threads.
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) = restore_profile(&saved) {
+                log::warn!(
+                    "bt_profile: failed to restore profile asynchronously ({}): {}",
+                    saved.card_name,
+                    err
+                );
+            }
+        });
+    }
 }
 
 impl Drop for HeadsetGuard {
@@ -824,5 +862,46 @@ mod tests {
         // PulseAudio (we have no PA running in unit tests).
         let g = HeadsetGuard::new(None);
         drop(g);
+    }
+
+    #[tokio::test]
+    async fn restore_now_async_with_none_is_noop_and_clears_guard() {
+        // No saved profile → restore_now_async must NOT spawn a
+        // blocking task, must NOT touch PulseAudio, and must leave
+        // the guard's saved field as None so the subsequent Drop is
+        // also a no-op.
+        let mut g = HeadsetGuard::new(None);
+        g.restore_now_async();
+        assert!(g.saved.is_none());
+        // Dropping is also a no-op (and doesn't panic).
+        drop(g);
+    }
+
+    #[tokio::test]
+    async fn restore_now_async_takes_saved_profile() {
+        // Confirm the API contract: after `restore_now_async`, the
+        // guard no longer owns the saved profile, so a subsequent
+        // Drop will not double-restore.  We cannot assert that the
+        // spawned blocking task succeeds (no PulseAudio in unit
+        // tests), but we CAN assert the synchronous side-effect on
+        // the guard.
+        let saved = SavedProfile {
+            card_name: "bluez_card.UNIT_TEST".to_string(),
+            original_profile: "a2dp_sink".to_string(),
+            switched_at: chrono::Utc::now(),
+        };
+        let mut g = HeadsetGuard::new(Some(saved));
+        assert!(g.saved.is_some());
+        g.restore_now_async();
+        assert!(
+            g.saved.is_none(),
+            "restore_now_async must take() the saved profile"
+        );
+        // The spawned blocking task will fail to connect to PA (no
+        // server in unit tests) and log a warning — but it does so
+        // OFF this thread, so the assertion above runs immediately.
+        // We yield once to let the spawn happen and not leave the
+        // task lingering past the test end.
+        tokio::task::yield_now().await;
     }
 }

@@ -355,9 +355,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     //    original profile, not to whatever HFP profile was active when
     //    the previous run died.
     // 2. Switch any connected BT headset to its best HFP profile so
-    //    the headset microphone is enabled.  The returned guard
-    //    restores the original profile on Drop — works on normal
-    //    return, ?-propagation, panic, and SIGINT-driven exits.
+    //    the headset microphone is enabled.  The returned guard is
+    //    moved into dictate_streaming / dictate_realtime, where it is
+    //    triggered explicitly the moment `capture.stop()` returns —
+    //    so the user gets A2DP audio back IMMEDIATELY on toggle-off,
+    //    not only after the transcription + paste pipeline finishes.
+    //    The guard's Drop is also the safety net for early ?-returns
+    //    and panics on the path between activation and dispatch.
     //
     // Failures are logged but never fatal; the dictation proceeds on
     // whatever input device is currently active.
@@ -367,7 +371,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             .as_ref()
             .map(|a| a.bt_auto_switch_enabled())
             .unwrap_or(true);
-    let _bt_guard = if from_file || !bt_auto_switch_enabled {
+    let bt_guard = if from_file || !bt_auto_switch_enabled {
         if !bt_auto_switch_enabled {
             log::debug!("bt_profile: auto-switching disabled by config/flag");
         }
@@ -619,6 +623,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             Some(seg_tx),
             visualizer.as_ref(),
             &shutdown,
+            bt_guard,
         )
         .await
         {
@@ -671,6 +676,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             provider,
             opts.model.as_deref(),
             opts.diarize,
+            bt_guard,
         )
         .await;
         t_stop = t_stop_val;
