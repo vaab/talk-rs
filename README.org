@@ -1,5 +1,17 @@
 * talk-rs
 
+#+begin_quote
+*⚠️  Disclaimer: this project is entirely "vibe coded".*
+
+Every line of code, test, and documentation in this repository was
+produced by an AI coding agent under human direction.  No part of it
+has been written, line-by-line audited, or formally reviewed by a
+human engineer.  It works on the author's machine and ships with
+tests, but treat it accordingly: read the source before trusting it
+with anything important, and expect rough edges, dead code paths, and
+the occasional architectural oddity that a human would have caught.
+#+end_quote
+
 Voice dictation for Linux. Record, transcribe, and paste text into any
 application -- all from a single keyboard shortcut.
 
