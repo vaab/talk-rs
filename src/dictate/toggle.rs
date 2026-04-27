@@ -25,6 +25,7 @@ pub async fn toggle_dispatch(
     viz: Option<VizMode>,
     mono: bool,
     upload_format: crate::transcription::UploadFormat,
+    no_bt_auto_switch: bool,
     save: Option<&std::path::Path>,
     verbose: u8,
 ) -> Result<(), TalkError> {
@@ -53,6 +54,7 @@ pub async fn toggle_dispatch(
                 viz,
                 mono,
                 upload_format,
+                no_bt_auto_switch,
                 save,
                 verbose,
             )
@@ -83,6 +85,7 @@ async fn toggle_spawn(
     viz: Option<VizMode>,
     mono: bool,
     upload_format: crate::transcription::UploadFormat,
+    no_bt_auto_switch: bool,
     save: Option<&std::path::Path>,
     verbose: u8,
 ) -> Result<(), TalkError> {
@@ -154,6 +157,10 @@ async fn toggle_spawn(
     if upload_format != crate::transcription::UploadFormat::Wav {
         cmd.arg("--upload-format")
             .arg(format!("{:?}", upload_format).to_lowercase());
+    }
+
+    if no_bt_auto_switch {
+        cmd.arg("--no-bt-auto-switch");
     }
 
     if let Some(path) = save {

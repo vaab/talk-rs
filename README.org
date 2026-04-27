@@ -47,6 +47,19 @@ happening.
   monochrome mode with ~--mono~.
 - *Audio feedback* -- start/stop tones and periodic boop during
   recording; fully configurable or disabled.
+- *Bluetooth headset auto-switch* -- when a Bluetooth headset is
+  connected in A2DP mode (high-quality stereo, no microphone),
+  ~talk-rs~ automatically switches it to its Hands-Free Profile (HFP)
+  for the duration of the recording so the headset microphone is
+  available, then restores the original profile on stop.  Survives
+  unclean termination: a state file at
+  ~$XDG_RUNTIME_DIR/talk-rs/card-profile.json~ is written before the
+  switch, and the next invocation restores the original profile from
+  that file before starting a new recording.  Works with any HFP-capable
+  headset (uses PulseAudio's standard ~device.form_factor~ property,
+  not vendor-specific identifiers).  Disable per-invocation with
+  ~--no-bt-auto-switch~ or globally via the
+  ~audio.bt_auto_switch~ config key.
 - *Context bias* -- supply domain-specific vocabulary to improve
   transcription accuracy.
 - *Daemon toggle mode* -- first invocation spawns a short-lived daemon
@@ -78,12 +91,21 @@ happening.
 #+begin_src sh
 # Debian / Ubuntu
 sudo apt install build-essential pkg-config libasound2-dev libopus-dev \
-  libgtk-4-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev
+  libgtk-4-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+  libpulse-dev
 
 # Fedora
 sudo dnf install alsa-lib-devel opus-devel pkg-config \
-  gtk4-devel pipewire-devel spa-devel clang-devel
+  gtk4-devel pipewire-devel spa-devel clang-devel \
+  pulseaudio-libs-devel
 #+end_src
+
+~libpulse-dev~ / ~pulseaudio-libs-devel~ provides the PulseAudio client
+library used to switch a Bluetooth headset's PulseAudio card profile
+between A2DP (high-quality stereo) and HFP (microphone-enabled) when
+recording.  On PipeWire systems, ~pipewire-pulse~ supplies the
+~libpulse.so~ shared object at runtime, so no PulseAudio daemon is
+needed -- only the development headers for compilation.
 
 A working Rust toolchain is required (1.70+). Install via
 [[https://rustup.rs][rustup]] if needed.
@@ -161,6 +183,7 @@ providers:
 | ~indicators.viz~                   | /none/                    | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ (also ~--viz~; env ~TALK_RS_INDICATORS_VIZ~) |
 | ~indicators.mono~                  | ~false~                   | Monochrome visualizer (also ~--mono~) |
 | ~paste.chunk_chars~                | ~150~                     | Max chars per paste chunk (~0~ disables chunking; also ~--no-chunk-paste~) |
+| ~audio.bt_auto_switch~             | ~true~                    | Auto-switch a connected Bluetooth headset to HFP for the duration of a recording, then restore (also ~--no-bt-auto-switch~; env ~TALK_RS_AUDIO_BT_AUTO_SWITCH~) |
 
 *** Environment overrides
 
@@ -224,6 +247,7 @@ Options:
 | ~--upload-format <FORMAT>~  | Audio format for batch uploads: ~wav~ (default) or ~ogg~ |
 | ~--viz <MODE>~              | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ |
 | ~--mono~                    | Monochrome visualizer (theme-aware)             |
+| ~--no-bt-auto-switch~       | Disable Bluetooth headset HFP auto-switch (overrides ~audio.bt_auto_switch~) |
 
 *** Record
 
@@ -236,10 +260,11 @@ talk-rs record meeting-notes.ogg     # custom filename
 
 Options:
 
-| Flag        | Effect                                           |
-|-------------+--------------------------------------------------|
-| ~--monitor~ | Mix system audio (monitor) with microphone input |
-| ~--ui~      | Open GTK4 recordings browser (play, delete, open folder) |
+| Flag                  | Effect                                           |
+|-----------------------+--------------------------------------------------|
+| ~--monitor~           | Mix system audio (monitor) with microphone input |
+| ~--ui~                | Open GTK4 recordings browser (play, delete, open folder) |
+| ~--no-bt-auto-switch~ | Disable Bluetooth headset HFP auto-switch (overrides ~audio.bt_auto_switch~) |
 
 *** Transcribe
 

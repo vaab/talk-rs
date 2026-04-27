@@ -121,6 +121,7 @@ async fn test_transcribe_audio_cache_only_on_missing_entry() {
         indicators: None,
         transcription: None,
         paste: None,
+        audio: None,
     };
 
     let sink: std::sync::Arc<dyn talk_rs::telemetry::TelemetrySink> =
@@ -195,6 +196,7 @@ async fn test_mistral_transcriber_real_api() {
         indicators: None,
         transcription: None,
         paste: None,
+        audio: None,
     };
 
     // Transcribe the file
