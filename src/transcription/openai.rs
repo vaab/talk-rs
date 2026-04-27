@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::transport::http::{build_client, parse_u64_field, proportional_timeout, ProgressBody};
+use super::transport::http::{
+    build_client, format_reqwest_error, parse_u64_field, proportional_timeout, ProgressBody,
+};
 use super::BatchTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
 
@@ -248,7 +250,10 @@ impl OpenAIBatchTranscriber {
                     success: false,
                     t: Instant::now(),
                 });
-                TalkError::Transcription(format!("Failed to send request to OpenAI API: {:#}", err))
+                TalkError::Transcription(format!(
+                    "Failed to send request to OpenAI API: {}",
+                    format_reqwest_error(&err)
+                ))
             })?;
 
         let request_latency_ms = started.elapsed().as_millis() as u64;

@@ -16,7 +16,9 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::transport::http::{build_client, parse_u64_field, proportional_timeout, ProgressBody};
+use super::transport::http::{
+    build_client, format_reqwest_error, parse_u64_field, proportional_timeout, ProgressBody,
+};
 use super::BatchTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
 
@@ -273,8 +275,8 @@ impl MistralBatchTranscriber {
                     t: Instant::now(),
                 });
                 TalkError::Transcription(format!(
-                    "Failed to send request to Mistral API: {:#}",
-                    err
+                    "Failed to send request to Mistral API: {}",
+                    format_reqwest_error(&err)
                 ))
             })?;
 
