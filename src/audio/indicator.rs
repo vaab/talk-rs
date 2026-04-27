@@ -430,14 +430,39 @@ impl SoundPlayer {
     /// The boop plays every `interval` and is immediately preempted if a
     /// new sound (e.g., stop) is played on this player.
     ///
-    /// When `suppress` is provided, the boop is silently skipped
-    /// whenever the flag is `true` (e.g. during a no-sound alert).
+    /// Two independent flags gate playback. They have orthogonal
+    /// responsibilities and BOTH must allow playback for a boop to fire:
+    ///
+    /// * `play_when` — positive gate. When provided, a boop is emitted
+    ///   ONLY while the flag is `true`. Used to scope the heartbeat to
+    ///   the "LISTENING" (auto-pause) state, so boops are silent while
+    ///   the user is actively speaking and only chirp during silence.
+    ///   `None` ⇒ boops play unconditionally w.r.t. this gate.
+    ///
+    /// * `suppress` — negative gate. When provided, a boop is skipped
+    ///   whenever the flag is `true`. Used by the dead-signal alert
+    ///   path to prevent the boop and the alert tone from colliding.
+    ///   `None` ⇒ boops are never suppressed by this gate.
+    ///
+    /// **Phase reset on `play_when` rising edge.** The `interval` clock
+    /// is anchored to the moment `play_when` becomes `true`, not to
+    /// loop creation.  Concretely: on the rising edge of `play_when`
+    /// the next boop fires `interval` later — never sooner, regardless
+    /// of how much time elapsed during the preceding `play_when=false`
+    /// stretch.  This makes the heartbeat predictable from the user's
+    /// perspective: the first boop after entering the LISTENING badge
+    /// always lands a full `interval` after entry, so a brief silence
+    /// shorter than `interval` produces no boops at all.
+    ///
+    /// `suppress` does NOT reset the phase — it is a transient mute
+    /// that skips boops in-place while the alert is active.
     ///
     /// The loop runs in a tokio task that only holds the shared playback
     /// state (not the cpal stream), keeping it `Send`.
     pub fn start_boop_loop(
         &self,
         interval: std::time::Duration,
+        play_when: Option<Arc<std::sync::atomic::AtomicBool>>,
         suppress: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> CancellationToken {
         let token = CancellationToken::new();
@@ -446,23 +471,15 @@ impl SoundPlayer {
         let boop_samples = self.sounds.boop.clone();
 
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(interval) => {
-                        let suppressed = suppress
-                            .as_ref()
-                            .is_some_and(|f| f.load(Ordering::Relaxed));
-                        if !suppressed {
-                            if let Ok(mut guard) = state.lock() {
-                                guard.replace(boop_samples.clone());
-                            }
-                        }
-                    }
-                    _ = token_clone.cancelled() => {
-                        break;
-                    }
-                }
-            }
+            run_boop_loop(
+                interval,
+                play_when,
+                suppress,
+                state,
+                boop_samples,
+                token_clone,
+            )
+            .await;
         });
 
         token
@@ -476,6 +493,96 @@ impl SoundPlayer {
             state: Arc::clone(&self.state),
             samples: self.sounds.alert.clone(),
         }
+    }
+}
+
+// ── Boop loop body (free function for testability) ──────────────────
+
+/// Polling period used by [`run_boop_loop`] to detect the rising edge
+/// of `play_when` while the gate is closed.  100 ms is well under any
+/// realistic `interval` (typically 5 s) and well above the auto-pause
+/// debounce window, so the user perceives the rising edge as
+/// instantaneous.
+const BOOP_GATE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// State-machine driving the periodic boop heartbeat.
+///
+/// Extracted from [`SoundPlayer::start_boop_loop`] so it can be unit
+/// tested without a real audio device.  See that method's doc comment
+/// for the full contract — in particular the phase-reset semantics on
+/// the rising edge of `play_when`.
+///
+/// `state` is the shared playback buffer (preempted by writes from
+/// other sounds); `boop_samples` is the pre-rendered boop waveform.
+/// `cancel` terminates the loop cleanly at any await point.
+async fn run_boop_loop(
+    interval: std::time::Duration,
+    play_when: Option<Arc<std::sync::atomic::AtomicBool>>,
+    suppress: Option<Arc<std::sync::atomic::AtomicBool>>,
+    state: Arc<Mutex<PlaybackState>>,
+    boop_samples: Vec<f32>,
+    cancel: CancellationToken,
+) {
+    // Outer state machine.  Each iteration represents one potential
+    // "listening period": we wait for the gate to open, then sleep
+    // `interval`, then (re-)check the gate and emit if it's still
+    // open.  If the gate closes during the interval sleep we abandon
+    // the partial wait and go back to polling — the NEXT open will
+    // start a fresh `interval` from scratch.
+    'outer: loop {
+        // ── 1. Wait for the play-when gate to open. ──────────────────
+        //
+        // When `play_when` is `None` the gate is implicitly always
+        // open and this loop falls through immediately.
+        loop {
+            let play_when_ok = play_when.as_ref().is_none_or(|f| f.load(Ordering::Relaxed));
+            if play_when_ok {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(BOOP_GATE_POLL) => {}
+                _ = cancel.cancelled() => break 'outer,
+            }
+        }
+
+        // ── 2. Wait one full `interval` from the rising edge. ────────
+        //
+        // If the gate closes during this wait we abort the partial
+        // sleep and jump back to step 1; the next rising edge will
+        // start a brand-new `interval` clock.
+        let deadline = tokio::time::Instant::now() + interval;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+            let step = remaining.min(BOOP_GATE_POLL);
+            tokio::select! {
+                _ = tokio::time::sleep(step) => {}
+                _ = cancel.cancelled() => break 'outer,
+            }
+            // Mid-interval gate check: if the user resumed speaking,
+            // restart the whole state machine so the next boop is
+            // delayed a full `interval` after the NEXT entry into
+            // LISTENING.
+            let still_open = play_when.as_ref().is_none_or(|f| f.load(Ordering::Relaxed));
+            if !still_open {
+                continue 'outer;
+            }
+        }
+
+        // ── 3. Emit if both gates still allow it. ────────────────────
+        let play_when_ok = play_when.as_ref().is_none_or(|f| f.load(Ordering::Relaxed));
+        let suppressed = suppress.as_ref().is_some_and(|f| f.load(Ordering::Relaxed));
+        if play_when_ok && !suppressed {
+            if let Ok(mut guard) = state.lock() {
+                guard.replace(boop_samples.clone());
+            }
+        }
+        // Loop body restarts: another full `interval` will elapse
+        // before the next boop, anchored to the boop we just emitted
+        // (steady cadence within a listening period).
     }
 }
 
@@ -924,6 +1031,216 @@ mod tests {
         let has_replacement = output.iter().any(|&s| (s - (-0.5)).abs() < f32::EPSILON);
         assert!(has_original, "should have played some of the original");
         assert!(has_replacement, "should have played the replacement");
+    }
+
+    // ── run_boop_loop gating tests ───────────────────────────────────
+    //
+    // These exercise the production [`run_boop_loop`] state machine
+    // directly (no audio device required).  The harness counts boops
+    // by polling `state.position` for resets — every emit replaces
+    // the buffer with `boop_samples` and resets `position` to 0.
+
+    /// Test harness: spawn `run_boop_loop` and a counter task that
+    /// observes buffer replacements.  Returns the number of boops
+    /// emitted across `run_for`.  Cancels the loop cleanly on exit.
+    ///
+    /// The harness samples the playback state every 5 ms — much
+    /// finer-grained than any test interval — so it cannot miss a
+    /// boop even under heavy timer jitter.
+    async fn drive_boop_loop(
+        interval: std::time::Duration,
+        play_when: Option<Arc<AtomicBool>>,
+        suppress: Option<Arc<AtomicBool>>,
+        run_for: std::time::Duration,
+        gate_script: Option<Box<dyn FnOnce(Arc<AtomicBool>) + Send + 'static>>,
+    ) -> u32 {
+        let state = Arc::new(Mutex::new(PlaybackState::new()));
+        let boop_samples = vec![0.42_f32; 8];
+        let cancel = CancellationToken::new();
+
+        // Optionally script a mid-run gate flip.
+        if let (Some(script), Some(gate)) = (gate_script, play_when.as_ref()) {
+            let gate = Arc::clone(gate);
+            tokio::spawn(async move { script(gate) });
+        }
+
+        let loop_state = Arc::clone(&state);
+        let loop_samples = boop_samples.clone();
+        let loop_cancel = cancel.clone();
+        let loop_play_when = play_when.clone();
+        let loop_suppress = suppress.clone();
+        let handle = tokio::spawn(async move {
+            run_boop_loop(
+                interval,
+                loop_play_when,
+                loop_suppress,
+                loop_state,
+                loop_samples,
+                loop_cancel,
+            )
+            .await;
+        });
+
+        // Poll the playback state at 5 ms granularity.  An emit
+        // replaces the buffer with `boop_samples` and resets
+        // `position = 0`; a subsequent partial drain (none in this
+        // test, since no callback is running) would advance position.
+        // Without an output callback, `position` stays at 0 after the
+        // first emit — so we must compare buffer contents to detect
+        // re-emits.  We do that by tagging each emit with a different
+        // value: clear the buffer between samples.
+        let mut emitted = 0u32;
+        let deadline = tokio::time::Instant::now() + run_for;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let mut guard = match state.lock() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            // If the buffer matches our boop sample → an emit just
+            // happened.  Clear it so the next emit is detectable.
+            if guard.samples == boop_samples {
+                emitted += 1;
+                guard.samples.clear();
+                guard.position = 0;
+            }
+        }
+
+        cancel.cancel();
+        let _ = handle.await;
+        emitted
+    }
+
+    /// `play_when = None` ⇒ heartbeat fires periodically.  Confirms
+    /// backward-compat behaviour for callers that don't gate.
+    #[tokio::test]
+    async fn test_boop_loop_no_play_when_fires_periodically() {
+        // 50 ms interval, run for 280 ms → expect 5 emits (at 50, 100,
+        // 150, 200, 250).  Allow ±1 for scheduling jitter.
+        let emitted = drive_boop_loop(
+            std::time::Duration::from_millis(50),
+            None,
+            None,
+            std::time::Duration::from_millis(280),
+            None,
+        )
+        .await;
+        assert!(
+            (4..=6).contains(&emitted),
+            "expected ~5 boops at 50 ms cadence over 280 ms, got {}",
+            emitted,
+        );
+    }
+
+    /// `play_when = Some(false)` for the entire run ⇒ zero boops.
+    #[tokio::test]
+    async fn test_boop_loop_play_when_false_silences_all() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let emitted = drive_boop_loop(
+            std::time::Duration::from_millis(50),
+            Some(gate),
+            None,
+            std::time::Duration::from_millis(300),
+            None,
+        )
+        .await;
+        assert_eq!(emitted, 0, "expected zero boops while play_when is false");
+    }
+
+    /// `play_when = Some(true)` AND `suppress = Some(true)` ⇒
+    /// suppress wins: the heartbeat ticks but every boop is muted.
+    #[tokio::test]
+    async fn test_boop_loop_suppress_overrides_play_when() {
+        let play = Arc::new(AtomicBool::new(true));
+        let suppress = Arc::new(AtomicBool::new(true));
+        let emitted = drive_boop_loop(
+            std::time::Duration::from_millis(50),
+            Some(play),
+            Some(suppress),
+            std::time::Duration::from_millis(300),
+            None,
+        )
+        .await;
+        assert_eq!(
+            emitted, 0,
+            "suppress=true must silence boops even when play_when=true",
+        );
+    }
+
+    /// **The key user-reported invariant.**  When `play_when` flips
+    /// from `false` → `true`, the FIRST boop fires `interval` after
+    /// the flip — never sooner, regardless of how much time elapsed
+    /// while the gate was closed.
+    ///
+    /// Setup: gate closed for 200 ms, then opened.  Interval = 100 ms.
+    /// Run total = 350 ms.  Expected timeline:
+    ///   t=0   gate closed
+    ///   t=200 gate opens   ← rising edge resets clock
+    ///   t=300 first boop   (200 + 100)
+    ///   t=350 stop         (no second boop yet)
+    /// Expect exactly 1 boop.  A regression to per-tick scheduling
+    /// would produce a boop at t=100 (still gated, 0 emits) then
+    /// t=200 (just opened, would emit immediately = WRONG) — the
+    /// regression manifests as ≥2 boops or a boop arriving before
+    /// t≈300 ms.
+    #[tokio::test]
+    async fn test_boop_loop_phase_resets_on_play_when_rising_edge() {
+        let gate = Arc::new(AtomicBool::new(false));
+
+        let emitted = drive_boop_loop(
+            std::time::Duration::from_millis(100),
+            Some(gate),
+            None,
+            std::time::Duration::from_millis(350),
+            Some(Box::new(|gate: Arc<AtomicBool>| {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    gate.store(true, Ordering::Relaxed);
+                });
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            emitted, 1,
+            "expected exactly 1 boop ~100ms after the gate flipped open at t=200ms; \
+             a count != 1 means the interval clock did NOT restart on the rising edge",
+        );
+    }
+
+    /// Brief silences shorter than `interval` produce zero boops,
+    /// because each rising edge restarts the clock from scratch and
+    /// each falling edge cancels the in-flight wait.
+    #[tokio::test]
+    async fn test_boop_loop_short_listening_burst_emits_no_boop() {
+        let gate = Arc::new(AtomicBool::new(false));
+
+        let emitted = drive_boop_loop(
+            std::time::Duration::from_millis(200),
+            Some(gate),
+            None,
+            std::time::Duration::from_millis(400),
+            Some(Box::new(|gate: Arc<AtomicBool>| {
+                tokio::spawn(async move {
+                    // Open, hold for 100 ms (< interval), close again.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    gate.store(true, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    gate.store(false, Ordering::Relaxed);
+                });
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            emitted, 0,
+            "a 100ms listening burst with a 200ms interval must emit zero boops; \
+             got {} (clock was not reset on falling edge)",
+            emitted,
+        );
     }
 
     /// The key correctness property: play_and_wait never blocks longer
