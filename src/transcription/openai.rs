@@ -6,8 +6,9 @@
 use crate::config::OpenAIConfig;
 use crate::error::TalkError;
 use crate::transcription::{
-    parse_transcript_segments, OpenAIProviderMetadata, ProviderSpecificMetadata, TokenUsage,
-    TranscriptionBody, TranscriptionMetadata, TranscriptionResult,
+    parse_transcript_segments, OpenAIProviderMetadata, ProviderSpecificMetadata,
+    RequestTimeoutPolicy, TokenUsage, TranscriptionBody, TranscriptionMetadata,
+    TranscriptionResult,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -18,7 +19,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::transport::http::{
-    build_client, format_reqwest_error, parse_u64_field, proportional_timeout, ProgressBody,
+    build_client, format_reqwest_error_with_timers, parse_u64_field, proportional_timeout,
+    ProgressBody, TimerSpec, CONNECT_TIMEOUT,
 };
 use super::BatchTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
@@ -125,17 +127,25 @@ pub(crate) async fn enrich_model_error(
 /// at `api_base`.
 ///
 /// Also used by [`super::openai_realtime::OpenAIRealtimeTranscriber`].
+///
+/// Thin wrapper around [`super::transport::http::validate_model`] that
+/// fixes provider-specific bits (provider enum, display name,
+/// transcription-model filter) so callers only carry the variable
+/// inputs (api key, model, api_base, telemetry sink).
 pub(crate) async fn validate_openai_model(
     api_key: &str,
     model: &str,
     api_base: &str,
+    sink: &Arc<dyn TelemetrySink>,
 ) -> Result<(), TalkError> {
     super::transport::http::validate_model(
+        crate::config::Provider::OpenAI,
         "OpenAI",
         api_key,
         model,
         api_base,
         is_transcription_model,
+        sink,
     )
     .await
 }
@@ -151,27 +161,49 @@ pub struct OpenAIBatchTranscriber {
     config: OpenAIConfig,
     /// API endpoint URL (can be overridden for testing).
     endpoint: String,
+    /// Per-request wall-clock-timeout policy.  Set at construction
+    /// via [`Self::with_policy`]; [`Self::new`] forwards
+    /// [`RequestTimeoutPolicy::Proportional`].  Read by
+    /// [`Self::send_once`] to decide whether to attach
+    /// `.timeout(proportional_timeout(file_len))` to the reqwest
+    /// builder.
+    policy: RequestTimeoutPolicy,
     /// Telemetry event sink for HTTP lifecycle reporting.
     sink: Arc<dyn TelemetrySink>,
 }
 
 impl OpenAIBatchTranscriber {
-    /// Create a new OpenAI transcriber with the given configuration.
+    /// Create a new OpenAI transcriber with the given configuration
+    /// and the default
+    /// [`RequestTimeoutPolicy::Proportional`] wall-clock policy.
     ///
     /// The transcription endpoint is derived from `config.url` (if set)
     /// by appending `/v1/audio/transcriptions`.  When `config.url` is
     /// `None`, the default OpenAI API base URL is used.
     ///
+    /// Use [`Self::with_policy`] when the caller needs a different
+    /// timeout policy (e.g. interactive picker rows).
+    ///
     /// # Arguments
     ///
     /// * `config` - OpenAI API configuration containing the API key
     pub fn new(config: OpenAIConfig) -> Result<Self, TalkError> {
+        Self::with_policy(config, RequestTimeoutPolicy::Proportional)
+    }
+
+    /// Create a new OpenAI transcriber with an explicit timeout
+    /// policy.  See [`RequestTimeoutPolicy`].
+    pub fn with_policy(
+        config: OpenAIConfig,
+        policy: RequestTimeoutPolicy,
+    ) -> Result<Self, TalkError> {
         let base = config.url.as_deref().unwrap_or(API_BASE);
         let endpoint = format!("{}/v1/audio/transcriptions", base.trim_end_matches('/'));
         Ok(Self {
             client: build_client()?,
             config,
             endpoint,
+            policy,
             sink: Arc::new(NoOpSink),
         })
     }
@@ -188,6 +220,7 @@ impl OpenAIBatchTranscriber {
             client: build_client()?,
             config,
             endpoint,
+            policy: RequestTimeoutPolicy::Proportional,
             sink: Arc::new(NoOpSink),
         })
     }
@@ -224,12 +257,37 @@ impl OpenAIBatchTranscriber {
                 .file_name(file_name.to_string()),
             );
 
-        let request_timeout = proportional_timeout(file_len);
-        log::warn!(
-            "openai batch file: request timeout = {}s (audio = {} KB)",
-            request_timeout.as_secs(),
+        // Resolve timeout-policy choices once.  See the matching
+        // branch in `mistral::send_once` for the rationale.
+        let wall_clock = match self.policy {
+            RequestTimeoutPolicy::Proportional => Some(proportional_timeout(file_len)),
+            RequestTimeoutPolicy::UserAttended => None,
+        };
+
+        log::debug!(
+            "openai batch send_once: policy={:?}, connect_timeout={}s, wall_clock={}, audio={} KB",
+            self.policy,
+            CONNECT_TIMEOUT.as_secs(),
+            wall_clock
+                .map(|d| format!("{}s", d.as_secs()))
+                .unwrap_or_else(|| "none".to_string()),
             file_len / 1024
         );
+
+        let connect_timer = TimerSpec {
+            name: "connect_timeout",
+            budget: CONNECT_TIMEOUT,
+        };
+        let timers: Vec<TimerSpec> = match wall_clock {
+            Some(budget) => vec![
+                connect_timer,
+                TimerSpec {
+                    name: "request_wall_clock",
+                    budget,
+                },
+            ],
+            None => vec![connect_timer],
+        };
 
         self.sink.emit(TranscriptionEvent::RequestStarted {
             endpoint: self.endpoint.clone(),
@@ -237,24 +295,24 @@ impl OpenAIBatchTranscriber {
         });
 
         let started = Instant::now();
-        let response = self
+        let mut request = self
             .client
             .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .multipart(form)
-            .timeout(request_timeout)
-            .send()
-            .await
-            .map_err(|err| {
-                self.sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
-                TalkError::Transcription(format!(
-                    "Failed to send request to OpenAI API: {}",
-                    format_reqwest_error(&err)
-                ))
-            })?;
+            .multipart(form);
+        if let Some(budget) = wall_clock {
+            request = request.timeout(budget);
+        }
+        let response = request.send().await.map_err(|err| {
+            self.sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
+            TalkError::Transcription(format!(
+                "Failed to send request to OpenAI API: {}",
+                format_reqwest_error_with_timers(&err, &timers)
+            ))
+        })?;
 
         let request_latency_ms = started.elapsed().as_millis() as u64;
         self.sink.emit(TranscriptionEvent::ResponseHeaders {
@@ -400,7 +458,13 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
             .find("/v1/")
             .map(|pos| &self.endpoint[..pos])
             .unwrap_or(&self.endpoint);
-        validate_openai_model(&self.config.api_key, &self.config.model, api_base).await
+        validate_openai_model(
+            &self.config.api_key,
+            &self.config.model,
+            api_base,
+            &self.sink,
+        )
+        .await
     }
 
     async fn fetch_transcription(

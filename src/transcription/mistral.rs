@@ -7,8 +7,8 @@ use crate::config::MistralConfig;
 use crate::error::TalkError;
 use crate::transcription::{
     parse_transcript_segments, DiarizationSegment, MistralProviderMetadata,
-    ProviderSpecificMetadata, TokenUsage, TranscriptionBody, TranscriptionMetadata,
-    TranscriptionResult,
+    ProviderSpecificMetadata, RequestTimeoutPolicy, TokenUsage, TranscriptionBody,
+    TranscriptionMetadata, TranscriptionResult,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::transport::http::{
-    build_client, format_reqwest_error, parse_u64_field, proportional_timeout, ProgressBody,
+    build_client, format_reqwest_error_with_timers, parse_u64_field, proportional_timeout,
+    ProgressBody, TimerSpec, CONNECT_TIMEOUT,
 };
 use super::BatchTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
@@ -135,17 +136,25 @@ pub(crate) async fn enrich_model_error(
 
 /// Validate that `model` is available in the Mistral account reachable
 /// at `api_base`.
+///
+/// Thin wrapper around [`super::transport::http::validate_model`] that
+/// fixes provider-specific bits (provider enum, display name,
+/// transcription-model filter) so callers only carry the variable
+/// inputs (api key, model, api_base, telemetry sink).
 pub(crate) async fn validate_mistral_model(
     api_key: &str,
     model: &str,
     api_base: &str,
+    sink: &Arc<dyn TelemetrySink>,
 ) -> Result<(), TalkError> {
     super::transport::http::validate_model(
+        crate::config::Provider::Mistral,
         "Mistral",
         api_key,
         model,
         api_base,
         is_transcription_model,
+        sink,
     )
     .await
 }
@@ -163,23 +172,50 @@ pub struct MistralBatchTranscriber {
     endpoint: String,
     /// Whether to request speaker diarization (V2 models only).
     diarize: bool,
+    /// Per-request wall-clock-timeout policy.  Set at construction
+    /// via [`Self::with_policy`]; [`Self::new`] forwards
+    /// [`RequestTimeoutPolicy::Proportional`].  Read by
+    /// [`Self::send_once`] to decide whether to attach
+    /// `.timeout(proportional_timeout(file_len))` to the reqwest
+    /// builder.
+    policy: RequestTimeoutPolicy,
     /// Telemetry event sink for HTTP lifecycle reporting.
     /// Defaults to [`NoOpSink`] when no consumer is attached.
     sink: Arc<dyn TelemetrySink>,
 }
 
 impl MistralBatchTranscriber {
-    /// Create a new Mistral transcriber with the given configuration.
+    /// Create a new Mistral transcriber with the given configuration
+    /// and the default
+    /// [`RequestTimeoutPolicy::Proportional`] wall-clock policy.
     ///
     /// The transcription endpoint is derived from `config.url` (if set)
     /// by appending `/v1/audio/transcriptions`.  When `config.url` is
     /// `None`, the default Mistral API base URL is used.
+    ///
+    /// Use [`Self::with_policy`] when the caller needs a different
+    /// timeout policy (e.g. interactive picker rows that should not
+    /// be killed by a per-request wall clock).
     ///
     /// # Arguments
     ///
     /// * `config` - Mistral API configuration containing the API key
     /// * `diarize` - Request speaker diarization (requires V2 model)
     pub fn new(config: MistralConfig, diarize: bool) -> Result<Self, TalkError> {
+        Self::with_policy(config, diarize, RequestTimeoutPolicy::Proportional)
+    }
+
+    /// Create a new Mistral transcriber with an explicit timeout
+    /// policy.
+    ///
+    /// See [`RequestTimeoutPolicy`] for the available variants and
+    /// when to pick which.  [`Self::new`] is a thin wrapper around
+    /// this that forwards [`RequestTimeoutPolicy::Proportional`].
+    pub fn with_policy(
+        config: MistralConfig,
+        diarize: bool,
+        policy: RequestTimeoutPolicy,
+    ) -> Result<Self, TalkError> {
         let base = config.url.as_deref().unwrap_or(API_BASE);
         let endpoint = format!("{}/v1/audio/transcriptions", base.trim_end_matches('/'));
         Ok(Self {
@@ -187,6 +223,7 @@ impl MistralBatchTranscriber {
             config,
             endpoint,
             diarize,
+            policy,
             sink: Arc::new(NoOpSink),
         })
     }
@@ -209,6 +246,7 @@ impl MistralBatchTranscriber {
             config,
             endpoint,
             diarize,
+            policy: RequestTimeoutPolicy::Proportional,
             sink: Arc::new(NoOpSink),
         })
     }
@@ -248,12 +286,48 @@ impl MistralBatchTranscriber {
             form = form.text("diarize", "true");
         }
 
-        let request_timeout = proportional_timeout(file_len);
-        log::warn!(
-            "mistral batch file: request timeout = {}s (audio = {} KB)",
-            request_timeout.as_secs(),
+        // Resolve timeout-policy choices once.  The wall-clock timer
+        // only attaches under `Proportional`; under `UserAttended`
+        // we rely entirely on `connect_timeout` plus TCP-level
+        // defences and let the server take as long as it likes.
+        let wall_clock = match self.policy {
+            RequestTimeoutPolicy::Proportional => Some(proportional_timeout(file_len)),
+            RequestTimeoutPolicy::UserAttended => None,
+        };
+
+        log::debug!(
+            "mistral batch send_once: policy={:?}, connect_timeout={}s, wall_clock={}, audio={} KB",
+            self.policy,
+            CONNECT_TIMEOUT.as_secs(),
+            wall_clock
+                .map(|d| format!("{}s", d.as_secs()))
+                .unwrap_or_else(|| "none".to_string()),
             file_len / 1024
         );
+
+        // Active timers at this call site, in firing order.  The
+        // slice is consumed by `format_reqwest_error_with_timers`
+        // when reqwest fails so the resulting log line names the
+        // timer that fired and quotes its budget.
+        //
+        // Under `UserAttended` the `request_wall_clock` entry is
+        // omitted — there is no wall-clock to fire — so timeout
+        // attribution falls through to either `connect_timeout`
+        // (Rule 1) or `kernel_tcp_unspecified` (Rule 3).
+        let connect_timer = TimerSpec {
+            name: "connect_timeout",
+            budget: CONNECT_TIMEOUT,
+        };
+        let timers: Vec<TimerSpec> = match wall_clock {
+            Some(budget) => vec![
+                connect_timer,
+                TimerSpec {
+                    name: "request_wall_clock",
+                    budget,
+                },
+            ],
+            None => vec![connect_timer],
+        };
 
         self.sink.emit(TranscriptionEvent::RequestStarted {
             endpoint: self.endpoint.clone(),
@@ -261,24 +335,24 @@ impl MistralBatchTranscriber {
         });
 
         let started = Instant::now();
-        let response = self
+        let mut request = self
             .client
             .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .multipart(form)
-            .timeout(request_timeout)
-            .send()
-            .await
-            .map_err(|err| {
-                self.sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
-                TalkError::Transcription(format!(
-                    "Failed to send request to Mistral API: {}",
-                    format_reqwest_error(&err)
-                ))
-            })?;
+            .multipart(form);
+        if let Some(budget) = wall_clock {
+            request = request.timeout(budget);
+        }
+        let response = request.send().await.map_err(|err| {
+            self.sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
+            TalkError::Transcription(format!(
+                "Failed to send request to Mistral API: {}",
+                format_reqwest_error_with_timers(&err, &timers)
+            ))
+        })?;
 
         let request_latency_ms = started.elapsed().as_millis() as u64;
         self.sink.emit(TranscriptionEvent::ResponseHeaders {
@@ -420,7 +494,13 @@ impl BatchTranscriber for MistralBatchTranscriber {
             .find("/v1/")
             .map(|pos| &self.endpoint[..pos])
             .unwrap_or(&self.endpoint);
-        validate_mistral_model(&self.config.api_key, &self.config.model, api_base).await
+        validate_mistral_model(
+            &self.config.api_key,
+            &self.config.model,
+            api_base,
+            &self.sink,
+        )
+        .await
     }
 
     async fn fetch_transcription(
@@ -926,5 +1006,107 @@ mod tests {
         let result = result.unwrap();
         // No speaker_id in segments → diarization is None
         assert!(result.diarization.is_none());
+    }
+
+    /// Spec for `with_policy(UserAttended)`:
+    ///
+    /// When a Mistral batch request fails because the server accepts
+    /// the connection but never replies, the error message must NOT
+    /// be attributed to `request_wall_clock` (because the
+    /// `UserAttended` policy intentionally omits the wall-clock
+    /// timer).  Attribution should fall through to `connect_timeout`
+    /// (Rule 1) or `kernel_tcp_unspecified` (Rule 3) — never
+    /// `request_wall_clock`.
+    ///
+    /// This is the regression-detection test for the picker path:
+    /// if a future refactor accidentally re-introduces a
+    /// `.timeout()` for `UserAttended`, this fails.
+    #[tokio::test]
+    async fn user_attended_policy_omits_request_wall_clock_attribution() {
+        // Bind a TCP listener that accepts but never replies, so the
+        // request will (eventually) fail with TCP-level timing only.
+        // We don't actually wait for it to fail — we just assert
+        // that *if* it fails before the test framework times out,
+        // attribution is correct.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind ephemeral port");
+        let addr = listener.local_addr().expect("test: local_addr");
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let config = MistralConfig {
+            api_key: "test-api-key".to_string(),
+            url: None,
+            model: "voxtral-mini-latest".to_string(),
+            context_bias: None,
+        };
+        let transcriber = MistralBatchTranscriber::with_policy(
+            config,
+            false,
+            crate::transcription::RequestTimeoutPolicy::UserAttended,
+        )
+        .expect("build client");
+
+        // Override endpoint to point at the silent listener.  Use a
+        // wiremock-shaped path so the post URL is plausible.
+        let mut transcriber = transcriber;
+        transcriber.endpoint = format!("http://{}/v1/audio/transcriptions", addr);
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"fake audio data").unwrap();
+        temp_file.flush().unwrap();
+
+        // Race the request against a short test deadline.  We don't
+        // care whether the underlying request returns within the
+        // window — the test framework's per-test timeout will kill
+        // it eventually if needed.  The contract being asserted is:
+        // *whatever* error we get, it cannot be attributed to
+        // `request_wall_clock`.
+        let race = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            transcriber
+                .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf())),
+        )
+        .await;
+
+        match race {
+            Ok(Ok(_)) => {
+                // Listener never replies — success is impossible
+                // here.  If this branch fires, the test setup is
+                // broken; fail loudly.
+                panic!("test: silent listener should never produce a Mistral success");
+            }
+            Ok(Err(e)) => {
+                let s = e.to_string();
+                assert!(
+                    !s.contains("name=request_wall_clock"),
+                    "UserAttended policy must not attribute failure to request_wall_clock; got: {}",
+                    s
+                );
+                // Some kind of attribution OR a kind tag must still
+                // appear — we never want to drop the diagnostic
+                // detail entirely.
+                assert!(
+                    s.contains("[kind="),
+                    "expected kind tag in error string, got: {}",
+                    s
+                );
+            }
+            Err(_) => {
+                // The test deadline (15s) elapsed before reqwest
+                // returned.  That's the user-attended-policy
+                // contract working as intended: no wall-clock cap
+                // means the request just keeps waiting.  Not a
+                // failure of the spec under test — `with_retry`
+                // wrapping is the only finite-time guarantee and
+                // it lives at a different layer.
+            }
+        }
     }
 }

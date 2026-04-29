@@ -6,10 +6,125 @@
 
 use super::ui::{PickerCandidate, PickerMessage};
 use crate::config::{Config, Provider};
+use crate::telemetry::{TelemetrySink, TranscriptionEvent as PipelineEvent};
 use crate::transcription::{
     RealtimeTranscriber, TranscriptSegment, TranscriptionEvent, TranscriptionMetadata,
 };
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// Telemetry sink that translates HTTP-pipeline events into picker
+/// row status strings.
+///
+/// One instance per in-flight candidate.  The sink is plugged in via
+/// [`crate::transcription::BatchTranscriber::set_sink`] before the
+/// transcription request starts and forwards
+/// [`PickerMessage::CandidateStatus`] messages to the GTK channel as
+/// the request transitions between phases.
+///
+/// # Status mapping
+///
+/// | Telemetry event                        | Status string             |
+/// |----------------------------------------|---------------------------|
+/// | `PreflightStarted`                     | `pre-validating model…`   |
+/// | `PreflightCompleted`                   | (silent — next event      |
+/// |                                        |  replaces the status)     |
+/// | `RequestStarted`                       | `connecting…`             |
+/// | `ConnectionEstablished`                | `uploading…`              |
+/// | `UploadComplete`                       | `waiting for server…`     |
+/// | `ResponseHeaders { status: 2xx }`      | `transcribing…`           |
+/// | `RetryScheduled { attempt, max }`      | `retry attempt/max…`      |
+/// | `RequestCompleted { success: false }`  | (silent — final candidate |
+/// |                                        |  message takes over)      |
+///
+/// Other events (`UploadProgress`, `DownloadProgress`,
+/// `ResponseComplete`, `PasteStarted`, …) are dropped per the
+/// "phase transitions + retry attempts only" UX choice.
+///
+/// `PreflightStarted` only fires on a validate-cache miss (see
+/// [`super::super::transcription::transport::validate_cache`]); a
+/// cache hit skips the preflight entirely and the row's status
+/// jumps straight to `connecting…` from `RequestStarted`.
+///
+/// # Idempotency
+///
+/// The sink only emits when the status string actually changes —
+/// repeated identical phase transitions don't flood the GTK channel.
+/// Achieved via the `last` mutex storing the most-recently-emitted
+/// status text.
+pub(super) struct PickerStatusSink {
+    tx: std::sync::mpsc::Sender<PickerMessage>,
+    provider: Provider,
+    model: String,
+    last: Mutex<Option<String>>,
+}
+
+impl PickerStatusSink {
+    /// Build a new sink for the given candidate row.  `tx` is the
+    /// shared GTK channel; `provider`/`model` identify which row
+    /// the status updates belong to.
+    pub(super) fn new(
+        tx: std::sync::mpsc::Sender<PickerMessage>,
+        provider: Provider,
+        model: String,
+    ) -> Self {
+        Self {
+            tx,
+            provider,
+            model,
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Send a status update to the GTK channel, deduplicating
+    /// against the last emitted string.  Errors on a closed channel
+    /// are silently dropped — the picker may have already closed.
+    fn push(&self, status_text: String) {
+        // Lock guard: identical-string dedup.  If the string is
+        // unchanged, do nothing.  Errors locking the mutex (e.g.
+        // poisoning from a panicking peer) fall through to a
+        // best-effort send — losing a single status update is
+        // strictly better than panicking the producer.
+        if let Ok(mut last) = self.last.lock() {
+            if last.as_deref() == Some(status_text.as_str()) {
+                return;
+            }
+            *last = Some(status_text.clone());
+        }
+        let _ = self.tx.send(PickerMessage::CandidateStatus {
+            provider: self.provider,
+            model: self.model.clone(),
+            status_text,
+        });
+    }
+}
+
+impl TelemetrySink for PickerStatusSink {
+    fn emit(&self, event: PipelineEvent) {
+        match event {
+            PipelineEvent::PreflightStarted { .. } => {
+                self.push("pre-validating model…".to_string())
+            }
+            // PreflightCompleted is intentionally silent — the
+            // next event (RequestStarted on success, or a final
+            // error candidate on failure) replaces the status.
+            PipelineEvent::PreflightCompleted { .. } => {}
+            PipelineEvent::RequestStarted { .. } => self.push("connecting…".to_string()),
+            PipelineEvent::ConnectionEstablished { .. } => self.push("uploading…".to_string()),
+            PipelineEvent::UploadComplete { .. } => self.push("waiting for server…".to_string()),
+            PipelineEvent::ResponseHeaders { status, .. } if (200..300).contains(&status) => {
+                self.push("transcribing…".to_string())
+            }
+            PipelineEvent::RetryScheduled { attempt, max, .. } => {
+                self.push(format!("retry {}/{}…", attempt, max))
+            }
+            // All other events (progress, paste, terminal events,
+            // non-2xx response headers) are dropped — phase
+            // transitions + retry attempts only.
+            _ => {}
+        }
+    }
+}
 
 /// PCM chunk size for realtime WAV feeding (480 samples = 30 ms at
 /// 16 kHz).
@@ -148,13 +263,23 @@ pub(super) async fn run_realtime_transcription(
     }
 }
 
-/// Spawn a single batch transcription task.
+/// Spawn a single batch transcription task for one picker row.
 ///
-/// Dead connections are detected by the HTTP client's
-/// `tcp_user_timeout` / `read_timeout` / keepalive settings — no
-/// artificial outer timeout is needed.  Sends a
-/// [`PickerMessage::Candidate`] (success or error) to `tx` when
-/// complete.
+/// The picker is interactive — the user is watching the row and can
+/// dismiss the picker at any time — so the request runs under
+/// [`RequestTimeoutPolicy::UserAttended`]: only the
+/// `connect_timeout` (TCP+TLS phase) and the kernel-level TCP
+/// defences (`tcp_user_timeout`, TCP keepalive) bound the wait.
+/// There is intentionally no per-request wall-clock cap — a slow
+/// server is allowed to take its time.
+///
+/// While the request is in progress, a [`PickerStatusSink`] forwards
+/// HTTP-pipeline phase transitions (and retry events) to the GTK
+/// channel as [`PickerMessage::CandidateStatus`] messages so the
+/// row can show `connecting…` / `uploading…` / `waiting for
+/// server…` / `transcribing…` / `retry N/M…` in italic dimmed text.
+/// The final [`PickerMessage::Candidate`] (success or error)
+/// replaces the status line with the actual transcript or error.
 pub(super) fn spawn_transcription(
     tasks: &mut tokio::task::JoinSet<()>,
     tx: std::sync::mpsc::Sender<PickerMessage>,
@@ -163,8 +288,8 @@ pub(super) fn spawn_transcription(
     model: String,
     config: std::sync::Arc<Config>,
 ) {
-    let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
-        std::sync::Arc::new(crate::telemetry::NoOpSink);
+    let sink: std::sync::Arc<dyn TelemetrySink> =
+        std::sync::Arc::new(PickerStatusSink::new(tx.clone(), provider, model.clone()));
     tasks.spawn(async move {
         let msg = match crate::transcription::transcribe_audio(
             &audio,
@@ -172,7 +297,10 @@ pub(super) fn spawn_transcription(
             provider,
             Some(&model),
             false,
-            true,
+            crate::transcription::TranscribeOptions {
+                allow_api: true,
+                policy: crate::transcription::RequestTimeoutPolicy::UserAttended,
+            },
             &sink,
         )
         .await
@@ -200,4 +328,272 @@ pub(super) fn spawn_transcription(
         };
         let _ = tx.send(msg);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Drain every queued message and return the
+    /// `(provider, model, status_text)` tuples in arrival order.
+    /// Non-`CandidateStatus` messages are returned as `None`.
+    fn drain_status(
+        rx: &std::sync::mpsc::Receiver<PickerMessage>,
+    ) -> Vec<Option<(Provider, String, String)>> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(match msg {
+                PickerMessage::CandidateStatus {
+                    provider,
+                    model,
+                    status_text,
+                } => Some((provider, model, status_text)),
+                _ => None,
+            });
+        }
+        out
+    }
+
+    /// Spec: the sink translates a representative event sequence
+    /// (including the validate-preflight phase that fires only on
+    /// cache miss) into the documented status strings, in order,
+    /// with no duplicates from idempotency dedup.
+    #[test]
+    fn picker_status_sink_translates_phase_transitions() {
+        let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral-mini-2602".to_string());
+
+        let now = Instant::now();
+        // Cache-miss path: preflight events come first.
+        sink.emit(PipelineEvent::PreflightStarted { t: now });
+        sink.emit(PipelineEvent::PreflightCompleted {
+            success: true,
+            t: now,
+        });
+        sink.emit(PipelineEvent::RequestStarted {
+            endpoint: "https://example.invalid".into(),
+            t: now,
+        });
+        sink.emit(PipelineEvent::ConnectionEstablished { t: now });
+        // Progress events are intentionally dropped (phase
+        // transitions only).
+        sink.emit(PipelineEvent::UploadProgress {
+            bytes_sent: 1024,
+            total: 8192,
+            t: now,
+        });
+        sink.emit(PipelineEvent::UploadProgress {
+            bytes_sent: 4096,
+            total: 8192,
+            t: now,
+        });
+        sink.emit(PipelineEvent::UploadComplete {
+            total: 8192,
+            t: now,
+        });
+        sink.emit(PipelineEvent::ResponseHeaders {
+            status: 200,
+            t: now,
+        });
+        // Download progress also dropped.
+        sink.emit(PipelineEvent::DownloadProgress {
+            bytes_received: 64,
+            total: None,
+            t: now,
+        });
+        sink.emit(PipelineEvent::ResponseComplete { total: 64, t: now });
+        // RequestCompleted with success=true is silent — final
+        // candidate carries the result.
+        sink.emit(PipelineEvent::RequestCompleted {
+            success: true,
+            t: now,
+        });
+
+        let drained = drain_status(&rx);
+        let strings: Vec<&str> = drained
+            .iter()
+            .filter_map(|o| o.as_ref().map(|(_, _, s)| s.as_str()))
+            .collect();
+        assert_eq!(
+            strings,
+            vec![
+                "pre-validating model…",
+                "connecting…",
+                "uploading…",
+                "waiting for server…",
+                "transcribing…",
+            ],
+            "phase-transition strings must arrive in the documented order"
+        );
+    }
+
+    /// Spec: on cache hit, no preflight events fire — the row's
+    /// status starts directly at `connecting…`.  This test
+    /// simulates the cache-hit path by simply omitting the
+    /// `Preflight*` events; the sink must still produce the
+    /// downstream phases correctly.
+    #[test]
+    fn picker_status_sink_cache_hit_starts_at_connecting() {
+        let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+
+        let now = Instant::now();
+        // No PreflightStarted / PreflightCompleted — cache hit.
+        sink.emit(PipelineEvent::RequestStarted {
+            endpoint: "https://x".into(),
+            t: now,
+        });
+        sink.emit(PipelineEvent::ConnectionEstablished { t: now });
+        sink.emit(PipelineEvent::UploadComplete {
+            total: 1024,
+            t: now,
+        });
+        sink.emit(PipelineEvent::ResponseHeaders {
+            status: 200,
+            t: now,
+        });
+
+        let drained = drain_status(&rx);
+        let strings: Vec<&str> = drained
+            .iter()
+            .filter_map(|o| o.as_ref().map(|(_, _, s)| s.as_str()))
+            .collect();
+        assert_eq!(
+            strings,
+            vec![
+                "connecting…",
+                "uploading…",
+                "waiting for server…",
+                "transcribing…",
+            ],
+            "cache-hit path must skip the pre-validating status"
+        );
+    }
+
+    /// Spec: `PreflightCompleted` is intentionally silent — it
+    /// doesn't push its own status; the next event (either
+    /// `RequestStarted` on success or a final error candidate on
+    /// failure, neither produced here) is what the user sees.
+    #[test]
+    fn picker_status_sink_preflight_completed_is_silent() {
+        let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+
+        let now = Instant::now();
+        sink.emit(PipelineEvent::PreflightStarted { t: now });
+        // Drain the pre-validating message so the next assertion
+        // sees only what `PreflightCompleted` itself produces.
+        let _ = drain_status(&rx);
+
+        sink.emit(PipelineEvent::PreflightCompleted {
+            success: true,
+            t: now,
+        });
+        sink.emit(PipelineEvent::PreflightCompleted {
+            success: false,
+            t: now,
+        });
+
+        let drained = drain_status(&rx);
+        assert!(
+            drained.is_empty(),
+            "PreflightCompleted must not push any status; got {:?}",
+            drained
+        );
+    }
+
+    /// Spec: identical consecutive emissions are deduplicated so
+    /// the GTK channel does not receive redundant updates.
+    #[test]
+    fn picker_status_sink_dedups_repeated_phase() {
+        let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+
+        let now = Instant::now();
+        sink.emit(PipelineEvent::RequestStarted {
+            endpoint: "https://x".into(),
+            t: now,
+        });
+        sink.emit(PipelineEvent::RequestStarted {
+            endpoint: "https://x".into(),
+            t: now,
+        });
+        sink.emit(PipelineEvent::RequestStarted {
+            endpoint: "https://x".into(),
+            t: now,
+        });
+
+        let drained = drain_status(&rx);
+        assert_eq!(drained.len(), 1, "dedup must collapse repeated phases");
+    }
+
+    /// Spec: retry events surface attempt/max in the status string,
+    /// in `retry N/M…` form.
+    #[test]
+    fn picker_status_sink_formats_retry_attempts() {
+        let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
+        let sink = PickerStatusSink::new(tx, Provider::OpenAI, "whisper-1".to_string());
+
+        let now = Instant::now();
+        sink.emit(PipelineEvent::RetryScheduled {
+            attempt: 2,
+            max: 5,
+            reason: "transient".into(),
+            t: now,
+        });
+
+        let drained = drain_status(&rx);
+        assert_eq!(drained.len(), 1);
+        let (_, _, s) = drained[0].as_ref().expect("status message");
+        assert_eq!(s, "retry 2/5…");
+    }
+
+    /// Spec: non-2xx response headers do NOT produce a
+    /// `transcribing…` status — the row will get a final error
+    /// candidate shortly and we don't want to flicker through a
+    /// misleading "transcribing" state on a 4xx/5xx.
+    #[test]
+    fn picker_status_sink_drops_non_2xx_response_headers() {
+        let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+
+        let now = Instant::now();
+        sink.emit(PipelineEvent::ResponseHeaders {
+            status: 401,
+            t: now,
+        });
+        sink.emit(PipelineEvent::ResponseHeaders {
+            status: 500,
+            t: now,
+        });
+
+        let drained = drain_status(&rx);
+        assert!(
+            drained.is_empty(),
+            "non-2xx response headers must not emit a status; got: {:?}",
+            drained
+        );
+    }
+
+    /// Spec: the sink carries the (provider, model) identity it
+    /// was constructed with verbatim — the picker UI relies on
+    /// these to route the status to the correct row.
+    #[test]
+    fn picker_status_sink_preserves_row_identity() {
+        let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral-mini-2602".to_string());
+
+        let now = Instant::now();
+        sink.emit(PipelineEvent::RequestStarted {
+            endpoint: "https://x".into(),
+            t: now,
+        });
+
+        let drained = drain_status(&rx);
+        assert_eq!(drained.len(), 1);
+        let (p, m, _) = drained[0].as_ref().expect("status message");
+        assert_eq!(*p, Provider::Mistral);
+        assert_eq!(m, "voxtral-mini-2602");
+    }
 }

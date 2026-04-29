@@ -87,6 +87,24 @@ pub(super) enum PickerMessage {
         model: String,
         accumulated_text: String,
     },
+    /// Live status update for an in-flight batch candidate.
+    ///
+    /// Emitted by [`super::backend::PickerStatusSink`] while the
+    /// HTTP request is in progress.  The picker UI renders
+    /// `status_text` in italic at reduced opacity in the row's
+    /// transcription text area, replacing it with the final
+    /// transcript when the matching [`Self::Candidate`] arrives.
+    ///
+    /// String values are short, lowercase, ellipsis-suffixed phase
+    /// labels (e.g. `"connecting…"`, `"uploading…"`, `"waiting for
+    /// server…"`, `"transcribing…"`, `"retry 2/5…"`,
+    /// `"failed; retrying…"`) — the consumer treats the string as
+    /// opaque and renders it verbatim.
+    CandidateStatus {
+        provider: Provider,
+        model: String,
+        status_text: String,
+    },
 }
 
 /// Result of the picker: selected provider/model/text and whether it
@@ -1574,6 +1592,10 @@ pub(super) async fn pick_with_streaming_gtk(
                                     if let Some(btn) = buttons_poll.borrow().get(idx) {
                                         btn.set_sensitive(true);
                                         set_action_icon(btn, false);
+                                        // Clear any in-flight status
+                                        // tooltip left over from
+                                        // `CandidateStatus` events.
+                                        btn.set_tooltip_text(None);
                                     }
                                     // Clear the transcription flag —
                                     // the error wiped the row.
@@ -1633,6 +1655,10 @@ pub(super) async fn pick_with_streaming_gtk(
                                     if let Some(btn) = buttons_poll.borrow().get(idx) {
                                         btn.set_sensitive(true);
                                         set_action_icon(btn, has_text);
+                                        // Clear any in-flight status
+                                        // tooltip left over from
+                                        // `CandidateStatus` events.
+                                        btn.set_tooltip_text(None);
                                     }
                                     // Track whether this row now holds
                                     // a transcription, so selecting it
@@ -1720,6 +1746,72 @@ pub(super) async fn pick_with_streaming_gtk(
                                 }
                             }
                         }
+                        Ok(PickerMessage::CandidateStatus {
+                            provider,
+                            model,
+                            status_text,
+                        }) => {
+                            // Find the row by (provider, model) — only
+                            // batch rows ever receive `CandidateStatus`,
+                            // and we explicitly match the non-streaming
+                            // row to avoid colliding with a parallel
+                            // realtime row of the same provider/model.
+                            let idx = {
+                                let cands = cands.borrow();
+                                cands.iter().position(|(p, m, _, _, _, s, _, _)| {
+                                    *p == provider && *m == model && !*s
+                                })
+                            };
+                            if let Some(idx) = idx {
+                                // Skip if a final candidate has already
+                                // arrived for this row — its content
+                                // takes precedence over status updates.
+                                let already_has_text =
+                                    has_tx_poll.borrow().get(idx).copied().unwrap_or(false);
+                                let already_errored =
+                                    cands.borrow().get(idx).map(|t| t.4).unwrap_or(false);
+                                if already_has_text || already_errored {
+                                    continue;
+                                }
+
+                                // Replace the cell content (spinner or
+                                // previous status label) with an italic
+                                // dimmed status line.  Pango markup:
+                                // `<i>` for italic; opacity is set on
+                                // the widget (Pango `alpha` only
+                                // supports text colour, not the
+                                // background, and renders with the
+                                // theme's foreground colour anyway).
+                                let cells = cells.borrow();
+                                if let Some(cell) = cells.get(idx) {
+                                    while let Some(child) = cell.first_child() {
+                                        cell.remove(&child);
+                                    }
+                                    let label = make_transcript_label("");
+                                    label.set_markup(&format!(
+                                        "<i>{}</i>",
+                                        glib::markup_escape_text(&status_text),
+                                    ));
+                                    label.set_opacity(0.55);
+                                    cell.append(&label);
+                                    // Don't store this label in
+                                    // `labels_poll` — that's reserved
+                                    // for transcript labels used by
+                                    // diff updates.  When the final
+                                    // `Candidate` arrives it clears
+                                    // and replaces the cell anyway.
+                                }
+
+                                // Surface the live status via the
+                                // action button's tooltip so users who
+                                // hover the disabled T button see
+                                // *why* it's disabled and what phase
+                                // the request is in.
+                                if let Some(btn) = buttons_poll.borrow().get(idx) {
+                                    btn.set_tooltip_text(Some(&status_text));
+                                }
+                            }
+                        }
                         Ok(PickerMessage::InitialBatchDone) => {
                             // Mark rows that still show a spinner as
                             // failed — the API never responded.  Rows
@@ -1751,6 +1843,7 @@ pub(super) async fn pick_with_streaming_gtk(
                                 if let Some(btn) = buttons_poll.borrow().get(idx) {
                                     btn.set_sensitive(true);
                                     set_action_icon(btn, false);
+                                    btn.set_tooltip_text(None);
                                 }
                                 // No response means no transcription.
                                 if let Some(flag) = has_tx_poll.borrow_mut().get_mut(idx) {

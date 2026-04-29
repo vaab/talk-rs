@@ -69,13 +69,19 @@ pub async fn transcribe(
 
     let output_text = if specific_options {
         // Specific options -> Layer 3 directly, no pick I/O.
+        // CLI is an autonomous caller (no human watching a GTK
+        // window), so use `Proportional` so a hung server cannot
+        // wedge the CLI invocation indefinitely.
         let result = transcription::transcribe_audio(
             &input_path,
             &config,
             provider,
             cli_model.as_deref(),
             diarize,
-            true,
+            transcription::TranscribeOptions {
+                allow_api: true,
+                policy: transcription::RequestTimeoutPolicy::Proportional,
+            },
             &sink,
         )
         .await?;
