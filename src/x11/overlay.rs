@@ -641,12 +641,18 @@ fn render_time_grid(
 ///
 /// The overlay maintains a simple state machine driven by events
 /// arriving from the telemetry broker.  Each variant maps to a
-/// distinct colour in the phase overlay layer drawn above the
-/// waterfall.
+/// distinct colour (and opacity) in the phase overlay layer drawn
+/// above the waterfall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// No HTTP activity in progress.
     Idle,
+    /// `PreflightStarted` received — `/v1/models` validation in
+    /// flight.  Visually distinct from the actual transcription
+    /// connection: same green as [`Self::Done`] but at half
+    /// opacity, so the user knows we're not yet doing the real
+    /// transcription work.
+    Validating,
     /// `RequestStarted` received, waiting for first byte pull.
     Connecting,
     /// `ConnectionEstablished` received, body bytes flowing.
@@ -661,38 +667,81 @@ enum Phase {
     Error,
 }
 
+/// Reuseable BGRA constant for the "transcription succeeded /
+/// validation in progress" green so [`Phase::color`] cannot drift
+/// between the two variants by accident.
+const PHASE_GREEN: [u8; 4] = [110, 255, 60, 255]; // RGB(60,255,110)
+
+/// Opacity used by [`Phase::Validating`] for both its phase-line
+/// stripe and the retry counter overlay.  At 0.5 the validation
+/// state is visibly in-progress without blending into the
+/// transcription colours of subsequent phases.
+const VALIDATING_OPACITY: f32 = 0.5;
+
 impl Phase {
-    /// BGRA colour for this phase, or `None` for `Idle` (nothing
-    /// drawn).  Colours are chosen to stand out against the
-    /// monochrome waterfall without being garish.
-    fn color(self) -> Option<[u8; 4]> {
+    /// BGRA colour and opacity for this phase, or `None` for
+    /// `Idle` (nothing drawn).  Colours are chosen to stand out
+    /// against the monochrome waterfall without being garish.
+    /// Opacity is `1.0` for every phase except [`Self::Validating`]
+    /// (`0.5`) — see [`VALIDATING_OPACITY`] for rationale.
+    fn color(self) -> Option<([u8; 4], f32)> {
         match self {
             Self::Idle => None,
+            Self::Validating => Some((PHASE_GREEN, VALIDATING_OPACITY)),
             // dim blue  RGB(80,130,200) → BGRA
-            Self::Connecting => Some([200, 130, 80, 255]),
+            Self::Connecting => Some(([200, 130, 80, 255], 1.0)),
             // bright blue  RGB(60,170,255)
-            Self::Uploading => Some([255, 170, 60, 255]),
+            Self::Uploading => Some(([255, 170, 60, 255], 1.0)),
             // amber  RGB(255,180,50)
-            Self::WaitingResponse => Some([50, 180, 255, 255]),
+            Self::WaitingResponse => Some(([50, 180, 255, 255], 1.0)),
             // teal  RGB(60,200,180)
-            Self::Receiving => Some([180, 200, 60, 255]),
+            Self::Receiving => Some(([180, 200, 60, 255], 1.0)),
             // green  RGB(60,255,110)
-            Self::Done => Some([110, 255, 60, 255]),
+            Self::Done => Some((PHASE_GREEN, 1.0)),
             // red  RGB(200,40,40)
-            Self::Error => Some([40, 40, 200, 255]),
+            Self::Error => Some(([40, 40, 200, 255], 1.0)),
         }
+    }
+
+    /// Opacity component of [`Self::color`], or `1.0` when the
+    /// phase has no colour (i.e. `Idle`).  Used by overlay
+    /// elements like the retry counter that should match the
+    /// phase line's dimming during validation.
+    fn opacity(self) -> f32 {
+        self.color().map(|(_, op)| op).unwrap_or(1.0)
     }
 
     /// Advance the state machine given a telemetry event.
     fn advance(self, event: &TranscriptionEvent) -> Self {
         match event {
+            // Preflight (validate-cache miss path).
+            TranscriptionEvent::PreflightStarted { .. } => Self::Validating,
+            TranscriptionEvent::PreflightCompleted { success: true, .. } => {
+                // Successful preflight — wait for the real
+                // transcription request to start.  The next event
+                // will normally be `RequestStarted` which advances
+                // us to `Connecting`.  Until then, drop back to
+                // `Idle` so the phase stripe doesn't keep
+                // emitting green-50%.
+                Self::Idle
+            }
+            TranscriptionEvent::PreflightCompleted { success: false, .. } => Self::Error,
+            // Transcription request lifecycle.
             TranscriptionEvent::RequestStarted { .. } => Self::Connecting,
             TranscriptionEvent::ConnectionEstablished { .. } => Self::Uploading,
             TranscriptionEvent::UploadComplete { .. } => Self::WaitingResponse,
             TranscriptionEvent::ResponseHeaders { .. } => Self::Receiving,
             TranscriptionEvent::RequestCompleted { success: true, .. } => Self::Done,
             TranscriptionEvent::RequestCompleted { success: false, .. } => Self::Error,
-            TranscriptionEvent::RetryScheduled { .. } => Self::Connecting,
+            // A retry inside the transcription path drops back to
+            // `Connecting` (a new attempt is about to fire).  A
+            // retry inside the validate path (where `self` is
+            // `Validating`) stays in `Validating` so the stripe
+            // remains dimmed.
+            TranscriptionEvent::RetryScheduled { .. } => match self {
+                Self::Validating => Self::Validating,
+                _ => Self::Connecting,
+            },
             TranscriptionEvent::PasteStarted { .. } => Self::Done, // green during paste
             TranscriptionEvent::Done { .. } | TranscriptionEvent::PasteCompleted { .. } => {
                 Self::Idle
@@ -711,17 +760,19 @@ const PHASE_LINE_HEIGHT: usize = 2;
 /// top of the spectrogram area, one colour per column, right-aligned
 /// in the same way as the waterfall.
 ///
-/// Columns without a phase (`None`) are skipped — nothing drawn,
-/// the waterfall underneath is unobscured.  Columns with a phase
-/// get a solid-colour stripe of [`PHASE_LINE_HEIGHT`] pixels drawn
-/// as a direct pixel overwrite (no alpha blend needed — the top
-/// rows of the spec area are almost always empty in practice).
+/// Each entry in `phase_history` is `Some((color, opacity))` for a
+/// column we want stripped, or `None` for columns where nothing
+/// should be drawn.  Columns at full opacity overwrite the
+/// underlying pixel; sub-1.0 columns alpha-blend into whatever
+/// waterfall content was there underneath, which makes the
+/// half-opacity validation stripe visibly translucent rather than
+/// hiding the spectrogram entirely.
 fn render_phase_line(
     pb: &mut PixelBuffer,
     x0: usize,
     y0: usize,
     w: usize,
-    phase_history: &[Option<[u8; 4]>],
+    phase_history: &[Option<([u8; 4], f32)>],
 ) {
     let n = phase_history.len();
     if n == 0 || w == 0 {
@@ -731,8 +782,8 @@ fn render_phase_line(
     let num = n.min(w);
 
     for col_idx in 0..num {
-        let color = match phase_history[n - num + col_idx] {
-            Some(c) => c,
+        let (color, opacity) = match phase_history[n - num + col_idx] {
+            Some(t) => t,
             None => continue,
         };
 
@@ -744,8 +795,18 @@ fn render_phase_line(
 
         for dy in 0..PHASE_LINE_HEIGHT {
             let y = y0 + dy;
-            if y < pb.height {
+            if y >= pb.height {
+                continue;
+            }
+            // Use the cheap direct path for full opacity (the
+            // common case), and the blend path when the phase
+            // explicitly asks for translucency.  A `1.0` opacity
+            // through `blend_pixel` is equivalent but pays an
+            // unnecessary float multiplication per pixel.
+            if opacity >= 1.0 {
                 pb.set_pixel(x, y, color);
+            } else {
+                pb.blend_pixel(x, y, color, opacity);
             }
         }
     }
@@ -777,7 +838,7 @@ fn render_throughput_tracks(
     upload_history: &[u64],
     download_history: &[u64],
     paste_history: &[u64],
-    _phase_history: &[Option<[u8; 4]>],
+    _phase_history: &[Option<([u8; 4], f32)>],
     upload_peak: u64,
     download_peak: u64,
     paste_peak: u64,
@@ -800,9 +861,21 @@ fn render_throughput_tracks(
     let bar_zone_bottom = y0 + h - 1;
     let bar_zone_center = y0 + h / 2;
 
-    let upload_color: [u8; 4] = Phase::Uploading.color().unwrap_or([255, 170, 60, 255]);
-    let download_color: [u8; 4] = Phase::Receiving.color().unwrap_or([180, 200, 60, 255]);
-    let paste_color: [u8; 4] = Phase::Done.color().unwrap_or([110, 255, 60, 255]);
+    // Throughput tracks always render at full opacity regardless of
+    // the per-column phase opacity, so we drop the opacity component
+    // and keep just the BGRA tuple.
+    let upload_color: [u8; 4] = Phase::Uploading
+        .color()
+        .map(|(c, _)| c)
+        .unwrap_or([255, 170, 60, 255]);
+    let download_color: [u8; 4] = Phase::Receiving
+        .color()
+        .map(|(c, _)| c)
+        .unwrap_or([180, 200, 60, 255]);
+    let paste_color: [u8; 4] = Phase::Done
+        .color()
+        .map(|(c, _)| c)
+        .unwrap_or([110, 255, 60, 255]);
 
     for col_idx in 0..num {
         let x = x0 + w - num + col_idx;
@@ -1180,6 +1253,66 @@ fn render_transcribing_text(
     render_badge_text(pb, font, "TRANSCRIBING", color, x0, y0, w, h);
 }
 
+/// Font size for the retry-attempt counter.  Smaller than the
+/// `TRANSCRIBING`/`LISTENING` badge text so it doesn't compete
+/// for attention; large enough that "1"–"5" remain legible
+/// against the spectrogram waterfall behind.
+const RETRY_COUNTER_FONT_SIZE: f32 = 14.0;
+
+/// Render a small retry-attempt counter over the SPEC area.
+///
+/// Drawn at the top-left of the spectrogram, immediately below
+/// the phase-line stripe, in the same green used for the
+/// validating phase but at the phase's current opacity (so during
+/// validation the digit fades along with the stripe).  Only fired
+/// when an actual retry is in progress (`attempt >= 1`); the
+/// initial attempt does not produce a counter.
+///
+/// `opacity` is the current [`Phase::opacity`], allowing the
+/// counter to dim during validation and pop back to full opacity
+/// during transcription retries.
+fn render_retry_counter(
+    pb: &mut PixelBuffer,
+    font: &fontdue::Font,
+    x0: usize,
+    y0: usize,
+    attempt: u32,
+    _max: u32,
+    opacity: f32,
+) {
+    if attempt == 0 {
+        return;
+    }
+    // Single-digit display per the user spec ("first, second or
+    // third retry").  If the schedule ever exceeds 9 attempts the
+    // digit will overflow visually; this is acceptable because
+    // [`super::transport::retry::MAX_RETRIES`] is 5 and the
+    // validate-cache schedule has 5 entries — both single-digit.
+    let text = format!("{}", attempt);
+    let (glyphs, _) = rasterise_glyphs(&text, font, RETRY_COUNTER_FONT_SIZE);
+
+    let buf_w = pb.width;
+    let buf_h = pb.height;
+    let mut cursor_x = x0 as i32;
+    // Baseline a few pixels below the top of the SPEC area so the
+    // glyph sits just under the phase-line stripe.
+    let baseline = y0 as i32 + RETRY_COUNTER_FONT_SIZE as i32;
+    for (metrics, bitmap) in &glyphs {
+        blit_glyph_at(
+            pb,
+            metrics,
+            bitmap,
+            cursor_x,
+            baseline,
+            buf_w,
+            buf_h,
+            PHASE_GREEN,
+            opacity,
+        );
+        cursor_x += metrics.advance_width as i32;
+    }
+}
+
 // ── Centered no-sound overlay rendering ──────────────────────────────
 
 /// Render the content of the large centered "no sound" overlay.
@@ -1534,7 +1667,14 @@ fn overlay_thread(
     // The state machine is driven by events from the telemetry
     // broker, drained non-blockingly every frame.
     let mut current_phase: Phase = Phase::Idle;
-    let mut phase_history: Vec<Option<[u8; 4]>> = Vec::new();
+    let mut phase_history: Vec<Option<([u8; 4], f32)>> = Vec::new();
+
+    // Retry-counter state, drawn over the SPEC area to advertise
+    // "we're on attempt N out of M" to the user.  `None` until a
+    // `RetryScheduled` event arrives; cleared when a fresh
+    // request/preflight starts (so completing a successful retry
+    // doesn't leave a stale digit on screen for the next cycle).
+    let mut current_retry: Option<(u32, u32)> = None;
 
     // True when the recording has ended and the HTTP transcription is
     // in flight.  The render loop keeps running: empty columns are
@@ -1654,6 +1794,7 @@ fn overlay_thread(
                     paste_peak_delta = 1;
                     columns_pushed_total = 0;
                     current_phase = Phase::Idle;
+                    current_retry = None;
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
                     spectrum_peak = PEAK_FLOOR;
@@ -1727,6 +1868,7 @@ fn overlay_thread(
                     paste_peak_delta = 1;
                     columns_pushed_total = 0;
                     current_phase = Phase::Idle;
+                    current_retry = None;
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
                     spectrum_peak = PEAK_FLOOR;
@@ -1801,6 +1943,30 @@ fn overlay_thread(
                                 prev_upload_bytes = 0;
                                 current_download_bytes = 0;
                                 prev_download_bytes = 0;
+                                // The actual transcription request is
+                                // about to start — clear any retry
+                                // counter left over from validate, so
+                                // we don't show a stale digit during
+                                // the transcription's first attempt.
+                                current_retry = None;
+                            }
+                            TranscriptionEvent::PreflightStarted { .. } => {
+                                // Fresh preflight cycle — clear any
+                                // retry counter that lingered from a
+                                // previous attempt's terminal state.
+                                current_retry = None;
+                            }
+                            TranscriptionEvent::RetryScheduled { attempt, max, .. } => {
+                                // Surface the retry attempt to the
+                                // overlay.  `RetryScheduled` is
+                                // emitted both by `with_retry`
+                                // (transcription request) and by the
+                                // validate-cache miss path; the
+                                // counter is rendered in both cases
+                                // (dimmed during validate, full
+                                // opacity during transcription —
+                                // controlled by the current phase).
+                                current_retry = Some((*attempt, *max));
                             }
                             TranscriptionEvent::PasteStarted { .. } => {
                                 current_paste_chars = 0;
@@ -2221,6 +2387,22 @@ fn overlay_thread(
             // pattern as "LISTENING" during auto-pause).
             if let Some(ref f) = badge_font {
                 render_transcribing_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+                // Retry-attempt indicator (1, 2, 3, …) drawn small
+                // at the top-left of the SPEC area so it doesn't
+                // collide with the centered TRANSCRIBING text.
+                // Opacity follows the current phase: dimmed during
+                // validation, full during transcription retries.
+                if let Some((attempt, max)) = current_retry {
+                    render_retry_counter(
+                        &mut pb,
+                        f,
+                        SPEC_LEFT + 2,
+                        SPEC_TOP + PHASE_LINE_HEIGHT,
+                        attempt,
+                        max,
+                        current_phase.opacity(),
+                    );
+                }
             }
         } else if no_sound_active {
             // ── NO SOUND mode: prohibit icon + red text ──────
@@ -3078,5 +3260,214 @@ mod tests {
             "full badge render should produce significant visible content, got {} pixels with alpha > 0",
             visible
         );
+    }
+
+    // ── Phase state machine ─────────────────────────────────────
+
+    /// Spec: `PreflightStarted` enters the dimmed validating phase.
+    #[test]
+    fn phase_advance_preflight_started_enters_validating() {
+        use std::time::Instant;
+        let now = Instant::now();
+        let after = Phase::Idle.advance(&TranscriptionEvent::PreflightStarted { t: now });
+        assert_eq!(after, Phase::Validating);
+    }
+
+    /// Spec: a successful preflight drops back to `Idle` (the next
+    /// `RequestStarted` will move us forward to `Connecting`); we
+    /// don't go directly to `Connecting` to avoid emitting a
+    /// connecting stripe before the actual transcription request
+    /// fires.
+    #[test]
+    fn phase_advance_preflight_completed_success_returns_to_idle() {
+        use std::time::Instant;
+        let after = Phase::Validating.advance(&TranscriptionEvent::PreflightCompleted {
+            success: true,
+            t: Instant::now(),
+        });
+        assert_eq!(after, Phase::Idle);
+    }
+
+    /// Spec: a failed preflight transitions to `Error` so the user
+    /// sees red, not just a quiet drop-back to idle.
+    #[test]
+    fn phase_advance_preflight_completed_failure_enters_error() {
+        use std::time::Instant;
+        let after = Phase::Validating.advance(&TranscriptionEvent::PreflightCompleted {
+            success: false,
+            t: Instant::now(),
+        });
+        assert_eq!(after, Phase::Error);
+    }
+
+    /// Spec: a `RetryScheduled` while inside `Validating` keeps
+    /// us in `Validating` (so the dimmed stripe persists across
+    /// the validate retry attempts), unlike a retry inside the
+    /// transcription path which falls back to `Connecting`.
+    #[test]
+    fn phase_advance_retry_during_validating_stays_validating() {
+        use std::time::Instant;
+        let after = Phase::Validating.advance(&TranscriptionEvent::RetryScheduled {
+            attempt: 2,
+            max: 5,
+            reason: "timeout".into(),
+            t: Instant::now(),
+        });
+        assert_eq!(after, Phase::Validating);
+    }
+
+    /// Spec: a `RetryScheduled` outside `Validating` drops to
+    /// `Connecting` (a new attempt is about to fire) — preserves
+    /// the existing pre-Preflight behaviour.
+    #[test]
+    fn phase_advance_retry_outside_validating_returns_to_connecting() {
+        use std::time::Instant;
+        let after = Phase::Receiving.advance(&TranscriptionEvent::RetryScheduled {
+            attempt: 2,
+            max: 5,
+            reason: "timeout".into(),
+            t: Instant::now(),
+        });
+        assert_eq!(after, Phase::Connecting);
+    }
+
+    // ── Phase color/opacity ─────────────────────────────────────
+
+    /// Spec: `Validating` reuses the same green as `Done` but at
+    /// half opacity, so the visualization is visibly different
+    /// without choosing a colour that competes with success or
+    /// connection states.
+    #[test]
+    fn phase_color_validating_is_green_at_half_opacity() {
+        let (color, opacity) = Phase::Validating.color().expect("validating has a color");
+        assert_eq!(color, PHASE_GREEN);
+        assert!(
+            (opacity - VALIDATING_OPACITY).abs() < f32::EPSILON,
+            "expected {}, got {}",
+            VALIDATING_OPACITY,
+            opacity
+        );
+    }
+
+    /// Spec: `Done` uses the same green at full opacity.
+    #[test]
+    fn phase_color_done_is_green_at_full_opacity() {
+        let (color, opacity) = Phase::Done.color().expect("done has a color");
+        assert_eq!(color, PHASE_GREEN);
+        assert!((opacity - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// Spec: `Idle` has no colour — overlay renders nothing.
+    #[test]
+    fn phase_color_idle_is_none() {
+        assert!(Phase::Idle.color().is_none());
+    }
+
+    /// Spec: every non-validating, non-idle phase renders at full
+    /// opacity (1.0).  Catches future refactors that accidentally
+    /// dim a non-validation phase.
+    #[test]
+    fn phase_color_all_non_validating_phases_render_at_full_opacity() {
+        for phase in [
+            Phase::Connecting,
+            Phase::Uploading,
+            Phase::WaitingResponse,
+            Phase::Receiving,
+            Phase::Done,
+            Phase::Error,
+        ] {
+            let (_, opacity) = phase.color().expect("non-idle phase has color");
+            assert!(
+                (opacity - 1.0).abs() < f32::EPSILON,
+                "phase {:?} should render at full opacity, got {}",
+                phase,
+                opacity
+            );
+        }
+    }
+
+    /// Spec: `Phase::opacity` is a thin accessor for the opacity
+    /// component, returning 1.0 for `Idle` (no colour, no dimming
+    /// for the retry counter that calls this method).
+    #[test]
+    fn phase_opacity_idle_is_full() {
+        assert!((Phase::Idle.opacity() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn phase_opacity_validating_is_half() {
+        assert!((Phase::Validating.opacity() - VALIDATING_OPACITY).abs() < f32::EPSILON);
+    }
+
+    // ── render_retry_counter ────────────────────────────────────
+
+    /// Spec: attempt 0 renders nothing — the counter is reserved
+    /// for actual retry attempts (1, 2, 3, …).  No pixels written.
+    #[test]
+    fn retry_counter_attempt_zero_writes_no_pixels() {
+        let font = match decode_font_or_skip() {
+            Some(f) => f,
+            None => return,
+        };
+        let mut pb = PixelBuffer::new(SPEC_W, SPEC_H);
+        // Pre-fill so any change is detectable.
+        pb.clear([0, 0, 0, 0]);
+        render_retry_counter(&mut pb, &font, 2, 4, 0, 5, 1.0);
+        let any_painted = pb.data.iter().any(|&b| b != 0);
+        assert!(!any_painted, "attempt=0 must not paint anything");
+    }
+
+    /// Spec: attempt >= 1 paints visible pixels at the requested
+    /// position.  Doesn't assert which glyphs; just that *some*
+    /// foreground pixels appear, confirming the renderer fires.
+    #[test]
+    fn retry_counter_attempt_one_writes_visible_pixels() {
+        let font = match decode_font_or_skip() {
+            Some(f) => f,
+            None => return,
+        };
+        let mut pb = PixelBuffer::new(SPEC_W, SPEC_H);
+        pb.clear([0, 0, 0, 0]);
+        render_retry_counter(&mut pb, &font, 2, 4, 1, 5, 1.0);
+        let any_painted = pb.data.iter().any(|&b| b != 0);
+        assert!(any_painted, "attempt>=1 must produce visible pixels");
+    }
+
+    /// Spec: lower opacity produces dimmer (smaller-magnitude)
+    /// pixel values for the same glyph than full opacity.  This
+    /// is the invariant the validating-phase counter depends on.
+    #[test]
+    fn retry_counter_dimmer_at_half_opacity() {
+        let font = match decode_font_or_skip() {
+            Some(f) => f,
+            None => return,
+        };
+        let mut full = PixelBuffer::new(SPEC_W, SPEC_H);
+        full.clear([0, 0, 0, 0]);
+        let mut half = PixelBuffer::new(SPEC_W, SPEC_H);
+        half.clear([0, 0, 0, 0]);
+        render_retry_counter(&mut full, &font, 2, 4, 1, 5, 1.0);
+        render_retry_counter(&mut half, &font, 2, 4, 1, 5, 0.5);
+
+        let full_brightness: u64 = full.data.iter().map(|&b| b as u64).sum();
+        let half_brightness: u64 = half.data.iter().map(|&b| b as u64).sum();
+        assert!(
+            half_brightness < full_brightness,
+            "half-opacity counter should be dimmer; got full={} half={}",
+            full_brightness,
+            half_brightness
+        );
+        assert!(
+            half_brightness > 0,
+            "half-opacity counter should still be visible"
+        );
+    }
+
+    /// Try to load the system badge font.  Tests that exercise
+    /// glyph rasterisation skip themselves cleanly when no
+    /// suitable system font is available (e.g. minimal CI
+    /// environments without DejaVu / Liberation / Noto).
+    fn decode_font_or_skip() -> Option<fontdue::Font> {
+        super::super::render_util::load_system_font(RETRY_COUNTER_FONT_SIZE)
     }
 }

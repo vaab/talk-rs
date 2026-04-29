@@ -203,6 +203,35 @@ impl PixelBuffer {
         }
     }
 
+    /// Alpha-blend `color` over the existing pixel at (x, y) using
+    /// the given `opacity` (0.0–1.0).  Sibling to [`Self::set_pixel`]
+    /// for the case where a phase or overlay element wants to be
+    /// dimmer than full opacity without compositing through a
+    /// glyph alpha mask.
+    ///
+    /// At `opacity == 1.0` this is identical to `set_pixel`; at
+    /// `opacity == 0.0` the pixel is left unchanged.  The alpha
+    /// channel of `color` is ignored — the BGRA channels are
+    /// blended into the existing background using the supplied
+    /// scalar opacity.
+    pub fn blend_pixel(&mut self, x: usize, y: usize, color: [u8; 4], opacity: f32) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let a = opacity.clamp(0.0, 1.0);
+        if a <= f32::EPSILON {
+            return;
+        }
+        let off = (y * self.width + x) * 4;
+        for (c, &fg_val) in color.iter().enumerate().take(3) {
+            let bg_val = self.data[off + c] as f32;
+            self.data[off + c] = (bg_val + (fg_val as f32 - bg_val) * a) as u8;
+        }
+        // Leave the alpha channel as the background's; the X11
+        // overlay window has its own opacity treatment and we
+        // never want a transparent hole in the badge.
+    }
+
     /// Fill the buffer with `fg` inside a rounded rectangle that spans
     /// the full buffer.  Pixels outside the rounded corners are left
     /// transparent (all zeroes) so the window shape mask clips them.
@@ -902,5 +931,68 @@ mod tests {
     #[test]
     fn rms_empty_is_zero() {
         assert!((rms(&[])).abs() < f32::EPSILON);
+    }
+
+    // ── PixelBuffer::blend_pixel ──────────────────────────────────
+
+    /// Spec: at opacity 1.0, `blend_pixel` matches `set_pixel` for
+    /// the BGR channels (alpha is intentionally not overwritten).
+    #[test]
+    fn blend_pixel_at_full_opacity_overwrites_bgr() {
+        let mut pb = PixelBuffer::new(2, 2);
+        pb.set_pixel(0, 0, [10, 20, 30, 40]); // background
+        pb.blend_pixel(0, 0, [200, 100, 50, 0], 1.0);
+        let off = 0;
+        assert_eq!(pb.data[off], 200);
+        assert_eq!(pb.data[off + 1], 100);
+        assert_eq!(pb.data[off + 2], 50);
+        // Alpha channel intentionally preserved.
+        assert_eq!(pb.data[off + 3], 40);
+    }
+
+    /// Spec: at opacity 0.0, the pixel is unchanged.
+    #[test]
+    fn blend_pixel_at_zero_opacity_is_noop() {
+        let mut pb = PixelBuffer::new(2, 2);
+        pb.set_pixel(0, 0, [10, 20, 30, 40]);
+        pb.blend_pixel(0, 0, [200, 100, 50, 0], 0.0);
+        assert_eq!(&pb.data[0..4], &[10, 20, 30, 40]);
+    }
+
+    /// Spec: at opacity 0.5 the resulting BGR channels are halfway
+    /// between background and foreground.
+    #[test]
+    fn blend_pixel_at_half_opacity_averages_bgr() {
+        let mut pb = PixelBuffer::new(2, 2);
+        pb.set_pixel(0, 0, [0, 0, 0, 0]); // black background
+        pb.blend_pixel(0, 0, [100, 200, 50, 0], 0.5);
+        // 0 + (100-0)*0.5 = 50, etc.
+        assert_eq!(pb.data[0], 50);
+        assert_eq!(pb.data[1], 100);
+        assert_eq!(pb.data[2], 25);
+    }
+
+    /// Spec: out-of-bounds coordinates do not panic.
+    #[test]
+    fn blend_pixel_out_of_bounds_is_noop() {
+        let mut pb = PixelBuffer::new(2, 2);
+        pb.blend_pixel(5, 5, [255, 255, 255, 255], 1.0);
+        // No panic, no change to in-bounds pixels.
+        for b in &pb.data {
+            assert_eq!(*b, 0);
+        }
+    }
+
+    /// Spec: opacity values outside [0.0, 1.0] are clamped (do not
+    /// produce wraparound or panics).
+    #[test]
+    fn blend_pixel_clamps_opacity() {
+        let mut pb = PixelBuffer::new(2, 2);
+        pb.set_pixel(0, 0, [0, 0, 0, 0]);
+        pb.blend_pixel(0, 0, [100, 200, 50, 0], 2.0); // > 1.0
+                                                      // Clamped to 1.0 → identical to full overwrite.
+        assert_eq!(pb.data[0], 100);
+        assert_eq!(pb.data[1], 200);
+        assert_eq!(pb.data[2], 50);
     }
 }
