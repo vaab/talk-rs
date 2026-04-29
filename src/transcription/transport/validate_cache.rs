@@ -14,13 +14,22 @@
 //!
 //! Multiple talk-rs processes (picker spawn, dictate daemon,
 //! `record --ui`, …) may all attempt to write the cache
-//! simultaneously.  Writes use the standard tempfile + atomic
-//! rename pattern: a temporary sibling is written and fsynced,
-//! then `rename(2)` swaps it onto the target path.  POSIX rename
-//! is atomic, so concurrent readers always see a complete file;
-//! concurrent writers race and the loser's write is lost — which
-//! is acceptable because each writer is just confirming a model
-//! that's already validated.
+//! simultaneously.  Writes are protected by a POSIX advisory file
+//! lock ([`fs2::FileExt::lock_exclusive`]) on a sibling lock file
+//! (`validate-cache.yaml.lock`).  The write path is read-modify-write:
+//!
+//! 1. Acquire the exclusive lock.
+//! 2. Re-read the cache file from disk and merge with our
+//!    in-process map (newer timestamp wins per `(provider, model,
+//!    api_base)` key).
+//! 3. Write the merged set to a tempfile + atomic rename onto the
+//!    final path.
+//! 4. Release the lock.
+//!
+//! This eliminates the read-modify-write race that earlier versions
+//! of this module had, where a process with only its own entries in
+//! the in-process map could clobber sibling-process entries on
+//! `persist_to_disk()`.
 //!
 //! # Cache scope
 //!
@@ -33,6 +42,15 @@
 //!   sibling process's write becomes visible without a process
 //!   restart).
 //!
+//! # Test isolation
+//!
+//! The cache file path can be overridden via the
+//! `TALK_RS_VALIDATE_CACHE_PATH` environment variable.  Tests that
+//! exercise the cache point this at a tempfile so they neither
+//! pollute the user's real cache nor depend on env-mutation
+//! ordering across the test binary.  In production this variable
+//! is unset and the cache lives at the standard XDG location.
+//!
 //! # Failure handling
 //!
 //! Cache failures are non-fatal.  `is_fresh` returning `false` on
@@ -43,8 +61,10 @@
 use crate::config::Provider;
 use crate::error::TalkError;
 use chrono::{DateTime, Duration, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -116,20 +136,60 @@ fn last_disk_mtime() -> &'static Mutex<Option<std::time::SystemTime>> {
     LAST_DISK_MTIME.get_or_init(|| Mutex::new(None))
 }
 
-/// Resolve the cache file path: `$XDG_CACHE_HOME/talk-rs/validate-cache.yaml`.
+/// Environment variable that, when set, overrides the on-disk
+/// cache file path.  Used exclusively by the test suite to
+/// redirect cache I/O at a tempfile so tests cannot pollute the
+/// user's real cache.  Production code does not set this.
+const CACHE_PATH_ENV: &str = "TALK_RS_VALIDATE_CACHE_PATH";
+
+/// Resolve the cache file path.
+///
+/// Resolution order:
+///
+/// 1. `$TALK_RS_VALIDATE_CACHE_PATH` — explicit override (tests).
+/// 2. `$XDG_CACHE_HOME/talk-rs/validate-cache.yaml` — production.
 ///
 /// Reuses the project-wide cache directory established by
 /// [`crate::daemon::cache_dir`] so the file sits alongside
 /// `daemon.log`, `talk-rs.log`, etc.
 fn cache_path() -> Result<PathBuf, TalkError> {
+    if let Some(p) = std::env::var_os(CACHE_PATH_ENV) {
+        return Ok(PathBuf::from(p));
+    }
     Ok(crate::daemon::cache_dir()?.join(CACHE_FILE_NAME))
 }
 
-/// Read the disk file (if present and fresh-mtime-relative-to-our-last-read).
+/// Resolve the lock file path: sibling of the cache file with the
+/// extension `.lock`.  Created on demand by the locking code; the
+/// file's contents are irrelevant — only its existence matters
+/// for `flock(2)` to attach to.
+fn lock_path(cache: &std::path::Path) -> PathBuf {
+    let mut p = cache.as_os_str().to_owned();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
+/// Read the disk file unconditionally (no mtime gate).
 ///
 /// Returns the parsed entries, or `None` if the file is missing,
 /// unreadable, or unparseable.  Cache corruption is non-fatal —
-/// the caller falls through to the network.
+/// the caller falls through to the network.  Used inside the
+/// locked write path where we always want the freshest disk state.
+fn read_disk_unconditional() -> Option<Vec<Entry>> {
+    let path = cache_path().ok()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let file: CacheFile = serde_yaml::from_slice(&bytes).ok()?;
+    Some(file.entries)
+}
+
+/// Read the disk file only when its mtime has advanced past our
+/// last-known mtime.
+///
+/// Returns the parsed entries on a fresh read, or `None` when the
+/// disk hasn't changed (so callers don't redundantly merge identical
+/// data into the in-process map every lookup).  Used by the read
+/// path ([`is_fresh`]); the write path uses
+/// [`read_disk_unconditional`] under flock for correctness.
 fn read_disk_if_changed() -> Option<Vec<Entry>> {
     let path = cache_path().ok()?;
     let metadata = std::fs::metadata(&path).ok()?;
@@ -202,9 +262,10 @@ pub(crate) fn is_fresh(provider: Provider, model: &str, api_base: &str) -> bool 
 /// Record a successful validation for `(provider, model, api_base)`.
 ///
 /// Updates the in-process overlay, then atomically rewrites the
-/// disk file.  Disk-write errors are logged at `warn` and
-/// swallowed — a cache miss next call is strictly preferable to
-/// failing a transcription that already validated on the wire.
+/// disk file under an exclusive POSIX file lock.  Disk-write
+/// errors are logged at `warn` and swallowed — a cache miss next
+/// call is strictly preferable to failing a transcription that
+/// already validated on the wire.
 pub(crate) fn record(provider: Provider, model: &str, api_base: &str) {
     let key = Key {
         provider: provider.to_string(),
@@ -222,8 +283,20 @@ pub(crate) fn record(provider: Provider, model: &str, api_base: &str) {
     }
 }
 
-/// Serialise the current in-process map and write it atomically
-/// to disk via tempfile + rename.
+/// Serialise the in-process map (merged with any sibling-process
+/// entries currently on disk) and atomically write it back.
+///
+/// The full sequence under an exclusive POSIX file lock:
+///
+/// 1. Acquire the exclusive lock on `validate-cache.yaml.lock`.
+/// 2. Re-read the on-disk YAML.  Each entry is merged into the
+///    in-process map iff it's newer than what we already have for
+///    the same key (this preserves entries that other processes
+///    have validated since we last refreshed and prevents the
+///    "fresh-process clobbers everyone else's rows" failure mode).
+/// 3. Build a [`CacheFile`] from the merged map and serialise.
+/// 4. Tempfile + atomic rename onto the final path.
+/// 5. Drop the lock guard (releases the flock).
 ///
 /// Errors propagate so [`record`] can log them; the in-process
 /// overlay is already updated regardless of disk-write outcome.
@@ -239,6 +312,68 @@ fn persist_to_disk() -> Result<(), TalkError> {
         })?;
     }
 
+    // ── Acquire exclusive flock on a sibling lock file ──────────
+    //
+    // Using a sibling rather than the cache file itself means
+    // readers (which never lock) don't race against writers; the
+    // atomic rename gives them either the previous-complete file
+    // or the new-complete file.  The lock file is created on
+    // demand and never deleted (no benefit and adds churn).
+    let lock_file_path = lock_path(&path);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_file_path)
+        .map_err(|e| {
+            TalkError::Config(format!(
+                "validate-cache: failed to open lock file {}: {}",
+                lock_file_path.display(),
+                e
+            ))
+        })?;
+    lock_file.lock_exclusive().map_err(|e| {
+        TalkError::Config(format!(
+            "validate-cache: failed to acquire exclusive flock on {}: {}",
+            lock_file_path.display(),
+            e
+        ))
+    })?;
+
+    // RAII guard: any early return below releases the lock when
+    // `_lock_guard` drops.
+    let _lock_guard = LockGuard(&lock_file);
+
+    // ── Re-read disk + merge into in-process map ────────────────
+    //
+    // Under the flock, the disk state cannot change between read
+    // and write.  Newer-timestamp-wins on conflict so two
+    // concurrent successful validations of the same key produce
+    // the latest one; sibling-process entries we've never seen are
+    // adopted into our in-process map verbatim.
+    if let Some(disk_entries) = read_disk_unconditional() {
+        if let Ok(mut map) = in_process().lock() {
+            for e in disk_entries {
+                let key = Key {
+                    provider: e.provider,
+                    model: e.model,
+                    api_base: e.api_base,
+                };
+                match map.get(&key).copied() {
+                    None => {
+                        map.insert(key, e.validated_at);
+                    }
+                    Some(existing) if e.validated_at > existing => {
+                        map.insert(key, e.validated_at);
+                    }
+                    _ => {} // we already have a newer or equal entry
+                }
+            }
+        }
+    }
+
+    // ── Snapshot in-process map → disk ──────────────────────────
     let entries: Vec<Entry> = match in_process().lock() {
         Ok(map) => map
             .iter()
@@ -290,63 +425,99 @@ fn persist_to_disk() -> Result<(), TalkError> {
         }
     }
 
+    // Lock released when `_lock_guard` drops at end of scope.
     Ok(())
+}
+
+/// RAII wrapper around a held [`fs2::FileExt::lock_exclusive`]
+/// that releases the lock on drop.
+///
+/// fs2's default behaviour is to release on close, but explicit
+/// unlock at the end of `persist_to_disk` is clearer and ensures
+/// release happens before any subsequent disk operation in the
+/// same caller frame.
+struct LockGuard<'a>(&'a std::fs::File);
+
+impl Drop for LockGuard<'_> {
+    fn drop(&mut self) {
+        // Best-effort unlock; the file close on subsequent drop of
+        // the underlying `File` will release the lock anyway.
+        let _ = fs2::FileExt::unlock(self.0);
+    }
+}
+
+/// Process-wide test serialisation lock.
+///
+/// Every cache-touching test in this crate (whether in this
+/// module's `tests` submodule, or in sibling modules like
+/// `http::tests`) acquires this same lock at setup so they do
+/// not race on the shared `IN_PROCESS` / `LAST_DISK_MTIME`
+/// statics or on the `TALK_RS_VALIDATE_CACHE_PATH` env var.
+///
+/// Public so cross-module test helpers can hold the lock for
+/// the duration of a test.
+#[cfg(test)]
+pub(crate) static __TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only helper: clear the in-process map and the
+/// last-known mtime so the next access reads fresh from
+/// (whatever the env var points at).  Compiled out of release
+/// builds via `#[cfg(test)]`.
+///
+/// Public so test code in sibling modules (e.g.
+/// `transcription::transport::http::tests`) can reset cache
+/// state at test setup/teardown without re-implementing the
+/// internals.
+#[cfg(test)]
+pub(crate) fn __test_reset() {
+    if let Some(map) = IN_PROCESS.get() {
+        if let Ok(mut m) = map.lock() {
+            m.clear();
+        }
+    }
+    if let Some(mtime) = LAST_DISK_MTIME.get() {
+        if let Ok(mut t) = mtime.lock() {
+            *t = None;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
 
-    /// All cache tests share the same `OnceLock`-backed
-    /// in-process map and the same `cache_path()` (resolved via
-    /// XDG).  Serialise them so they don't trample each other.
-    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
-
-    /// Reset the in-process overlay between tests.  Necessary
-    /// because the `OnceLock` persists across `#[test]` boundaries.
-    fn reset_in_process() {
-        if let Some(map) = IN_PROCESS.get() {
-            if let Ok(mut m) = map.lock() {
-                m.clear();
-            }
-        }
-        if let Some(mtime) = LAST_DISK_MTIME.get() {
-            if let Ok(mut t) = mtime.lock() {
-                *t = None;
-            }
-        }
-    }
-
-    /// Override the cache path for tests by overriding the home
-    /// dir.  ProjectDirs honours `$HOME` on Linux.
+    /// Override the cache path for tests using the
+    /// [`CACHE_PATH_ENV`] env var, pointing at a tempfile.
+    ///
+    /// Resists the env-mutation racing problem of the older
+    /// `$HOME`/`$XDG_CACHE_HOME` swap: only one variable is
+    /// touched, the test lock serialises access (process-wide
+    /// via [`__TEST_LOCK`] so cross-module tests don't race),
+    /// and any production code path bypassing the env override
+    /// would be caught by a stray write to the dev's real cache
+    /// file.
     fn with_temp_home<F: FnOnce()>(f: F) {
-        let _guard = TEST_LOCK.lock().expect("test: lock poisoned");
-        reset_in_process();
+        let _guard = __TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        __test_reset();
 
         let tmp = tempfile::TempDir::new().expect("test: tempdir");
-        let prev_home = std::env::var_os("HOME");
-        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let cache_file = tmp.path().join("validate-cache.yaml");
+        let prev = std::env::var_os(CACHE_PATH_ENV);
         // SAFETY: tests are serialised by TEST_LOCK so concurrent
         // env mutation is impossible within this binary.
         unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::set_var("XDG_CACHE_HOME", tmp.path().join("cache"));
+            std::env::set_var(CACHE_PATH_ENV, &cache_file);
         }
 
         f();
 
         unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
+            match prev {
+                Some(v) => std::env::set_var(CACHE_PATH_ENV, v),
+                None => std::env::remove_var(CACHE_PATH_ENV),
             }
         }
-        reset_in_process();
+        __test_reset();
     }
 
     /// Spec: a freshly-recorded entry is reported as fresh, and
@@ -488,6 +659,83 @@ mod tests {
 
             // Lookup must not panic; missing-or-corrupt = not-fresh.
             assert!(!is_fresh(Provider::Mistral, "voxtral", "https://x"));
+        });
+    }
+
+    /// Spec: a `record()` call MUST NOT clobber sibling-process
+    /// entries already on disk.  Simulates the "fresh process
+    /// records its first entry" case that previously wiped the
+    /// real production cache.
+    ///
+    /// Sequence:
+    ///   1. Hand-write a YAML file containing a sibling entry
+    ///      ("openai" / "whisper-1") simulating a different
+    ///      process having recorded it earlier.
+    ///   2. Clear our in-process map (simulating a fresh
+    ///      process that has never seen the disk file).
+    ///   3. Call `record()` for a different key ("mistral" /
+    ///      "voxtral-mini-2602").
+    ///   4. Read back the disk file; assert BOTH entries are
+    ///      present.  Pre-flock this would have wiped the
+    ///      sibling and left only the new entry.
+    #[test]
+    fn record_merges_with_sibling_disk_entries() {
+        with_temp_home(|| {
+            // 1. Pre-populate disk with a sibling entry.
+            let path = cache_path().expect("test: path");
+            std::fs::create_dir_all(path.parent().expect("test: parent"))
+                .expect("test: create dir");
+            let sibling_yaml = "\
+entries:
+- provider: openai
+  model: whisper-1
+  api_base: https://api.openai.com
+  validated_at: 2026-04-29T10:00:00Z
+";
+            std::fs::write(&path, sibling_yaml).expect("test: write sibling cache");
+
+            // 2. Clear our in-process map and our last-known
+            //    mtime: simulate fresh process that has never
+            //    read this file.
+            if let Ok(mut map) = in_process().lock() {
+                map.clear();
+            }
+            if let Ok(mut t) = last_disk_mtime().lock() {
+                *t = None;
+            }
+
+            // 3. Record a *different* key.  Pre-flock this would
+            //    have written ONLY the new entry, wiping the
+            //    sibling.
+            record(
+                Provider::Mistral,
+                "voxtral-mini-2602",
+                "https://api.mistral.ai",
+            );
+
+            // 4. Read the disk file directly and assert both
+            //    entries are preserved.
+            let bytes = std::fs::read(&path).expect("test: read disk after record");
+            let parsed: CacheFile = serde_yaml::from_slice(&bytes).expect("test: parse YAML");
+            let keys: Vec<(String, String, String)> = parsed
+                .entries
+                .iter()
+                .map(|e| (e.provider.clone(), e.model.clone(), e.api_base.clone()))
+                .collect();
+
+            assert!(
+                keys.iter()
+                    .any(|(p, m, _)| p == "openai" && m == "whisper-1"),
+                "sibling openai entry must be preserved, got: {:?}",
+                keys
+            );
+            assert!(
+                keys.iter()
+                    .any(|(p, m, _)| p == "mistral" && m == "voxtral-mini-2602"),
+                "newly-recorded mistral entry must be present, got: {:?}",
+                keys
+            );
+            assert_eq!(keys.len(), 2, "expected exactly 2 entries, got: {:?}", keys);
         });
     }
 

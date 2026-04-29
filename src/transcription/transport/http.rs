@@ -1504,19 +1504,76 @@ mod tests {
         assert_eq!(VALIDATE_BUDGET_SECS.len(), 5);
     }
 
+    /// Redirect the validate-cache file at a fresh tempfile via
+    /// the `TALK_RS_VALIDATE_CACHE_PATH` env var, returning a
+    /// [`CacheTestGuard`] whose `Drop` restores the previous env
+    /// value and clears the in-process cache state.  Every
+    /// network-touching `validate_model` test below holds one of
+    /// these to keep its writes off the developer's real cache.
+    ///
+    /// Holds the process-wide
+    /// [`super::super::validate_cache::__TEST_LOCK`] so it
+    /// serialises against tests in `validate_cache::tests` (which
+    /// also touch `IN_PROCESS` / `LAST_DISK_MTIME` / the env
+    /// var) — `cargo test` runs test threads in parallel by
+    /// default and concurrent access to those globals would
+    /// produce nondeterministic failures.
+    fn cache_test_guard() -> CacheTestGuard {
+        let lock = super::super::validate_cache::__TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::TempDir::new().expect("test: tempdir");
+        let path = tmp.path().join("validate-cache.yaml");
+        let prev = std::env::var_os("TALK_RS_VALIDATE_CACHE_PATH");
+        // SAFETY: tests are serialised by the process-wide
+        // __TEST_LOCK so concurrent env mutation is impossible.
+        unsafe {
+            std::env::set_var("TALK_RS_VALIDATE_CACHE_PATH", &path);
+        }
+        // Reset module statics so the next call sees a clean
+        // in-process map.  Safe because the lock guarantees we're
+        // the only test mutating these.
+        super::super::validate_cache::__test_reset();
+        CacheTestGuard {
+            _tmp: tmp,
+            _lock: lock,
+            prev,
+        }
+    }
+
+    struct CacheTestGuard {
+        _tmp: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for CacheTestGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialised by the held `_lock`.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("TALK_RS_VALIDATE_CACHE_PATH", v),
+                    None => std::env::remove_var("TALK_RS_VALIDATE_CACHE_PATH"),
+                }
+            }
+            super::super::validate_cache::__test_reset();
+        }
+    }
+
     /// Spec: a successful validate emits `PreflightStarted` then
     /// `PreflightCompleted { success: true }` on the sink — and only
     /// those two preflight events, in that order, on the cache-miss
     /// path.
     ///
-    /// Uses `wiremock` to stand in for `/v1/models`.  Cache state
-    /// is not isolated here (the disk cache is process-global) so
-    /// we use a unique api_base per test to avoid collisions with
-    /// other tests recording into the cache.
+    /// Cache state is isolated to a tempfile via
+    /// [`cache_test_guard`] so this test cannot pollute the
+    /// developer's real cache.
     #[tokio::test]
     async fn validate_model_emits_preflight_pair_on_cache_miss() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _cache_guard = cache_test_guard();
 
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1583,6 +1640,8 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let _cache_guard = cache_test_guard();
+
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -1620,6 +1679,8 @@ mod tests {
     async fn validate_model_does_not_retry_on_model_not_found() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _cache_guard = cache_test_guard();
 
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1668,6 +1729,8 @@ mod tests {
     async fn validate_model_cache_hit_skips_network() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _cache_guard = cache_test_guard();
 
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))

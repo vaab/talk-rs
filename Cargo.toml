@@ -57,6 +57,7 @@ gtk4 = { version = "0.8", features = ["v4_10"] }
 gdk4-x11 = "0.8"
 dark-light = "2.0"
 dissimilar = "1"
+fs2 = "0.4.3"
 
 [dev-dependencies]
 assert_cmd = "2"
