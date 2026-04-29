@@ -668,11 +668,15 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         result
     } else {
         // Batch mode (default): capture audio, encode, then transcribe.
+        // Dictate is an autonomous pipeline (no human watching),
+        // so use `Proportional` so a hung server cannot wedge the
+        // pipeline forever.
         let mut transcriber = transcription::create_batch_transcriber(
             &config,
             provider,
             opts.model.as_deref(),
             opts.diarize,
+            transcription::RequestTimeoutPolicy::Proportional,
         )?;
         transcriber.set_sink(sink.clone());
 
@@ -707,14 +711,19 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                 log::warn!("streaming transcription failed: {}", first_err);
 
                 // Fall back to file-based transcription.  Retry is
-                // already handled by Layer 3.
+                // already handled by Layer 3.  Same `Proportional`
+                // policy as the streaming path above — autonomous
+                // dictate must not hang.
                 let result = transcription::transcribe_audio(
                     &cache_path,
                     &config,
                     provider,
                     opts.model.as_deref(),
                     opts.diarize,
-                    true,
+                    transcription::TranscribeOptions {
+                        allow_api: true,
+                        policy: transcription::RequestTimeoutPolicy::Proportional,
+                    },
                     &sink,
                 )
                 .await;

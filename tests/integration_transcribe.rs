@@ -132,7 +132,10 @@ async fn test_transcribe_audio_cache_only_on_missing_entry() {
         Provider::Mistral,
         None,
         false,
-        false,
+        talk_rs::transcription::TranscribeOptions {
+            allow_api: false,
+            policy: talk_rs::transcription::RequestTimeoutPolicy::Proportional,
+        },
         &sink,
     )
     .await;
@@ -208,7 +211,10 @@ async fn test_mistral_transcriber_real_api() {
         Provider::Mistral,
         None,
         false,
-        true,
+        talk_rs::transcription::TranscribeOptions {
+            allow_api: true,
+            policy: talk_rs::transcription::RequestTimeoutPolicy::Proportional,
+        },
         &sink,
     )
     .await;

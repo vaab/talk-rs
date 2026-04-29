@@ -104,13 +104,22 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         }
         let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
             std::sync::Arc::new(crate::telemetry::NoOpSink);
+        // `allow_api=false` short-circuits before any HTTP call, so
+        // the `policy` here is purely a typing requirement — the
+        // wall-clock branch in `send_once` is never reached.  Pass
+        // `Proportional` (the function-default flavour) so this
+        // call site does not look like it is asking for picker
+        // semantics it cannot use.
         match transcription::transcribe_audio(
             &audio_path,
             config.as_ref(),
             *p,
             Some(m),
             false,
-            false,
+            transcription::TranscribeOptions {
+                allow_api: false,
+                policy: transcription::RequestTimeoutPolicy::Proportional,
+            },
             &sink,
         )
         .await

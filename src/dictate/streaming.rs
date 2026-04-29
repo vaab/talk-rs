@@ -251,7 +251,14 @@ pub(crate) async fn dictate_streaming(
                         viz.push_message(&msg);
                     }
                     match transcription::create_batch_transcriber(
-                        config, provider, model, diarize,
+                        config,
+                        provider,
+                        model,
+                        diarize,
+                        // Reconnect after a streaming failure stays
+                        // on the autonomous-pipeline `Proportional`
+                        // policy — dictate has no human watching.
+                        transcription::RequestTimeoutPolicy::Proportional,
                     ) {
                         Ok(new_transcriber) => {
                             let pipeline = spawn_encode_pipeline(

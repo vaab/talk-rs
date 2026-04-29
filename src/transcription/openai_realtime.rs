@@ -586,7 +586,15 @@ impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
             .endpoint
             .replace("wss://", "https://")
             .replace("ws://", "http://");
-        super::openai::validate_openai_model(&self.config.api_key, &self.model, &api_base).await?;
+        // The realtime path does not yet thread a telemetry sink
+        // (see the TODO at `connect_with_retry`), so the preflight
+        // events emitted by `validate_openai_model` go to a no-op
+        // sink here.  Cache hits are unaffected; cache misses
+        // simply don't surface preflight progress to any UI.
+        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+            std::sync::Arc::new(crate::telemetry::NoOpSink);
+        super::openai::validate_openai_model(&self.config.api_key, &self.model, &api_base, &sink)
+            .await?;
 
         // Step 2: WebSocket check — connect, send
         // transcription_session.update with our model config, and wait

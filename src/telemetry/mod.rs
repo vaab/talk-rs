@@ -51,6 +51,22 @@ use tokio::sync::broadcast;
 /// throughput windows, retry counts, etc.) from a stream of these.
 #[derive(Debug, Clone)]
 pub enum TranscriptionEvent {
+    /// Model preflight (`/v1/models` validation) started — emitted
+    /// by [`crate::transcription::transport::http::validate_model`]
+    /// only on cache miss.  When the validate-cache hits, the
+    /// preflight is skipped entirely and no `Preflight*` events are
+    /// emitted, so consumers must be prepared for [`Self::RequestStarted`]
+    /// to arrive without a preceding [`Self::PreflightStarted`].
+    PreflightStarted { t: Instant },
+
+    /// Model preflight finished (success or failure).  Emitted only
+    /// on cache miss, paired with [`Self::PreflightStarted`].  On
+    /// `success: true`, the next event is normally
+    /// [`Self::RequestStarted`] from the actual transcription
+    /// request.  On `success: false`, the call site returns the
+    /// error and no transcription request is made.
+    PreflightCompleted { success: bool, t: Instant },
+
     /// Wire goes hot: reqwest's `.send()` has been called.  No
     /// bytes have been sent yet; the connection may or may not be
     /// established.

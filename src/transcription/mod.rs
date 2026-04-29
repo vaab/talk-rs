@@ -36,6 +36,65 @@ pub(crate) enum TranscriptionBody {
     },
 }
 
+/// Per-request wall-clock-timeout policy for batch transcription.
+///
+/// Two distinct call contexts demand opposite defaults:
+///
+/// - Autonomous pipelines (dictate end-of-recording, `transcribe`
+///   CLI) MUST not hang forever — there is no human watching to
+///   abort.  These callers pick [`Self::Proportional`].
+/// - Interactive callers (the GTK picker row) prefer "wait as long
+///   as it takes" — the user can dismiss the picker if a candidate
+///   is taking forever.  These callers pick [`Self::UserAttended`].
+///
+/// The policy is stored on each [`BatchTranscriber`] (chosen at
+/// construction via `with_policy`) and consulted by `send_once`
+/// when it issues the HTTP request.  In both cases the
+/// `connect_timeout` from `build_client()` and the kernel-level TCP
+/// defences (TCP keepalive, `tcp_user_timeout` on Linux) still
+/// fire, so dead connections cannot hang either path indefinitely
+/// — only legitimately slow servers benefit from `UserAttended`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestTimeoutPolicy {
+    /// Cap each attempt at `proportional_timeout(file_len)` so an
+    /// unattended pipeline cannot hang forever.  This is the legacy
+    /// behaviour and remains the default of [`MistralBatchTranscriber::new`]
+    /// / [`OpenAIBatchTranscriber::new`].
+    Proportional,
+    /// No per-request wall-clock cap; rely solely on
+    /// `connect_timeout` plus TCP-level defences.  Used by the
+    /// picker so a slow-responding server can take its time without
+    /// being killed mid-transcription.  Cancellation is the user's
+    /// responsibility (close the picker, or — once wired — a
+    /// per-row cancel button).
+    UserAttended,
+}
+
+/// Caller-controlled options for [`transcribe_audio`].
+///
+/// Bundles the orthogonal axes that affect a single transcription
+/// call so the function signature stays readable as new axes
+/// appear.  Each field is a typed concept that means something
+/// specific at the call site:
+///
+/// - `allow_api`: whether the cache-miss path may hit the network.
+///   `false` = cache-only probe (returns [`TalkError::CacheOnly`]
+///   on miss); `true` = full pipeline with API call.
+/// - `policy`: per-request wall-clock policy.  See
+///   [`RequestTimeoutPolicy`].
+///
+/// Construct via the public fields directly — there is no builder.
+#[derive(Debug, Clone, Copy)]
+pub struct TranscribeOptions {
+    /// Permit network I/O on cache miss.  `false` makes the call
+    /// cache-only (returns [`TalkError::CacheOnly`] on miss);
+    /// `true` runs the full pipeline including API.
+    pub allow_api: bool,
+    /// Per-request wall-clock-timeout policy.  See
+    /// [`RequestTimeoutPolicy`] for variant semantics.
+    pub policy: RequestTimeoutPolicy,
+}
+
 pub mod mistral;
 pub mod model_suggestions;
 pub mod openai;
@@ -342,12 +401,16 @@ pub async fn enrich_model_error(
 /// When `model` is `Some`, it overrides the config default for that
 /// provider (the `--model` CLI flag).  When `diarize` is `true`, the
 /// transcriber will request speaker diarization (if supported by the
-/// provider).
+/// provider).  The `policy` is stored on the transcriber and
+/// consulted by its `send_once` implementation to decide whether to
+/// attach a per-request wall-clock timeout — see
+/// [`RequestTimeoutPolicy`] for variant semantics.
 pub(crate) fn create_batch_transcriber(
     config: &Config,
     provider: Provider,
     model: Option<&str>,
     diarize: bool,
+    policy: RequestTimeoutPolicy,
 ) -> Result<Box<dyn BatchTranscriber>, TalkError> {
     match provider {
         Provider::Mistral => {
@@ -364,7 +427,9 @@ pub(crate) fn create_batch_transcriber(
             if let Some(m) = model {
                 cfg.model = m.to_string();
             }
-            Ok(Box::new(MistralBatchTranscriber::new(cfg, diarize)?))
+            Ok(Box::new(MistralBatchTranscriber::with_policy(
+                cfg, diarize, policy,
+            )?))
         }
         Provider::OpenAI => {
             let mut cfg = config.providers.openai.clone().ok_or_else(|| {
@@ -380,7 +445,7 @@ pub(crate) fn create_batch_transcriber(
             if let Some(m) = model {
                 cfg.model = m.to_string();
             }
-            Ok(Box::new(OpenAIBatchTranscriber::new(cfg)?))
+            Ok(Box::new(OpenAIBatchTranscriber::with_policy(cfg, policy)?))
         }
     }
 }
@@ -457,7 +522,22 @@ pub async fn produce_transcript(
 
     let effective_model = resolve_effective_model(config, provider, model);
 
-    let result = transcribe_audio(audio_path, config, provider, model, false, true, sink).await;
+    // `produce_transcript` is called from autonomous backends
+    // (recording cache layer 2 producer) — pick `Proportional` so a
+    // hung server cannot wedge the producer indefinitely.
+    let result = transcribe_audio(
+        audio_path,
+        config,
+        provider,
+        model,
+        false,
+        TranscribeOptions {
+            allow_api: true,
+            policy: RequestTimeoutPolicy::Proportional,
+        },
+        sink,
+    )
+    .await;
 
     let final_result = match result {
         Ok(r) => {
@@ -503,9 +583,10 @@ pub async fn transcribe_audio(
     provider: Provider,
     model: Option<&str>,
     diarize: bool,
-    allow_api: bool,
+    options: TranscribeOptions,
     sink: &std::sync::Arc<dyn crate::telemetry::TelemetrySink>,
 ) -> Result<TranscriptionResult, TalkError> {
+    let TranscribeOptions { allow_api, policy } = options;
     use crate::recording_cache::{self, TranscriptionCache};
 
     let effective_model = resolve_effective_model(config, provider, model);
@@ -544,7 +625,7 @@ pub async fn transcribe_audio(
 
     // Wrap API call in a closure so we can always release the lock.
     let api_result = async {
-        let mut transcriber = create_batch_transcriber(config, provider, model, diarize)?;
+        let mut transcriber = create_batch_transcriber(config, provider, model, diarize, policy)?;
         transcriber.set_sink(sink.clone());
         transcriber.validate().await?;
         transcriber
