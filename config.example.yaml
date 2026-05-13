@@ -41,9 +41,32 @@ providers:
   #   model: whisper-1                          # batch model (whisper-1, gpt-4o-transcribe)
   #   realtime_model: gpt-4o-mini-transcribe    # realtime WebSocket model
 
+  # Local whisper.cpp Configuration (optional, offline + GPU-accelerated)
+  # No API key required.  Download a GGML model file from
+  # https://huggingface.co/ggerganov/whisper.cpp and point model_path at it.
+  # whisper_local:
+  #   # Absolute path to the GGML model file (required).
+  #   model_path: /home/<user>/.local/share/talk-rs/models/ggml-large-v3.bin
+  #
+  #   # ISO 639-1 language code (e.g. "fr", "en") or "auto".  Defaults to "auto".
+  #   language: auto
+  #
+  #   # Run inference on the GPU when the binary is built with the
+  #   # `cuda` feature (or another `_gpu` backend).  Defaults to true.
+  #   use_gpu: true
+  #
+  #   # CPU threads for non-GPU parts of the pipeline.  Defaults to 4.
+  #   threads: 4
+  #
+  #   # Free-form prompt biasing the decoder toward expected vocabulary.
+  #   # Local equivalent of the Mistral `context_bias`.
+  #   initial_prompt: |
+  #     Project names, technical terms, proper nouns,
+  #     domain-specific words to recognise.
+
 # Optional: Default provider when --provider is not specified
 # transcription:
-#   default_provider: mistral
+#   default_provider: mistral        # mistral | openai | whisper_local
 
 # Optional: Visual and Audio Indicators
 # Configure feedback mechanisms during recording
@@ -74,3 +97,11 @@ indicators:
 #   # paste-summary behaviour.  Set to 0 to disable chunking (paste in
 #   # one shot).  Also overridden by --no-chunk-paste (which forces 0).
 #   chunk_chars: 150
+#
+#   # Clipboard-only mode (recommended on Wayland).  When true, talk-rs
+#   # writes the transcription to the X11 clipboard *and* pipes it into
+#   # `wl-copy` (best-effort) for the Wayland clipboard, then exits.
+#   # It does NOT simulate Ctrl+Shift+V and does NOT restore the
+#   # previous clipboard contents.  Combine with a clipboard manager
+#   # (GPaste, Pano, Copyous…) for a "transcribe → Ctrl+V" workflow.
+#   no_paste: false

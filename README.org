@@ -60,25 +60,60 @@ happening.
 #+begin_src sh
 # Debian / Ubuntu
 sudo apt install build-essential pkg-config libasound2-dev libopus-dev \
-  libgtk-4-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev
+  libgtk-4-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev \
+  libssl-dev
 
 # Fedora
 sudo dnf install alsa-lib-devel opus-devel pkg-config \
-  gtk4-devel pipewire-devel spa-devel clang-devel
+  gtk4-devel pipewire-devel spa-devel clang-devel \
+  openssl-devel
 #+end_src
 
 A working Rust toolchain is required (1.70+). Install via
 [[https://rustup.rs][rustup]] if needed.
+
+The optional ~whisper_local~ provider (offline transcription via
+whisper.cpp with CUDA) requires the NVIDIA CUDA toolkit so that
+~nvcc~ is available at build time:
+
+#+begin_src sh
+# Debian / Ubuntu
+sudo apt install nvidia-cuda-toolkit
+#+end_src
+
+CPU-only builds work without the toolkit but are too slow for
+practical dictation with the ~large-v3~ model.
 
 *** Runtime dependencies
 
 =PipeWire= must be running (used for audio capture). Most modern Linux
 desktops ship with PipeWire by default.
 
-An API key for at least one transcription provider is required:
+Pick one of the transcription backends below.
+
+**** Cloud (default)
+
+An API key for at least one cloud provider is required:
 
 - [[https://console.mistral.ai/][Mistral]] (default)
 - [[https://platform.openai.com/][OpenAI]]
+
+**** Local whisper.cpp (offline, GPU-accelerated)
+
+No API key needed.  Download a GGML model file from
+[[https://huggingface.co/ggerganov/whisper.cpp][ggerganov/whisper.cpp]]:
+
+#+begin_src sh
+mkdir -p ~/.local/share/talk-rs/models
+curl -L -o ~/.local/share/talk-rs/models/ggml-large-v3.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
+#+end_src
+
+Smaller models (~medium~, ~small~, ~base~, ~tiny~) trade quality for
+speed and VRAM.  ~large-v3~ needs ~3.5 GB of VRAM and gives the best
+French accuracy.  See the
+[[https://github.com/ggerganov/whisper.cpp/blob/master/models/README.md][whisper.cpp model README]]
+for the full catalog.
 
 ** Installation
 
@@ -109,7 +144,7 @@ mkdir -p ~/.config/talk-rs
 cp config.example.yaml ~/.config/talk-rs/config.yaml
 #+end_src
 
-Minimal working configuration:
+Minimal working configuration (cloud — Mistral):
 
 #+begin_src yaml
 output_dir: ~/talk-rs-output
@@ -119,13 +154,30 @@ providers:
     api_key: YOUR_MISTRAL_API_KEY
 #+end_src
 
+Minimal working configuration (local — whisper.cpp, no API key):
+
+#+begin_src yaml
+output_dir: ~/talk-rs-output
+
+providers:
+  whisper_local:
+    model_path: ~/.local/share/talk-rs/models/ggml-large-v3.bin
+    language: fr            # or "auto"
+    initial_prompt: >-
+      Vocabulary hint: project names, technical terms, proper nouns…
+
+transcription:
+  default_provider: whisper_local
+#+end_src
+
 *** Required fields
 
-| Field                        | Description                                          |
-|------------------------------+------------------------------------------------------|
-| ~output_dir~                 | Absolute path to a writable directory for recordings |
-| ~providers.mistral.api_key~  | Mistral API key (if using Mistral)                   |
-| ~providers.openai.api_key~   | OpenAI API key (if using OpenAI)                     |
+| Field                                  | Description                                            |
+|----------------------------------------+--------------------------------------------------------|
+| ~output_dir~                           | Absolute path to a writable directory for recordings   |
+| ~providers.mistral.api_key~            | Mistral API key (if using Mistral)                     |
+| ~providers.openai.api_key~             | OpenAI API key (if using OpenAI)                       |
+| ~providers.whisper_local.model_path~   | Path to a GGML model file (if using ~whisper_local~)   |
 
 *** Optional fields
 
@@ -143,6 +195,11 @@ providers:
 | ~indicators.viz~                   | /none/                    | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ (also ~--viz~; env ~TALK_RS_INDICATORS_VIZ~) |
 | ~indicators.mono~                  | ~false~                   | Monochrome visualizer (also ~--mono~) |
 | ~paste.chunk_chars~                | ~150~                     | Max chars per paste chunk (~0~ disables chunking; also ~--no-chunk-paste~) |
+| ~paste.no_paste~                   | ~false~                   | Skip auto-paste: leave the transcription in the clipboard only.  Recommended on Wayland — see "Wayland tips" below. |
+| ~providers.whisper_local.language~       | ~auto~      | Language code (~fr~, ~en~, …) or ~auto~      |
+| ~providers.whisper_local.use_gpu~        | ~true~      | Run inference on the GPU when built with ~cuda~ |
+| ~providers.whisper_local.threads~        | ~4~         | CPU threads for non-GPU stages               |
+| ~providers.whisper_local.initial_prompt~ | /none/      | Free-form vocabulary hint (local equivalent of ~context_bias~) |
 
 *** Environment overrides
 
@@ -154,6 +211,33 @@ export TALK_RS_PROVIDERS_OPENAI_API_KEY="sk-..."
 #+end_src
 
 See ~config.example.yaml~ for the full list.
+
+*** Wayland tips
+
+talk-rs's auto-paste path uses the X11 ~XTEST~ extension to fake a
+~Ctrl+Shift+V~ keystroke into the focused window.  Under a Wayland
+compositor (GNOME ≥ 41, KDE Plasma, sway, …) this keystroke is
+blocked: the transcription ends up in the clipboard only briefly,
+then talk-rs restores the previous clipboard contents — leaving the
+user with nothing to paste.
+
+The recommended Wayland workflow is therefore:
+
+1. Set ~paste.no_paste: true~ in the config.  In this mode talk-rs
+   writes the transcription to both the X11 and Wayland clipboards
+   and exits without simulating any keystroke or restoring the
+   previous clipboard contents.
+2. Install ~wl-clipboard~ so ~wl-copy~ is available to talk-rs:
+   ~sudo apt install wl-clipboard~.
+3. Install a clipboard manager so each transcription is kept in
+   history and easy to insert: [[https://github.com/Keruspe/GPaste][GPaste]]
+   (~sudo apt install gpaste-2 gnome-shell-extension-gpaste~),
+   [[https://github.com/oae/gnome-shell-pano][Pano]] (GNOME Shell extension),
+   [[https://github.com/boerdereinar/copyous][Copyous]], or any other
+   manager that observes the system clipboard.
+4. Trigger talk-rs as usual; press ~Ctrl+V~ (or pick from the
+   clipboard manager UI) to insert the transcription where you want
+   it.
 
 ** Usage
 
