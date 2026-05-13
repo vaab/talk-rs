@@ -48,6 +48,16 @@ pub(super) fn resolve_model(
                     .unwrap_or_else(|| "whisper-1".to_string())
             }
         }
+        Provider::WhisperLocal => config
+            .providers
+            .whisper_local
+            .as_ref()
+            .and_then(|c| {
+                c.model_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "ggml-large-v3".to_string()),
     }
 }
 
@@ -71,9 +81,12 @@ const OPENAI_REALTIME_MODELS: &[&str] = &["gpt-4o-mini-transcribe", "gpt-4o-tran
 /// Push all known realtime transcription models for `provider` into
 /// `out`.  The third element of each tuple is `true` (streaming).
 fn add_known_realtime_models(out: &mut Vec<(Provider, String, bool)>, provider: Provider) {
-    let models = match provider {
+    let models: &[&str] = match provider {
         Provider::OpenAI => OPENAI_REALTIME_MODELS,
         Provider::Mistral => MISTRAL_REALTIME_MODELS,
+        // Local whisper.cpp has no realtime mode and no model catalog —
+        // the model is whatever GGML file is on disk.
+        Provider::WhisperLocal => &[],
     };
     for m in models {
         out.push((provider, (*m).to_string(), true));
@@ -133,9 +146,13 @@ pub(super) fn build_retry_candidates(
 /// Push all known batch transcription models for `provider` into `out`
 /// as `(provider, model, streaming=false)` triples.
 fn add_known_models_with_streaming(out: &mut Vec<(Provider, String, bool)>, provider: Provider) {
-    let models = match provider {
+    let models: &[&str] = match provider {
         Provider::OpenAI => OPENAI_TRANSCRIPTION_MODELS,
         Provider::Mistral => MISTRAL_TRANSCRIPTION_MODELS,
+        // Local whisper.cpp: the user-provided GGML file is the only
+        // model; we don't generate retry candidates pointing at other
+        // local files because we have no way to enumerate them.
+        Provider::WhisperLocal => &[],
     };
     for m in models {
         out.push((provider, (*m).to_string(), false));
