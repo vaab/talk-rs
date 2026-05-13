@@ -102,6 +102,9 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             .unwrap_or(PASTE_CHUNK_CHARS)
     };
 
+    // Clipboard-only mode: read from config; defaults to false.
+    let paste_no_paste = config.paste.as_ref().map(|p| p.no_paste).unwrap_or(false);
+
     // Determine target window: use --target-window arg (from daemon mode)
     // or capture the currently active window.
     let target_window = if let Some(wid) = opts.target_window {
@@ -147,6 +150,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                 model: opts.model,
                 target_window,
                 paste_chunk_chars,
+                paste_no_paste,
             },
         )
         .await;
@@ -757,7 +761,14 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         if let Some(ref o) = overlay {
             o.hide();
         }
-        paste_text_to_target(target_window.as_ref(), &text, 0, paste_chunk_chars).await?;
+        paste_text_to_target(
+            target_window.as_ref(),
+            &text,
+            0,
+            paste_chunk_chars,
+            paste_no_paste,
+        )
+        .await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
     }
 

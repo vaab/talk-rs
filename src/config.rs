@@ -310,6 +310,24 @@ pub struct PasteConfig {
     /// shot).
     #[serde(default = "default_paste_chunk_chars")]
     pub chunk_chars: usize,
+
+    /// Skip auto-paste — only write the transcription to the system
+    /// clipboard.
+    ///
+    /// Recommended on Wayland sessions where the X11 ``XTEST`` fake
+    /// keypress used by the standard paste path is blocked by the
+    /// compositor, leaving the transcription unreachable.  Combined
+    /// with a clipboard manager (GPaste, Pano, …) this becomes a
+    /// "transcribe → press Ctrl+V to insert" workflow.
+    ///
+    /// When enabled, talk-rs:
+    /// - writes the text to the X11 clipboard, and
+    /// - best-effort piping into ``wl-copy`` so the Wayland-native
+    ///   clipboard receives the same text (``wl-clipboard`` package),
+    /// - does not simulate any keypress, and
+    /// - does not restore the previous clipboard contents.
+    #[serde(default)]
+    pub no_paste: bool,
 }
 
 fn default_paste_chunk_chars() -> usize {
