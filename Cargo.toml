@@ -56,6 +56,9 @@ gtk4 = { version = "0.8", features = ["v4_10"] }
 gdk4-x11 = "0.8"
 dark-light = "2.0"
 dissimilar = "1"
+whisper-rs = { version = "0.16", features = ["cuda", "log_backend"] }
+hound = "3"
+tempfile = "3"
 
 [dev-dependencies]
 assert_cmd = "2"
