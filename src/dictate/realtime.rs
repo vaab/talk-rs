@@ -539,6 +539,10 @@ pub(crate) async fn dictate_realtime(
             usage_raw: None,
             unknown_event_types,
         })),
+        // Realtime is rejected at the factory for WhisperLocal, so this
+        // branch is unreachable in practice — but the match must stay
+        // exhaustive.
+        Provider::WhisperLocal => None,
     };
 
     Ok(TranscriptionResult {

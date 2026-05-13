@@ -120,8 +120,28 @@ pub async fn paste_text_to_target(
     text: &str,
     delete_chars_before_paste: usize,
     chunk_chars: usize,
+    no_paste: bool,
 ) -> Result<(), TalkError> {
     let clipboard = X11Clipboard::new();
+
+    // Clipboard-only mode: write to both X11 and the Wayland-native
+    // clipboard, then return without simulating any keystroke and
+    // without restoring any prior clipboard contents.  Recommended
+    // under Wayland, where the XTEST-based paste path is blocked by
+    // the compositor.
+    if no_paste {
+        clipboard.set_text(text).await?;
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            if let Err(e) = write_to_wayland_clipboard(text).await {
+                log::warn!(
+                    "wl-copy unavailable — Wayland-native apps may not see the \
+                     transcription (install the ``wl-clipboard`` package): {}",
+                    e
+                );
+            }
+        }
+        return Ok(());
+    }
 
     if let Some(wid) = target_window {
         log::debug!("refocusing target window: {}", wid);
@@ -223,6 +243,49 @@ pub async fn simulate_backspace(count: usize) -> Result<(), TalkError> {
         return Err(TalkError::Clipboard(
             "XTest backspace simulation failed".to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// Pipe `text` into ``wl-copy`` so that the Wayland-native clipboard
+/// is populated.
+///
+/// This is best-effort: the binary may not be installed, the spawn
+/// may fail, or stdin may close before the data is fully written.
+/// The caller logs a warning and continues — the X11 clipboard has
+/// already been set, which is enough for XWayland-based apps.
+async fn write_to_wayland_clipboard(text: &str) -> Result<(), TalkError> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let mut child = Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| TalkError::Clipboard(format!("wl-copy spawn failed: {}", e)))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .await
+            .map_err(|e| TalkError::Clipboard(format!("wl-copy write failed: {}", e)))?;
+        stdin
+            .shutdown()
+            .await
+            .map_err(|e| TalkError::Clipboard(format!("wl-copy shutdown failed: {}", e)))?;
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| TalkError::Clipboard(format!("wl-copy wait failed: {}", e)))?;
+
+    if !status.success() {
+        return Err(TalkError::Clipboard(format!(
+            "wl-copy exited with status {}",
+            status
+        )));
     }
     Ok(())
 }

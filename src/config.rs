@@ -34,13 +34,16 @@ pub struct Config {
 
 /// Transcription provider identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Provider {
     /// Mistral / Voxtral transcription.
     Mistral,
     /// OpenAI Whisper / GPT-4o transcription.
     #[serde(alias = "openai")]
     OpenAI,
+    /// Local whisper.cpp transcription (offline, GPU-accelerated).
+    #[serde(alias = "whisper-local", alias = "whisperlocal")]
+    WhisperLocal,
 }
 
 impl std::fmt::Display for Provider {
@@ -48,6 +51,7 @@ impl std::fmt::Display for Provider {
         match self {
             Provider::Mistral => write!(f, "mistral"),
             Provider::OpenAI => write!(f, "openai"),
+            Provider::WhisperLocal => write!(f, "whisper_local"),
         }
     }
 }
@@ -59,8 +63,9 @@ impl std::str::FromStr for Provider {
         match s.to_lowercase().as_str() {
             "mistral" => Ok(Provider::Mistral),
             "openai" => Ok(Provider::OpenAI),
+            "whisper_local" | "whisper-local" | "whisperlocal" => Ok(Provider::WhisperLocal),
             other => Err(format!(
-                "unknown provider '{}' (expected 'mistral' or 'openai')",
+                "unknown provider '{}' (expected 'mistral', 'openai' or 'whisper_local')",
                 other
             )),
         }
@@ -77,6 +82,11 @@ pub struct ProvidersConfig {
     /// OpenAI API configuration (optional — only required when using OpenAI).
     #[serde(default)]
     pub openai: Option<OpenAIConfig>,
+
+    /// Local whisper.cpp configuration (optional — only required when using
+    /// the `whisper_local` provider).
+    #[serde(default)]
+    pub whisper_local: Option<WhisperLocalConfig>,
 }
 
 /// Mistral API configuration.
@@ -139,6 +149,55 @@ fn default_openai_model() -> String {
 
 fn default_openai_realtime_model() -> String {
     "gpt-4o-mini-transcribe".to_string()
+}
+
+/// Local whisper.cpp configuration.
+///
+/// Offline transcription using a GGML model file loaded into VRAM
+/// (when built with the `cuda` feature) or RAM (CPU fallback).
+#[derive(Debug, Deserialize, Clone)]
+pub struct WhisperLocalConfig {
+    /// Filesystem path to the GGML model file (e.g.
+    /// `~/.local/share/talk-rs/models/ggml-large-v3.bin`).
+    ///
+    /// Required.  Download GGML models from
+    /// <https://huggingface.co/ggerganov/whisper.cpp>.
+    pub model_path: PathBuf,
+
+    /// ISO 639-1 language code (e.g. `fr`, `en`).  Use `auto` to let
+    /// the model detect the spoken language.  Defaults to `auto`.
+    #[serde(default = "default_whisper_language")]
+    pub language: String,
+
+    /// Use GPU acceleration when available.  Defaults to `true`.
+    /// Has no effect when the binary is built without a GPU backend.
+    #[serde(default = "default_whisper_use_gpu")]
+    pub use_gpu: bool,
+
+    /// Initial prompt to bias the model toward specific vocabulary.
+    ///
+    /// Whisper's equivalent of the cloud `context_bias`: a free-form
+    /// text snippet that primes the decoder with names, technical
+    /// terms, or proper nouns the model would otherwise mis-spell.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
+
+    /// Number of CPU threads used for the non-GPU parts of decoding.
+    /// Defaults to `4`.
+    #[serde(default = "default_whisper_threads")]
+    pub threads: i32,
+}
+
+fn default_whisper_language() -> String {
+    "auto".to_string()
+}
+
+fn default_whisper_use_gpu() -> bool {
+    true
+}
+
+fn default_whisper_threads() -> i32 {
+    4
 }
 
 /// Transcription defaults.
@@ -251,6 +310,24 @@ pub struct PasteConfig {
     /// shot).
     #[serde(default = "default_paste_chunk_chars")]
     pub chunk_chars: usize,
+
+    /// Skip auto-paste — only write the transcription to the system
+    /// clipboard.
+    ///
+    /// Recommended on Wayland sessions where the X11 ``XTEST`` fake
+    /// keypress used by the standard paste path is blocked by the
+    /// compositor, leaving the transcription unreachable.  Combined
+    /// with a clipboard manager (GPaste, Pano, …) this becomes a
+    /// "transcribe → press Ctrl+V to insert" workflow.
+    ///
+    /// When enabled, talk-rs:
+    /// - writes the text to the X11 clipboard, and
+    /// - best-effort piping into ``wl-copy`` so the Wayland-native
+    ///   clipboard receives the same text (``wl-clipboard`` package),
+    /// - does not simulate any keypress, and
+    /// - does not restore the previous clipboard contents.
+    #[serde(default)]
+    pub no_paste: bool,
 }
 
 fn default_paste_chunk_chars() -> usize {
@@ -285,6 +362,9 @@ impl Config {
     /// - TALK_RS_PROVIDERS_OPENAI_URL
     /// - TALK_RS_PROVIDERS_OPENAI_MODEL
     /// - TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL
+    /// - TALK_RS_PROVIDERS_WHISPER_LOCAL_MODEL_PATH
+    /// - TALK_RS_PROVIDERS_WHISPER_LOCAL_LANGUAGE
+    /// - TALK_RS_PROVIDERS_WHISPER_LOCAL_INITIAL_PROMPT
     pub fn load(path: Option<&Path>) -> Result<Self, TalkError> {
         let config_path = match path {
             Some(path) => path.to_path_buf(),
@@ -372,6 +452,30 @@ impl Config {
                         .unwrap_or_else(default_openai_realtime_model),
                 });
             }
+        }
+
+        // WhisperLocal env var overrides.
+        if let Some(ref mut wl) = config.providers.whisper_local {
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_WHISPER_LOCAL_MODEL_PATH")? {
+                wl.model_path = PathBuf::from(value);
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_WHISPER_LOCAL_LANGUAGE")? {
+                wl.language = value;
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_WHISPER_LOCAL_INITIAL_PROMPT")? {
+                wl.initial_prompt = Some(value);
+            }
+        } else if let Some(model_path) =
+            env_var_string("TALK_RS_PROVIDERS_WHISPER_LOCAL_MODEL_PATH")?
+        {
+            config.providers.whisper_local = Some(WhisperLocalConfig {
+                model_path: PathBuf::from(model_path),
+                language: env_var_string("TALK_RS_PROVIDERS_WHISPER_LOCAL_LANGUAGE")?
+                    .unwrap_or_else(default_whisper_language),
+                use_gpu: default_whisper_use_gpu(),
+                initial_prompt: env_var_string("TALK_RS_PROVIDERS_WHISPER_LOCAL_INITIAL_PROMPT")?,
+                threads: default_whisper_threads(),
+            });
         }
 
         validate_config(&config)?;
@@ -471,6 +575,9 @@ mod tests {
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_URL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_MODEL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_WHISPER_LOCAL_MODEL_PATH")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_WHISPER_LOCAL_LANGUAGE")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_WHISPER_LOCAL_INITIAL_PROMPT")?,
         ])
     }
 

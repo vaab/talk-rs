@@ -19,11 +19,13 @@ pub mod model_suggestions;
 pub mod openai;
 pub mod openai_realtime;
 pub mod realtime;
+pub mod whisper_local;
 
 pub use mistral::MistralBatchTranscriber;
 pub use openai::OpenAIBatchTranscriber;
 pub use openai_realtime::OpenAIRealtimeTranscriber;
 pub use realtime::{MistralRealtimeTranscriber, TranscriptionEvent};
+pub use whisper_local::WhisperLocalBatchTranscriber;
 
 /// Result type for transcription operations.
 #[derive(Debug, Clone, Default)]
@@ -221,6 +223,7 @@ pub fn is_model_error(provider: Provider, error: &TalkError) -> bool {
     match provider {
         Provider::Mistral => mistral::is_model_error(error),
         Provider::OpenAI => openai::is_model_error(error),
+        Provider::WhisperLocal => whisper_local::is_model_error(error),
     }
 }
 
@@ -252,6 +255,7 @@ pub async fn enrich_model_error(
             let api_base = cfg.url.as_deref().unwrap_or(openai::API_BASE);
             openai::enrich_model_error(error, &cfg.api_key, model_name, api_base).await
         }
+        Provider::WhisperLocal => whisper_local::enrich_model_error(error),
     }
 }
 
@@ -302,6 +306,30 @@ pub fn create_batch_transcriber(
             }
             Ok(Box::new(OpenAIBatchTranscriber::new(cfg)?))
         }
+        Provider::WhisperLocal => {
+            let cfg = config.providers.whisper_local.clone().ok_or_else(|| {
+                TalkError::Config(
+                    "whisper_local provider selected but providers.whisper_local is not \
+                     configured"
+                        .to_string(),
+                )
+            })?;
+            if diarize {
+                return Err(TalkError::Config(
+                    "whisper_local does not support speaker diarization yet — \
+                     use mistral or openai for --diarize"
+                        .to_string(),
+                ));
+            }
+            if model.is_some() {
+                log::warn!(
+                    "--model is ignored for whisper_local; the model is selected by the \
+                     `model_path` config key (currently {:?})",
+                    cfg.model_path
+                );
+            }
+            Ok(Box::new(WhisperLocalBatchTranscriber::new(cfg)))
+        }
     }
 }
 
@@ -344,6 +372,12 @@ pub fn create_realtime_transcriber(
             }
             Ok(Box::new(OpenAIRealtimeTranscriber::new(cfg)))
         }
+        Provider::WhisperLocal => Err(TalkError::Config(
+            "whisper_local does not support realtime mode yet — \
+             drop --realtime to use batch transcription (the file is buffered then \
+             transcribed once recording stops)"
+                .to_string(),
+        )),
     }
 }
 

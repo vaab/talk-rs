@@ -29,6 +29,7 @@ pub(crate) struct PickParams {
     pub model: Option<String>,
     pub target_window: Option<String>,
     pub paste_chunk_chars: usize,
+    pub paste_no_paste: bool,
 }
 
 /// Run pick mode: show a GTK picker with cached and live transcriptions.
@@ -253,6 +254,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         &selection.text,
         delete_chars,
         params.paste_chunk_chars,
+        params.paste_no_paste,
     )
     .await?;
     let _ =
