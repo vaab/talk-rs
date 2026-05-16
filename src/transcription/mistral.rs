@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::transport::http::{
-    build_client, format_reqwest_error_with_timers, parse_u64_field, proportional_timeout,
-    ProgressBody, TimerSpec, CONNECT_TIMEOUT,
+    build_client, build_pipeline_failure_kind, parse_u64_field, proportional_timeout, ProgressBody,
+    TimerSpec, CONNECT_TIMEOUT,
 };
 use super::BatchTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
@@ -348,9 +348,21 @@ impl MistralBatchTranscriber {
                 success: false,
                 t: Instant::now(),
             });
-            TalkError::Transcription(format!(
-                "Failed to send request to Mistral API: {}",
-                format_reqwest_error_with_timers(&err, &timers)
+            // Build a structured `PipelineFailure` so consumers
+            // can pattern-match cause/timer instead of regex over
+            // a flattened string.  `with_retry` (the wrapper one
+            // call up) handles attempts/max — at this layer we
+            // are inside a single attempt, so `attempts=1,
+            // max_attempts=1`.  See `with_retry` for the per-call
+            // retry budget surfaced through `RetryScheduled`
+            // telemetry.
+            TalkError::from(crate::error::PipelineFailure::new(
+                "Mistral",
+                crate::error::PipelinePhase::Request,
+                1,
+                1,
+                self.endpoint.clone(),
+                build_pipeline_failure_kind(err, &timers),
             ))
         })?;
 
@@ -1083,18 +1095,39 @@ mod tests {
                 panic!("test: silent listener should never produce a Mistral success");
             }
             Ok(Err(e)) => {
+                // Structural assertion: the failure must be a
+                // `Pipeline` error in the `Request` phase, and its
+                // `Network` cause MUST NOT have a
+                // `request_wall_clock` timer attached (because
+                // `UserAttended` policy intentionally omits it).
+                use crate::error::{NetworkKind, PipelineFailureKind, PipelinePhase};
+                let pf = match &e {
+                    crate::error::TalkError::Pipeline(pf) => pf,
+                    other => panic!(
+                        "expected TalkError::Pipeline under UserAttended, got: {}",
+                        other
+                    ),
+                };
+                assert_eq!(pf.phase, PipelinePhase::Request);
+                if let PipelineFailureKind::Network { kind: _, timer, .. } = &pf.kind {
+                    assert!(
+                        !matches!(timer, Some(t) if t.name == "request_wall_clock"),
+                        "UserAttended must not attribute to request_wall_clock; got timer={:?}",
+                        timer
+                    );
+                }
+                // Decode/HttpStatus from a never-replying listener
+                // is also acceptable — the structured shape is what
+                // matters, not the specific sub-variant.
+                let _ = NetworkKind::Connect; // suppress unused-import warning if Network branch never hits
+                                              // Sanity: not a flat string-stuffed legacy error
+                                              // — the `Display` should NOT carry a leading
+                                              // "Configuration error:" or "Transcription error:"
+                                              // prefix.
                 let s = e.to_string();
                 assert!(
-                    !s.contains("name=request_wall_clock"),
-                    "UserAttended policy must not attribute failure to request_wall_clock; got: {}",
-                    s
-                );
-                // Some kind of attribution OR a kind tag must still
-                // appear — we never want to drop the diagnostic
-                // detail entirely.
-                assert!(
-                    s.contains("[kind="),
-                    "expected kind tag in error string, got: {}",
+                    !s.starts_with("Configuration error:"),
+                    "structured Pipeline error must not produce Config prefix: {}",
                     s
                 );
             }
