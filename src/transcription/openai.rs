@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::transport::http::{
-    build_client, format_reqwest_error_with_timers, parse_u64_field, proportional_timeout,
-    ProgressBody, TimerSpec, CONNECT_TIMEOUT,
+    build_client, build_pipeline_failure_kind, parse_u64_field, proportional_timeout, ProgressBody,
+    TimerSpec, CONNECT_TIMEOUT,
 };
 use super::BatchTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
@@ -308,9 +308,18 @@ impl OpenAIBatchTranscriber {
                 success: false,
                 t: Instant::now(),
             });
-            TalkError::Transcription(format!(
-                "Failed to send request to OpenAI API: {}",
-                format_reqwest_error_with_timers(&err, &timers)
+            // Build a structured `PipelineFailure` so consumers
+            // can pattern-match cause/timer instead of regex over
+            // a flattened string.  See the parallel call site in
+            // `mistral.rs::send_once` for the attempts=1/max=1
+            // rationale.
+            TalkError::from(crate::error::PipelineFailure::new(
+                "OpenAI",
+                crate::error::PipelinePhase::Request,
+                1,
+                1,
+                self.endpoint.clone(),
+                build_pipeline_failure_kind(err, &timers),
             ))
         })?;
 

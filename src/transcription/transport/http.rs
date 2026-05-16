@@ -4,7 +4,9 @@
 //! utilities, and model validation logic used by both the Mistral
 //! and OpenAI providers.
 
-use crate::error::TalkError;
+use crate::error::{
+    NetworkKind, PipelineFailure, PipelineFailureKind, PipelinePhase, TalkError, TimerLabel,
+};
 use crate::telemetry::{TelemetrySink, TranscriptionEvent};
 use futures::Stream;
 use reqwest::Client;
@@ -150,163 +152,76 @@ pub(crate) struct TimerSpec {
     pub budget: Duration,
 }
 
-/// Format a [`Duration`] for log output: whole seconds when possible,
-/// fractional seconds otherwise.  Keeps log lines compact and stable
-/// across builds (no platform-dependent `Debug` formatting).
-fn fmt_budget(d: Duration) -> String {
-    if d.subsec_nanos() == 0 {
-        format!("{}s", d.as_secs())
-    } else {
-        format!("{:.3}s", d.as_secs_f64())
+/// Build a structured [`PipelineFailureKind`] from a
+/// [`reqwest::Error`] plus the [`TimerSpec`]s active at the
+/// failing call site.
+///
+/// This is the single place that maps reqwest's classification
+/// methods (`is_connect`, `is_timeout`) and source-chain
+/// inspection (kernel `io::ErrorKind::TimedOut` walks) onto the
+/// project-wide structured failure vocabulary.  The display layer
+/// in [`crate::error`] consumes the resulting
+/// [`PipelineFailureKind`] without ever importing reqwest.
+///
+/// # Attribution rules
+///
+/// 1. [`reqwest::Error::is_connect`] → [`NetworkKind::Connect`]
+///    with the `connect_timeout` [`TimerSpec`] (when declared).
+/// 2. [`reqwest::Error::is_timeout`] AND not `is_connect` →
+///    [`NetworkKind::WallClock`] with the
+///    `request_wall_clock`/`validate_request` [`TimerSpec`]
+///    (whichever was declared at the call site).
+/// 3. Source chain contains an `io::ErrorKind::TimedOut` AND
+///    neither `is_connect` nor `is_timeout` matched →
+///    [`NetworkKind::KernelTcp`] with a synthetic timer label
+///    `name=kernel_tcp_unspecified, budget=<tcp_user_timeout>+<tcp_keepalive>`
+///    (single field; both contributing budgets joined with `+`
+///    so log greppers see a single grep target).
+/// 4. Otherwise → [`NetworkKind::Other`] with `timer: None`.
+///
+/// The reqwest error itself is captured as the
+/// [`PipelineFailureKind::Network::source`] field so the
+/// [`crate::error::PipelineFailure`] `Display` walks it for novel
+/// chain layers (DNS, ECONNREFUSED, TLS alerts, OS errno).
+pub(crate) fn build_pipeline_failure_kind(
+    err: reqwest::Error,
+    timers: &[TimerSpec],
+) -> PipelineFailureKind {
+    let (kind, timer) = classify_reqwest_error(&err, timers);
+    PipelineFailureKind::Network {
+        kind,
+        timer,
+        source: Box::new(err),
     }
 }
 
-/// Format a [`reqwest::Error`] with full diagnostic detail and
-/// timeout-source attribution for logs.
-///
-/// `reqwest::Error`'s default `Display` prints only the top-level
-/// message (e.g. `"error sending request for url (...)"`) and hides
-/// the actual cause behind `std::error::Error::source()`.  For talk-rs
-/// users who land in the logs trying to figure out why a transcription
-/// failed, that single line is useless: it does not distinguish DNS
-/// failure from connection refused from TLS handshake failure from
-/// read timeout — and it does not say *which* of the multiple timers
-/// active at the call site fired.
-///
-/// This helper produces a single-line string that:
-///
-/// - Starts with the top-level [`reqwest::Error`] message.
-/// - Appends a `[kind=...]` tag derived from the structured
-///   classifiers ([`reqwest::Error::is_timeout`],
-///   [`reqwest::Error::is_connect`], etc.).
-/// - When `timers` is non-empty AND the failure is timeout-shaped,
-///   appends `name=...` and `budget=...` (or `budgets=[...]` for
-///   ambiguous kernel-level timeouts) identifying *which* timer
-///   fired.  See [Timer attribution rules](#timer-attribution-rules).
-/// - Appends `[status=NNN]` if the error carries an HTTP status.
-/// - Appends `[url=...]` if the error carries a URL.
-/// - Walks [`std::error::Error::source`] to the root, joining each
-///   layer with ` -> `.  Consecutive identical messages are
-///   deduplicated to avoid noise from libraries that wrap an error
-///   in itself.
-///
-/// The output is intentionally one line so it composes with the
-/// existing `log::warn!` / `log::error!` patterns in the codebase.
-///
-/// # Timer attribution rules
-///
-/// Given the active timers at a call site, the helper attributes
-/// the failure as follows:
-///
-/// 1. [`reqwest::Error::is_connect`] → look for a timer named
-///    `"connect_timeout"` in `timers`; if present, emit
-///    `name=connect_timeout, budget=<value>`.
-/// 2. [`reqwest::Error::is_timeout`] AND not `is_connect` → look for
-///    a timer named `"request_wall_clock"` or `"validate_request"`
-///    in `timers`; emit the first match.
-/// 3. Source chain contains an `io::ErrorKind::TimedOut` AND neither
-///    `is_connect` nor `is_timeout` matched a configured timer →
-///    emit `name=kernel_tcp_unspecified` plus
-///    `budgets=[tcp_user_timeout=3s, tcp_keepalive=5s+1s×3]` so the
-///    reader sees both candidate kernel timers.  Reqwest cannot
-///    distinguish [`TCP_USER_TIMEOUT`] from [`TCP_KEEPALIVE`]
-///    expiration after the fact, so we surface both rather than
-///    pretending to know.
-/// 4. Otherwise → no `name=`/`budget=` tag; the existing
-///    `[kind=..., url=...]` format alone.
-pub(crate) fn format_reqwest_error_with_timers(
+/// Inner helper: classify a reqwest error into a `(NetworkKind,
+/// Option<TimerLabel>)` pair without consuming the error.  Pulled
+/// out so it can be unit-tested with a synthesised reqwest error
+/// without losing the original for [`build_pipeline_failure_kind`]
+/// to box.
+fn classify_reqwest_error(
     err: &reqwest::Error,
     timers: &[TimerSpec],
-) -> String {
-    use std::error::Error as _;
-    use std::fmt::Write as _;
-
-    // Classify the failure into a coarse kind tag so log greppers can
-    // bucket failures without re-parsing the message.  Order matters:
-    // `is_timeout` and `is_connect` can both be true for some kernel
-    // errors; we report the more actionable one first.
-    let kind = if err.is_timeout() {
-        "timeout"
-    } else if err.is_connect() {
-        "connect"
-    } else if err.is_request() {
-        "request"
-    } else if err.is_body() {
-        "body"
-    } else if err.is_decode() {
-        "decode"
-    } else if err.is_redirect() {
-        "redirect"
-    } else if err.is_status() {
-        "status"
-    } else {
-        "other"
-    };
-
-    let mut out = err.to_string();
-    let _ = write!(out, " [kind={}", kind);
-
-    // Timer attribution.  We compute this before status/url so the
-    // `name=`/`budget=` tag stays close to `kind=` for readability.
-    if let Some(attr) = attribute_timer(err, timers) {
-        let _ = write!(out, ", {}", attr);
-    }
-
-    if let Some(status) = err.status() {
-        let _ = write!(out, ", status={}", status.as_u16());
-    }
-    if let Some(url) = err.url() {
-        let _ = write!(out, ", url={}", url);
-    }
-    out.push(']');
-
-    // Walk the source chain to surface the underlying cause (DNS
-    // error, OS error, TLS alert, etc.).  Dedup consecutive identical
-    // messages — `hyper` and `reqwest` occasionally wrap an error in
-    // a layer that re-prints the inner message verbatim.
-    let mut last_layer = err.to_string();
-    let mut current: Option<&dyn std::error::Error> = err.source();
-    while let Some(e) = current {
-        let msg = e.to_string();
-        if msg != last_layer {
-            out.push_str(" -> ");
-            out.push_str(&msg);
-            last_layer = msg;
-        }
-        current = e.source();
-    }
-
-    out
-}
-
-/// Compute the `name=...`, `budget=...` (or `budgets=[...]`) tag
-/// fragment to insert into the formatted error, or `None` when no
-/// timer attribution applies.
-///
-/// Encapsulated as a free function so the timer-matching rules in
-/// the doc-comment of [`format_reqwest_error_with_timers`] live in
-/// exactly one place and are unit-testable in isolation.
-fn attribute_timer(err: &reqwest::Error, timers: &[TimerSpec]) -> Option<String> {
+) -> (NetworkKind, Option<TimerLabel>) {
     use std::error::Error as _;
 
     // Rule 1 — connect-phase failure.
     if err.is_connect() {
-        if let Some(t) = timers.iter().find(|t| t.name == "connect_timeout") {
-            return Some(format!("name={}, budget={}", t.name, fmt_budget(t.budget)));
-        }
-        // Connect failure with no `connect_timeout` declared is
-        // diagnostically interesting (caller forgot to declare it),
-        // but we don't synthesize a name — fall through to no tag.
+        let timer = timers
+            .iter()
+            .find(|t| t.name == "connect_timeout")
+            .map(|t| TimerLabel::from_duration(t.name, t.budget));
+        return (NetworkKind::Connect, timer);
     }
 
     // Rule 2 — request-level wall-clock or validate-preflight timeout.
     if err.is_timeout() && !err.is_connect() {
-        if let Some(t) = timers
+        let timer = timers
             .iter()
             .find(|t| matches!(t.name, "request_wall_clock" | "validate_request"))
-        {
-            return Some(format!("name={}, budget={}", t.name, fmt_budget(t.budget)));
-        }
+            .map(|t| TimerLabel::from_duration(t.name, t.budget));
+        return (NetworkKind::WallClock, timer);
     }
 
     // Rule 3 — kernel TCP timeout surfaced as a generic IO error.
@@ -315,9 +230,9 @@ fn attribute_timer(err: &reqwest::Error, timers: &[TimerSpec]) -> Option<String>
     // socket is killed mid-stream by the kernel via `TCP_USER_TIMEOUT`
     // or unanswered keepalive probes.  Those surface as a plain
     // `std::io::Error` of kind `TimedOut` somewhere in the source
-    // chain.  We can't tell which kernel timer expired, so we report
-    // both candidate budgets — the reader can correlate with elapsed
-    // time if needed.
+    // chain.  We can't tell which kernel timer expired, so we
+    // report both candidate budgets joined with `+` — the reader
+    // correlates with elapsed time if needed.
     let mut current: Option<&dyn std::error::Error> = err.source();
     while let Some(e) = current {
         if let Some(io) = e.downcast_ref::<std::io::Error>() {
@@ -327,24 +242,40 @@ fn attribute_timer(err: &reqwest::Error, timers: &[TimerSpec]) -> Option<String>
                 #[cfg(target_os = "linux")]
                 let user_timeout = TCP_USER_TIMEOUT;
                 #[cfg(not(target_os = "linux"))]
-                let user_timeout = Duration::ZERO; // not active on non-Linux
+                let user_timeout = Duration::ZERO;
 
-                let budgets = if cfg!(target_os = "linux") {
+                let budget_str = if cfg!(target_os = "linux") {
                     format!(
-                        "budgets=[tcp_user_timeout={}, tcp_keepalive={}]",
-                        fmt_budget(user_timeout),
-                        fmt_budget(keepalive_dead),
+                        "{}+{}",
+                        fmt_duration_compact(user_timeout),
+                        fmt_duration_compact(keepalive_dead),
                     )
                 } else {
-                    format!("budgets=[tcp_keepalive={}]", fmt_budget(keepalive_dead))
+                    fmt_duration_compact(keepalive_dead)
                 };
-                return Some(format!("name=kernel_tcp_unspecified, {}", budgets));
+                return (
+                    NetworkKind::KernelTcp,
+                    Some(TimerLabel {
+                        name: "kernel_tcp_unspecified".to_string(),
+                        budget: budget_str,
+                    }),
+                );
             }
         }
         current = e.source();
     }
 
-    None
+    (NetworkKind::Other, None)
+}
+
+/// Compact `Duration` formatter for the kernel-tcp budget label.
+/// Lives next to the producer so the wire format stays in one place.
+fn fmt_duration_compact(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{:.3}s", d.as_secs_f64())
+    }
 }
 
 /// Chunk size used by [`ProgressBody`] when yielding bytes from an
@@ -564,6 +495,7 @@ pub(crate) async fn validate_model(
         model,
         api_base,
         is_transcription_model,
+        sink,
     )
     .await;
     sink.emit(TranscriptionEvent::PreflightCompleted {
@@ -584,7 +516,13 @@ pub(crate) async fn validate_model(
 /// memoization concern.
 ///
 /// Retry semantics:
-/// - 5 attempts (`VALIDATE_BUDGET_SECS.len()`).
+/// - 5 total attempts ([`VALIDATE_BUDGET_SECS`].len()) — the
+///   initial attempt plus 4 retries.
+/// - Between attempts the loop emits
+///   [`TranscriptionEvent::RetryScheduled`] with `attempt = 1..=4`
+///   and `max = 4`, mirroring the existing transcription-request
+///   retry telemetry shape (`attempt` is 1-indexed retry number,
+///   the initial call is attempt 0 and does not produce an event).
 /// - Each attempt uses a fresh `.timeout(...)` wall-clock derived
 ///   from [`VALIDATE_BUDGET_SECS`]; client-wide `connect_timeout`
 ///   (2s) and TCP-level defences are unchanged.
@@ -592,27 +530,56 @@ pub(crate) async fn validate_model(
 ///   retrying — the model list is authoritative).
 /// - On any other error, retry the next attempt.
 /// - After all attempts exhausted, return the last error.
+///
+/// All non-`Ok(())` returns produce
+/// [`TalkError::Pipeline`]`(PipelineFailure { phase: Validate, ..
+/// })` so consumers can pattern-match the structured cause.
 async fn validate_model_uncached(
     provider_name: &str,
     api_key: &str,
     model: &str,
     api_base: &str,
     is_transcription_model: fn(&str) -> bool,
+    sink: &Arc<dyn TelemetrySink>,
 ) -> Result<(), TalkError> {
     let models_url = format!("{}/v1/models", api_base);
     let client = build_client()?;
 
-    let mut last_err: Option<TalkError> = None;
+    let total_attempts = VALIDATE_BUDGET_SECS.len() as u32;
+    // Number of retries = total attempts - 1 (the initial call is
+    // not a retry).  Reflects the established `RetryScheduled`
+    // contract from `with_retry`.
+    let max_retries = total_attempts.saturating_sub(1);
+    let mut last_failure: Option<PipelineFailure> = None;
 
     for (attempt_idx, &budget_secs) in VALIDATE_BUDGET_SECS.iter().enumerate() {
+        // 1-indexed total attempt number (1..=5) for logs.
         let attempt_num = (attempt_idx as u32) + 1;
-        let total = VALIDATE_BUDGET_SECS.len() as u32;
         let budget = Duration::from_secs(budget_secs);
+
+        // Emit `RetryScheduled` BEFORE every attempt past the
+        // first, so consumers (picker UI, overlay) can render a
+        // "retry N/M…" status while this attempt is in flight.
+        // `attempt` here is the 1-indexed retry number (1..=4 for
+        // 5 total attempts).
+        if attempt_idx > 0 {
+            let retry_num = attempt_idx as u32; // 1-indexed retry
+            let reason = last_failure
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_default();
+            sink.emit(TranscriptionEvent::RetryScheduled {
+                attempt: retry_num,
+                max: max_retries,
+                reason,
+                t: Instant::now(),
+            });
+        }
 
         log::debug!(
             "validate_model: attempt {}/{} for {}:{} (budget={}s)",
             attempt_num,
-            total,
+            total_attempts,
             provider_name,
             model,
             budget_secs
@@ -643,11 +610,14 @@ async fn validate_model_uncached(
         let response = match send_result {
             Ok(r) => r,
             Err(e) => {
-                last_err = Some(TalkError::Config(format!(
-                    "{} model validation failed (preflight to /v1/models): {}",
+                last_failure = Some(PipelineFailure::new(
                     provider_name,
-                    format_reqwest_error_with_timers(&e, &timers)
-                )));
+                    PipelinePhase::Validate,
+                    attempt_num,
+                    total_attempts,
+                    &models_url,
+                    build_pipeline_failure_kind(e, &timers),
+                ));
                 continue; // retry
             }
         };
@@ -657,10 +627,18 @@ async fn validate_model_uncached(
             let body = response.text().await.unwrap_or_default();
             // HTTP error from the server is permanent — no point
             // retrying a 401/403/404 from the models endpoint.
-            return Err(TalkError::Config(format!(
-                "{} model validation failed (preflight to /v1/models): {} ({})",
-                provider_name, status, body
-            )));
+            return Err(PipelineFailure::new(
+                provider_name,
+                PipelinePhase::Validate,
+                attempt_num,
+                total_attempts,
+                &models_url,
+                PipelineFailureKind::HttpStatus {
+                    status: status.as_u16(),
+                    body,
+                },
+            )
+            .into());
         }
 
         let models: ModelsResponse = match response.json().await {
@@ -669,11 +647,14 @@ async fn validate_model_uncached(
                 // Decode error mid-response is more likely a
                 // network glitch than a permanent server issue —
                 // retry.
-                last_err = Some(TalkError::Config(format!(
-                    "{} model validation failed (preflight to /v1/models): \
-                     could not parse response: {}",
-                    provider_name, e
-                )));
+                last_failure = Some(PipelineFailure::new(
+                    provider_name,
+                    PipelinePhase::Validate,
+                    attempt_num,
+                    total_attempts,
+                    &models_url,
+                    PipelineFailureKind::Decode(e.to_string()),
+                ));
                 continue;
             }
         };
@@ -684,36 +665,47 @@ async fn validate_model_uncached(
 
         // Model not found in the (successfully retrieved) list —
         // permanent.  No retry can change this answer.
-        let mut transcription_models: Vec<&str> = models
+        let mut suggestions: Vec<String> = models
             .data
             .iter()
             .map(|m| m.id.as_str())
             .filter(|id| is_transcription_model(id))
+            .map(String::from)
             .collect();
-        transcription_models.sort();
+        suggestions.sort();
 
-        return if transcription_models.is_empty() {
-            Err(TalkError::Config(format!(
-                "Model '{}' not found in {} account",
-                model, provider_name
-            )))
-        } else {
-            Err(TalkError::Config(format!(
-                "Model '{}' not found. Available transcription models: {}",
-                model,
-                transcription_models.join(", ")
-            )))
-        };
+        return Err(PipelineFailure::new(
+            provider_name,
+            PipelinePhase::Validate,
+            attempt_num,
+            total_attempts,
+            &models_url,
+            PipelineFailureKind::ModelRejected {
+                model: model.to_string(),
+                suggestions,
+            },
+        )
+        .into());
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        TalkError::Config(format!(
-            "{} model validation failed (preflight to /v1/models): \
-             all {} attempts exhausted",
+    // All attempts exhausted; surface the last attempt's failure.
+    let last = last_failure.unwrap_or_else(|| {
+        // Should be unreachable — every iteration either returns
+        // or sets last_failure — but build a structured "exhausted
+        // with no recorded cause" failure rather than panicking.
+        PipelineFailure::new(
             provider_name,
-            VALIDATE_BUDGET_SECS.len()
-        ))
-    }))
+            PipelinePhase::Validate,
+            total_attempts,
+            total_attempts,
+            &models_url,
+            PipelineFailureKind::Decode(format!(
+                "all {} attempts exhausted with no recorded cause",
+                total_attempts
+            )),
+        )
+    });
+    Err(last.into())
 }
 
 /// Enrich a model error with available transcription model suggestions.
@@ -987,153 +979,28 @@ mod tests {
     }
 
     // ── format_reqwest_error ────────────────────────────────────
+    //
+    // The string-formatting helper `format_reqwest_error_with_timers`
+    // was removed when the structured pipeline error type took over.
+    // Equivalent coverage now lives in:
+    //   - `classify_*` tests in this module (timer attribution).
+    //   - `pipeline_failure_*` tests in `crate::error` (display
+    //      and source-chain dedup).
 
+    // ── classify_reqwest_error — structural attribution ────────
+    //
+    // Pre-migration: tests called `format_reqwest_error_with_timers`
+    // and asserted on the rendered string.  Post-migration the
+    // formatter is split: `classify_reqwest_error` returns a typed
+    // `(NetworkKind, Option<TimerLabel>)` pair; the rendering
+    // lives in `crate::error::PipelineFailure::Display`.  Each
+    // test below now exercises the structural classifier
+    // directly — same coverage, no string parsing.
+
+    /// Spec: connect-phase failure with a `connect_timeout` timer
+    /// declared returns `(Connect, Some(connect_timeout))`.
     #[tokio::test]
-    async fn format_reqwest_error_classifies_connect_refused() {
-        // 127.0.0.1:1 is reserved (tcpmux) and never has a listener
-        // on any well-configured system; this gives us a deterministic
-        // connect refusal without external dependencies.
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .build()
-            .expect("test: build client");
-        let err = client
-            .get("http://127.0.0.1:1/")
-            .send()
-            .await
-            .expect_err("test: connection to :1 must fail");
-
-        let s = format_reqwest_error_with_timers(&err, &[]);
-        // Top-level message preserved.
-        assert!(s.starts_with("error sending request"), "got: {}", s);
-        // Kind tag present and either `connect` or `request`
-        // depending on reqwest version (both are diagnostically useful).
-        assert!(
-            s.contains("[kind=connect") || s.contains("[kind=request"),
-            "expected kind=connect or kind=request, got: {}",
-            s
-        );
-        // URL surfaced.
-        assert!(s.contains("url=http://127.0.0.1:1/"), "got: {}", s);
-        // Source chain walked — should contain at least one ` -> ` and
-        // ideally an OS-level hint like "refused" / "connection".
-        assert!(
-            s.contains(" -> "),
-            "expected source chain in error string, got: {}",
-            s
-        );
-    }
-
-    #[tokio::test]
-    async fn format_reqwest_error_classifies_dns_failure() {
-        // RFC 2606 reserves `.invalid` so this name is guaranteed to
-        // never resolve, giving us a deterministic DNS failure.
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .build()
-            .expect("test: build client");
-        let err = client
-            .get("http://nonexistent.invalid/")
-            .send()
-            .await
-            .expect_err("test: DNS for .invalid must fail");
-
-        let s = format_reqwest_error_with_timers(&err, &[]);
-        // The DNS failure should appear somewhere in the chain — exact
-        // wording varies between trust-dns / system resolver / glibc,
-        // so match on robust substrings.
-        let lower = s.to_lowercase();
-        assert!(
-            lower.contains("dns")
-                || lower.contains("resolve")
-                || lower.contains("lookup")
-                || lower.contains("name or service")
-                || lower.contains("nodename"),
-            "expected DNS-related phrase in error chain, got: {}",
-            s
-        );
-        assert!(s.contains("url=http://nonexistent.invalid/"), "got: {}", s);
-    }
-
-    #[tokio::test]
-    async fn format_reqwest_error_handles_request_cancelled_by_timeout() {
-        // Hit a TCP listener that accepts but never replies, with a
-        // very short per-request timeout.  In reqwest 0.13 this surfaces
-        // as `is_request()` (the request was cancelled mid-flight)
-        // rather than `is_timeout()` — `is_timeout()` only flips on for
-        // certain code paths.  Either classification is diagnostically
-        // useful: what matters is that the helper:
-        //   (a) emits a kind tag,
-        //   (b) preserves the URL,
-        //   (c) walks the source chain and surfaces the cancellation
-        //       reason ("canceled" / "closed before message completed").
-        let client = reqwest::Client::builder()
-            .build()
-            .expect("test: build client");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test: bind ephemeral port");
-        let addr = listener.local_addr().expect("test: local_addr");
-        tokio::spawn(async move {
-            loop {
-                if listener.accept().await.is_err() {
-                    break;
-                }
-            }
-        });
-        let url = format!("http://{}/", addr);
-        let err = client
-            .get(&url)
-            .timeout(Duration::from_millis(50))
-            .send()
-            .await
-            .expect_err("test: send must fail when peer never replies");
-
-        let s = format_reqwest_error_with_timers(&err, &[]);
-        // Some kind tag must be present.
-        assert!(s.contains("[kind="), "missing kind tag, got: {}", s);
-        // Either of the diagnostically-useful classifications is fine.
-        assert!(
-            s.contains("[kind=timeout") || s.contains("[kind=request"),
-            "expected kind=timeout or kind=request, got: {}",
-            s
-        );
-        // URL surfaced.
-        assert!(s.contains(&format!("url={}", url)), "got: {}", s);
-        // Source chain was walked — there must be at least one ` -> `
-        // and the chain must mention the underlying cancellation /
-        // closure (this is the whole point of the helper).
-        assert!(s.contains(" -> "), "expected source chain, got: {}", s);
-        let lower = s.to_lowercase();
-        assert!(
-            lower.contains("cancel")
-                || lower.contains("closed")
-                || lower.contains("timed out")
-                || lower.contains("timeout"),
-            "expected cancellation/closure/timeout phrase in chain, got: {}",
-            s
-        );
-    }
-
-    #[test]
-    fn format_reqwest_error_dedups_identical_layers() {
-        // Pure-logic check: the dedup is implemented in our helper, so
-        // it is exercised by the dyn-error-chain walk on real
-        // `reqwest::Error`s above.  This unit-level guard is folded
-        // into those integration-style tests rather than synthesising
-        // a `reqwest::Error` (no public constructor) — leaving this
-        // marker so future maintainers know dedup is intentional.
-    }
-
-    // ── format_reqwest_error_with_timers — timer attribution ────
-
-    /// Spec: when reqwest reports a connect-phase failure AND the
-    /// caller declared a `connect_timeout` timer, the formatted error
-    /// must name that timer and quote its budget — so log readers can
-    /// tell *which* timer fired without correlating with elapsed
-    /// time.
-    #[tokio::test]
-    async fn format_with_timers_attributes_connect_phase_to_connect_timeout() {
+    async fn classify_attributes_connect_phase_to_connect_timeout() {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .build()
@@ -1154,40 +1021,23 @@ mod tests {
                 budget: Duration::from_secs(5),
             },
         ];
-        let s = format_reqwest_error_with_timers(&err, &timers);
+        let (kind, timer) = classify_reqwest_error(&err, &timers);
 
         // Some reqwest versions classify a refused connect as
-        // `is_request()` rather than `is_connect()`.  Only assert the
-        // attribution when reqwest itself reports it as connect — the
-        // helper's contract is: "if reqwest says is_connect(), name
-        // the connect_timeout".  Otherwise attribution may be absent
-        // (Rule 4) which is also correct behaviour.
+        // `is_request()`.  Only assert when reqwest reports
+        // `is_connect()` — the contract is "structural".
         if err.is_connect() {
-            assert!(
-                s.contains("name=connect_timeout"),
-                "expected name=connect_timeout in attribution, got: {}",
-                s
-            );
-            assert!(
-                s.contains("budget=2s"),
-                "expected budget=2s in attribution, got: {}",
-                s
-            );
+            assert_eq!(kind, NetworkKind::Connect);
+            let t = timer.expect("connect_timeout timer must be picked");
+            assert_eq!(t.name, "connect_timeout");
+            assert_eq!(t.budget, "2s");
         }
     }
 
-    /// Spec: when a request-level wall-clock timeout fires (not a
-    /// connect-phase failure) AND the caller declared
-    /// `request_wall_clock`, the formatted error must name that timer
-    /// and quote its budget.  This is the regression-detection test:
-    /// if a future refactor reverts to a generic "timed out" message,
-    /// this fails.
+    /// Spec: a request-level wall-clock timeout (not connect-phase)
+    /// returns `(WallClock, Some(request_wall_clock))`.
     #[tokio::test]
-    async fn format_with_timers_attributes_request_timeout_to_wall_clock() {
-        // Bind a TCP listener that accepts but never replies — the
-        // connect phase succeeds, then the per-request `.timeout()`
-        // fires.  This is exactly the failure mode the user observed
-        // after `bf22c0c` regressed the timeout behaviour.
+    async fn classify_attributes_request_timeout_to_wall_clock() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test: bind ephemeral port");
@@ -1221,32 +1071,19 @@ mod tests {
                 budget: Duration::from_millis(50),
             },
         ];
-        let s = format_reqwest_error_with_timers(&err, &timers);
+        let (kind, timer) = classify_reqwest_error(&err, &timers);
 
-        // Assert attribution only when reqwest classifies the failure
-        // as a non-connect timeout — i.e. the spec's Rule 2 case.
-        // Some reqwest versions surface this as `is_request()`
-        // instead, in which case Rule 4 applies (no attribution) —
-        // both are correct, neither is a regression.
         if err.is_timeout() && !err.is_connect() {
-            assert!(
-                s.contains("name=request_wall_clock"),
-                "expected name=request_wall_clock in attribution, got: {}",
-                s
-            );
-            assert!(
-                s.contains("budget="),
-                "expected budget=... in attribution, got: {}",
-                s
-            );
+            assert_eq!(kind, NetworkKind::WallClock);
+            let t = timer.expect("request_wall_clock timer must be picked");
+            assert_eq!(t.name, "request_wall_clock");
         }
     }
 
-    /// Spec: the validate-preflight path uses `validate_request` as
-    /// its non-connect timer name; attribution must select that name
-    /// (not `request_wall_clock`) when only it is declared.
+    /// Spec: when `validate_request` is the only non-connect timer
+    /// declared, it MUST be picked (not `request_wall_clock`).
     #[tokio::test]
-    async fn format_with_timers_attributes_validate_preflight_separately() {
+    async fn classify_attributes_validate_preflight_separately() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test: bind ephemeral port");
@@ -1270,8 +1107,6 @@ mod tests {
             .await
             .expect_err("test: send must fail when peer never replies");
 
-        // Note: only `validate_request` declared — no
-        // `request_wall_clock`.  Helper must pick the validate name.
         let timers = [
             TimerSpec {
                 name: "connect_timeout",
@@ -1282,27 +1117,19 @@ mod tests {
                 budget: Duration::from_secs(10),
             },
         ];
-        let s = format_reqwest_error_with_timers(&err, &timers);
+        let (_kind, timer) = classify_reqwest_error(&err, &timers);
 
         if err.is_timeout() && !err.is_connect() {
-            assert!(
-                s.contains("name=validate_request"),
-                "expected name=validate_request, got: {}",
-                s
-            );
-            assert!(
-                !s.contains("name=request_wall_clock"),
-                "must not pick request_wall_clock when not declared, got: {}",
-                s
-            );
+            let t = timer.expect("validate_request timer must be picked");
+            assert_eq!(t.name, "validate_request");
+            assert_ne!(t.name, "request_wall_clock");
         }
     }
 
-    /// Spec: `format_reqwest_error` (no timers) must continue to
-    /// produce valid output for callers that have not yet declared
-    /// their timers.  No `name=`/`budget=` tag is emitted.
+    /// Spec: an empty timers slice yields a typed result with no
+    /// timer attribution.  The kind is still classified.
     #[tokio::test]
-    async fn format_without_timers_omits_attribution_tag() {
+    async fn classify_without_timers_omits_attribution() {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .build()
@@ -1313,89 +1140,18 @@ mod tests {
             .await
             .expect_err("test: connection to :1 must fail");
 
-        let s = format_reqwest_error_with_timers(&err, &[]);
-
+        let (_kind, timer) = classify_reqwest_error(&err, &[]);
         assert!(
-            !s.contains("name="),
-            "format_reqwest_error must not synthesize attribution tags, got: {}",
-            s
+            timer.is_none(),
+            "classify must not synthesize a timer when none declared",
         );
-        assert!(
-            !s.contains("budget="),
-            "format_reqwest_error must not synthesize budget tags, got: {}",
-            s
-        );
-        // But the existing kind/url tags must still be present.
-        assert!(s.contains("[kind="), "missing kind tag, got: {}", s);
     }
 
-    /// Spec: when a wall-clock timer fires at a call site, the
-    /// helper must NOT attribute the failure to `connect_timeout`
-    /// even if a connect_timeout TimerSpec is also in the slice.
-    /// This guards against attribution flipping back to "connect" on
-    /// reqwest version upgrades that change is_connect() semantics.
+    /// Spec: a non-connect, non-timeout error with no IO TimedOut
+    /// in the chain returns `(Other, None)`.  Decode errors are
+    /// the canonical case.
     #[tokio::test]
-    async fn format_with_timers_does_not_misattribute_wall_clock_to_connect() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test: bind ephemeral port");
-        let addr = listener.local_addr().expect("test: local_addr");
-        tokio::spawn(async move {
-            loop {
-                if listener.accept().await.is_err() {
-                    break;
-                }
-            }
-        });
-        let url = format!("http://{}/", addr);
-
-        let client = reqwest::Client::builder()
-            .build()
-            .expect("test: build client");
-        let err = client
-            .get(&url)
-            .timeout(Duration::from_millis(50))
-            .send()
-            .await
-            .expect_err("test: send must fail when peer never replies");
-
-        let timers = [
-            TimerSpec {
-                name: "connect_timeout",
-                budget: Duration::from_secs(2),
-            },
-            TimerSpec {
-                name: "request_wall_clock",
-                budget: Duration::from_millis(50),
-            },
-        ];
-        let s = format_reqwest_error_with_timers(&err, &timers);
-
-        // If reqwest reported is_connect()=true, attribution to
-        // connect_timeout is correct (Rule 1).  Otherwise the helper
-        // MUST NOT mention connect_timeout — that would be lying
-        // about which timer fired.
-        if !err.is_connect() {
-            assert!(
-                !s.contains("name=connect_timeout"),
-                "must not attribute non-connect failure to connect_timeout, got: {}",
-                s
-            );
-        }
-    }
-
-    /// Spec: `attribute_timer` directly — non-timeout, non-connect
-    /// errors with no IO TimedOut in the chain must produce no
-    /// attribution (Rule 4).  Use the dedicated helper test path so
-    /// we exercise the negative case without depending on a network
-    /// listener.
-    #[tokio::test]
-    async fn format_without_timeout_or_connect_emits_no_attribution() {
-        // A bind on a known-valid local URL with `.json()` body that
-        // is never sent — not a viable construction.  Instead, force
-        // a decode error: serve invalid JSON via an in-process server
-        // and decode it.  This produces an `is_decode()` error which
-        // matches Rule 4 (no attribution).
+    async fn classify_without_timeout_or_connect_returns_other() {
         use std::convert::Infallible;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1438,36 +1194,12 @@ mod tests {
                 budget: Duration::from_secs(5),
             },
         ];
-        let s = format_reqwest_error_with_timers(&err, &timers);
+        let (kind, timer) = classify_reqwest_error(&err, &timers);
 
-        // Decode errors are neither timeouts nor connect errors and
-        // typically don't carry an io::TimedOut in their chain — so
-        // attribution must be silent.
-        assert!(
-            !s.contains("name=connect_timeout"),
-            "decode error must not attribute to connect_timeout, got: {}",
-            s
-        );
-        assert!(
-            !s.contains("name=request_wall_clock"),
-            "decode error must not attribute to request_wall_clock, got: {}",
-            s
-        );
-    }
-
-    /// Spec: `fmt_budget` produces stable, log-friendly strings for
-    /// whole-second and sub-second durations.
-    #[test]
-    fn fmt_budget_formats_whole_seconds_compactly() {
-        assert_eq!(fmt_budget(Duration::from_secs(0)), "0s");
-        assert_eq!(fmt_budget(Duration::from_secs(2)), "2s");
-        assert_eq!(fmt_budget(Duration::from_secs(108)), "108s");
-    }
-
-    #[test]
-    fn fmt_budget_formats_subsecond_with_three_decimals() {
-        assert_eq!(fmt_budget(Duration::from_millis(50)), "0.050s");
-        assert_eq!(fmt_budget(Duration::from_millis(1500)), "1.500s");
+        // Decode errors don't fit any timeout-class; should be Other
+        // with no timer.
+        assert_eq!(kind, NetworkKind::Other);
+        assert!(timer.is_none());
     }
 
     #[tokio::test]
@@ -1662,13 +1394,29 @@ mod tests {
             &sink,
         )
         .await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("model validation failed (preflight to /v1/models)"),
-            "expected preflight-failed lead phrase, got: {}",
-            msg
-        );
+        // Structural assertion: the failure is a Pipeline error
+        // in the Validate phase carrying an HttpStatus kind with
+        // status=401.  The Display contract is regression-tested
+        // separately in `crate::error` tests; here we just assert
+        // that the structural shape is correct so a future
+        // refactor cannot silently drop the variant.
+        let err = result.unwrap_err();
+        let pf = match &err {
+            crate::error::TalkError::Pipeline(pf) => pf,
+            other => panic!("expected TalkError::Pipeline, got: {}", other),
+        };
+        assert_eq!(pf.phase, crate::error::PipelinePhase::Validate);
+        match &pf.kind {
+            crate::error::PipelineFailureKind::HttpStatus { status, body } => {
+                assert_eq!(*status, 401);
+                assert!(
+                    body.contains("Unauthorized"),
+                    "expected body to mention 'Unauthorized', got: {}",
+                    body
+                );
+            }
+            other => panic!("expected HttpStatus kind, got: {:?}", other),
+        }
         // mock_server's `.expect(1)` panics on drop if we exceeded
         // one request; nothing more to assert.
     }
@@ -1791,6 +1539,147 @@ mod tests {
             events, 2,
             "exactly one Preflight pair (start+complete) across both calls; got {} events",
             events
+        );
+    }
+
+    /// Spec: when validation must retry (every attempt fails on
+    /// the network), `validate_model_uncached` emits exactly
+    /// `MAX_RETRIES = MAX_ATTEMPTS - 1` `RetryScheduled` events
+    /// (4 events for the 5-attempt budget), with `attempt`
+    /// running 1..=4 and `max=4`.
+    ///
+    /// Mirrors the pre-existing
+    /// `with_retry`-for-transcription-request retry contract so
+    /// the picker UI's `retry N/M…` rendering covers BOTH the
+    /// validate phase AND the transcription phase with the same
+    /// vocabulary.  Pre-migration this was the missing piece —
+    /// validate retried 5 times silently and the picker showed
+    /// `pre-validating model…` for the entire duration with no
+    /// progress feedback.
+    #[tokio::test]
+    async fn validate_model_emits_one_retry_event_per_retry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _cache_guard = cache_test_guard();
+
+        // Make every request fail at the JSON-decode layer so the
+        // retry loop runs to exhaustion.  HTTP 200 with malformed
+        // body avoids the bail-immediately HttpStatus path.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+            .mount(&mock_server)
+            .await;
+
+        let sink_concrete = Arc::new(RecordingSink::new());
+        let sink: Arc<dyn TelemetrySink> = sink_concrete.clone();
+
+        let api_base = mock_server.uri();
+        let result = validate_model(
+            crate::config::Provider::Mistral,
+            "Mistral",
+            "test-key",
+            "voxtral-mini-2602",
+            &api_base,
+            |id| id.contains("voxtral"),
+            &sink,
+        )
+        .await;
+        assert!(result.is_err());
+
+        // Count RetryScheduled events.  VALIDATE_BUDGET_SECS has
+        // 5 entries → 5 total attempts → 4 retries → 4 events
+        // (per the established `with_retry` contract: the
+        // initial call is attempt 0, retries are 1..=N).
+        let retries: Vec<_> = sink_concrete
+            .events()
+            .into_iter()
+            .filter_map(|e| {
+                if let TranscriptionEvent::RetryScheduled { attempt, max, .. } = e {
+                    Some((attempt, max))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let expected_retries = (VALIDATE_BUDGET_SECS.len() as u32) - 1;
+        assert_eq!(
+            retries.len() as u32,
+            expected_retries,
+            "expected {} RetryScheduled events for 5-attempt budget, got: {:?}",
+            expected_retries,
+            retries
+        );
+        // Each event's `attempt` field is 1-indexed; sequence
+        // must be 1, 2, 3, 4 with max = expected_retries.
+        for (i, (attempt, max)) in retries.iter().enumerate() {
+            assert_eq!(
+                *attempt,
+                (i as u32) + 1,
+                "wrong attempt index in {:?}",
+                retries
+            );
+            assert_eq!(*max, expected_retries, "wrong max in {:?}", retries);
+        }
+    }
+
+    /// Spec: structural `is_model_error` detects the new
+    /// `Pipeline(ModelRejected)` variant directly, without
+    /// falling back to the legacy provider-specific string match.
+    /// Regression detection: a future refactor that drops the
+    /// structural branch must fail here.
+    #[test]
+    fn is_model_error_detects_structural_model_rejected() {
+        use crate::error::{PipelineFailure, PipelineFailureKind, PipelinePhase, TalkError};
+        let pf = PipelineFailure::new(
+            "Mistral",
+            PipelinePhase::Validate,
+            1,
+            5,
+            "https://x",
+            PipelineFailureKind::ModelRejected {
+                model: "ghost".into(),
+                suggestions: vec![],
+            },
+        );
+        let err: TalkError = pf.into();
+        assert!(
+            crate::transcription::is_model_error(crate::config::Provider::Mistral, &err),
+            "structural ModelRejected must be detected as model_error",
+        );
+    }
+
+    /// Spec: a `Pipeline(Network { .. })` failure is NOT a model
+    /// error; the structural fast path must short-circuit only
+    /// for `ModelRejected`.
+    #[test]
+    fn is_model_error_does_not_match_structural_network_failure() {
+        use crate::error::{
+            NetworkKind, PipelineFailure, PipelineFailureKind, PipelinePhase, TalkError, TimerLabel,
+        };
+        let inner = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+        let pf = PipelineFailure::new(
+            "Mistral",
+            PipelinePhase::Validate,
+            5,
+            5,
+            "https://x",
+            PipelineFailureKind::Network {
+                kind: NetworkKind::Connect,
+                timer: Some(TimerLabel::from_duration(
+                    "connect_timeout",
+                    Duration::from_secs(2),
+                )),
+                source: Box::new(inner),
+            },
+        );
+        let err: TalkError = pf.into();
+        assert!(
+            !crate::transcription::is_model_error(crate::config::Provider::Mistral, &err),
+            "Network failure must not be treated as model_error",
         );
     }
 }

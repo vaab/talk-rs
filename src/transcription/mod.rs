@@ -355,8 +355,29 @@ pub(crate) trait RealtimeTranscriber: Send + Sync {
 
 /// Check if an error is a model-not-found error for the given provider.
 ///
-/// Dispatches to the provider module's own detection logic.
+/// Detection order:
+///
+/// 1. **Structural fast path** — if the error is a
+///    [`TalkError::Pipeline`] carrying a
+///    [`crate::error::PipelineFailureKind::ModelRejected`], return
+///    `true` regardless of provider.  Producers (validate-path
+///    HTTP code) emit this variant directly, so consumers can
+///    detect model-rejection without parsing strings.
+/// 2. **Legacy string-matching fallback** — for any pre-migration
+///    call sites that still surface model-not-found as
+///    `TalkError::Config(String)` / `TalkError::Transcription(String)`,
+///    dispatch to the provider's own detection logic.
+///
+/// The structural path runs first so a future refactor cannot
+/// accidentally regress retry/bail behaviour by skipping the
+/// legacy string match — structural producers always win.
 pub fn is_model_error(provider: Provider, error: &TalkError) -> bool {
+    use crate::error::PipelineFailureKind;
+    if let TalkError::Pipeline(pf) = error {
+        if matches!(pf.kind, PipelineFailureKind::ModelRejected { .. }) {
+            return true;
+        }
+    }
     match provider {
         Provider::Mistral => mistral::is_model_error(error),
         Provider::OpenAI => openai::is_model_error(error),
