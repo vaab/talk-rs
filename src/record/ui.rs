@@ -905,7 +905,17 @@ fn show_recordings_window() -> Result<(), TalkError> {
                             }
 
                             let is_yml = name.ends_with(".yml");
-                            let is_audio = name.ends_with(".wav") || name.ends_with(".ogg");
+                            // Treat every listable audio format as a
+                            // refresh trigger.  Keep the comparison
+                            // case-insensitive so files imported from
+                            // external sources (e.g. `.M4A`) still
+                            // trigger the live-refresh.
+                            let lname = name.to_ascii_lowercase();
+                            let is_audio = lname.ends_with(".wav")
+                                || lname.ends_with(".ogg")
+                                || lname.ends_with(".m4a")
+                                || lname.ends_with(".mp4")
+                                || lname.ends_with(".aac");
 
                             match event {
                                 // ── Deletion ─────────────────────────────────
