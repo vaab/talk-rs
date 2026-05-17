@@ -1,6 +1,6 @@
 //! Audio playback for the recordings browser via cpal.
 
-use super::audio::{read_ogg_as_f32, read_wav_as_f32};
+use super::audio::{read_m4a_as_f32, read_ogg_as_f32, read_wav_as_f32};
 use crate::error::TalkError;
 
 /// Shared state between the GUI thread and the `cpal` output callback.
@@ -97,14 +97,24 @@ impl WavPlayer {
         })
     }
 
-    /// Load an audio file (WAV or OGG) and start playing it from the beginning.
+    /// Load an audio file (WAV, OGG Opus, or M4A/MP4/AAC) and start
+    /// playing it from the beginning.
+    ///
+    /// Dispatches on the file extension (case-insensitive) to the
+    /// matching decoder in [`super::audio`].  Unknown extensions fall
+    /// through to the WAV parser for backwards compatibility — this
+    /// errors loudly on non-PCM data rather than silently producing
+    /// garbage, which matches the long-standing behaviour for
+    /// unsupported formats.
     pub(crate) fn play(&self, audio_path: &std::path::Path) -> Result<(), TalkError> {
         let ext = audio_path
             .extension()
             .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let samples = match ext {
-            "ogg" => read_ogg_as_f32(audio_path, self.device_sample_rate)?,
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let samples = match ext.as_str() {
+            "ogg" | "opus" => read_ogg_as_f32(audio_path, self.device_sample_rate)?,
+            "m4a" | "mp4" | "aac" => read_m4a_as_f32(audio_path, self.device_sample_rate)?,
             _ => read_wav_as_f32(audio_path, self.device_sample_rate)?,
         };
         if let Ok(mut guard) = self.state.lock() {

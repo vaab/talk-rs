@@ -1,10 +1,58 @@
 //! Recording entry listing and file operations for the recordings browser.
 
-use super::audio::ogg_duration_secs;
+use super::audio::{m4a_duration_secs, ogg_duration_secs};
 use crate::config::Config;
 use crate::error::TalkError;
 use crate::recording_cache;
 use std::path::{Path, PathBuf};
+
+/// File extensions that the recordings browser considers playable
+/// audio.  Used both by [`collect_audio_recursive`] and by
+/// [`list_cache_recordings`] so listing and cache stay in sync.
+///
+/// Currently:
+/// * `ogg` — talk-rs's own Opus output (and dictation cache).
+/// * `m4a` / `mp4` / `aac` — imported audio (e.g. iPhone voice memos),
+///   decoded via the `symphonia` AAC/MP4 backend in
+///   [`super::audio::read_m4a_as_f32`].
+///
+/// `wav` is intentionally excluded from the listing: it is only used
+/// for legacy cache entries that the cleanup path in
+/// [`delete_recording`] still handles, but no current code path writes
+/// or browses `.wav` recordings.
+const AUDIO_EXTENSIONS: &[&str] = &["ogg", "m4a", "mp4", "aac"];
+
+/// Return `true` when `path` has an extension this UI considers a
+/// listable audio recording.  Comparison is case-insensitive to be
+/// kind to files imported from external sources (e.g. `.M4A` from a
+/// camera).
+fn has_audio_extension(path: &Path) -> bool {
+    let ext = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e.to_ascii_lowercase(),
+        None => return false,
+    };
+    AUDIO_EXTENSIONS.iter().any(|&candidate| candidate == ext)
+}
+
+/// Compute the duration of an audio file in seconds, dispatching on
+/// file extension.  Returns `None` when the format is unknown or the
+/// header cannot be parsed.
+///
+/// This is the listing-time peer of [`super::audio::read_audio_as_i16`]:
+/// it picks the right O(1) duration probe per format instead of fully
+/// decoding the file, which keeps the recordings browser snappy even
+/// with many entries.
+fn audio_duration_secs(path: &Path) -> Option<f64> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "ogg" | "opus" => ogg_duration_secs(path),
+        "m4a" | "mp4" | "aac" => m4a_duration_secs(path),
+        _ => None,
+    }
+}
 
 /// Entry for one cached recording.
 pub(super) struct RecordingEntry {
@@ -88,7 +136,8 @@ pub(super) fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Recursively collect every `.ogg` file under `dir` into `out`.
+/// Recursively collect every supported audio file (see
+/// [`AUDIO_EXTENSIONS`]) under `dir` into `out`.
 ///
 /// Used by [`list_ogg_recordings`] so the recordings browser still works
 /// after the archival directory was namespaced into `YYYY/MM/`
@@ -99,7 +148,7 @@ pub(super) fn format_size(bytes: u64) -> String {
 /// avoid cycles and to match the existing flat reader's behaviour.
 /// Errors on a subtree are logged and the walk continues — a single
 /// unreadable nested directory must not break the whole listing.
-fn collect_oggs_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), TalkError> {
+fn collect_audio_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), TalkError> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
         TalkError::Config(format!(
             "failed to read recordings directory {}: {}",
@@ -120,10 +169,10 @@ fn collect_oggs_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Talk
         }
 
         if path.is_dir() {
-            if let Err(err) = collect_oggs_recursive(&path, out) {
-                log::warn!("list_ogg: skipping subtree {}: {}", path.display(), err);
+            if let Err(err) = collect_audio_recursive(&path, out) {
+                log::warn!("list_audio: skipping subtree {}: {}", path.display(), err);
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("ogg") {
+        } else if has_audio_extension(&path) {
             out.push(path);
         }
     }
@@ -131,22 +180,28 @@ fn collect_oggs_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Talk
     Ok(())
 }
 
-/// Gather OGG recordings (actual `talk-rs record` output), sorted newest-first.
+/// Gather audio recordings (actual `talk-rs record` output plus any
+/// imported audio in the same tree), sorted newest-first.
 ///
 /// Reads `output_dir` from the user configuration file and walks it
 /// recursively, so files living in `YYYY/MM/` subdirectories are listed
-/// alongside any legacy flat files.
+/// alongside any legacy flat files.  All extensions in
+/// [`AUDIO_EXTENSIONS`] are listed — historically that was only `.ogg`
+/// (talk-rs's own Opus output), but the browser now also surfaces
+/// `.m4a` / `.mp4` / `.aac` files dropped into the directory (e.g.
+/// iPhone voice memos imported manually), so they can be played and
+/// transcribed alongside native recordings.
 pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     let t = std::time::Instant::now();
     let config = Config::load(None)?;
-    log::debug!("list_ogg: config load {:.0?}", t.elapsed());
+    log::debug!("list_audio: config load {:.0?}", t.elapsed());
     let dir = config.output_dir.clone();
     if !dir.exists() {
         return Ok(Vec::new());
     }
 
-    let mut oggs: Vec<PathBuf> = Vec::new();
-    collect_oggs_recursive(&dir, &mut oggs)?;
+    let mut audio: Vec<PathBuf> = Vec::new();
+    collect_audio_recursive(&dir, &mut audio)?;
 
     // Sort by file name (the timestamp-bearing basename) rather than by
     // full path.  This keeps chronological ordering correct when flat
@@ -155,19 +210,22 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     // `2026-04-05T…` before `2026/04/2026-04-10T…` because `-` < `/` in
     // ASCII, producing an out-of-order result.  Sorting by file name
     // alone ignores the directory prefix and yields the right order.
-    oggs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-    oggs.reverse();
+    audio.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    audio.reverse();
 
-    let mut result = Vec::with_capacity(oggs.len());
-    for ogg_path in oggs {
-        let stem = ogg_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let mut result = Vec::with_capacity(audio.len());
+    for audio_path in audio {
+        let stem = audio_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         let date_label = date_label_from_stem(stem);
 
-        let duration_label = ogg_duration_secs(&ogg_path)
+        let duration_label = audio_duration_secs(&audio_path)
             .map(format_duration)
             .unwrap_or_else(|| "?:??".to_string());
 
-        let size_label = std::fs::metadata(&ogg_path)
+        let size_label = std::fs::metadata(&audio_path)
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
@@ -175,9 +233,9 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
         // default-provider/model sidecar (no API call).  Keeps the
         // pick-lock state visible separately so the UI can still
         // show "transcription ongoing".
-        let status = match crate::recording_cache::get_transcript(&ogg_path) {
+        let status = match crate::recording_cache::get_transcript(&audio_path) {
             status @ crate::recording_cache::TranscriptStatus::InProgress => status,
-            _ => match crate::transcription::read_cached_transcript(&ogg_path, &config) {
+            _ => match crate::transcription::read_cached_transcript(&audio_path, &config) {
                 Some(text) => crate::recording_cache::TranscriptStatus::Available(text),
                 None => crate::recording_cache::TranscriptStatus::NotAvailable,
             },
@@ -188,7 +246,7 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
         };
 
         result.push(RecordingEntry {
-            path: ogg_path,
+            path: audio_path,
             date_label,
             duration_label,
             size_label,
@@ -199,7 +257,7 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     }
 
     log::debug!(
-        "list_ogg: {} entries, total {:.0?}",
+        "list_audio: {} entries, total {:.0?}",
         result.len(),
         t.elapsed(),
     );
@@ -223,44 +281,50 @@ pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> 
         ))
     })?;
 
-    let mut oggs: Vec<PathBuf> = Vec::new();
+    let mut audio: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = entry
             .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
         let path = entry.path();
 
-        // Skip symlinks (last_recording.ogg, last_metadata.yml)
+        // Skip symlinks (last_recording.ogg, last_metadata.yml).  The
+        // cache is flat (no subdirectories), so a non-recursive walk
+        // is intentional here — unlike `list_ogg_recordings` which
+        // walks `output_dir` recursively.
         if path.is_symlink() {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) == Some("ogg") {
-            oggs.push(path);
+        if has_audio_extension(&path) {
+            audio.push(path);
         }
     }
 
     // Sort lexicographically (timestamp-based names → chronological)
-    oggs.sort();
+    audio.sort();
     // Reverse for newest-first
-    oggs.reverse();
+    audio.reverse();
 
-    let mut result = Vec::with_capacity(oggs.len());
-    for ogg_path in oggs {
-        let stem = ogg_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let mut result = Vec::with_capacity(audio.len());
+    for audio_path in audio {
+        let stem = audio_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         let date_label = date_label_from_stem(stem);
 
-        let duration_label = ogg_duration_secs(&ogg_path)
+        let duration_label = audio_duration_secs(&audio_path)
             .map(format_duration)
             .unwrap_or_else(|| "?:??".to_string());
 
-        let size_label = std::fs::metadata(&ogg_path)
+        let size_label = std::fs::metadata(&audio_path)
             .map(|m| format_size(m.len()))
             .unwrap_or_else(|_| "?".to_string());
 
         // Read transcript via the waterfall: pick → default-model
         // sidecar (no API call).
-        let status = match recording_cache::get_transcript(&ogg_path) {
+        let status = match recording_cache::get_transcript(&audio_path) {
             status @ recording_cache::TranscriptStatus::InProgress => status,
-            _ => match crate::transcription::read_cached_transcript(&ogg_path, &config) {
+            _ => match crate::transcription::read_cached_transcript(&audio_path, &config) {
                 Some(text) => recording_cache::TranscriptStatus::Available(text),
                 None => recording_cache::TranscriptStatus::NotAvailable,
             },
@@ -271,7 +335,7 @@ pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> 
         };
 
         result.push(RecordingEntry {
-            path: ogg_path,
+            path: audio_path,
             date_label,
             duration_label,
             size_label,
@@ -304,8 +368,12 @@ pub(super) fn delete_recording(file_path: &std::path::Path) -> Result<(), TalkEr
 
     // For cache audio files, also delete matching YAML metadata
     // files and the waterfall spectrogram cache (.wf).
-    // Keep `wav` for backward compatibility with older cache entries.
-    if (ext == "wav" || ext == "ogg") && !stem.is_empty() {
+    // Keep `wav` for backward compatibility with older cache entries;
+    // include every extension recognised by [`AUDIO_EXTENSIONS`] so
+    // m4a / mp4 / aac imports get the same cleanup treatment as
+    // native `.ogg` recordings.
+    let is_known_audio = ext == "wav" || AUDIO_EXTENSIONS.contains(&ext);
+    if is_known_audio && !stem.is_empty() {
         if let Ok(dir) = recording_cache::recordings_dir() {
             // Remove companion YAML files (<stem>_*.yml and <stem>.pick.yml).
             if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -465,7 +533,7 @@ mod tests {
         assert_eq!(preview.chars().count(), TRANSCRIPT_PREVIEW_CHARS + 1);
     }
 
-    // ---- collect_oggs_recursive ----
+    // ---- collect_audio_recursive ----
 
     use tempfile::TempDir;
 
@@ -475,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_oggs_flat_layout() {
+    fn collect_audio_flat_layout() {
         let tmp = TempDir::new().expect("tempdir");
         let dir = tmp.path();
         std::fs::write(dir.join("a.ogg"), b"").unwrap();
@@ -484,7 +552,7 @@ mod tests {
         std::fs::write(dir.join("also-ignored.wf"), b"").unwrap();
 
         let mut out = Vec::new();
-        collect_oggs_recursive(dir, &mut out).expect("collect");
+        collect_audio_recursive(dir, &mut out).expect("collect");
 
         let mut names: Vec<_> = out.iter().map(|p| basename(p).to_string()).collect();
         names.sort();
@@ -492,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_oggs_nested_layout() {
+    fn collect_audio_nested_layout() {
         let tmp = TempDir::new().expect("tempdir");
         let dir = tmp.path();
 
@@ -514,7 +582,7 @@ mod tests {
         std::fs::write(nested_2026_04.join("2026-04-10T08-23-15+0200.txt"), b"").unwrap();
 
         let mut out = Vec::new();
-        collect_oggs_recursive(dir, &mut out).expect("collect");
+        collect_audio_recursive(dir, &mut out).expect("collect");
 
         assert_eq!(out.len(), 2, "should find exactly 2 nested .ogg files");
         let mut names: Vec<_> = out.iter().map(|p| basename(p).to_string()).collect();
@@ -529,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_oggs_mixed_flat_and_nested() {
+    fn collect_audio_mixed_flat_and_nested() {
         let tmp = TempDir::new().expect("tempdir");
         let dir = tmp.path();
 
@@ -542,7 +610,7 @@ mod tests {
         std::fs::write(nested.join("2026-04-10T10-00-00+0200.ogg"), b"").unwrap();
 
         let mut out = Vec::new();
-        collect_oggs_recursive(dir, &mut out).expect("collect");
+        collect_audio_recursive(dir, &mut out).expect("collect");
 
         assert_eq!(out.len(), 2, "should find both flat and nested files");
 
@@ -562,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_oggs_skips_symlinks() {
+    fn collect_audio_skips_symlinks() {
         let tmp = TempDir::new().expect("tempdir");
         let dir = tmp.path();
 
@@ -577,22 +645,22 @@ mod tests {
         std::os::unix::fs::symlink(dir, dir.join("self-link")).unwrap();
 
         let mut out = Vec::new();
-        collect_oggs_recursive(dir, &mut out).expect("collect");
+        collect_audio_recursive(dir, &mut out).expect("collect");
 
         assert_eq!(out.len(), 1, "symlinks must be skipped");
         assert_eq!(basename(&out[0]), "real.ogg");
     }
 
     #[test]
-    fn collect_oggs_empty_directory() {
+    fn collect_audio_empty_directory() {
         let tmp = TempDir::new().expect("tempdir");
         let mut out = Vec::new();
-        collect_oggs_recursive(tmp.path(), &mut out).expect("collect");
+        collect_audio_recursive(tmp.path(), &mut out).expect("collect");
         assert!(out.is_empty());
     }
 
     #[test]
-    fn collect_oggs_deep_nesting() {
+    fn collect_audio_deep_nesting() {
         // Sanity check: the walker handles more than two levels (e.g.
         // `year/month/day/` if the layout ever gets deeper).
         let tmp = TempDir::new().expect("tempdir");
@@ -601,9 +669,82 @@ mod tests {
         std::fs::write(deep.join("memo.ogg"), b"").unwrap();
 
         let mut out = Vec::new();
-        collect_oggs_recursive(tmp.path(), &mut out).expect("collect");
+        collect_audio_recursive(tmp.path(), &mut out).expect("collect");
 
         assert_eq!(out.len(), 1);
         assert_eq!(basename(&out[0]), "memo.ogg");
+    }
+
+    #[test]
+    fn collect_audio_picks_up_m4a_files() {
+        // The recordings browser must list `.m4a` files (e.g. iPhone
+        // voice memos dropped into the recordings directory), not
+        // just talk-rs's own `.ogg` output.
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        std::fs::write(dir.join("memo.m4a"), b"").unwrap();
+        std::fs::write(dir.join("clip.MP4"), b"").unwrap(); // case-insensitive
+        std::fs::write(dir.join("stream.aac"), b"").unwrap();
+        std::fs::write(dir.join("ignored.txt"), b"").unwrap();
+        std::fs::write(dir.join("also-ignored.wav"), b"").unwrap(); // wav is NOT listable
+
+        let mut out = Vec::new();
+        collect_audio_recursive(dir, &mut out).expect("collect");
+
+        let mut names: Vec<_> = out.iter().map(|p| basename(p).to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["clip.MP4", "memo.m4a", "stream.aac"]);
+    }
+
+    #[test]
+    fn collect_audio_mixed_ogg_and_m4a() {
+        // Real-world layout: a recordings directory containing both
+        // native `.ogg` recordings and imported `.m4a` files.  Both
+        // must be listed alongside one another.
+        let tmp = TempDir::new().expect("tempdir");
+        let nested = tmp.path().join("2026").join("04");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        std::fs::write(nested.join("2026-04-10T08-23-15+0200.ogg"), b"").unwrap();
+        std::fs::write(nested.join("imported-memo.m4a"), b"").unwrap();
+
+        let mut out = Vec::new();
+        collect_audio_recursive(tmp.path(), &mut out).expect("collect");
+
+        let mut names: Vec<_> = out.iter().map(|p| basename(p).to_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "2026-04-10T08-23-15+0200.ogg".to_string(),
+                "imported-memo.m4a".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn has_audio_extension_is_case_insensitive() {
+        assert!(has_audio_extension(Path::new("foo.M4A")));
+        assert!(has_audio_extension(Path::new("foo.m4a")));
+        assert!(has_audio_extension(Path::new("foo.OGG")));
+        assert!(has_audio_extension(Path::new("foo.mp4")));
+        assert!(has_audio_extension(Path::new("foo.aac")));
+        assert!(!has_audio_extension(Path::new("foo.wav"))); // not listable
+        assert!(!has_audio_extension(Path::new("foo.txt")));
+        assert!(!has_audio_extension(Path::new("foo")));
+    }
+
+    #[test]
+    fn audio_duration_secs_dispatches_correctly() {
+        // Unknown extension → None (not an error).
+        let tmp = TempDir::new().expect("tempdir");
+        let unknown = tmp.path().join("clip.flac");
+        std::fs::write(&unknown, b"x").unwrap();
+        assert_eq!(audio_duration_secs(&unknown), None);
+
+        // No extension → None.
+        let bare = tmp.path().join("noext");
+        std::fs::write(&bare, b"x").unwrap();
+        assert_eq!(audio_duration_secs(&bare), None);
     }
 }
