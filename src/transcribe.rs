@@ -50,6 +50,7 @@ pub async fn transcribe(
     cli_provider: Option<Provider>,
     cli_model: Option<String>,
     diarize: bool,
+    timestamp: bool,
 ) -> Result<(), TalkError> {
     let (input_path, output_path) = parse_args(&args)?;
     if !input_path.exists() {
@@ -85,7 +86,7 @@ pub async fn transcribe(
             &sink,
         )
         .await?;
-        transcription::format_transcription_output(&result)
+        transcription::format_transcription_output(&result, timestamp)
     } else {
         // Default options -> Layer 2 (uses pick file as cache).
         produce_or_wait(&input_path, &config, provider, &sink).await?
@@ -229,7 +230,7 @@ mod tests {
             .await
             .expect("transcribe should succeed");
 
-        let output_text = transcription::format_transcription_output(&transcription);
+        let output_text = transcription::format_transcription_output(&transcription, false);
         let sidecar_path = recording_cache::write_metadata_to_dir(
             temp_dir.path(),
             "test-audio",

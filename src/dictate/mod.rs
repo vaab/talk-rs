@@ -49,6 +49,7 @@ pub struct DictateOpts {
     pub provider: Option<Provider>,
     pub model: Option<String>,
     pub diarize: bool,
+    pub timestamp: bool,
     pub realtime: bool,
     pub toggle: bool,
     pub no_sounds: bool,
@@ -801,7 +802,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Batch mode: overlay is still showing "Transcribing" badge —
     // it will be hidden after paste (below).
 
-    let text = crate::transcription::format_transcription_output(&result)
+    let text = crate::transcription::format_transcription_output(&result, opts.timestamp)
         .trim()
         .to_string();
     let segments = result.segments;
