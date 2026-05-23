@@ -27,12 +27,13 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             provider,
             model,
             diarize,
+            timestamp,
         } => {
             let mut args = vec![input];
             if let Some(output_file) = output {
                 args.push(output_file);
             }
-            transcribe(args, provider, model, diarize).await?;
+            transcribe(args, provider, model, diarize, timestamp).await?;
         }
         Commands::Dictate {
             save,
@@ -44,6 +45,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             provider,
             model,
             diarize,
+            timestamp,
             realtime,
             toggle,
             no_sounds,
@@ -70,6 +72,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
                 provider,
                 model,
                 diarize,
+                timestamp,
                 realtime,
                 toggle,
                 no_sounds,
