@@ -52,6 +52,9 @@ pub enum Commands {
         /// Enable speaker diarization (identify who is speaking)
         #[arg(long)]
         diarize: bool,
+        /// Include timestamps in the output (HH:MM:SS prefix)
+        #[arg(long)]
+        timestamp: bool,
     },
     /// Record, transcribe, and paste text into the focused application
     Dictate {
@@ -82,6 +85,9 @@ pub enum Commands {
         /// Enable speaker diarization (identify who is speaking)
         #[arg(long)]
         diarize: bool,
+        /// Include timestamps in the output (HH:MM:SS prefix)
+        #[arg(long)]
+        timestamp: bool,
         /// Use realtime mode (stream audio via WebSocket, get incremental text)
         #[arg(long)]
         realtime: bool,

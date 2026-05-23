@@ -212,7 +212,10 @@ pub(crate) fn parse_transcript_segments(
 /// `[SPEAKER_ID]`.  Adjacent segments from the same speaker are merged
 /// into a single block.  When no diarization is present, returns the
 /// plain transcript text.
-pub fn format_transcription_output(result: &TranscriptionResult) -> String {
+///
+/// When `timestamp` is true and diarization is present, each line is
+/// prefixed with `[HH:MM:SS]` before the speaker label.
+pub fn format_transcription_output(result: &TranscriptionResult, timestamp: bool) -> String {
     let Some(ref segments) = result.diarization else {
         return result.text.clone();
     };
@@ -224,6 +227,7 @@ pub fn format_transcription_output(result: &TranscriptionResult) -> String {
     let mut lines = Vec::new();
     let mut current_speaker: Option<&str> = None;
     let mut current_texts: Vec<&str> = Vec::new();
+    let mut current_start: f64 = 0.0;
 
     for seg in segments {
         if current_speaker == Some(seg.speaker.as_str()) {
@@ -231,19 +235,47 @@ pub fn format_transcription_output(result: &TranscriptionResult) -> String {
         } else {
             // Flush previous speaker block
             if let Some(speaker) = current_speaker {
-                lines.push(format!("[{}] {}", speaker, current_texts.join(" ")));
+                if timestamp {
+                    lines.push(format!(
+                        "[{}] {} {}",
+                        format_timestamp(current_start),
+                        speaker,
+                        current_texts.join(" ")
+                    ));
+                } else {
+                    lines.push(format!("[{}] {}", speaker, current_texts.join(" ")));
+                }
             }
             current_speaker = Some(&seg.speaker);
+            current_start = seg.start;
             current_texts.clear();
             current_texts.push(seg.text.trim());
         }
     }
     // Flush last block
     if let Some(speaker) = current_speaker {
-        lines.push(format!("[{}] {}", speaker, current_texts.join(" ")));
+        if timestamp {
+            lines.push(format!(
+                "[{}] {} {}",
+                format_timestamp(current_start),
+                speaker,
+                current_texts.join(" ")
+            ));
+        } else {
+            lines.push(format!("[{}] {}", speaker, current_texts.join(" ")));
+        }
     }
 
     lines.join("\n")
+}
+
+/// Format seconds as HH:MM:SS.
+fn format_timestamp(seconds: f64) -> String {
+    let total_secs = seconds as u64;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, minutes, secs)
 }
 
 /// Provider-agnostic metadata that can be written to YAML.
@@ -911,7 +943,7 @@ mod tests {
             diarization: None,
             segments: None,
         };
-        assert_eq!(format_transcription_output(&result), "Hello world.");
+        assert_eq!(format_transcription_output(&result, false), "Hello world.");
     }
 
     #[test]
@@ -936,7 +968,7 @@ mod tests {
             segments: None,
         };
         assert_eq!(
-            format_transcription_output(&result),
+            format_transcription_output(&result, false),
             "[SPEAKER_00] Hello.\n[SPEAKER_01] I am fine."
         );
     }
@@ -969,7 +1001,7 @@ mod tests {
             segments: None,
         };
         assert_eq!(
-            format_transcription_output(&result),
+            format_transcription_output(&result, false),
             "[SPEAKER_00] Hello. How are you?\n[SPEAKER_01] I am fine."
         );
     }
@@ -983,7 +1015,75 @@ mod tests {
             segments: None,
         };
         // Empty segments → fall back to plain text
-        assert_eq!(format_transcription_output(&result), "Hello world.");
+        assert_eq!(format_transcription_output(&result, false), "Hello world.");
+    }
+
+    #[test]
+    fn test_format_diarized_with_timestamps() {
+        let result = TranscriptionResult {
+            text: "Hello. I am fine.".to_string(),
+            metadata: Default::default(),
+            diarization: Some(vec![
+                DiarizationSegment {
+                    speaker: "speaker_1".to_string(),
+                    start: 0.0,
+                    end: 1.5,
+                    text: "Hello.".to_string(),
+                },
+                DiarizationSegment {
+                    speaker: "speaker_2".to_string(),
+                    start: 1.5,
+                    end: 3.0,
+                    text: "I am fine.".to_string(),
+                },
+            ]),
+            segments: None,
+        };
+        assert_eq!(
+            format_transcription_output(&result, true),
+            "[00:00:00] speaker_1 Hello.\n[00:00:01] speaker_2 I am fine."
+        );
+    }
+
+    #[test]
+    fn test_format_diarized_with_timestamps_merges_same_speaker() {
+        let result = TranscriptionResult {
+            text: "Hello. How are you? I am fine.".to_string(),
+            metadata: Default::default(),
+            diarization: Some(vec![
+                DiarizationSegment {
+                    speaker: "speaker_1".to_string(),
+                    start: 0.0,
+                    end: 1.0,
+                    text: "Hello.".to_string(),
+                },
+                DiarizationSegment {
+                    speaker: "speaker_1".to_string(),
+                    start: 1.0,
+                    end: 2.0,
+                    text: "How are you?".to_string(),
+                },
+                DiarizationSegment {
+                    speaker: "speaker_2".to_string(),
+                    start: 2.0,
+                    end: 3.5,
+                    text: "I am fine.".to_string(),
+                },
+            ]),
+            segments: None,
+        };
+        assert_eq!(
+            format_transcription_output(&result, true),
+            "[00:00:00] speaker_1 Hello. How are you?\n[00:00:02] speaker_2 I am fine."
+        );
+    }
+
+    #[test]
+    fn test_format_timestamp_helper() {
+        assert_eq!(format_timestamp(0.0), "00:00:00");
+        assert_eq!(format_timestamp(1.5), "00:00:01");
+        assert_eq!(format_timestamp(61.0), "00:01:01");
+        assert_eq!(format_timestamp(3661.0), "01:01:01");
     }
 
     #[test]

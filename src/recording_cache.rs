@@ -259,7 +259,7 @@ impl TranscriptionCache {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| TalkError::Config("audio path has no filename".to_string()))?;
-        let text = crate::transcription::format_transcription_output(result);
+        let text = crate::transcription::format_transcription_output(result, false);
         write_metadata_to_dir(
             dir,
             stem,
