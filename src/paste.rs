@@ -5,6 +5,7 @@
 //! via X11 and the clipboard.
 
 use crate::clipboard::{Clipboard, X11Clipboard};
+use crate::config::PasteShortcut;
 use crate::error::TalkError;
 
 /// Maximum number of attempts to focus the target window.
@@ -122,6 +123,7 @@ pub async fn paste_text_to_target(
     chunk_chars: usize,
     t_stop: Option<std::time::Instant>,
     sink: &dyn crate::telemetry::TelemetrySink,
+    shortcut: PasteShortcut,
 ) -> Result<(), TalkError> {
     let clipboard = X11Clipboard::new();
     let total_chars = text.len() as u64;
@@ -148,7 +150,7 @@ pub async fn paste_text_to_target(
         if let Some(t) = t_stop {
             log::info!("timing: stop +{}ms first_paste", t.elapsed().as_millis());
         }
-        simulate_paste().await?;
+        simulate_paste(shortcut.clone()).await?;
         chars_pasted = total_chars;
         sink.emit(crate::telemetry::TranscriptionEvent::PasteProgress {
             chars_pasted,
@@ -167,7 +169,7 @@ pub async fn paste_text_to_target(
                 }
                 first_paste_logged = true;
             }
-            simulate_paste().await?;
+            simulate_paste(shortcut.clone()).await?;
             chars_pasted += chunk.len() as u64;
             sink.emit(crate::telemetry::TranscriptionEvent::PasteProgress {
                 chars_pasted,
@@ -210,15 +212,30 @@ pub async fn focus_window(window_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Simulate a Ctrl+Shift+V paste keystroke via the XTest extension.
-pub async fn simulate_paste() -> Result<(), TalkError> {
-    // X11 keysyms for Control_L, Shift_L, v
+/// Resolve a [`PasteShortcut`] into the X11 keysyms to send.
+///
+/// Pure function — enables unit testing without an X11 connection.
+pub fn paste_keysyms(shortcut: &PasteShortcut) -> Vec<u32> {
     const CONTROL_L: u32 = 0xffe3;
     const SHIFT_L: u32 = 0xffe1;
     const KEY_V: u32 = 0x0076;
 
-    let ok = tokio::task::spawn_blocking(|| {
-        crate::x11::x11_send_key_combo(&[CONTROL_L, SHIFT_L, KEY_V])
+    match shortcut {
+        PasteShortcut::CtrlShiftV => vec![CONTROL_L, SHIFT_L, KEY_V],
+        PasteShortcut::CtrlV => vec![CONTROL_L, KEY_V],
+    }
+}
+
+/// Simulate a paste keystroke via the XTest extension.
+///
+/// The exact key combination depends on `shortcut`:
+/// - `PasteShortcut::CtrlShiftV` → Ctrl+Shift+V
+/// - `PasteShortcut::CtrlV` → Ctrl+V
+pub async fn simulate_paste(shortcut: PasteShortcut) -> Result<(), TalkError> {
+    let keysyms = paste_keysyms(&shortcut);
+
+    let ok = tokio::task::spawn_blocking(move || {
+        crate::x11::x11_send_key_combo(&keysyms)
     })
     .await
     .unwrap_or(false);
@@ -318,5 +335,17 @@ mod tests {
     fn test_chunk_single_word() {
         let chunks = split_into_char_chunks("hello", 150);
         assert_eq!(chunks, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_paste_keysyms_ctrl_shift_v() {
+        let keysyms = paste_keysyms(&PasteShortcut::CtrlShiftV);
+        assert_eq!(keysyms, vec![0xffe3, 0xffe1, 0x0076]);
+    }
+
+    #[test]
+    fn test_paste_keysyms_ctrl_v() {
+        let keysyms = paste_keysyms(&PasteShortcut::CtrlV);
+        assert_eq!(keysyms, vec![0xffe3, 0x0076]);
     }
 }
