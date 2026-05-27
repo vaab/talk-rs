@@ -823,7 +823,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     let result_for_cache = transcription::TranscriptionResult {
         text: text.clone(),
         metadata: metadata.clone(),
-        diarization: None,
+        diarization: result.diarization.clone(),
         segments: segments.clone(),
     };
     let cache_meta_path = recording_cache::TranscriptionCache::store(
