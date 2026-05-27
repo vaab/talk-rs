@@ -92,6 +92,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             .unwrap_or(PASTE_CHUNK_CHARS)
     };
 
+    // Resolve paste shortcut from config (default: Ctrl+Shift+V).
+    let paste_shortcut = config
+        .paste
+        .as_ref()
+        .map(|p| p.shortcut.clone())
+        .unwrap_or_default();
+
     // Determine target window: use --target-window arg (from daemon mode)
     // or capture the currently active window.
     let target_window = if let Some(wid) = opts.target_window {
@@ -149,6 +156,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                 model: opts.model,
                 target_window,
                 paste_chunk_chars,
+                paste_shortcut: paste_shortcut.clone(),
             },
         )
         .await;
@@ -175,6 +183,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     paste_chunk_chars,
                     None,
                     &crate::telemetry::NoOpSink,
+                    paste_shortcut.clone(),
                 )
                 .await?;
                 let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
@@ -602,7 +611,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     continue;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                if let Err(e) = simulate_paste().await {
+                if let Err(e) = simulate_paste(paste_shortcut.clone()).await {
                     log::warn!("per-segment paste failed: {}", e);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(15)).await;
@@ -896,6 +905,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             paste_chunk_chars,
             t_stop,
             &*sink,
+            paste_shortcut,
         )
         .await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);

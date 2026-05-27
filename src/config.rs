@@ -269,6 +269,18 @@ pub struct IndicatorsConfig {
     pub viz: Option<VizMode>,
 }
 
+/// Keyboard shortcut used for pasting text into the target application.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+pub enum PasteShortcut {
+    /// Default: Ctrl+Shift+V (paste from primary clipboard).
+    #[default]
+    #[serde(rename = "ctrl_shift_v")]
+    CtrlShiftV,
+    /// Ctrl+V (paste from regular clipboard, common in terminals / Emacs).
+    #[serde(rename = "ctrl_v")]
+    CtrlV,
+}
+
 /// Paste behaviour configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PasteConfig {
@@ -281,6 +293,14 @@ pub struct PasteConfig {
     /// shot).
     #[serde(default = "default_paste_chunk_chars")]
     pub chunk_chars: usize,
+
+    /// Keyboard shortcut to trigger paste in the target application.
+    ///
+    /// `ctrl_shift_v` (default) uses the primary selection clipboard.
+    /// `ctrl_v` uses the regular clipboard, useful for terminal
+    /// applications that don't support Shift+Insert / Ctrl+Shift+V.
+    #[serde(default)]
+    pub shortcut: PasteShortcut,
 }
 
 fn default_paste_chunk_chars() -> usize {
