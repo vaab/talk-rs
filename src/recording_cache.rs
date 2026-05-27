@@ -49,6 +49,8 @@ pub struct RecordingMetadata {
     pub provider_api: Option<ProviderApiMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<CommonSegment>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diarization: Option<Vec<CommonDiarizationSegment>>,
 }
 
 /// Minimal metadata used for retry/replacement flows.
@@ -123,6 +125,14 @@ pub struct CommonSegment {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CommonDiarizationSegment {
+    pub speaker: String,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ProviderApiMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai: Option<OpenAIApiMetadata>,
@@ -181,6 +191,17 @@ impl RecordingMetadata {
                 .collect()
         });
 
+        let diarization = self.diarization.map(|segs| {
+            segs.into_iter()
+                .map(|s| crate::transcription::DiarizationSegment {
+                    speaker: s.speaker,
+                    start: s.start,
+                    end: s.end,
+                    text: s.text,
+                })
+                .collect()
+        });
+
         let metadata = self
             .metadata
             .map(|cm| TranscriptionMetadata {
@@ -204,7 +225,7 @@ impl RecordingMetadata {
         TranscriptionResult {
             text: self.transcript,
             metadata,
-            diarization: None,
+            diarization,
             segments,
         }
     }
@@ -270,6 +291,7 @@ impl TranscriptionCache {
             audio_filename,
             &result.metadata,
             result.segments.as_deref(),
+            result.diarization.as_deref(),
         )
     }
 
@@ -412,6 +434,25 @@ pub(crate) fn common_segments_from_result(
     Some(
         segs.iter()
             .map(|s| CommonSegment {
+                start: s.start,
+                end: s.end,
+                text: s.text.clone(),
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn common_diarization_from_result(
+    diarization: Option<&[crate::transcription::DiarizationSegment]>,
+) -> Option<Vec<CommonDiarizationSegment>> {
+    let segs = diarization?;
+    if segs.is_empty() {
+        return None;
+    }
+    Some(
+        segs.iter()
+            .map(|s| CommonDiarizationSegment {
+                speaker: s.speaker.clone(),
                 start: s.start,
                 end: s.end,
                 text: s.text.clone(),
@@ -818,6 +859,7 @@ pub fn write_metadata_to_dir(
     audio_filename: &str,
     transcription_metadata: &TranscriptionMetadata,
     segments: Option<&[crate::transcription::TranscriptSegment]>,
+    diarization: Option<&[crate::transcription::DiarizationSegment]>,
 ) -> Result<PathBuf, TalkError> {
     let meta = RecordingMetadata {
         recording: audio_filename.to_string(),
@@ -829,6 +871,7 @@ pub fn write_metadata_to_dir(
         metadata: common_metadata_from_transcription(transcription_metadata),
         provider_api: provider_api_metadata_from_transcription(transcription_metadata),
         segments: common_segments_from_result(segments),
+        diarization: common_diarization_from_result(diarization),
     };
 
     let yaml = serde_yaml::to_string(&meta)
@@ -860,6 +903,7 @@ pub fn write_metadata(
     audio_filename: &str,
     transcription_metadata: &TranscriptionMetadata,
     segments: Option<&[crate::transcription::TranscriptSegment]>,
+    diarization: Option<&[crate::transcription::DiarizationSegment]>,
 ) -> Result<PathBuf, TalkError> {
     let dir = ensure_recordings_dir()?;
     let meta_path = write_metadata_to_dir(
@@ -872,6 +916,7 @@ pub fn write_metadata(
         audio_filename,
         transcription_metadata,
         segments,
+        diarization,
     )?;
 
     let audio_path = dir.join(audio_filename);
@@ -1161,6 +1206,7 @@ mod tests {
             metadata: None,
             provider_api: None,
             segments: None,
+            diarization: None,
         })
         .expect("serialise metadata")
     }
@@ -1264,6 +1310,7 @@ mod tests {
             metadata: None,
             provider_api: None,
             segments: None,
+            diarization: None,
         };
         let yaml = serde_yaml::to_string(&meta).expect("serialise");
         assert!(yaml.contains("recording: 2026-02-18T12-33-45.ogg"));
@@ -1309,6 +1356,7 @@ mod tests {
                 mistral: None,
             }),
             segments: None,
+            diarization: None,
         };
 
         let yaml = serde_yaml::to_string(&meta).expect("serialise");
@@ -1330,6 +1378,7 @@ mod tests {
             timestamp: "2026-02-18T12-33-45".to_string(),
             metadata: None,
             provider_api: None,
+            diarization: None,
             segments: Some(vec![CommonSegment {
                 start: 1.2,
                 end: 10.7,
@@ -1353,6 +1402,7 @@ mod tests {
             metadata: None,
             provider_api: None,
             segments: None,
+            diarization: None,
         };
 
         let yaml = serde_yaml::to_string(&meta).expect("serialise");
@@ -1866,5 +1916,58 @@ mod tests {
             "whisper-1",
             false
         ));
+    }
+
+    #[test]
+    fn test_transcription_cache_round_trip_with_diarization() {
+        let dir = TempDir::new().expect("create temp dir");
+        let audio_path = dir.path().join("sample.ogg");
+        fs::write(&audio_path, b"fake ogg").expect("write audio");
+
+        let mut result = sample_result();
+        result.diarization = Some(vec![
+            crate::transcription::DiarizationSegment {
+                speaker: "SPEAKER_00".to_string(),
+                start: 0.0,
+                end: 2.5,
+                text: "Bonjour tout le monde".to_string(),
+            },
+            crate::transcription::DiarizationSegment {
+                speaker: "SPEAKER_01".to_string(),
+                start: 2.5,
+                end: 5.0,
+                text: "Hello, comment ca va ?".to_string(),
+            },
+        ]);
+
+        let path = TranscriptionCache::store(
+            &audio_path,
+            Provider::Mistral,
+            "voxtral-mini-2602",
+            false,
+            &result,
+        )
+        .expect("store sidecar");
+
+        assert!(path.exists());
+
+        let cached = TranscriptionCache::get(&audio_path, Provider::Mistral, "voxtral-mini-2602")
+            .expect("read cached sidecar");
+
+        // When diarization is present, store() formats text with speakers.
+        // We verify the diarization segments survive round-trip — that's the real bug.
+        let diarization = cached
+            .diarization
+            .expect("diarization should survive round-trip");
+        assert_eq!(diarization.len(), 2);
+        assert_eq!(diarization[0].speaker, "SPEAKER_00");
+        assert_eq!(diarization[0].text, "Bonjour tout le monde");
+        assert_eq!(diarization[1].speaker, "SPEAKER_01");
+        assert_eq!(diarization[1].text, "Hello, comment ca va ?");
+
+        // Verify YAML contains speaker labels
+        let yaml = fs::read_to_string(&path).expect("read yaml");
+        assert!(yaml.contains("speaker: SPEAKER_00"));
+        assert!(yaml.contains("speaker: SPEAKER_01"));
     }
 }

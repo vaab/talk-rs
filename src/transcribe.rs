@@ -243,6 +243,7 @@ mod tests {
             "test-audio.ogg",
             &transcription.metadata,
             transcription.segments.as_deref(),
+            transcription.diarization.as_deref(),
         )
         .expect("write sidecar metadata");
 
