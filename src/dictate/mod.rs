@@ -72,25 +72,7 @@ pub struct DictateOpts {
 pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Toggle mode: start or stop a daemon
     if opts.toggle {
-        return toggle_dispatch(
-            opts.provider,
-            opts.model,
-            opts.diarize,
-            opts.realtime,
-            opts.no_sounds,
-            opts.no_boop,
-            opts.no_chunk_paste,
-            opts.monitor,
-            opts.no_overlay,
-            opts.no_auto_pause,
-            opts.viz,
-            opts.mono,
-            opts.upload_format,
-            opts.no_bt_auto_switch,
-            opts.save.as_deref(),
-            opts.verbose,
-        )
-        .await;
+        return toggle_dispatch(&opts).await;
     }
 
     let save_path = opts.save;
