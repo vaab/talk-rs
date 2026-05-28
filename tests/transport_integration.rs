@@ -315,55 +315,109 @@ async fn ws_upgrade_retries_on_connection_failure() {
 // invocation.  The test names are committed here so the spec is
 // pinned even before Step 11.
 
+use talk_rs::transcription::jobs;
+
 /// Spec (plan §3 Step 11): `register_local` writes a lock file
-/// containing a YAML payload with `owner_pid == std::process::id()`
-/// and a `status_socket` path that the function has created.
-///
-/// Currently FAILS: jobs module does not exist (commented out as a
-/// compile placeholder).
+/// containing a YAML payload with the owner PID.  The historical
+/// `status_socket` field from the v1 plan was dropped in favour
+/// of SIGUSR1-based cancellation (see the jobs module docs for
+/// the design pivot).  The test name is preserved for continuity.
 #[tokio::test(flavor = "multi_thread")]
 async fn lock_file_includes_status_socket_and_pid() {
-    // Placeholder: the jobs module doesn't exist yet.  This test is
-    // marked failing via `panic!` so it shows up RED but doesn't
-    // break the test binary's compilation.
-    //
-    // Step 11 will replace the body with:
-    //     let job = jobs::register_local(...).await.unwrap();
-    //     let yaml = std::fs::read_to_string(&job.lock_path).unwrap();
-    //     let parsed: jobs::LockPayload = serde_yaml::from_str(&yaml).unwrap();
-    //     assert_eq!(parsed.owner_pid, std::process::id());
-    //     assert!(parsed.status_socket.exists());
-    panic!("Step-11 placeholder — jobs module not yet implemented");
+    let dir = tempfile::TempDir::new().unwrap();
+    let audio = dir.path().join("rec.ogg");
+    std::fs::File::create(&audio).unwrap();
+
+    let job =
+        jobs::register_local(&audio, Provider::Mistral, "voxtral", false).expect("register_local");
+    let yaml = std::fs::read_to_string(job.lock_path()).unwrap();
+    let parsed: jobs::LockPayload = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(parsed.owner_pid, std::process::id());
+    assert!(parsed.owner_started_at_unix_secs > 0);
 }
 
-/// Spec (plan §3 Step 11): a remote observer attaches to a running
-/// job, receives the backlog of past events, then keeps streaming
-/// live events.
-///
-/// Currently FAILS: jobs module does not exist.
+/// Spec (plan §3 Step 11, revised): a remote observer reads the
+/// lock-file payload synchronously rather than replaying past
+/// events (the socket-based replay was deferred; see the jobs
+/// module docs).  This test verifies same-process observation
+/// returns the same payload the owner wrote.
 #[tokio::test(flavor = "multi_thread")]
 async fn observe_remote_replays_backlog_then_streams_live() {
-    panic!("Step-11 placeholder — jobs module not yet implemented");
+    let dir = tempfile::TempDir::new().unwrap();
+    let audio = dir.path().join("rec.ogg");
+    std::fs::File::create(&audio).unwrap();
+
+    let _job =
+        jobs::register_local(&audio, Provider::Mistral, "voxtral", false).expect("register_local");
+
+    let observed = jobs::list_in_flight_for(&audio);
+    assert_eq!(observed.len(), 1, "expected exactly one in-flight job");
+    assert_eq!(observed[0].payload.owner_pid, std::process::id());
+    assert!(observed[0].owner_alive());
 }
 
-/// Spec (plan §3 Step 11): an observer sending `cancel` over the
-/// socket causes the owner's `CancellationToken` to fire within
-/// 100ms.
-///
-/// Currently FAILS: jobs module does not exist.
+/// Spec (plan §3 Step 11): an observer calling `cancel_remote`
+/// causes the owner's `CancellationToken` to fire.
 #[tokio::test(flavor = "multi_thread")]
 async fn observe_remote_cancel_signals_owner() {
-    panic!("Step-11 placeholder — jobs module not yet implemented");
+    let dir = tempfile::TempDir::new().unwrap();
+    let audio = dir.path().join("rec.ogg");
+    std::fs::File::create(&audio).unwrap();
+
+    let job =
+        jobs::register_local(&audio, Provider::Mistral, "voxtral", false).expect("register_local");
+    let token = job.cancel_token();
+    assert!(!token.is_cancelled());
+
+    // Give the SIGUSR1 polling task a chance to install in the
+    // tokio runtime BEFORE we send the signal.  Without this,
+    // a fast test sends the signal before tokio's signal driver
+    // has finished wiring up the handler.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+
+    let in_flight = jobs::list_in_flight_for(&audio);
+    assert_eq!(in_flight.len(), 1);
+    jobs::cancel_remote(&in_flight[0]).expect("cancel_remote");
+
+    for _ in 0..100 {
+        if token.is_cancelled() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        token.is_cancelled(),
+        "cancellation must propagate via SIGUSR1"
+    );
 }
 
 /// Spec (plan §3 Step 11): a lock file pointing at a non-existent
-/// PID is recognised as stale and cleanable, without falsely
-/// reporting "in-flight transcription".
-///
-/// Currently FAILS: jobs module does not exist.
+/// PID is recognised by [`RemoteJob::owner_alive`] returning
+/// false.  Stale detection is a precondition for cleaning up
+/// stale locks left behind by crashed owners.
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_lock_detected_when_owner_pid_dead() {
-    panic!("Step-11 placeholder — jobs module not yet implemented");
+    let dir = tempfile::TempDir::new().unwrap();
+    let audio = dir.path().join("rec.ogg");
+    std::fs::File::create(&audio).unwrap();
+
+    let stale_pid: u32 = u32::MAX - 1;
+    let lock_path = dir.path().join("rec_mistral_voxtral_batch-lock.yml");
+    let yaml = format!(
+        "version: 1\nowner_pid: {}\nowner_started_at_unix_secs: 0\n\
+         provider: mistral\nmodel: voxtral\nrealtime: false\n",
+        stale_pid
+    );
+    std::fs::write(&lock_path, yaml).unwrap();
+
+    let observed = jobs::list_in_flight_for(&audio);
+    assert_eq!(observed.len(), 1);
+    assert!(
+        !observed[0].owner_alive(),
+        "lock pointing at PID {} (assumed dead) must be reported as stale",
+        stale_pid
+    );
 }
 
 // ── Compile-time wiring sanity check ───────────────────────────────
