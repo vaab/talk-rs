@@ -87,15 +87,26 @@ pub enum Method {
 ///
 /// Each variant maps to a reqwest body strategy; the transport
 /// chooses the right one without leaking reqwest types to callers.
+///
+/// Note: the [`Multipart`](Self::Multipart) variant takes a
+/// **factory** closure rather than a constructed form because
+/// `reqwest::multipart::Form` is not `Clone` and retries need to
+/// rebuild it fresh per attempt.  Each call to the factory
+/// produces a fresh, sendable form (typically wrapping the same
+/// underlying audio buffer in a fresh `ProgressBody` stream).
 pub enum RequestBody {
     /// No body (e.g. for GETs).
     Empty,
-    /// In-memory bytes.  Sent with `Content-Length`.
-    Bytes(Vec<u8>),
-    /// `multipart/form-data` body.  The form is constructed by the
-    /// caller (typically a provider's request builder) and handed
-    /// over to the transport for sending.
-    Multipart(reqwest::multipart::Form),
+    /// In-memory bytes.  Sent with `Content-Length`.  Cheaply
+    /// reusable across retries — the transport `.clone()`s the
+    /// underlying `Arc<Vec<u8>>` per attempt.
+    Bytes(std::sync::Arc<Vec<u8>>),
+    /// `multipart/form-data` body produced by a factory closure.
+    /// The transport invokes the closure once per attempt.  The
+    /// closure must be cheap to call (the audio buffer is
+    /// typically wrapped in `Arc` and reused; only the multipart
+    /// envelope and progress-stream wrapper are rebuilt).
+    Multipart(Box<dyn Fn() -> reqwest::multipart::Form + Send + Sync>),
 }
 
 /// A request to be sent through the transport.
@@ -437,32 +448,19 @@ async fn run_single_http_attempt(
         request_builder = request_builder.header(name, value);
     }
     // Bodies: the transport owns the body construction so the
-    // caller never touches reqwest::Body directly.  Note that we
-    // CANNOT consume `req.body` here because the outer loop may
-    // need to retry — Step 2 limitation: the body must be cloneable.
-    // We work around this by accepting only `Empty` and `Bytes`
-    // for now; `Multipart` will be enabled in Step 4 when the
-    // provider migration happens (Step 4 reshapes the body into
-    // a re-buildable factory).
+    // caller never touches reqwest::Body directly.  Each retry
+    // rebuilds the body fresh by either cloning the Arc<Vec<u8>>
+    // (cheap) or invoking the multipart factory (rebuilds the
+    // form envelope; the underlying audio buffer is typically
+    // Arc-shared so the rebuild is also cheap).
     match &req.body {
         RequestBody::Empty => {}
         RequestBody::Bytes(bytes) => {
-            request_builder = request_builder.body(bytes.clone());
+            request_builder = request_builder.body(bytes.as_ref().clone());
         }
-        RequestBody::Multipart(_) => {
-            return SingleAttempt::Permanent(PipelineFailure::new(
-                req.provider_name.clone(),
-                req.phase,
-                attempt_num,
-                max_attempts,
-                req.url.clone(),
-                PipelineFailureKind::Decode(
-                    "transport::http_request: Multipart body is not yet \
-                     supported in Step 2 (Step 4 enables it via a body \
-                     factory)"
-                        .into(),
-                ),
-            ));
+        RequestBody::Multipart(factory) => {
+            let form = factory();
+            request_builder = request_builder.multipart(form);
         }
     }
     if let Some(budget) = req.wall_clock {

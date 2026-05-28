@@ -11,19 +11,16 @@ use crate::transcription::{
     TranscriptionResult,
 };
 use async_trait::async_trait;
-use futures::StreamExt;
-use reqwest::Client;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::transport::http::{
-    build_client, build_pipeline_failure_kind, parse_u64_field, proportional_timeout, ProgressBody,
-    TimerSpec, CONNECT_TIMEOUT,
-};
+use super::transport::http::{parse_u64_field, proportional_timeout, ProgressBody};
+use super::transport::{self, Method, Request, RequestBody};
 use super::BatchTranscriber;
-use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
+use crate::telemetry::{NoOpSink, TelemetrySink};
+use tokio_util::sync::CancellationToken;
 
 /// Default API base URL for the OpenAI API.
 pub(crate) const API_BASE: &str = "https://api.openai.com";
@@ -73,14 +70,12 @@ fn parse_openai_audio_seconds(usage: &serde_json::Value) -> Option<f64> {
     usage.get("seconds").and_then(|v| v.as_f64())
 }
 
-fn extract_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
+fn extract_rate_limit_headers(headers: &[(String, String)]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (name, value) in headers {
-        let key = name.as_str();
+        let key = name.to_lowercase();
         if key.starts_with("x-ratelimit-") {
-            if let Ok(v) = value.to_str() {
-                out.insert(key.to_string(), v.to_string());
-            }
+            out.insert(key, value.clone());
         }
     }
     out
@@ -154,19 +149,18 @@ pub(crate) async fn validate_openai_model(
 ///
 /// This implementation sends audio files to the OpenAI API for transcription
 /// and parses the JSON response to extract the transcribed text.
+///
+/// All network I/O funnels through
+/// [`super::transport::http_request`] — this struct no longer
+/// owns a `reqwest::Client` directly.
 pub struct OpenAIBatchTranscriber {
-    /// HTTP client for making requests to the OpenAI API.
-    client: Client,
     /// OpenAI API configuration (contains API key and model).
     config: OpenAIConfig,
     /// API endpoint URL (can be overridden for testing).
     endpoint: String,
     /// Per-request wall-clock-timeout policy.  Set at construction
     /// via [`Self::with_policy`]; [`Self::new`] forwards
-    /// [`RequestTimeoutPolicy::Proportional`].  Read by
-    /// [`Self::send_once`] to decide whether to attach
-    /// `.timeout(proportional_timeout(file_len))` to the reqwest
-    /// builder.
+    /// [`RequestTimeoutPolicy::Proportional`].
     policy: RequestTimeoutPolicy,
     /// Telemetry event sink for HTTP lifecycle reporting.
     sink: Arc<dyn TelemetrySink>,
@@ -200,7 +194,6 @@ impl OpenAIBatchTranscriber {
         let base = config.url.as_deref().unwrap_or(API_BASE);
         let endpoint = format!("{}/v1/audio/transcriptions", base.trim_end_matches('/'));
         Ok(Self {
-            client: build_client()?,
             config,
             endpoint,
             policy,
@@ -217,7 +210,6 @@ impl OpenAIBatchTranscriber {
     #[cfg(test)]
     pub fn with_endpoint(config: OpenAIConfig, endpoint: String) -> Result<Self, TalkError> {
         Ok(Self {
-            client: build_client()?,
             config,
             endpoint,
             policy: RequestTimeoutPolicy::Proportional,
@@ -225,162 +217,99 @@ impl OpenAIBatchTranscriber {
         })
     }
 
-    /// Send one HTTP attempt to the OpenAI transcription endpoint.
+    /// Send a transcription request through the consolidated
+    /// transport.
     ///
-    /// This is a single, non-retrying primitive.  It is wrapped by
-    /// [`Self::send_request`] in
-    /// [`super::transport::retry::with_retry`] so every caller gets
-    /// transparent retry.
-    async fn send_once(
+    /// All retry, cancellation, error attribution, and progress
+    /// telemetry live inside
+    /// [`super::transport::http_request`].
+    async fn send_request(
         &self,
         audio_bytes: Vec<u8>,
         file_name: &str,
     ) -> Result<TranscriptionResult, TalkError> {
         let file_len = audio_bytes.len() as u64;
-        let progress_body = ProgressBody::new(audio_bytes, self.sink.clone());
-        let body_len = progress_body.len();
+        let started = Instant::now();
 
         let response_format = if self.config.model.starts_with("whisper") {
             "verbose_json"
         } else {
             "json"
         };
-        let form = reqwest::multipart::Form::new()
-            .text("model", self.config.model.clone())
-            .text("response_format", response_format)
-            .part(
-                "file",
-                reqwest::multipart::Part::stream_with_length(
-                    reqwest::Body::wrap_stream(progress_body),
-                    body_len,
-                )
-                .file_name(file_name.to_string()),
-            );
 
-        // Resolve timeout-policy choices once.  See the matching
-        // branch in `mistral::send_once` for the rationale.
+        let audio_arc = std::sync::Arc::new(audio_bytes);
+        let model = self.config.model.clone();
+        let file_name_owned = file_name.to_string();
+        let response_format_owned = response_format.to_string();
+        let sink_for_factory = self.sink.clone();
+
+        let body_factory: Box<dyn Fn() -> reqwest::multipart::Form + Send + Sync> = {
+            let audio_arc = audio_arc.clone();
+            Box::new(move || {
+                let audio_bytes_for_attempt = audio_arc.as_ref().clone();
+                let progress_body =
+                    ProgressBody::new(audio_bytes_for_attempt, sink_for_factory.clone());
+                let body_len = progress_body.len();
+
+                reqwest::multipart::Form::new()
+                    .text("model", model.clone())
+                    .text("response_format", response_format_owned.clone())
+                    .part(
+                        "file",
+                        reqwest::multipart::Part::stream_with_length(
+                            reqwest::Body::wrap_stream(progress_body),
+                            body_len,
+                        )
+                        .file_name(file_name_owned.clone()),
+                    )
+            })
+        };
+
         let wall_clock = match self.policy {
             RequestTimeoutPolicy::Proportional => Some(proportional_timeout(file_len)),
             RequestTimeoutPolicy::UserAttended => None,
         };
 
         log::debug!(
-            "openai batch send_once: policy={:?}, connect_timeout={}s, wall_clock={}, audio={} KB",
+            "openai send_request: policy={:?}, wall_clock={}, audio={} KB",
             self.policy,
-            CONNECT_TIMEOUT.as_secs(),
             wall_clock
                 .map(|d| format!("{}s", d.as_secs()))
                 .unwrap_or_else(|| "none".to_string()),
             file_len / 1024
         );
 
-        let connect_timer = TimerSpec {
-            name: "connect_timeout",
-            budget: CONNECT_TIMEOUT,
+        let req = Request {
+            method: Method::Post,
+            url: self.endpoint.clone(),
+            headers: vec![(
+                "Authorization".into(),
+                format!("Bearer {}", self.config.api_key),
+            )],
+            body: RequestBody::Multipart(body_factory),
+            provider: crate::config::Provider::OpenAI,
+            provider_name: "OpenAI".into(),
+            phase: crate::error::PipelinePhase::Request,
+            wall_clock,
         };
-        let timers: Vec<TimerSpec> = match wall_clock {
-            Some(budget) => vec![
-                connect_timer,
-                TimerSpec {
-                    name: "request_wall_clock",
-                    budget,
-                },
-            ],
-            None => vec![connect_timer],
-        };
 
-        self.sink.emit(TranscriptionEvent::RequestStarted {
-            endpoint: self.endpoint.clone(),
-            t: Instant::now(),
-        });
-
-        let started = Instant::now();
-        let mut request = self
-            .client
-            .post(&self.endpoint)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .multipart(form);
-        if let Some(budget) = wall_clock {
-            request = request.timeout(budget);
-        }
-        let response = request.send().await.map_err(|err| {
-            self.sink.emit(TranscriptionEvent::RequestCompleted {
-                success: false,
-                t: Instant::now(),
-            });
-            // Build a structured `PipelineFailure` so consumers
-            // can pattern-match cause/timer instead of regex over
-            // a flattened string.  See the parallel call site in
-            // `mistral.rs::send_once` for the attempts=1/max=1
-            // rationale.
-            TalkError::from(crate::error::PipelineFailure::new(
-                "OpenAI",
-                crate::error::PipelinePhase::Request,
-                1,
-                1,
-                self.endpoint.clone(),
-                build_pipeline_failure_kind(err, &timers),
-            ))
-        })?;
-
+        let response = transport::http_request(req, &self.sink, CancellationToken::new())
+            .await
+            .map_err(TalkError::from)?;
         let request_latency_ms = started.elapsed().as_millis() as u64;
-        self.sink.emit(TranscriptionEvent::ResponseHeaders {
-            status: response.status().as_u16(),
-            t: Instant::now(),
-        });
-        let headers = response.headers().clone();
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            self.sink.emit(TranscriptionEvent::RequestCompleted {
-                success: false,
-                t: Instant::now(),
-            });
+        if !(200..300).contains(&response.status) {
+            let body = String::from_utf8_lossy(&response.body).to_string();
             return Err(TalkError::Transcription(format!(
                 "OpenAI API error ({}): {}",
-                status, body
+                response.status, body
             )));
         }
 
-        let mut body_bytes: Vec<u8> = Vec::new();
-        let mut body_stream = response.bytes_stream();
-        while let Some(chunk_result) = body_stream.next().await {
-            let chunk = chunk_result.map_err(|err| {
-                self.sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
-                TalkError::Transcription(format!(
-                    "Failed to read OpenAI API response body: {}",
-                    err
-                ))
-            })?;
-            body_bytes.extend_from_slice(&chunk);
-            self.sink.emit(TranscriptionEvent::DownloadProgress {
-                bytes_received: body_bytes.len() as u64,
-                total: None,
-                t: Instant::now(),
-            });
-        }
-        self.sink.emit(TranscriptionEvent::ResponseComplete {
-            total: body_bytes.len() as u64,
-            t: Instant::now(),
-        });
-
         let openai_response: OpenAIResponse =
-            serde_json::from_slice(&body_bytes).map_err(|err| {
-                self.sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
+            serde_json::from_slice(&response.body).map_err(|err| {
                 TalkError::Transcription(format!("Failed to parse OpenAI API response: {}", err))
             })?;
-
-        self.sink.emit(TranscriptionEvent::RequestCompleted {
-            success: true,
-            t: Instant::now(),
-        });
 
         let token_usage = openai_response
             .usage
@@ -398,15 +327,17 @@ impl OpenAIBatchTranscriber {
             .as_deref()
             .and_then(parse_transcript_segments);
         let word_count = openai_response.words.as_ref().map(std::vec::Vec::len);
-        let request_id = headers
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(ToString::to_string);
-        let provider_processing_ms = headers
-            .get("openai-processing-ms")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        let rate_limit_headers = extract_rate_limit_headers(&headers);
+        let request_id = response
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("x-request-id"))
+            .map(|(_, v)| v.clone());
+        let provider_processing_ms = response
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("openai-processing-ms"))
+            .and_then(|(_, v)| v.parse::<u64>().ok());
+        let rate_limit_headers = extract_rate_limit_headers(&response.headers);
 
         let text = openai_response.text;
         Ok(TranscriptionResult {
@@ -432,23 +363,6 @@ impl OpenAIBatchTranscriber {
             diarization: None,
             segments,
         })
-    }
-
-    /// Send a transcription request with shared retry semantics.
-    ///
-    /// Every batch HTTP call goes through this path.  Retry lives
-    /// inside [`super::transport::retry::with_retry`] — there is no
-    /// "no-retry" code path for HTTP transcription.
-    async fn send_request(
-        &self,
-        audio_bytes: Vec<u8>,
-        file_name: &str,
-    ) -> Result<TranscriptionResult, TalkError> {
-        let sink = self.sink.clone();
-        super::transport::retry::with_retry(crate::config::Provider::OpenAI, &sink, || async {
-            self.send_once(audio_bytes.clone(), file_name).await
-        })
-        .await
     }
 }
 

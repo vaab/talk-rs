@@ -11,17 +11,15 @@ use crate::transcription::{
     TranscriptionMetadata, TranscriptionResult,
 };
 use async_trait::async_trait;
-use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::transport::http::{
-    build_client, build_pipeline_failure_kind, parse_u64_field, proportional_timeout, ProgressBody,
-    TimerSpec, CONNECT_TIMEOUT,
-};
+use super::transport::http::{parse_u64_field, proportional_timeout, ProgressBody};
+use super::transport::{self, Method, Request, RequestBody};
 use super::BatchTranscriber;
-use crate::telemetry::{NoOpSink, TelemetrySink, TranscriptionEvent};
+use crate::telemetry::{NoOpSink, TelemetrySink};
+use tokio_util::sync::CancellationToken;
 
 /// Default API base URL for the Mistral API.
 pub(crate) const API_BASE: &str = "https://api.mistral.ai";
@@ -163,9 +161,13 @@ pub(crate) async fn validate_mistral_model(
 ///
 /// This implementation sends audio files to the Mistral API for transcription
 /// and parses the JSON response to extract the transcribed text.
+///
+/// All network I/O funnels through
+/// [`super::transport::http_request`] — this struct no longer
+/// owns a `reqwest::Client` directly.  Retries, cancellation, and
+/// [`crate::error::PipelineFailure`] construction are owned by the
+/// transport.
 pub struct MistralBatchTranscriber {
-    /// HTTP client for making requests to the Mistral API.
-    client: Client,
     /// Mistral API configuration (contains API key).
     config: MistralConfig,
     /// API endpoint URL (can be overridden for testing).
@@ -174,10 +176,10 @@ pub struct MistralBatchTranscriber {
     diarize: bool,
     /// Per-request wall-clock-timeout policy.  Set at construction
     /// via [`Self::with_policy`]; [`Self::new`] forwards
-    /// [`RequestTimeoutPolicy::Proportional`].  Read by
-    /// [`Self::send_once`] to decide whether to attach
-    /// `.timeout(proportional_timeout(file_len))` to the reqwest
-    /// builder.
+    /// [`RequestTimeoutPolicy::Proportional`].  Controls whether
+    /// [`Self::fetch_transcription`] sets a
+    /// `proportional_timeout(file_len)` wall clock on the
+    /// transport request.
     policy: RequestTimeoutPolicy,
     /// Telemetry event sink for HTTP lifecycle reporting.
     /// Defaults to [`NoOpSink`] when no consumer is attached.
@@ -219,7 +221,6 @@ impl MistralBatchTranscriber {
         let base = config.url.as_deref().unwrap_or(API_BASE);
         let endpoint = format!("{}/v1/audio/transcriptions", base.trim_end_matches('/'));
         Ok(Self {
-            client: build_client()?,
             config,
             endpoint,
             diarize,
@@ -242,7 +243,6 @@ impl MistralBatchTranscriber {
         diarize: bool,
     ) -> Result<Self, TalkError> {
         Ok(Self {
-            client: build_client()?,
             config,
             endpoint,
             diarize,
@@ -251,180 +251,113 @@ impl MistralBatchTranscriber {
         })
     }
 
-    /// Send one HTTP attempt to the Mistral transcription endpoint.
+    /// Send a transcription request through the consolidated
+    /// transport.
     ///
-    /// This is a single, non-retrying primitive.  It is wrapped by
-    /// [`Self::send_request`] in [`super::transport::retry::with_retry`]
-    /// so every caller gets transparent retry.
-    async fn send_once(
+    /// All retry, cancellation, error attribution, and progress
+    /// telemetry live inside
+    /// [`super::transport::http_request`].  This method's only
+    /// job is to (a) shape the multipart form with the Mistral
+    /// fields, (b) pick the wall-clock policy, (c) parse the
+    /// response body.
+    async fn send_request(
         &self,
         audio_bytes: Vec<u8>,
         file_name: &str,
     ) -> Result<TranscriptionResult, TalkError> {
         let file_len = audio_bytes.len() as u64;
-        let progress_body = ProgressBody::new(audio_bytes, self.sink.clone());
-        let body_len = progress_body.len();
+        let started = Instant::now();
 
-        let mut form = reqwest::multipart::Form::new()
-            .text("model", self.config.model.clone())
-            .part(
-                "file",
-                reqwest::multipart::Part::stream_with_length(
-                    reqwest::Body::wrap_stream(progress_body),
-                    body_len,
-                )
-                .file_name(file_name.to_string()),
-            );
+        // Wrap the audio bytes in `Arc` so the multipart factory
+        // can reuse the same buffer across retries without
+        // cloning the full payload.
+        let audio_arc = std::sync::Arc::new(audio_bytes);
 
-        form = form.text("timestamp_granularities", "segment");
+        // Capture the per-form construction inputs by value/clone
+        // so the factory closure (called once per retry) is `Fn`
+        // (re-entrant) and `'static`.
+        let model = self.config.model.clone();
+        let context_bias = self.config.context_bias.clone();
+        let diarize = self.diarize;
+        let file_name_owned = file_name.to_string();
+        let sink_for_factory = self.sink.clone();
 
-        if let Some(ref bias) = self.config.context_bias {
-            form = form.text("context_bias", bias.clone());
-        }
+        let body_factory: Box<dyn Fn() -> reqwest::multipart::Form + Send + Sync> = {
+            let audio_arc = audio_arc.clone();
+            Box::new(move || {
+                let audio_bytes_for_attempt = audio_arc.as_ref().clone();
+                let progress_body =
+                    ProgressBody::new(audio_bytes_for_attempt, sink_for_factory.clone());
+                let body_len = progress_body.len();
 
-        if self.diarize {
-            form = form.text("diarize", "true");
-        }
+                let mut form = reqwest::multipart::Form::new()
+                    .text("model", model.clone())
+                    .part(
+                        "file",
+                        reqwest::multipart::Part::stream_with_length(
+                            reqwest::Body::wrap_stream(progress_body),
+                            body_len,
+                        )
+                        .file_name(file_name_owned.clone()),
+                    )
+                    .text("timestamp_granularities", "segment");
 
-        // Resolve timeout-policy choices once.  The wall-clock timer
-        // only attaches under `Proportional`; under `UserAttended`
-        // we rely entirely on `connect_timeout` plus TCP-level
-        // defences and let the server take as long as it likes.
+                if let Some(ref bias) = context_bias {
+                    form = form.text("context_bias", bias.clone());
+                }
+
+                if diarize {
+                    form = form.text("diarize", "true");
+                }
+                form
+            })
+        };
+
         let wall_clock = match self.policy {
             RequestTimeoutPolicy::Proportional => Some(proportional_timeout(file_len)),
             RequestTimeoutPolicy::UserAttended => None,
         };
 
         log::debug!(
-            "mistral batch send_once: policy={:?}, connect_timeout={}s, wall_clock={}, audio={} KB",
+            "mistral send_request: policy={:?}, wall_clock={}, audio={} KB",
             self.policy,
-            CONNECT_TIMEOUT.as_secs(),
             wall_clock
                 .map(|d| format!("{}s", d.as_secs()))
                 .unwrap_or_else(|| "none".to_string()),
             file_len / 1024
         );
 
-        // Active timers at this call site, in firing order.  The
-        // slice is consumed by `format_reqwest_error_with_timers`
-        // when reqwest fails so the resulting log line names the
-        // timer that fired and quotes its budget.
-        //
-        // Under `UserAttended` the `request_wall_clock` entry is
-        // omitted — there is no wall-clock to fire — so timeout
-        // attribution falls through to either `connect_timeout`
-        // (Rule 1) or `kernel_tcp_unspecified` (Rule 3).
-        let connect_timer = TimerSpec {
-            name: "connect_timeout",
-            budget: CONNECT_TIMEOUT,
-        };
-        let timers: Vec<TimerSpec> = match wall_clock {
-            Some(budget) => vec![
-                connect_timer,
-                TimerSpec {
-                    name: "request_wall_clock",
-                    budget,
-                },
-            ],
-            None => vec![connect_timer],
+        let req = Request {
+            method: Method::Post,
+            url: self.endpoint.clone(),
+            headers: vec![(
+                "Authorization".into(),
+                format!("Bearer {}", self.config.api_key),
+            )],
+            body: RequestBody::Multipart(body_factory),
+            provider: crate::config::Provider::Mistral,
+            provider_name: "Mistral".into(),
+            phase: crate::error::PipelinePhase::Request,
+            wall_clock,
         };
 
-        self.sink.emit(TranscriptionEvent::RequestStarted {
-            endpoint: self.endpoint.clone(),
-            t: Instant::now(),
-        });
-
-        let started = Instant::now();
-        let mut request = self
-            .client
-            .post(&self.endpoint)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .multipart(form);
-        if let Some(budget) = wall_clock {
-            request = request.timeout(budget);
-        }
-        let response = request.send().await.map_err(|err| {
-            self.sink.emit(TranscriptionEvent::RequestCompleted {
-                success: false,
-                t: Instant::now(),
-            });
-            // Build a structured `PipelineFailure` so consumers
-            // can pattern-match cause/timer instead of regex over
-            // a flattened string.  `with_retry` (the wrapper one
-            // call up) handles attempts/max — at this layer we
-            // are inside a single attempt, so `attempts=1,
-            // max_attempts=1`.  See `with_retry` for the per-call
-            // retry budget surfaced through `RetryScheduled`
-            // telemetry.
-            TalkError::from(crate::error::PipelineFailure::new(
-                "Mistral",
-                crate::error::PipelinePhase::Request,
-                1,
-                1,
-                self.endpoint.clone(),
-                build_pipeline_failure_kind(err, &timers),
-            ))
-        })?;
-
+        let response = transport::http_request(req, &self.sink, CancellationToken::new())
+            .await
+            .map_err(TalkError::from)?;
         let request_latency_ms = started.elapsed().as_millis() as u64;
-        self.sink.emit(TranscriptionEvent::ResponseHeaders {
-            status: response.status().as_u16(),
-            t: Instant::now(),
-        });
-        let headers = response.headers().clone();
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            self.sink.emit(TranscriptionEvent::RequestCompleted {
-                success: false,
-                t: Instant::now(),
-            });
+        if !(200..300).contains(&response.status) {
+            let body = String::from_utf8_lossy(&response.body).to_string();
             return Err(TalkError::Transcription(format!(
                 "Mistral API error ({}): {}",
-                status, body
+                response.status, body
             )));
         }
 
-        use futures::StreamExt;
-        let mut body_bytes: Vec<u8> = Vec::new();
-        let mut body_stream = response.bytes_stream();
-        while let Some(chunk_result) = body_stream.next().await {
-            let chunk = chunk_result.map_err(|err| {
-                self.sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
-                TalkError::Transcription(format!(
-                    "Failed to read Mistral API response body: {}",
-                    err
-                ))
-            })?;
-            body_bytes.extend_from_slice(&chunk);
-            self.sink.emit(TranscriptionEvent::DownloadProgress {
-                bytes_received: body_bytes.len() as u64,
-                total: None,
-                t: Instant::now(),
-            });
-        }
-        self.sink.emit(TranscriptionEvent::ResponseComplete {
-            total: body_bytes.len() as u64,
-            t: Instant::now(),
-        });
-
         let mistral_response: MistralResponse =
-            serde_json::from_slice(&body_bytes).map_err(|err| {
-                self.sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
+            serde_json::from_slice(&response.body).map_err(|err| {
                 TalkError::Transcription(format!("Failed to parse Mistral API response: {}", err))
             })?;
-
-        self.sink.emit(TranscriptionEvent::RequestCompleted {
-            success: true,
-            t: Instant::now(),
-        });
 
         let token_usage = mistral_response
             .usage
@@ -435,10 +368,11 @@ impl MistralBatchTranscriber {
             .as_ref()
             .and_then(parse_mistral_audio_seconds);
         let segment_count = mistral_response.segments.as_ref().map(std::vec::Vec::len);
-        let request_id = headers
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(ToString::to_string);
+        let request_id = response
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("x-request-id"))
+            .map(|(_, v)| v.clone());
 
         let segments = mistral_response
             .segments
@@ -474,23 +408,6 @@ impl MistralBatchTranscriber {
             diarization,
             segments,
         })
-    }
-
-    /// Send a transcription request with shared retry semantics.
-    ///
-    /// Every batch HTTP call goes through this path.  Retry lives
-    /// inside [`super::transport::retry::with_retry`] — there is no
-    /// "no-retry" code path for HTTP transcription.
-    async fn send_request(
-        &self,
-        audio_bytes: Vec<u8>,
-        file_name: &str,
-    ) -> Result<TranscriptionResult, TalkError> {
-        let sink = self.sink.clone();
-        super::transport::retry::with_retry(crate::config::Provider::Mistral, &sink, || async {
-            self.send_once(audio_bytes.clone(), file_name).await
-        })
-        .await
     }
 }
 
