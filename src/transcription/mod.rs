@@ -95,6 +95,7 @@ pub struct TranscribeOptions {
     pub policy: RequestTimeoutPolicy,
 }
 
+pub mod jobs;
 pub mod mistral;
 pub mod model_suggestions;
 pub mod openai;
