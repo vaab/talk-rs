@@ -7,30 +7,25 @@
 //! the provider modules (`mistral.rs`, `openai.rs`), not here.
 
 use crate::error::TalkError;
-use reqwest::Client;
+use crate::telemetry::{NoOpSink, TelemetrySink};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use super::transport::http::build_client;
+use super::transport::{self, Method, Request, RequestBody};
+use tokio_util::sync::CancellationToken;
 
 /// Cache TTL — model lists rarely change.
 const CACHE_TTL: Duration = Duration::from_secs(3600);
 
-/// Overall timeout for a single `/v1/models` request.
-///
-/// This is a simple GET — an overall cap is appropriate (unlike
-/// transcription requests where server processing time varies).
+/// Wall-clock budget for a single `/v1/models` request.  The
+/// transport's connection-retry schedule covers transient network
+/// issues; this wall-clock guards against a server that accepts
+/// the connection but stalls.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Maximum number of retry attempts (matches the transcription retry
-/// count in `dictate/mod.rs`).
-const MAX_RETRIES: u32 = 5;
-
-/// Delay between retry attempts.
-const RETRY_DELAY: Duration = Duration::from_millis(500);
 
 // ── Cache ───────────────────────────────────────────────────────────
 
@@ -49,13 +44,13 @@ fn cache() -> &'static Mutex<HashMap<String, CachedModels>> {
 
 /// Fetch transcription-relevant model names from a provider API.
 ///
-/// Calls `GET {api_base}/v1/models`, filters results with the
-/// caller-supplied `filter` predicate, and caches the result
-/// in-process with a TTL.  Retries up to [`MAX_RETRIES`] times
-/// on transient failures.
+/// Calls `GET {api_base}/v1/models` via the consolidated
+/// [`super::transport::http_request`] (which owns the retry loop),
+/// filters results with the caller-supplied `filter` predicate, and
+/// caches the result in-process with a TTL.
 ///
-/// The caller provides the filter function so this utility has zero
-/// provider-specific knowledge.
+/// On transport failure, returns the stale cache if one exists,
+/// otherwise propagates the structured failure.
 pub(crate) async fn fetch_transcription_models(
     api_key: &str,
     api_base: &str,
@@ -72,102 +67,87 @@ pub(crate) async fn fetch_transcription_models(
         }
     }
 
-    // Fetch with retries.
-    let client = build_client()?;
     let models_url = format!("{}/v1/models", api_base);
-    let mut last_err: Option<TalkError> = None;
+    let req = Request {
+        method: Method::Get,
+        url: models_url,
+        headers: vec![("Authorization".into(), format!("Bearer {}", api_key))],
+        body: RequestBody::Empty,
+        // Provider tag is just for error display; the model
+        // suggestion fetch is shared across providers.
+        provider: crate::config::Provider::Mistral,
+        provider_name: "model-suggestions".into(),
+        phase: crate::error::PipelinePhase::Validate,
+        wall_clock: Some(FETCH_TIMEOUT),
+    };
 
-    for attempt in 0..MAX_RETRIES {
-        if attempt > 0 {
-            tokio::time::sleep(RETRY_DELAY).await;
-        }
+    let sink: Arc<dyn TelemetrySink> = Arc::new(NoOpSink);
 
-        match fetch_models_once(&client, &models_url, api_key, filter).await {
-            Ok(models) => {
-                // Update cache.
-                if let Ok(mut guard) = cache().lock() {
-                    guard.insert(
-                        cache_key,
-                        CachedModels {
-                            models: models.clone(),
-                            fetched_at: Instant::now(),
-                        },
-                    );
+    match transport::http_request(req, &sink, CancellationToken::new()).await {
+        Ok(response) => {
+            if !(200..300).contains(&response.status) {
+                let body = String::from_utf8_lossy(&response.body).to_string();
+                let err =
+                    TalkError::Config(format!("models API error ({}): {}", response.status, body));
+                return fallback_to_stale_cache(&cache_key, err);
+            }
+
+            let parsed: ModelsResponse = match serde_json::from_slice(&response.body) {
+                Ok(p) => p,
+                Err(e) => {
+                    let err = TalkError::Config(format!("failed to parse models response: {}", e));
+                    return fallback_to_stale_cache(&cache_key, err);
                 }
-                return Ok(models);
-            }
-            Err(e) => {
-                log::warn!(
-                    "models fetch attempt {}/{} failed: {}",
-                    attempt + 1,
-                    MAX_RETRIES,
-                    e
+            };
+
+            let mut result: Vec<String> = parsed
+                .data
+                .iter()
+                .map(|m| m.id.as_str())
+                .filter(|id| filter(id))
+                .map(String::from)
+                .collect();
+            result.sort();
+
+            // Update cache.
+            if let Ok(mut guard) = cache().lock() {
+                guard.insert(
+                    cache_key,
+                    CachedModels {
+                        models: result.clone(),
+                        fetched_at: Instant::now(),
+                    },
                 );
-                last_err = Some(e);
             }
+            Ok(result)
+        }
+        Err(pf) => {
+            let err: TalkError = pf.into();
+            fallback_to_stale_cache(&cache_key, err)
         }
     }
+}
 
-    // All retries exhausted — return stale cache if we have one.
+/// Return a stale cached entry if one exists, otherwise propagate
+/// the supplied error.
+fn fallback_to_stale_cache(cache_key: &str, err: TalkError) -> Result<Vec<String>, TalkError> {
     if let Ok(guard) = cache().lock() {
-        if let Some(cached) = guard.get(&cache_key) {
-            log::warn!("all model-list retries failed; using stale cache");
+        if let Some(cached) = guard.get(cache_key) {
+            log::warn!("model-list fetch failed ({}); using stale cache", err);
             return Ok(cached.models.clone());
         }
     }
-
-    Err(last_err.unwrap_or_else(|| TalkError::Config("failed to fetch model list".to_string())))
+    Err(err)
 }
 
-/// Single attempt to fetch and filter the model list.
-async fn fetch_models_once(
-    client: &Client,
-    url: &str,
-    api_key: &str,
-    filter: fn(&str) -> bool,
-) -> Result<Vec<String>, TalkError> {
-    #[derive(Deserialize)]
-    struct ModelsResponse {
-        data: Vec<ModelInfo>,
-    }
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelInfo>,
+}
 
-    #[derive(Deserialize)]
-    struct ModelInfo {
-        id: String,
-    }
-
-    let response = client
-        .get(url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .timeout(FETCH_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| TalkError::Config(format!("models list request failed: {}", e)))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(TalkError::Config(format!(
-            "models API error ({}): {}",
-            status, body
-        )));
-    }
-
-    let models: ModelsResponse = response
-        .json()
-        .await
-        .map_err(|e| TalkError::Config(format!("failed to parse models response: {}", e)))?;
-
-    let mut result: Vec<String> = models
-        .data
-        .iter()
-        .map(|m| m.id.as_str())
-        .filter(|id| filter(id))
-        .map(String::from)
-        .collect();
-    result.sort();
-
-    Ok(result)
+#[derive(Deserialize)]
+struct ModelInfo {
+    id: String,
 }
 
 #[cfg(test)]
