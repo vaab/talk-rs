@@ -330,7 +330,7 @@ impl std::fmt::Display for PipelineFailure {
                     "url={}] (after {}/{} attempts)",
                     self.url, self.attempts, self.max_attempts
                 )?;
-                render_dedup_source_chain(f, source.as_ref(), timer.as_ref())?;
+                render_dedup_source_chain(f, source.as_ref(), timer.as_ref(), &self.url)?;
                 Ok(())
             }
             PipelineFailureKind::HttpStatus { status, body } => {
@@ -412,6 +412,7 @@ fn render_dedup_source_chain(
     f: &mut std::fmt::Formatter<'_>,
     err: &(dyn std::error::Error + 'static),
     timer: Option<&TimerLabel>,
+    url: &str,
 ) -> std::fmt::Result {
     let mut shown: Vec<String> = Vec::new();
     let mut current: Option<&dyn std::error::Error> = Some(err);
@@ -419,7 +420,7 @@ fn render_dedup_source_chain(
         let msg = e.to_string();
         let lower = msg.to_lowercase();
 
-        let redundant = is_layer_redundant(&lower, timer)
+        let redundant = is_layer_redundant(&lower, timer, url)
             || shown
                 .iter()
                 .any(|prev| prev.contains(&msg) || msg.contains(prev.as_str()));
@@ -438,7 +439,7 @@ fn render_dedup_source_chain(
 /// block.  Kept private — its shape mirrors the
 /// [`PipelineFailureKind::Network`] Display rules and changes in
 /// lockstep.
-fn is_layer_redundant(lower: &str, timer: Option<&TimerLabel>) -> bool {
+fn is_layer_redundant(lower: &str, timer: Option<&TimerLabel>, url: &str) -> bool {
     // Restatements of `kind: NetworkKind::Connect` /
     // `name=connect_timeout`.
     if lower.contains("client error (connect)") {
@@ -458,6 +459,21 @@ fn is_layer_redundant(lower: &str, timer: Option<&TimerLabel>) -> bool {
         if lower == t.name {
             return true;
         }
+    }
+    // Reqwest restates the URL in its top-level error
+    // ``error sending request for url (...)``.  We already
+    // surface the URL in the ``url=...`` tag block; the layer
+    // is pure noise.
+    let url_lower = url.to_lowercase();
+    if !url_lower.is_empty()
+        && lower.contains(&format!("error sending request for url ({})", url_lower))
+    {
+        return true;
+    }
+    // Same dedup for the trailing ``for url (URL)`` fragment
+    // when reqwest nests it inside a wider message.
+    if !url_lower.is_empty() && lower == format!("error sending request for url ({})", url_lower) {
+        return true;
     }
     false
 }
@@ -580,6 +596,48 @@ mod tests {
         assert!(
             s.contains("Connection refused (os error 111)"),
             "ECONNREFUSED layer must be kept, got: {}",
+            s
+        );
+    }
+
+    /// Spec (Step 13 of transport-consolidation): reqwest's
+    /// top-level ``error sending request for url (URL)`` layer is
+    /// dropped from the source chain because the URL is already
+    /// surfaced in the structured ``url=`` tag.  The same URL must
+    /// not appear twice in the rendered failure.
+    #[test]
+    fn pipeline_failure_dedups_reqwest_url_restatement() {
+        let url = "https://mistral.vps-03.0k.io/v1/audio/transcriptions";
+        let reqwest_layer =
+            std::io::Error::other(format!("error sending request for url ({})", url));
+        let pf = PipelineFailure::new(
+            "Mistral",
+            PipelinePhase::Request,
+            5,
+            5,
+            url,
+            PipelineFailureKind::Network {
+                kind: NetworkKind::Connect,
+                timer: Some(TimerLabel::from_duration(
+                    "connect_timeout",
+                    Duration::from_secs(2),
+                )),
+                source: Box::new(reqwest_layer),
+            },
+        );
+
+        let s = pf.to_string();
+        // URL appears exactly once.
+        let url_occurrences = s.matches(url).count();
+        assert_eq!(
+            url_occurrences, 1,
+            "URL must appear exactly once (Step 13 dedup); got {} occurrences in {}",
+            url_occurrences, s
+        );
+        // Specifically: the reqwest restatement is not in the chain.
+        assert!(
+            !s.contains(" -> error sending request for url"),
+            "reqwest URL-restatement layer must be dropped; got: {}",
             s
         );
     }
