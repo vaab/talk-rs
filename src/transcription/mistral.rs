@@ -174,16 +174,16 @@ pub struct MistralBatchTranscriber {
     endpoint: String,
     /// Whether to request speaker diarization (V2 models only).
     diarize: bool,
-    /// Per-request wall-clock-timeout policy.  Set at construction
-    /// via [`Self::with_policy`]; [`Self::new`] forwards
-    /// [`RequestTimeoutPolicy::Proportional`].  Controls whether
-    /// [`Self::fetch_transcription`] sets a
-    /// `proportional_timeout(file_len)` wall clock on the
-    /// transport request.
+    /// Per-request wall-clock-timeout policy.
     policy: RequestTimeoutPolicy,
     /// Telemetry event sink for HTTP lifecycle reporting.
-    /// Defaults to [`NoOpSink`] when no consumer is attached.
     sink: Arc<dyn TelemetrySink>,
+    /// Cancellation token wired into the transport's request loop.
+    /// Defaults to a fresh token (never fires); the picker /
+    /// streaming orchestrator overrides via
+    /// [`BatchTranscriber::set_cancel_token`] so Stop buttons and
+    /// SIGUSR1 from another process abort the in-flight request.
+    cancel_token: CancellationToken,
 }
 
 impl MistralBatchTranscriber {
@@ -226,6 +226,7 @@ impl MistralBatchTranscriber {
             diarize,
             policy,
             sink: Arc::new(NoOpSink),
+            cancel_token: CancellationToken::new(),
         })
     }
 
@@ -248,6 +249,7 @@ impl MistralBatchTranscriber {
             diarize,
             policy: RequestTimeoutPolicy::Proportional,
             sink: Arc::new(NoOpSink),
+            cancel_token: CancellationToken::new(),
         })
     }
 
@@ -341,7 +343,7 @@ impl MistralBatchTranscriber {
             wall_clock,
         };
 
-        let response = transport::http_request(req, &self.sink, CancellationToken::new())
+        let response = transport::http_request(req, &self.sink, self.cancel_token.clone())
             .await
             .map_err(TalkError::from)?;
         let request_latency_ms = started.elapsed().as_millis() as u64;
@@ -415,6 +417,10 @@ impl MistralBatchTranscriber {
 impl BatchTranscriber for MistralBatchTranscriber {
     fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
         self.sink = sink;
+    }
+
+    fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.cancel_token = token;
     }
 
     async fn validate(&self) -> Result<(), TalkError> {

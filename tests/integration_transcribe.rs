@@ -135,6 +135,8 @@ async fn test_transcribe_audio_cache_only_on_missing_entry() {
         talk_rs::transcription::TranscribeOptions {
             allow_api: false,
             policy: talk_rs::transcription::RequestTimeoutPolicy::Proportional,
+            cancel_token: None,
+            skip_legacy_lock: false,
         },
         &sink,
     )
@@ -214,6 +216,8 @@ async fn test_mistral_transcriber_real_api() {
         talk_rs::transcription::TranscribeOptions {
             allow_api: true,
             policy: talk_rs::transcription::RequestTimeoutPolicy::Proportional,
+            cancel_token: None,
+            skip_legacy_lock: false,
         },
         &sink,
     )

@@ -158,12 +158,14 @@ pub struct OpenAIBatchTranscriber {
     config: OpenAIConfig,
     /// API endpoint URL (can be overridden for testing).
     endpoint: String,
-    /// Per-request wall-clock-timeout policy.  Set at construction
-    /// via [`Self::with_policy`]; [`Self::new`] forwards
-    /// [`RequestTimeoutPolicy::Proportional`].
+    /// Per-request wall-clock-timeout policy.
     policy: RequestTimeoutPolicy,
     /// Telemetry event sink for HTTP lifecycle reporting.
     sink: Arc<dyn TelemetrySink>,
+    /// Cancellation token wired into the transport's request loop.
+    /// See [`super::mistral::MistralBatchTranscriber::cancel_token`]
+    /// for the wiring rationale.
+    cancel_token: CancellationToken,
 }
 
 impl OpenAIBatchTranscriber {
@@ -198,15 +200,11 @@ impl OpenAIBatchTranscriber {
             endpoint,
             policy,
             sink: Arc::new(NoOpSink),
+            cancel_token: CancellationToken::new(),
         })
     }
 
     /// Create a new OpenAI transcriber with a custom endpoint (for testing).
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - OpenAI API configuration containing the API key
-    /// * `endpoint` - Custom API endpoint URL
     #[cfg(test)]
     pub fn with_endpoint(config: OpenAIConfig, endpoint: String) -> Result<Self, TalkError> {
         Ok(Self {
@@ -214,6 +212,7 @@ impl OpenAIBatchTranscriber {
             endpoint,
             policy: RequestTimeoutPolicy::Proportional,
             sink: Arc::new(NoOpSink),
+            cancel_token: CancellationToken::new(),
         })
     }
 
@@ -293,7 +292,7 @@ impl OpenAIBatchTranscriber {
             wall_clock,
         };
 
-        let response = transport::http_request(req, &self.sink, CancellationToken::new())
+        let response = transport::http_request(req, &self.sink, self.cancel_token.clone())
             .await
             .map_err(TalkError::from)?;
         let request_latency_ms = started.elapsed().as_millis() as u64;
@@ -370,6 +369,10 @@ impl OpenAIBatchTranscriber {
 impl BatchTranscriber for OpenAIBatchTranscriber {
     fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
         self.sink = sink;
+    }
+
+    fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.cancel_token = token;
     }
 
     async fn validate(&self) -> Result<(), TalkError> {

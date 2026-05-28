@@ -723,6 +723,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     transcription::TranscribeOptions {
                         allow_api: true,
                         policy: transcription::RequestTimeoutPolicy::Proportional,
+                        cancel_token: None,
+                        skip_legacy_lock: false,
                     },
                     &sink,
                 )

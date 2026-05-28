@@ -243,19 +243,16 @@ pub struct OpenAIRealtimeTranscriber {
     /// Transcription model (e.g. `gpt-4o-mini-transcribe`).
     model: String,
     endpoint: String,
-    /// Telemetry sink for WS upgrade lifecycle events.  See the
-    /// matching field in [`super::realtime::MistralRealtimeTranscriber`]
-    /// for the same rationale: picker UI needs phase + retry
-    /// strings to avoid the silent-blocking symptom.
+    /// Telemetry sink for WS upgrade lifecycle events.
     sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>,
+    /// Cancellation token wired into the WS upgrade.  See
+    /// [`super::realtime::MistralRealtimeTranscriber::cancel_token`]
+    /// for the wiring rationale.
+    cancel_token: CancellationToken,
 }
 
 impl OpenAIRealtimeTranscriber {
     /// Create a new realtime transcriber with the given configuration.
-    ///
-    /// The WebSocket endpoint is derived from `config.url` when set,
-    /// converting the HTTP(S) scheme to WS(S).  Falls back to the
-    /// default OpenAI WebSocket endpoint otherwise.
     pub fn new(config: OpenAIConfig) -> Self {
         let model = config.realtime_model.clone();
         let endpoint = config
@@ -268,6 +265,7 @@ impl OpenAIRealtimeTranscriber {
             model,
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -283,6 +281,7 @@ impl OpenAIRealtimeTranscriber {
             model,
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -295,6 +294,7 @@ impl OpenAIRealtimeTranscriber {
             model,
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -327,7 +327,7 @@ impl OpenAIRealtimeTranscriber {
             phase: crate::error::PipelinePhase::Validate,
             wall_clock: None,
         };
-        let ws_stream = super::transport::ws_upgrade(req, &self.sink, CancellationToken::new())
+        let ws_stream = super::transport::ws_upgrade(req, &self.sink, self.cancel_token.clone())
             .await
             .map_err(|pf| TalkError::Config(pf.to_string()))?;
 
@@ -438,7 +438,7 @@ impl OpenAIRealtimeTranscriber {
             phase: crate::error::PipelinePhase::Request,
             wall_clock: None,
         };
-        let ws_stream = super::transport::ws_upgrade(req, &self.sink, CancellationToken::new())
+        let ws_stream = super::transport::ws_upgrade(req, &self.sink, self.cancel_token.clone())
             .await
             .map_err(|pf| TalkError::Transcription(pf.to_string()))?;
         // No HTTP response wrapper exposed by the transport; the
@@ -582,6 +582,10 @@ impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
 
     fn set_sink(&mut self, sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) {
         self.sink = sink;
+    }
+
+    fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.cancel_token = token;
     }
 }
 
