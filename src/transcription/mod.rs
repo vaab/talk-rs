@@ -349,6 +349,18 @@ pub(crate) trait RealtimeTranscriber: Send + Sync {
         &self,
         audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     ) -> Result<tokio::sync::mpsc::Receiver<TranscriptionEvent>, TalkError>;
+
+    /// Inject a telemetry sink for event emission during the WS
+    /// upgrade phase (and, later, the in-session frame events).
+    ///
+    /// Default no-op so simple test stubs don't need to opt in.
+    /// Concrete transcribers (Mistral, OpenAI) override to thread
+    /// the sink down to [`super::transport::ws_upgrade`] so phase
+    /// transitions (``connecting…``, ``connect retry N/M…``) reach
+    /// the picker UI.  Called by the picker / streaming
+    /// orchestrator right after construction, before
+    /// `transcribe_realtime` is invoked.
+    fn set_sink(&mut self, _sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) {}
 }
 
 // ── Error detection / enrichment dispatchers ────────────────────────
