@@ -137,13 +137,26 @@ const REALTIME_FEED_CHUNK: usize = 480;
 /// On success the final text is sent as a [`PickerMessage::Candidate`];
 /// on error an error candidate is sent instead.  Intermediate text
 /// updates are forwarded as [`PickerMessage::StreamUpdate`].
+///
+/// Before connecting, attaches a [`PickerStatusSink`] to the
+/// transcriber so the WS-upgrade phase (and its growing-budget
+/// retries) reach the row's status column.  Without this hop, the
+/// row would sit in an empty spinner state for up to 41s before
+/// the transport surfaces a connection error — see plan section
+/// Step 8 for the diagnosis.
 pub(super) async fn run_realtime_transcription(
-    transcriber: Box<dyn RealtimeTranscriber>,
+    mut transcriber: Box<dyn RealtimeTranscriber>,
     samples: std::sync::Arc<Vec<i16>>,
     tx: std::sync::mpsc::Sender<PickerMessage>,
     provider: Provider,
     model: String,
 ) {
+    // Attach the row's status sink BEFORE the WS upgrade so
+    // connecting / retry events reach the UI.
+    let status_sink: std::sync::Arc<dyn TelemetrySink> =
+        std::sync::Arc::new(PickerStatusSink::new(tx.clone(), provider, model.clone()));
+    transcriber.set_sink(status_sink);
+
     // Connect to the realtime WebSocket.
     let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
     let event_rx = match transcriber.transcribe_realtime(audio_rx).await {

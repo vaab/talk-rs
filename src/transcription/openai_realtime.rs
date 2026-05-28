@@ -243,6 +243,11 @@ pub struct OpenAIRealtimeTranscriber {
     /// Transcription model (e.g. `gpt-4o-mini-transcribe`).
     model: String,
     endpoint: String,
+    /// Telemetry sink for WS upgrade lifecycle events.  See the
+    /// matching field in [`super::realtime::MistralRealtimeTranscriber`]
+    /// for the same rationale: picker UI needs phase + retry
+    /// strings to avoid the silent-blocking symptom.
+    sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>,
 }
 
 impl OpenAIRealtimeTranscriber {
@@ -262,6 +267,7 @@ impl OpenAIRealtimeTranscriber {
             config,
             model,
             endpoint,
+            sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
         }
     }
 
@@ -276,6 +282,7 @@ impl OpenAIRealtimeTranscriber {
             config,
             model,
             endpoint,
+            sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
         }
     }
 
@@ -287,6 +294,7 @@ impl OpenAIRealtimeTranscriber {
             config,
             model,
             endpoint,
+            sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
         }
     }
 
@@ -319,9 +327,7 @@ impl OpenAIRealtimeTranscriber {
             phase: crate::error::PipelinePhase::Validate,
             wall_clock: None,
         };
-        let sink_arc: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
-            std::sync::Arc::new(crate::telemetry::NoOpSink);
-        let ws_stream = super::transport::ws_upgrade(req, &sink_arc, CancellationToken::new())
+        let ws_stream = super::transport::ws_upgrade(req, &self.sink, CancellationToken::new())
             .await
             .map_err(|pf| TalkError::Config(pf.to_string()))?;
 
@@ -416,14 +422,6 @@ impl OpenAIRealtimeTranscriber {
 
         log::debug!("connecting to OpenAI Realtime WebSocket: {}", ws_url);
 
-        // TODO (Step 10 of transport-consolidation): plumb the real
-        // sink from the caller (picker / streaming dictate) so
-        // `RetryScheduled` events surface in the UI.  Today we use
-        // a NoOpSink to preserve behaviour; the sink's absence is
-        // why the picker's realtime row appears to "hang" silently
-        // — see plan §1.12 and the Step 8 diagnosis.
-        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
-            std::sync::Arc::new(crate::telemetry::NoOpSink);
         let req = super::transport::Request {
             method: super::transport::Method::Get,
             url: ws_url.clone(),
@@ -440,7 +438,7 @@ impl OpenAIRealtimeTranscriber {
             phase: crate::error::PipelinePhase::Request,
             wall_clock: None,
         };
-        let ws_stream = super::transport::ws_upgrade(req, &sink, CancellationToken::new())
+        let ws_stream = super::transport::ws_upgrade(req, &self.sink, CancellationToken::new())
             .await
             .map_err(|pf| TalkError::Transcription(pf.to_string()))?;
         // No HTTP response wrapper exposed by the transport; the
@@ -557,14 +555,15 @@ impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
             .replace("wss://", "https://")
             .replace("ws://", "http://");
         // The realtime path does not yet thread a telemetry sink
-        // (see the TODO at `connect_with_retry`), so the preflight
-        // events emitted by `validate_openai_model` go to a no-op
-        // sink here.  Cache hits are unaffected; cache misses
-        // simply don't surface preflight progress to any UI.
-        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
-            std::sync::Arc::new(crate::telemetry::NoOpSink);
-        super::openai::validate_openai_model(&self.config.api_key, &self.model, &api_base, &sink)
-            .await?;
+        // Preflight events go through `self.sink`, so when a UI is
+        // attached (via `set_sink`) they reach it.
+        super::openai::validate_openai_model(
+            &self.config.api_key,
+            &self.model,
+            &api_base,
+            &self.sink,
+        )
+        .await?;
 
         // Step 2: WebSocket check — connect, send
         // transcription_session.update with our model config, and wait
@@ -579,6 +578,10 @@ impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
         audio_rx: mpsc::Receiver<Vec<i16>>,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TalkError> {
         self.transcribe_realtime(audio_rx).await
+    }
+
+    fn set_sink(&mut self, sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) {
+        self.sink = sink;
     }
 }
 

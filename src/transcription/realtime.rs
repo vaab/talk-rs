@@ -170,6 +170,14 @@ fn http_to_ws(url: &str) -> String {
 pub struct MistralRealtimeTranscriber {
     config: MistralConfig,
     endpoint: String,
+    /// Telemetry sink for WS upgrade lifecycle events (phases +
+    /// retries).  Defaults to [`crate::telemetry::NoOpSink`]; the
+    /// picker / streaming orchestrator overrides via
+    /// [`RealtimeTranscriber::set_sink`] (see the trait at
+    /// [`super::RealtimeTranscriber::set_sink`]) so the row's
+    /// status column gets ``connecting…`` / ``connect retry 2/5…``
+    /// updates instead of silent blocking.
+    sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>,
 }
 
 impl MistralRealtimeTranscriber {
@@ -184,13 +192,21 @@ impl MistralRealtimeTranscriber {
             .as_deref()
             .map(|u| http_to_ws(u.trim_end_matches('/')))
             .unwrap_or_else(|| DEFAULT_REALTIME_ENDPOINT.to_string());
-        Self { config, endpoint }
+        Self {
+            config,
+            endpoint,
+            sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
+        }
     }
 
     /// Create a new realtime transcriber with a custom endpoint (for testing).
     #[cfg(test)]
     pub fn with_endpoint(config: MistralConfig, endpoint: String) -> Self {
-        Self { config, endpoint }
+        Self {
+            config,
+            endpoint,
+            sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
+        }
     }
 
     /// Return the realtime model name.
@@ -226,9 +242,7 @@ impl MistralRealtimeTranscriber {
             phase: crate::error::PipelinePhase::Validate,
             wall_clock: None,
         };
-        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
-            std::sync::Arc::new(crate::telemetry::NoOpSink);
-        let ws_stream = super::transport::ws_upgrade(req, &sink, CancellationToken::new())
+        let ws_stream = super::transport::ws_upgrade(req, &self.sink, CancellationToken::new())
             .await
             .map_err(|pf| TalkError::Config(pf.to_string()))?;
 
@@ -270,14 +284,6 @@ impl MistralRealtimeTranscriber {
 
         log::debug!("connecting to WebSocket: {}", ws_url);
 
-        // TODO (Step 10 of transport-consolidation): plumb the real
-        // sink from the caller (picker / streaming dictate) so
-        // `RetryScheduled` events surface in the UI.  Today we use
-        // a NoOpSink to preserve behaviour; the sink's absence is
-        // why the picker's realtime row appears to "hang" silently
-        // — see plan §1.12 and the Step 8 diagnosis.
-        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
-            std::sync::Arc::new(crate::telemetry::NoOpSink);
         let req = super::transport::Request {
             method: super::transport::Method::Get,
             url: ws_url.clone(),
@@ -291,7 +297,7 @@ impl MistralRealtimeTranscriber {
             phase: crate::error::PipelinePhase::Request,
             wall_clock: None,
         };
-        let ws_stream = super::transport::ws_upgrade(req, &sink, CancellationToken::new())
+        let ws_stream = super::transport::ws_upgrade(req, &self.sink, CancellationToken::new())
             .await
             .map_err(|pf| TalkError::Transcription(pf.to_string()))?;
 
@@ -379,6 +385,10 @@ impl RealtimeTranscriber for MistralRealtimeTranscriber {
         audio_rx: mpsc::Receiver<Vec<i16>>,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TalkError> {
         self.transcribe_realtime(audio_rx).await
+    }
+
+    fn set_sink(&mut self, sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) {
+        self.sink = sink;
     }
 }
 
