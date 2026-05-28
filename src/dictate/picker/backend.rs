@@ -150,12 +150,14 @@ pub(super) async fn run_realtime_transcription(
     tx: std::sync::mpsc::Sender<PickerMessage>,
     provider: Provider,
     model: String,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) {
     // Attach the row's status sink BEFORE the WS upgrade so
     // connecting / retry events reach the UI.
     let status_sink: std::sync::Arc<dyn TelemetrySink> =
         std::sync::Arc::new(PickerStatusSink::new(tx.clone(), provider, model.clone()));
     transcriber.set_sink(status_sink);
+    transcriber.set_cancel_token(cancel_token);
 
     // Connect to the realtime WebSocket.
     let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
@@ -300,10 +302,35 @@ pub(super) fn spawn_transcription(
     provider: Provider,
     model: String,
     config: std::sync::Arc<Config>,
+    _ignored_cancel: tokio_util::sync::CancellationToken,
 ) {
     let sink: std::sync::Arc<dyn TelemetrySink> =
         std::sync::Arc::new(PickerStatusSink::new(tx.clone(), provider, model.clone()));
     tasks.spawn(async move {
+        // Register this in-flight transcription with the jobs
+        // module.  This (a) writes a YAML lock file describing
+        // us so another talk-rs process can cancel us via
+        // `cancel_remote`, and (b) installs a SIGUSR1 handler
+        // that fires `local_job.cancel_token()` when a Stop
+        // button click in the picker GTK sends SIGUSR1 to our
+        // own PID.
+        let local_job =
+            match crate::transcription::jobs::register_local(&audio, provider, &model, false) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    log::warn!(
+                        "picker: failed to register job for {}:{}: {}",
+                        provider,
+                        model,
+                        e
+                    );
+                    None
+                }
+            };
+        let cancel_token = local_job
+            .as_ref()
+            .map(|j| j.cancel_token())
+            .unwrap_or_default();
         let msg = match crate::transcription::transcribe_audio(
             &audio,
             config.as_ref(),
@@ -313,6 +340,12 @@ pub(super) fn spawn_transcription(
             crate::transcription::TranscribeOptions {
                 allow_api: true,
                 policy: crate::transcription::RequestTimeoutPolicy::UserAttended,
+                cancel_token: Some(cancel_token),
+                // We registered via `register_local` above, which
+                // wrote the lock file with the YAML payload.
+                // `transcribe_audio` must not race us on the same
+                // file path.
+                skip_legacy_lock: local_job.is_some(),
             },
             &sink,
         )
@@ -339,6 +372,11 @@ pub(super) fn spawn_transcription(
                 )))
             }
         };
+        // Drop the LocalJob explicitly so the lock file is
+        // removed before we ack the result.  Without this,
+        // an immediate retry would race against the still-held
+        // lock.
+        drop(local_job);
         let _ = tx.send(msg);
     });
 }

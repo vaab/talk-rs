@@ -170,22 +170,16 @@ fn http_to_ws(url: &str) -> String {
 pub struct MistralRealtimeTranscriber {
     config: MistralConfig,
     endpoint: String,
-    /// Telemetry sink for WS upgrade lifecycle events (phases +
-    /// retries).  Defaults to [`crate::telemetry::NoOpSink`]; the
-    /// picker / streaming orchestrator overrides via
-    /// [`RealtimeTranscriber::set_sink`] (see the trait at
-    /// [`super::RealtimeTranscriber::set_sink`]) so the row's
-    /// status column gets ``connecting…`` / ``connect retry 2/5…``
-    /// updates instead of silent blocking.
+    /// Telemetry sink for WS upgrade lifecycle events.
     sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>,
+    /// Cancellation token wired into the WS upgrade.  Stops the
+    /// blocking connect / retry loop when the picker's Stop button
+    /// or a SIGUSR1 from another talk-rs process fires.
+    cancel_token: CancellationToken,
 }
 
 impl MistralRealtimeTranscriber {
     /// Create a new realtime transcriber with the given configuration.
-    ///
-    /// The WebSocket endpoint is derived from `config.url` when set,
-    /// converting the HTTP(S) scheme to WS(S).  Falls back to the
-    /// default Mistral WebSocket endpoint otherwise.
     pub fn new(config: MistralConfig) -> Self {
         let endpoint = config
             .url
@@ -196,6 +190,7 @@ impl MistralRealtimeTranscriber {
             config,
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -206,6 +201,7 @@ impl MistralRealtimeTranscriber {
             config,
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -242,7 +238,7 @@ impl MistralRealtimeTranscriber {
             phase: crate::error::PipelinePhase::Validate,
             wall_clock: None,
         };
-        let ws_stream = super::transport::ws_upgrade(req, &self.sink, CancellationToken::new())
+        let ws_stream = super::transport::ws_upgrade(req, &self.sink, self.cancel_token.clone())
             .await
             .map_err(|pf| TalkError::Config(pf.to_string()))?;
 
@@ -297,7 +293,7 @@ impl MistralRealtimeTranscriber {
             phase: crate::error::PipelinePhase::Request,
             wall_clock: None,
         };
-        let ws_stream = super::transport::ws_upgrade(req, &self.sink, CancellationToken::new())
+        let ws_stream = super::transport::ws_upgrade(req, &self.sink, self.cancel_token.clone())
             .await
             .map_err(|pf| TalkError::Transcription(pf.to_string()))?;
 
@@ -389,6 +385,10 @@ impl RealtimeTranscriber for MistralRealtimeTranscriber {
 
     fn set_sink(&mut self, sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) {
         self.sink = sink;
+    }
+
+    fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.cancel_token = token;
     }
 }
 

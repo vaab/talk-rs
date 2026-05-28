@@ -54,12 +54,13 @@ pub(crate) enum TranscriptionBody {
 /// defences (TCP keepalive, `tcp_user_timeout` on Linux) still
 /// fire, so dead connections cannot hang either path indefinitely
 /// — only legitimately slow servers benefit from `UserAttended`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RequestTimeoutPolicy {
     /// Cap each attempt at `proportional_timeout(file_len)` so an
     /// unattended pipeline cannot hang forever.  This is the legacy
     /// behaviour and remains the default of [`MistralBatchTranscriber::new`]
     /// / [`OpenAIBatchTranscriber::new`].
+    #[default]
     Proportional,
     /// No per-request wall-clock cap; rely solely on
     /// `connect_timeout` plus TCP-level defences.  Used by the
@@ -84,7 +85,7 @@ pub enum RequestTimeoutPolicy {
 ///   [`RequestTimeoutPolicy`].
 ///
 /// Construct via the public fields directly — there is no builder.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct TranscribeOptions {
     /// Permit network I/O on cache miss.  `false` makes the call
     /// cache-only (returns [`TalkError::CacheOnly`] on miss);
@@ -93,6 +94,19 @@ pub struct TranscribeOptions {
     /// Per-request wall-clock-timeout policy.  See
     /// [`RequestTimeoutPolicy`] for variant semantics.
     pub policy: RequestTimeoutPolicy,
+    /// Cancellation token to thread into the transport's request
+    /// loop.  When the token fires, the in-flight HTTP request
+    /// aborts within milliseconds.  Defaults to `None` (no
+    /// cancellation wired); the picker / streaming orchestrator
+    /// supplies a real token when it wants the user to be able to
+    /// stop the request.
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Skip `acquire_model_lock`/`release_model_lock` (the legacy
+    /// per-model lock).  Used by call sites that already register
+    /// the job via [`crate::transcription::jobs::register_local`]
+    /// (which writes the same lock file with a richer YAML
+    /// payload) so we don't conflict-on-self.
+    pub skip_legacy_lock: bool,
 }
 
 pub mod jobs;
@@ -331,6 +345,14 @@ pub(crate) trait BatchTranscriber: Send + Sync {
     /// (`dictate/mod.rs`) right after construction, before any
     /// `fetch_transcription` is invoked.
     fn set_sink(&mut self, _sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) {}
+
+    /// Inject a cancellation token for the transcription request.
+    ///
+    /// When the token fires, the in-flight ``http_request`` aborts
+    /// within milliseconds.  Used by the picker Stop button and by
+    /// SIGUSR1-routed cross-process cancellation via
+    /// [`crate::transcription::jobs::cancel_remote`].
+    fn set_cancel_token(&mut self, _token: tokio_util::sync::CancellationToken) {}
 }
 
 // ── Realtime trait ───────────────────────────────────────────────────
@@ -353,15 +375,14 @@ pub(crate) trait RealtimeTranscriber: Send + Sync {
 
     /// Inject a telemetry sink for event emission during the WS
     /// upgrade phase (and, later, the in-session frame events).
-    ///
-    /// Default no-op so simple test stubs don't need to opt in.
-    /// Concrete transcribers (Mistral, OpenAI) override to thread
-    /// the sink down to [`super::transport::ws_upgrade`] so phase
-    /// transitions (``connecting…``, ``connect retry N/M…``) reach
-    /// the picker UI.  Called by the picker / streaming
-    /// orchestrator right after construction, before
-    /// `transcribe_realtime` is invoked.
     fn set_sink(&mut self, _sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) {}
+
+    /// Inject a cancellation token for the realtime session.
+    ///
+    /// When the token fires, the in-flight WebSocket upgrade or
+    /// active session aborts.  See [`BatchTranscriber::set_cancel_token`]
+    /// for the wiring rationale.
+    fn set_cancel_token(&mut self, _token: tokio_util::sync::CancellationToken) {}
 }
 
 // ── Error detection / enrichment dispatchers ────────────────────────
@@ -568,6 +589,8 @@ pub async fn produce_transcript(
         TranscribeOptions {
             allow_api: true,
             policy: RequestTimeoutPolicy::Proportional,
+            cancel_token: None,
+            skip_legacy_lock: false,
         },
         sink,
     )
@@ -620,7 +643,12 @@ pub async fn transcribe_audio(
     options: TranscribeOptions,
     sink: &std::sync::Arc<dyn crate::telemetry::TelemetrySink>,
 ) -> Result<TranscriptionResult, TalkError> {
-    let TranscribeOptions { allow_api, policy } = options;
+    let TranscribeOptions {
+        allow_api,
+        policy,
+        cancel_token,
+        skip_legacy_lock,
+    } = options;
     use crate::recording_cache::{self, TranscriptionCache};
 
     let effective_model = resolve_effective_model(config, provider, model);
@@ -647,8 +675,12 @@ pub async fn transcribe_audio(
         return Err(TalkError::CacheOnly);
     }
 
-    // Acquire per-model lock before calling the API.
-    recording_cache::acquire_model_lock(audio_path, provider, &effective_model, false)?;
+    // Acquire per-model lock before calling the API, unless the
+    // caller has already registered via `jobs::register_local`
+    // (which writes the same lock with a richer payload).
+    if !skip_legacy_lock {
+        recording_cache::acquire_model_lock(audio_path, provider, &effective_model, false)?;
+    }
 
     log::info!(
         "transcription cache miss for {}:{} on {} — calling API",
@@ -661,12 +693,29 @@ pub async fn transcribe_audio(
     let api_result = async {
         let mut transcriber = create_batch_transcriber(config, provider, model, diarize, policy)?;
         transcriber.set_sink(sink.clone());
+        if let Some(token) = cancel_token {
+            transcriber.set_cancel_token(token);
+        }
         transcriber.validate().await?;
         transcriber
             .fetch_transcription(TranscriptionBody::File(audio_path.to_path_buf()))
             .await
     }
     .await;
+
+    // Lock release is skipped when the caller owns the lock via
+    // `jobs::register_local` (the `LocalJob` Drop removes the
+    // file).  Otherwise release here.
+    let release_lock = |context: &str| {
+        if skip_legacy_lock {
+            return;
+        }
+        if let Err(e) =
+            recording_cache::release_model_lock(audio_path, provider, &effective_model, false)
+        {
+            log::warn!("failed to release model lock {}: {}", context, e);
+        }
+    };
 
     match api_result {
         Ok(result) => {
@@ -675,19 +724,11 @@ pub async fn transcribe_audio(
             {
                 log::warn!("failed to cache transcription result: {}", e);
             }
-            if let Err(e) =
-                recording_cache::release_model_lock(audio_path, provider, &effective_model, false)
-            {
-                log::warn!("failed to release model lock: {}", e);
-            }
+            release_lock("after success");
             Ok(result)
         }
         Err(e) => {
-            if let Err(rel_err) =
-                recording_cache::release_model_lock(audio_path, provider, &effective_model, false)
-            {
-                log::warn!("failed to release model lock after error: {}", rel_err);
-            }
+            release_lock("after error");
             Err(e)
         }
     }
