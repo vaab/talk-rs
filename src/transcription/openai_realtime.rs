@@ -465,6 +465,14 @@ impl OpenAIRealtimeTranscriber {
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
+        // Surface the post-upgrade phase to the picker UI so the
+        // row doesn't appear silent during the 100ms-3s window
+        // between WS open and the first transcription delta.
+        self.sink
+            .emit(crate::telemetry::TranscriptionEvent::Status {
+                message: "session handshake…".into(),
+                t: std::time::Instant::now(),
+            });
         log::debug!("OpenAI WebSocket connected, waiting for session.created");
 
         // Wait for session.created with timeout.
@@ -480,6 +488,11 @@ impl OpenAIRealtimeTranscriber {
             ))
         })??;
         log::info!("OpenAI realtime session established");
+        self.sink
+            .emit(crate::telemetry::TranscriptionEvent::Status {
+                message: "session ready, awaiting audio…".into(),
+                t: std::time::Instant::now(),
+            });
 
         // Send session.update in the GA shape — see the mirror
         // call in `validate_realtime_session` for the rationale
@@ -505,6 +518,11 @@ impl OpenAIRealtimeTranscriber {
             .map_err(|e| {
                 TalkError::Transcription(format!("Failed to send session.update: {}", e))
             })?;
+        self.sink
+            .emit(crate::telemetry::TranscriptionEvent::Status {
+                message: "streaming audio…".into(),
+                t: std::time::Instant::now(),
+            });
 
         // Create event channel.
         let (event_tx, event_rx) = mpsc::channel::<TranscriptionEvent>(100);

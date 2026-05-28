@@ -156,6 +156,19 @@ pub enum TranscriptionEvent {
         t: Instant,
     },
 
+    /// Free-form status update for phases that do not map onto a
+    /// structured event (typically post-upgrade WS session
+    /// lifecycle: ``session handshake…``, ``session ready,
+    /// awaiting audio…``, ``streaming audio…``).
+    ///
+    /// Producers should emit this BEFORE any visible action that
+    /// would otherwise leave the UI silent.  Consumers (picker,
+    /// overlay) treat the string as the row's current status
+    /// label.  The message is replaced by the next structured
+    /// event (a fresh ``Status`` or, terminally, a transcript
+    /// text update).
+    Status { message: String, t: Instant },
+
     /// Paste phase started (keystroke / clipboard injection to the
     /// target application).
     PasteStarted { t: Instant },

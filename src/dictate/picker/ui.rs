@@ -103,6 +103,12 @@ pub(super) enum PickerMessage {
     CandidateStatus {
         provider: Provider,
         model: String,
+        /// Whether this status is for the streaming (realtime) row
+        /// or the batch row.  Required for picker row disambiguation
+        /// when both rows exist for the same (provider, model) pair
+        /// — without this the status would race to whichever row
+        /// `position()` finds first.
+        streaming: bool,
         status_text: String,
     },
 }
@@ -1795,17 +1801,20 @@ pub(super) async fn pick_with_streaming_gtk(
                         Ok(PickerMessage::CandidateStatus {
                             provider,
                             model,
+                            streaming,
                             status_text,
                         }) => {
-                            // Find the row by (provider, model) — only
-                            // batch rows ever receive `CandidateStatus`,
-                            // and we explicitly match the non-streaming
-                            // row to avoid colliding with a parallel
-                            // realtime row of the same provider/model.
+                            // Match on (provider, model, streaming).
+                            // Step 10 of the transport-consolidation
+                            // plan wired the realtime path's sink so
+                            // both batch AND realtime rows receive
+                            // status updates; the `streaming` flag
+                            // disambiguates them when both rows exist
+                            // for the same (provider, model) pair.
                             let idx = {
                                 let cands = cands.borrow();
                                 cands.iter().position(|(p, m, _, _, _, s, _, _)| {
-                                    *p == provider && *m == model && !*s
+                                    *p == provider && *m == model && *s == streaming
                                 })
                             };
                             if let Some(idx) = idx {

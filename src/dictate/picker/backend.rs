@@ -56,22 +56,30 @@ pub(super) struct PickerStatusSink {
     tx: std::sync::mpsc::Sender<PickerMessage>,
     provider: Provider,
     model: String,
+    /// Whether this sink belongs to the streaming (realtime) row or
+    /// the batch row.  Carried on every emitted
+    /// [`PickerMessage::CandidateStatus`] so the picker UI's
+    /// row-matcher can disambiguate when both rows exist for the
+    /// same (provider, model) pair.
+    streaming: bool,
     last: Mutex<Option<String>>,
 }
 
 impl PickerStatusSink {
     /// Build a new sink for the given candidate row.  `tx` is the
-    /// shared GTK channel; `provider`/`model` identify which row
-    /// the status updates belong to.
+    /// shared GTK channel; `provider`/`model`/`streaming` identify
+    /// which row the status updates belong to.
     pub(super) fn new(
         tx: std::sync::mpsc::Sender<PickerMessage>,
         provider: Provider,
         model: String,
+        streaming: bool,
     ) -> Self {
         Self {
             tx,
             provider,
             model,
+            streaming,
             last: Mutex::new(None),
         }
     }
@@ -80,11 +88,6 @@ impl PickerStatusSink {
     /// against the last emitted string.  Errors on a closed channel
     /// are silently dropped — the picker may have already closed.
     fn push(&self, status_text: String) {
-        // Lock guard: identical-string dedup.  If the string is
-        // unchanged, do nothing.  Errors locking the mutex (e.g.
-        // poisoning from a panicking peer) fall through to a
-        // best-effort send — losing a single status update is
-        // strictly better than panicking the producer.
         if let Ok(mut last) = self.last.lock() {
             if last.as_deref() == Some(status_text.as_str()) {
                 return;
@@ -94,6 +97,7 @@ impl PickerStatusSink {
         let _ = self.tx.send(PickerMessage::CandidateStatus {
             provider: self.provider,
             model: self.model.clone(),
+            streaming: self.streaming,
             status_text,
         });
     }
@@ -124,6 +128,13 @@ impl TelemetrySink for PickerStatusSink {
                 };
                 self.push(format!("{} {}/{}…", label, attempt, max))
             }
+            // Free-form status: pass the producer's message
+            // through verbatim.  Used by the realtime path for
+            // post-upgrade phases that have no structured event
+            // (session handshake, awaiting audio, etc.) — see
+            // `realtime.rs` / `openai_realtime.rs` for emission
+            // sites.
+            PipelineEvent::Status { message, .. } => self.push(message),
             // All other events (progress, paste, terminal events,
             // non-2xx response headers) are dropped — phase
             // transitions + retry attempts only.
@@ -159,9 +170,12 @@ pub(super) async fn run_realtime_transcription(
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
     // Attach the row's status sink BEFORE the WS upgrade so
-    // connecting / retry events reach the UI.
-    let status_sink: std::sync::Arc<dyn TelemetrySink> =
-        std::sync::Arc::new(PickerStatusSink::new(tx.clone(), provider, model.clone()));
+    // connecting / retry events reach the UI.  `streaming=true`
+    // tags every emitted `CandidateStatus` so the picker matches
+    // the realtime row, not the batch row of the same model.
+    let status_sink: std::sync::Arc<dyn TelemetrySink> = std::sync::Arc::new(
+        PickerStatusSink::new(tx.clone(), provider, model.clone(), true),
+    );
     transcriber.set_sink(status_sink);
     transcriber.set_cancel_token(cancel_token);
 
@@ -310,8 +324,13 @@ pub(super) fn spawn_transcription(
     config: std::sync::Arc<Config>,
     _ignored_cancel: tokio_util::sync::CancellationToken,
 ) {
-    let sink: std::sync::Arc<dyn TelemetrySink> =
-        std::sync::Arc::new(PickerStatusSink::new(tx.clone(), provider, model.clone()));
+    // `streaming=false` tags this sink for the batch row.
+    let sink: std::sync::Arc<dyn TelemetrySink> = std::sync::Arc::new(PickerStatusSink::new(
+        tx.clone(),
+        provider,
+        model.clone(),
+        false,
+    ));
     tasks.spawn(async move {
         // Register this in-flight transcription with the jobs
         // module.  This (a) writes a YAML lock file describing
@@ -405,6 +424,7 @@ mod tests {
                     provider,
                     model,
                     status_text,
+                    ..
                 } => Some((provider, model, status_text)),
                 _ => None,
             });
@@ -419,7 +439,12 @@ mod tests {
     #[test]
     fn picker_status_sink_translates_phase_transitions() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral-mini-2602".to_string());
+        let sink = PickerStatusSink::new(
+            tx,
+            Provider::Mistral,
+            "voxtral-mini-2602".to_string(),
+            false,
+        );
 
         let now = Instant::now();
         // Cache-miss path: preflight events come first.
@@ -493,7 +518,7 @@ mod tests {
     #[test]
     fn picker_status_sink_cache_hit_starts_at_connecting() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string(), false);
 
         let now = Instant::now();
         // No PreflightStarted / PreflightCompleted — cache hit.
@@ -535,7 +560,7 @@ mod tests {
     #[test]
     fn picker_status_sink_preflight_completed_is_silent() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string(), false);
 
         let now = Instant::now();
         sink.emit(PipelineEvent::PreflightStarted { t: now });
@@ -565,7 +590,7 @@ mod tests {
     #[test]
     fn picker_status_sink_dedups_repeated_phase() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string(), false);
 
         let now = Instant::now();
         sink.emit(PipelineEvent::RequestStarted {
@@ -590,7 +615,7 @@ mod tests {
     #[test]
     fn picker_status_sink_formats_retry_attempts() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::OpenAI, "whisper-1".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::OpenAI, "whisper-1".to_string(), false);
 
         let now = Instant::now();
         sink.emit(PipelineEvent::RetryScheduled {
@@ -623,7 +648,7 @@ mod tests {
     #[test]
     fn picker_status_sink_drops_non_2xx_response_headers() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string(), false);
 
         let now = Instant::now();
         sink.emit(PipelineEvent::ResponseHeaders {
@@ -649,7 +674,12 @@ mod tests {
     #[test]
     fn picker_status_sink_preserves_row_identity() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral-mini-2602".to_string());
+        let sink = PickerStatusSink::new(
+            tx,
+            Provider::Mistral,
+            "voxtral-mini-2602".to_string(),
+            false,
+        );
 
         let now = Instant::now();
         sink.emit(PipelineEvent::RequestStarted {
