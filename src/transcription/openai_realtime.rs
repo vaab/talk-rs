@@ -314,13 +314,15 @@ impl OpenAIRealtimeTranscriber {
         let req = super::transport::Request {
             method: super::transport::Method::Get,
             url: ws_url.clone(),
-            headers: vec![
-                (
-                    "Authorization".into(),
-                    format!("Bearer {}", self.config.api_key),
-                ),
-                ("OpenAI-Beta".into(), "realtime=v1".into()),
-            ],
+            // OpenAI deprecated the ``OpenAI-Beta: realtime=v1``
+            // header on 2026-02-27; the GA endpoint
+            // ``/v1/realtime`` rejects requests carrying it with
+            // "The Realtime Beta API is no longer supported.
+            // Please use /v1/realtime for the GA API."
+            headers: vec![(
+                "Authorization".into(),
+                format!("Bearer {}", self.config.api_key),
+            )],
             body: super::transport::RequestBody::Empty,
             provider: crate::config::Provider::OpenAI,
             provider_name: "OpenAI".into(),
@@ -346,19 +348,32 @@ impl OpenAIRealtimeTranscriber {
             ))
         })??;
 
-        // Send transcription_session.update with flat beta format.
+        // Send session.update in the GA shape.  The flat beta
+        // format (``type: transcription_session.update``,
+        // ``session.input_audio_format``, etc.) was deprecated on
+        // 2026-02-27; the GA endpoint replies with an
+        // ``unknown_event_type`` error and the session is closed.
+        //
+        // GA shape (see https://developers.openai.com/api/docs/guides/realtime-transcription):
+        // ``{ type: "session.update", session: { type: "transcription",
+        //     audio: { input: { format: {type:"audio/pcm",rate:24000},
+        //              transcription: {model: <name>} } } } }``.
+        //
+        // GA also dropped the separate ``transcription_session``
+        // namespace — the same ``session.update`` event handles
+        // both speech-to-speech and transcription, discriminated
+        // by the inner ``session.type`` field.
         let session_update = serde_json::json!({
-            "type": "transcription_session.update",
+            "type": "session.update",
             "session": {
-                "input_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": self.model,
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
+                "type": "transcription",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": {
+                            "model": self.model,
+                        }
+                    }
                 }
             }
         });
@@ -425,13 +440,12 @@ impl OpenAIRealtimeTranscriber {
         let req = super::transport::Request {
             method: super::transport::Method::Get,
             url: ws_url.clone(),
-            headers: vec![
-                (
-                    "Authorization".into(),
-                    format!("Bearer {}", self.config.api_key),
-                ),
-                ("OpenAI-Beta".into(), "realtime=v1".into()),
-            ],
+            // OpenAI deprecated the ``OpenAI-Beta: realtime=v1``
+            // header on 2026-02-27 — the GA endpoint rejects it.
+            headers: vec![(
+                "Authorization".into(),
+                format!("Bearer {}", self.config.api_key),
+            )],
             body: super::transport::RequestBody::Empty,
             provider: crate::config::Provider::OpenAI,
             provider_name: "OpenAI".into(),
@@ -467,26 +481,24 @@ impl OpenAIRealtimeTranscriber {
         })??;
         log::info!("OpenAI realtime session established");
 
-        // Send transcription_session.update with flat beta format.
+        // Send session.update in the GA shape — see the mirror
+        // call in `validate_realtime_session` for the rationale
+        // (flat beta format was deprecated 2026-02-27).
         let session_update = serde_json::json!({
-            "type": "transcription_session.update",
+            "type": "session.update",
             "session": {
-                "input_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": self.model,
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
+                "type": "transcription",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": {
+                            "model": self.model,
+                        }
+                    }
                 }
             }
         });
-        log::debug!(
-            "sending transcription_session.update with model={}",
-            self.model
-        );
+        log::debug!("sending session.update (GA) with model={}", self.model);
         ws_sink
             .send(Message::Text(session_update.to_string()))
             .await

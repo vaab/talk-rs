@@ -1079,7 +1079,8 @@ pub(super) async fn pick_with_streaming_gtk(
             move |provider: Provider,
                   model: String,
                   streaming: bool,
-                  is_primary_row: bool|
+                  is_primary_row: bool,
+                  row_idx_at_create: usize|
                   -> gtk4::Button {
                 let btn = gtk4::Button::with_label("T");
                 btn.set_tooltip_text(Some("Transcribe with this model"));
@@ -1096,14 +1097,15 @@ pub(super) async fn pick_with_streaming_gtk(
                     let has_tx_ref = Rc::clone(&has_tx_for_btn);
                     btn.connect_clicked(move |clicked| {
                         use gtk4::prelude::*;
+                        log::debug!(
+                            "picker click: provider={} model={} streaming={} is_primary={} row_idx_at_create={}",
+                            provider, model, streaming, is_primary_row, row_idx_at_create,
+                        );
+
                         // Stop mode: route the click to SIGUSR1 on
                         // our own PID, which fans out via the
                         // `jobs` SIGUSR1 handler to every
-                        // registered in-flight token.  Granularity
-                        // is "cancel everything we registered" —
-                        // matches the picker UX (the user
-                        // typically wants to stop the whole batch
-                        // they kicked off when they hit a Stop).
+                        // registered in-flight token.
                         if clicked.label().as_deref() == Some("✕") {
                             use nix::sys::signal::{kill, Signal};
                             use nix::unistd::Pid;
@@ -1125,6 +1127,7 @@ pub(super) async fn pick_with_streaming_gtk(
                                     && *prim == is_primary_row
                             })
                         };
+                        log::debug!("picker click resolved idx={:?}", idx);
                         let Some(idx) = idx else {
                             return;
                         };
@@ -1236,7 +1239,8 @@ pub(super) async fn pick_with_streaming_gtk(
             // "↻" (retry an existing one), and "✕" (stop an
             // in-flight request).  Always sensitive — in-flight
             // rows route the click to SIGUSR1.
-            let action_btn = make_action_button(*provider, model.clone(), *streaming, is_primary);
+            let action_btn =
+                make_action_button(*provider, model.clone(), *streaming, is_primary, row_idx);
             match kind {
                 RowKind::PendingBatch | RowKind::PendingRealtime => {
                     action_btn.set_sensitive(true);
