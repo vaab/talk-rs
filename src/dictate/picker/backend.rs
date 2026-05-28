@@ -115,8 +115,14 @@ impl TelemetrySink for PickerStatusSink {
             PipelineEvent::ResponseHeaders { status, .. } if (200..300).contains(&status) => {
                 self.push("transcribing…".to_string())
             }
-            PipelineEvent::RetryScheduled { attempt, max, .. } => {
-                self.push(format!("retry {}/{}…", attempt, max))
+            PipelineEvent::RetryScheduled {
+                kind, attempt, max, ..
+            } => {
+                let label = match kind {
+                    crate::telemetry::RetryKind::Connection => "connect retry",
+                    crate::telemetry::RetryKind::Data => "server retry",
+                };
+                self.push(format!("{} {}/{}…", label, attempt, max))
             }
             // All other events (progress, paste, terminal events,
             // non-2xx response headers) are dropped — phase
@@ -580,7 +586,7 @@ mod tests {
     }
 
     /// Spec: retry events surface attempt/max in the status string,
-    /// in `retry N/M…` form.
+    /// in `connect retry N/M…` / `server retry N/M…` form.
     #[test]
     fn picker_status_sink_formats_retry_attempts() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
@@ -588,16 +594,26 @@ mod tests {
 
         let now = Instant::now();
         sink.emit(PipelineEvent::RetryScheduled {
+            kind: crate::telemetry::RetryKind::Connection,
             attempt: 2,
             max: 5,
             reason: "transient".into(),
             t: now,
         });
+        sink.emit(PipelineEvent::RetryScheduled {
+            kind: crate::telemetry::RetryKind::Data,
+            attempt: 1,
+            max: 3,
+            reason: "5xx".into(),
+            t: now,
+        });
 
         let drained = drain_status(&rx);
-        assert_eq!(drained.len(), 1);
-        let (_, _, s) = drained[0].as_ref().expect("status message");
-        assert_eq!(s, "retry 2/5…");
+        let strings: Vec<&str> = drained
+            .iter()
+            .filter_map(|o| o.as_ref().map(|(_, _, s)| s.as_str()))
+            .collect();
+        assert_eq!(strings, vec!["connect retry 2/5…", "server retry 1/3…"]);
     }
 
     /// Spec: non-2xx response headers do NOT produce a

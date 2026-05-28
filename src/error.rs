@@ -340,15 +340,29 @@ impl std::fmt::Display for PipelineFailure {
                 } else {
                     body_trimmed.to_string()
                 };
+                // 4xx is permanent (no retry could change the
+                // answer); 5xx is data-phase-retryable (the
+                // transport exhausted its data-retry budget if
+                // attempts > 1).  Annotate so users don't
+                // think the "1/5" attempts in a 404 means we
+                // gave up early.
+                let retry_note: &'static str = if (400..500).contains(status) {
+                    " — 4xx permanent, no retry"
+                } else if (500..600).contains(status) && self.attempts >= self.max_attempts {
+                    " — server-retry budget exhausted"
+                } else {
+                    ""
+                };
                 write!(
                     f,
-                    "{} model {} failed [status={}, url={}] (after {}/{} attempts)",
+                    "{} model {} failed [status={}, url={}] (after {}/{} attempts{})",
                     provider_display,
                     self.phase.verb(),
                     status,
                     self.url,
                     self.attempts,
                     self.max_attempts,
+                    retry_note,
                 )?;
                 if !body_short.is_empty() {
                     write!(f, ": {}", body_short)?;
@@ -698,7 +712,10 @@ mod tests {
     }
 
     /// Spec: HttpStatus renders the status, URL, attempts, and a
-    /// trimmed body.
+    /// trimmed body.  4xx responses additionally render the
+    /// `4xx permanent, no retry` annotation so users don't
+    /// mistakenly think we gave up early (1/5 attempts for 4xx
+    /// is correct — retrying a 4xx is wasted effort).
     #[test]
     fn pipeline_failure_http_status_renders() {
         let pf = PipelineFailure::new(
@@ -715,7 +732,53 @@ mod tests {
         let s = pf.to_string();
         assert!(s.contains("status=401"), "got: {}", s);
         assert!(s.contains("Unauthorized"), "got: {}", s);
-        assert!(s.contains("(after 1/5 attempts)"), "got: {}", s);
+        assert!(s.contains("(after 1/5 attempts"), "got: {}", s);
+        assert!(s.contains("4xx permanent, no retry"), "got: {}", s);
+    }
+
+    /// Spec: a 5xx with exhausted retries shows the
+    /// "server-retry budget exhausted" annotation; a 5xx with
+    /// remaining budget (attempts < max_attempts) shows no
+    /// annotation (the caller is in the middle of the retry
+    /// loop and isn't ready to surface the failure yet).
+    #[test]
+    fn pipeline_failure_http_status_500_annotates_when_exhausted() {
+        let pf = PipelineFailure::new(
+            "OpenAI",
+            PipelinePhase::Request,
+            3,
+            3,
+            "https://x",
+            PipelineFailureKind::HttpStatus {
+                status: 503,
+                body: "Service Unavailable".into(),
+            },
+        );
+        let s = pf.to_string();
+        assert!(s.contains("status=503"), "got: {}", s);
+        assert!(
+            s.contains("server-retry budget exhausted"),
+            "exhausted 5xx must annotate; got: {}",
+            s
+        );
+
+        let mid = PipelineFailure::new(
+            "OpenAI",
+            PipelinePhase::Request,
+            1,
+            3,
+            "https://x",
+            PipelineFailureKind::HttpStatus {
+                status: 503,
+                body: "Service Unavailable".into(),
+            },
+        );
+        let s = mid.to_string();
+        assert!(
+            !s.contains("server-retry budget exhausted"),
+            "mid-retry 5xx must not annotate yet; got: {}",
+            s
+        );
     }
 
     /// Spec: PipelineFailure converts via `?` from `TalkError`
