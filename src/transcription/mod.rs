@@ -100,7 +100,7 @@ pub mod model_suggestions;
 pub mod openai;
 pub mod openai_realtime;
 pub mod realtime;
-pub(crate) mod transport;
+pub mod transport;
 
 pub use mistral::MistralBatchTranscriber;
 pub use openai::OpenAIBatchTranscriber;
