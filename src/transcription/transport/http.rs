@@ -9,36 +9,29 @@ use crate::error::{
 };
 use crate::telemetry::{TelemetrySink, TranscriptionEvent};
 use futures::Stream;
-use reqwest::Client;
 use serde::Deserialize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-/// TCP connect timeout — fail fast when the server is unreachable.
-///
-/// Historically used by [`build_client`].  Step 9 of the transport
-/// consolidation removes [`build_client`] entirely (in favour of
-/// [`super::http_request`]'s per-attempt
-/// `build_client_with_connect_timeout`) and this constant with it.
-/// Currently retained only because the realtime modules still call
-/// the legacy [`super::retry::with_retry`] path.
-#[allow(dead_code)]
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+// `CONNECT_TIMEOUT` and `build_client` were deleted in Step 9 of
+// transport-consolidation.  The unified `transport::http_request`
+// builds a fresh reqwest client per attempt with the right
+// per-attempt connect budget via
+// `transport::build_client_with_connect_timeout`.
+//
+// `TCP_USER_TIMEOUT`, `TCP_KEEPALIVE`, `TCP_KEEPALIVE_INTERVAL`,
+// `TCP_KEEPALIVE_RETRIES` survive (private) because
+// `classify_reqwest_error` synthesises a `kernel_tcp_unspecified`
+// timer label from them when a mid-stream IO TimedOut error
+// surfaces.
 
 /// Kernel-level unacknowledged-data timeout (Linux only).
-///
-/// If transmitted data (upload bytes, TCP ACKs) goes unacknowledged
-/// for this duration, the kernel forcefully closes the socket.  This
-/// is the primary mechanism for detecting silent VPN/network drops
-/// during active data transfer — unlike TCP keepalive, it fires even
-/// when the send buffer is full.
 #[cfg(target_os = "linux")]
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// TCP keepalive idle time — start sending probes after this much
-/// silence on an otherwise idle connection.
+/// TCP keepalive idle time.
 const TCP_KEEPALIVE: Duration = Duration::from_secs(5);
 
 /// Interval between TCP keepalive probes once probing starts.
@@ -47,37 +40,6 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// Number of unanswered keepalive probes before declaring the
 /// connection dead.
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
-
-/// Build an HTTP client tuned for VPN-hostile networks.
-///
-/// Step 9 of the transport consolidation deletes this function;
-/// callers now use [`super::http_request`] which builds a fresh
-/// client per attempt with the right per-attempt connect budget.
-/// Retained transiently because the realtime modules still use the
-/// legacy [`super::retry::with_retry`] path.
-#[allow(dead_code)]
-pub(crate) fn build_client() -> Result<Client, TalkError> {
-    // NOTE: The client-wide `read_timeout` is intentionally omitted.
-    // In reqwest 0.13 it acts as a non-resetting wall-clock timer
-    // during the upload + wait-for-headers phase, which would kill
-    // legitimate requests where upload + server processing exceeds
-    // the value.  Dead connections are detected by `tcp_user_timeout`
-    // (during active transfer) and TCP keepalive (during idle
-    // phases).  Per-request wall-clock caps for slow-but-alive
-    // servers are applied at each call site via [`proportional_timeout`].
-    let builder = Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .tcp_keepalive(TCP_KEEPALIVE)
-        .tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
-        .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES);
-
-    #[cfg(target_os = "linux")]
-    let builder = builder.tcp_user_timeout(TCP_USER_TIMEOUT);
-
-    builder
-        .build()
-        .map_err(|e| TalkError::Config(format!("failed to build HTTP client: {}", e)))
-}
 
 /// Floor for [`proportional_timeout`].
 ///

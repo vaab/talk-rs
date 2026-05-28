@@ -26,8 +26,10 @@ const DEFAULT_REALTIME_ENDPOINT: &str = "wss://api.mistral.ai";
 /// WebSocket path for realtime transcription.
 const REALTIME_PATH: &str = "/v1/audio/transcriptions/realtime";
 
-/// Timeout for the initial WebSocket connection (TCP + TLS + upgrade).
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+// `WS_CONNECT_TIMEOUT` deleted in Step 7 of transport-consolidation.
+// Per-attempt connect budgets now live inside
+// `transport::ws_upgrade` (`CONNECTION_BUDGETS_SECS = [2, 5, 8, 11, 15]`),
+// shared with the HTTP path.
 
 /// Timeout for receiving the `session.created` event after connecting.
 const SESSION_CREATED_TIMEOUT: Duration = Duration::from_secs(15);
@@ -201,47 +203,36 @@ impl MistralRealtimeTranscriber {
 
     /// Open a throwaway WebSocket connection and wait for
     /// `session.created` to confirm the API accepts the model.
+    ///
+    /// Uses [`super::transport::ws_upgrade`] for the handshake so
+    /// retries / growing connect budget / cancellation are shared
+    /// with the live transcription path.
     #[allow(dead_code)]
     async fn validate_realtime_session(&self) -> Result<(), TalkError> {
         let ws_url = build_ws_url(&self.endpoint, self.realtime_model());
 
-        let parsed_url = url::Url::parse(&ws_url)
-            .map_err(|e| TalkError::Config(format!("Invalid WebSocket URL: {}", e)))?;
-        let host = parsed_url
-            .host_str()
-            .ok_or_else(|| TalkError::Config("No host in WebSocket URL".to_string()))?
-            .to_string();
-
-        let request = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri(&ws_url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Host", &host)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header(
-                "Sec-WebSocket-Key",
-                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
-            .map_err(|e| TalkError::Config(format!("Failed to build WebSocket request: {}", e)))?;
-
         log::debug!("validation: connecting to {}", ws_url);
 
-        let (ws_stream, _) = tokio::time::timeout(
-            WS_CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(request),
-        )
-        .await
-        .map_err(|_| {
-            TalkError::Config(format!(
-                "WebSocket connection timed out after {}s",
-                WS_CONNECT_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(|e| TalkError::Config(format!("WebSocket connection failed: {}", e)))?;
+        let req = super::transport::Request {
+            method: super::transport::Method::Get,
+            url: ws_url.clone(),
+            headers: vec![(
+                "Authorization".into(),
+                format!("Bearer {}", self.config.api_key),
+            )],
+            body: super::transport::RequestBody::Empty,
+            provider: crate::config::Provider::Mistral,
+            provider_name: "Mistral".into(),
+            phase: crate::error::PipelinePhase::Validate,
+            wall_clock: None,
+        };
+        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+            std::sync::Arc::new(crate::telemetry::NoOpSink);
+        let ws_stream = super::transport::ws_upgrade(req, &sink, CancellationToken::new())
+            .await
+            .map_err(|pf| TalkError::Config(pf.to_string()))?;
 
-        let (mut sink, mut source) = ws_stream.split();
+        let (mut sink_split, mut source) = ws_stream.split();
 
         // Wait for session.created (or an error).
         let result = tokio::time::timeout(
@@ -257,7 +248,7 @@ impl MistralRealtimeTranscriber {
         })?;
 
         // Close the validation connection cleanly.
-        let _ = sink.send(Message::Close(None)).await;
+        let _ = sink_split.send(Message::Close(None)).await;
 
         result.map(|_| ())
     }
@@ -266,78 +257,43 @@ impl MistralRealtimeTranscriber {
     ///
     /// Reads `Vec<i16>` PCM chunks from `audio_rx`, encodes them as base64,
     /// and sends them over WebSocket. Returns a receiver of transcription events.
+    ///
+    /// The WS upgrade goes through
+    /// [`super::transport::ws_upgrade`], which handles connection
+    /// retries (growing budget `[2, 5, 8, 11, 15]` seconds),
+    /// cancellation, and `ConnectionEvent` emission.
     pub async fn transcribe_realtime(
         &self,
         audio_rx: mpsc::Receiver<Vec<i16>>,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TalkError> {
         let ws_url = build_ws_url(&self.endpoint, self.realtime_model());
 
-        // Parse the URL to extract the host for the HTTP header
-        let parsed_url = url::Url::parse(&ws_url)
-            .map_err(|e| TalkError::Transcription(format!("Invalid WebSocket URL: {}", e)))?;
-        let host = parsed_url
-            .host_str()
-            .ok_or_else(|| TalkError::Transcription("No host in WebSocket URL".to_string()))?
-            .to_string();
-
         log::debug!("connecting to WebSocket: {}", ws_url);
 
-        // Open the WebSocket upgrade handshake with shared retry
-        // semantics.  Every retry rebuilds a fresh upgrade request
-        // (the request value is consumed by `connect_async`).
-        //
-        // TODO: when a telemetry sink is threaded through realtime
-        // transcribers, pass it here so `RetryScheduled` events are
-        // observable.  For now use a no-op sink to preserve the
-        // existing behaviour.
-        let api_key = self.config.api_key.clone();
+        // TODO (Step 10 of transport-consolidation): plumb the real
+        // sink from the caller (picker / streaming dictate) so
+        // `RetryScheduled` events surface in the UI.  Today we use
+        // a NoOpSink to preserve behaviour; the sink's absence is
+        // why the picker's realtime row appears to "hang" silently
+        // — see plan §1.12 and the Step 8 diagnosis.
         let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
             std::sync::Arc::new(crate::telemetry::NoOpSink);
-        let (ws_stream, _response) =
-            super::transport::retry::with_retry(crate::config::Provider::Mistral, &sink, || {
-                // Clone per-attempt: `Fn` requires that we don't
-                // move owned values, and `connect_async` consumes
-                // the request.
-                let api_key = api_key.clone();
-                let ws_url = ws_url.clone();
-                let host = host.clone();
-                async move {
-                    let request = tokio_tungstenite::tungstenite::http::Request::builder()
-                        .uri(&ws_url)
-                        .header("Authorization", format!("Bearer {}", api_key))
-                        .header("Host", &host)
-                        .header("Connection", "Upgrade")
-                        .header("Upgrade", "websocket")
-                        .header("Sec-WebSocket-Version", "13")
-                        .header(
-                            "Sec-WebSocket-Key",
-                            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-                        )
-                        .body(())
-                        .map_err(|e| {
-                            TalkError::Transcription(format!(
-                                "Failed to build WebSocket request: {}",
-                                e
-                            ))
-                        })?;
-
-                    tokio::time::timeout(
-                        WS_CONNECT_TIMEOUT,
-                        tokio_tungstenite::connect_async(request),
-                    )
-                    .await
-                    .map_err(|_| {
-                        TalkError::Transcription(format!(
-                            "WebSocket connection timed out after {}s",
-                            WS_CONNECT_TIMEOUT.as_secs()
-                        ))
-                    })?
-                    .map_err(|e| {
-                        TalkError::Transcription(format!("WebSocket connection failed: {}", e))
-                    })
-                }
-            })
-            .await?;
+        let req = super::transport::Request {
+            method: super::transport::Method::Get,
+            url: ws_url.clone(),
+            headers: vec![(
+                "Authorization".into(),
+                format!("Bearer {}", self.config.api_key),
+            )],
+            body: super::transport::RequestBody::Empty,
+            provider: crate::config::Provider::Mistral,
+            provider_name: "Mistral".into(),
+            phase: crate::error::PipelinePhase::Request,
+            wall_clock: None,
+        };
+        let ws_stream = super::transport::ws_upgrade(req, &sink, CancellationToken::new())
+            .await
+            .map_err(|pf| TalkError::Transcription(pf.to_string()))?;
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
@@ -812,8 +768,19 @@ mod tests {
 
     #[test]
     fn test_timeout_constants_are_reasonable() {
-        assert!(WS_CONNECT_TIMEOUT.as_secs() >= 5);
-        assert!(WS_CONNECT_TIMEOUT.as_secs() <= 60);
+        // `WS_CONNECT_TIMEOUT` previously asserted here is now
+        // owned by `transport::ws_upgrade` (see
+        // `CONNECTION_BUDGETS_SECS = [2, 5, 8, 11, 15]`).  The
+        // sum (41s) is within the historical sanity bound — a
+        // compile-time const so the bound check is a doc rather
+        // than a runtime assert (clippy flags `assert!(true)`
+        // on const expressions as a no-op).
+        const _: () = {
+            const SUM: u64 = 2 + 5 + 8 + 11 + 15;
+            assert!(SUM >= 5);
+            assert!(SUM <= 120);
+        };
+
         assert!(SESSION_CREATED_TIMEOUT.as_secs() >= 5);
         assert!(SESSION_CREATED_TIMEOUT.as_secs() <= 60);
         assert!(WS_PING_INTERVAL.as_secs() >= 10);

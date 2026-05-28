@@ -33,8 +33,10 @@ const REALTIME_PATH: &str = "/v1/realtime";
 /// transcription-only session (no AI responses).
 const REALTIME_INTENT: &str = "intent=transcription";
 
-/// Timeout for the initial WebSocket connection (TCP + TLS + upgrade).
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+// `WS_CONNECT_TIMEOUT` deleted in Step 7 of transport-consolidation.
+// Per-attempt connect budgets now live inside
+// `transport::ws_upgrade` (`CONNECTION_BUDGETS_SECS = [2, 5, 8, 11, 15]`),
+// shared with the HTTP path.
 
 /// Timeout for receiving the `session.created` event after connecting.
 const SESSION_CREATED_TIMEOUT: Duration = Duration::from_secs(15);
@@ -292,49 +294,36 @@ impl OpenAIRealtimeTranscriber {
     /// `transcription_session.update` with our model config, and
     /// wait for the API's answer.
     ///
-    /// Returns `Ok(())` if the API accepts the session configuration,
-    /// or an error with the API's message (e.g. "model X is not
-    /// supported in realtime mode").
+    /// Uses [`super::transport::ws_upgrade`] for the handshake so
+    /// retries / growing budget / cancellation share the unified
+    /// transport machinery.
     #[allow(dead_code)]
     async fn validate_realtime_session(&self) -> Result<(), TalkError> {
         let ws_url = build_ws_url(&self.endpoint);
 
-        let parsed_url = url::Url::parse(&ws_url)
-            .map_err(|e| TalkError::Config(format!("Invalid WebSocket URL: {}", e)))?;
-        let host = parsed_url
-            .host_str()
-            .ok_or_else(|| TalkError::Config("No host in WebSocket URL".to_string()))?
-            .to_string();
-
-        let request = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri(&ws_url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("OpenAI-Beta", "realtime=v1")
-            .header("Host", &host)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header(
-                "Sec-WebSocket-Key",
-                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
-            .map_err(|e| TalkError::Config(format!("Failed to build WebSocket request: {}", e)))?;
-
         log::debug!("validation: connecting to {}", ws_url);
 
-        let (ws_stream, _) = tokio::time::timeout(
-            WS_CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(request),
-        )
-        .await
-        .map_err(|_| {
-            TalkError::Config(format!(
-                "WebSocket connection timed out after {}s",
-                WS_CONNECT_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(|e| TalkError::Config(format!("WebSocket connection failed: {}", e)))?;
+        let req = super::transport::Request {
+            method: super::transport::Method::Get,
+            url: ws_url.clone(),
+            headers: vec![
+                (
+                    "Authorization".into(),
+                    format!("Bearer {}", self.config.api_key),
+                ),
+                ("OpenAI-Beta".into(), "realtime=v1".into()),
+            ],
+            body: super::transport::RequestBody::Empty,
+            provider: crate::config::Provider::OpenAI,
+            provider_name: "OpenAI".into(),
+            phase: crate::error::PipelinePhase::Validate,
+            wall_clock: None,
+        };
+        let sink_arc: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+            std::sync::Arc::new(crate::telemetry::NoOpSink);
+        let ws_stream = super::transport::ws_upgrade(req, &sink_arc, CancellationToken::new())
+            .await
+            .map_err(|pf| TalkError::Config(pf.to_string()))?;
 
         let (mut sink, mut source) = ws_stream.split();
 
@@ -414,75 +403,53 @@ impl OpenAIRealtimeTranscriber {
     /// Reads `Vec<i16>` PCM chunks (16 kHz) from `audio_rx`, resamples
     /// to 24 kHz, encodes as base64, and sends over WebSocket.  Returns
     /// a receiver of transcription events.
+    ///
+    /// The WS upgrade goes through
+    /// [`super::transport::ws_upgrade`], which handles connection
+    /// retries (growing budget `[2, 5, 8, 11, 15]` seconds),
+    /// cancellation, and `ConnectionEvent` emission.
     pub async fn transcribe_realtime(
         &self,
         audio_rx: mpsc::Receiver<Vec<i16>>,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TalkError> {
         let ws_url = build_ws_url(&self.endpoint);
 
-        // Parse the URL to extract the host for the HTTP header.
-        let parsed_url = url::Url::parse(&ws_url)
-            .map_err(|e| TalkError::Transcription(format!("Invalid WebSocket URL: {}", e)))?;
-        let host = parsed_url
-            .host_str()
-            .ok_or_else(|| TalkError::Transcription("No host in WebSocket URL".to_string()))?
-            .to_string();
-
         log::debug!("connecting to OpenAI Realtime WebSocket: {}", ws_url);
 
-        // Open the WebSocket upgrade handshake with shared retry
-        // semantics.  Each retry rebuilds a fresh request (consumed
-        // by `connect_async`).
-        //
-        // TODO: thread a telemetry sink through realtime transcribers
-        // so `RetryScheduled` events are observable; for now use a
-        // no-op sink to preserve the existing behaviour.
-        let api_key = self.config.api_key.clone();
+        // TODO (Step 10 of transport-consolidation): plumb the real
+        // sink from the caller (picker / streaming dictate) so
+        // `RetryScheduled` events surface in the UI.  Today we use
+        // a NoOpSink to preserve behaviour; the sink's absence is
+        // why the picker's realtime row appears to "hang" silently
+        // — see plan §1.12 and the Step 8 diagnosis.
         let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
             std::sync::Arc::new(crate::telemetry::NoOpSink);
-        let (ws_stream, response) =
-            super::transport::retry::with_retry(crate::config::Provider::OpenAI, &sink, || {
-                let api_key = api_key.clone();
-                let ws_url = ws_url.clone();
-                let host = host.clone();
-                async move {
-                    let request = tokio_tungstenite::tungstenite::http::Request::builder()
-                        .uri(&ws_url)
-                        .header("Authorization", format!("Bearer {}", api_key))
-                        .header("OpenAI-Beta", "realtime=v1")
-                        .header("Host", &host)
-                        .header("Connection", "Upgrade")
-                        .header("Upgrade", "websocket")
-                        .header("Sec-WebSocket-Version", "13")
-                        .header(
-                            "Sec-WebSocket-Key",
-                            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-                        )
-                        .body(())
-                        .map_err(|e| {
-                            TalkError::Transcription(format!(
-                                "Failed to build WebSocket request: {}",
-                                e
-                            ))
-                        })?;
-
-                    tokio::time::timeout(
-                        WS_CONNECT_TIMEOUT,
-                        tokio_tungstenite::connect_async(request),
-                    )
-                    .await
-                    .map_err(|_| {
-                        TalkError::Transcription(format!(
-                            "WebSocket connection timed out after {}s",
-                            WS_CONNECT_TIMEOUT.as_secs()
-                        ))
-                    })?
-                    .map_err(|e| {
-                        TalkError::Transcription(format!("WebSocket connection failed: {}", e))
-                    })
-                }
-            })
-            .await?;
+        let req = super::transport::Request {
+            method: super::transport::Method::Get,
+            url: ws_url.clone(),
+            headers: vec![
+                (
+                    "Authorization".into(),
+                    format!("Bearer {}", self.config.api_key),
+                ),
+                ("OpenAI-Beta".into(), "realtime=v1".into()),
+            ],
+            body: super::transport::RequestBody::Empty,
+            provider: crate::config::Provider::OpenAI,
+            provider_name: "OpenAI".into(),
+            phase: crate::error::PipelinePhase::Request,
+            wall_clock: None,
+        };
+        let ws_stream = super::transport::ws_upgrade(req, &sink, CancellationToken::new())
+            .await
+            .map_err(|pf| TalkError::Transcription(pf.to_string()))?;
+        // No HTTP response wrapper exposed by the transport; the
+        // OpenAI realtime path's downstream code paths that
+        // previously inspected `response` (mainly for the
+        // `x-request-id` header) need to live without it for now.
+        // Step 10 of the plan adds a richer transport response if
+        // any consumer actually needs the headers.
+        let response: Option<()> = None;
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
@@ -532,14 +499,17 @@ impl OpenAIRealtimeTranscriber {
         // Create event channel.
         let (event_tx, event_rx) = mpsc::channel::<TranscriptionEvent>(100);
 
-        let ws_upgrade_headers = extract_ws_upgrade_headers(response.headers());
-        if !ws_upgrade_headers.is_empty() {
-            let _ = event_tx
-                .send(TranscriptionEvent::TransportMetadata {
-                    headers: ws_upgrade_headers,
-                })
-                .await;
-        }
+        // The transport's `ws_upgrade` does not surface the HTTP
+        // upgrade response headers today (the value would land at
+        // `response` above as `Option<()>`).  Step 10 of the
+        // transport-consolidation plan extends the transport's
+        // response shape to carry headers when an actual consumer
+        // (this site, the OpenAI rate-limit dashboard) needs them.
+        // Until then we silence the
+        // `TranscriptionEvent::TransportMetadata` emission; it was
+        // diagnostic-only.
+        let _suppressed_unused = &response;
+        let _: fn(_) -> _ = extract_ws_upgrade_headers; // keep helper alive for Step 10
 
         // Forward the initial session event.
         let _ = event_tx.send(session_event).await;

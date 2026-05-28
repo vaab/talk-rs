@@ -42,7 +42,6 @@
 //!   the consolidation.
 
 pub(crate) mod http;
-pub(crate) mod retry;
 pub(crate) mod validate_cache;
 pub(crate) mod ws;
 
@@ -695,21 +694,273 @@ fn build_generic_exhausted_failure(req: &Request, max_attempts: u32) -> Pipeline
 /// Returns a connected [`tokio_tungstenite::WebSocketStream`] on
 /// success.
 ///
-/// # Status — Step 1 stub
+/// # Implementation notes (Step 6)
 ///
-/// Body is `unimplemented!()`; Step 6 of the transport-consolidation
-/// plan implements it.  Step 7 migrates the realtime modules to
-/// call this function.
+/// Uses the same connection-retry schedule as [`http_request`]
+/// ([`CONNECTION_BUDGETS_SECS`]), wrapping each
+/// [`tokio_tungstenite::connect_async`] attempt in
+/// `tokio::time::timeout(connect_budget)` so a hung TCP SYN does
+/// not block beyond the budget for that attempt.
+///
+/// WebSocket upgrades have no "data retry" concept — once the
+/// upgrade succeeds, the caller drives the WS frame loop and
+/// any transient frame error is its concern (typically end of
+/// session).  Only connection-phase retries apply.
+///
+/// `req.body` must be [`RequestBody::Empty`] — the WS upgrade
+/// handshake is a `GET` with `Connection: Upgrade` headers and
+/// no body.  Any other body shape returns a `Decode` failure.
 pub async fn ws_upgrade(
-    _req: Request,
-    _sink: &Arc<dyn TelemetrySink>,
-    _cancel: CancellationToken,
+    req: Request,
+    sink: &Arc<dyn TelemetrySink>,
+    cancel: CancellationToken,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     PipelineFailure,
 > {
-    unimplemented!(
-        "transport::ws_upgrade is a Step-1 stub; Step 6 of the \
-         transport-consolidation plan will implement it"
-    )
+    let max_connection_attempts = CONNECTION_BUDGETS_SECS.len() as u32;
+    let mut last_failure: Option<PipelineFailure> = None;
+
+    if !matches!(req.body, RequestBody::Empty) {
+        return Err(PipelineFailure::new(
+            req.provider_name.clone(),
+            req.phase,
+            1,
+            1,
+            req.url.clone(),
+            PipelineFailureKind::Decode(
+                "transport::ws_upgrade: only RequestBody::Empty is supported \
+                 (a WebSocket upgrade handshake carries no body)"
+                    .into(),
+            ),
+        ));
+    }
+
+    sink.emit(TranscriptionEvent::RequestStarted {
+        endpoint: req.url.clone(),
+        t: Instant::now(),
+    });
+
+    for (idx, &budget_secs) in CONNECTION_BUDGETS_SECS.iter().enumerate() {
+        let connect_budget = Duration::from_secs(budget_secs);
+        let attempt_num = (idx as u32) + 1;
+
+        // Retry telemetry on attempts past the first.
+        if idx > 0 {
+            let reason = last_failure
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "ws connection failed".into());
+            sink.emit(TranscriptionEvent::RetryScheduled {
+                attempt: idx as u32,
+                max: max_connection_attempts.saturating_sub(1),
+                reason,
+                t: Instant::now(),
+            });
+        }
+
+        if cancel.is_cancelled() {
+            let pf = build_cancellation_failure(&req, attempt_num, max_connection_attempts);
+            sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
+            return Err(pf);
+        }
+
+        match run_single_ws_attempt(
+            &req,
+            connect_budget,
+            &cancel,
+            attempt_num,
+            max_connection_attempts,
+        )
+        .await
+        {
+            WsAttempt::Success(stream) => {
+                sink.emit(TranscriptionEvent::ConnectionEstablished { t: Instant::now() });
+                sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: true,
+                    t: Instant::now(),
+                });
+                return Ok(stream);
+            }
+            WsAttempt::Cancelled(pf) => {
+                sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                return Err(pf);
+            }
+            WsAttempt::ConnectionRetryable(pf) => {
+                last_failure = Some(pf);
+                continue;
+            }
+            WsAttempt::Permanent(pf) => {
+                sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                return Err(pf);
+            }
+        }
+    }
+
+    sink.emit(TranscriptionEvent::RequestCompleted {
+        success: false,
+        t: Instant::now(),
+    });
+    Err(last_failure
+        .unwrap_or_else(|| build_generic_exhausted_failure(&req, max_connection_attempts)))
+}
+
+/// Outcome of a single WebSocket upgrade attempt.
+enum WsAttempt {
+    Success(
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ),
+    Cancelled(PipelineFailure),
+    ConnectionRetryable(PipelineFailure),
+    Permanent(PipelineFailure),
+}
+
+/// Issue one WebSocket upgrade attempt against `req.url`, applying
+/// `req.headers` to the handshake and `connect_budget` as an outer
+/// wall-clock cap.
+async fn run_single_ws_attempt(
+    req: &Request,
+    connect_budget: Duration,
+    cancel: &CancellationToken,
+    attempt_num: u32,
+    max_attempts: u32,
+) -> WsAttempt {
+    // Parse URL for the Host header (tungstenite needs it
+    // explicitly when we build a custom Request).
+    let parsed = match url::Url::parse(&req.url) {
+        Ok(u) => u,
+        Err(e) => {
+            return WsAttempt::Permanent(PipelineFailure::new(
+                req.provider_name.clone(),
+                req.phase,
+                attempt_num,
+                max_attempts,
+                req.url.clone(),
+                PipelineFailureKind::Decode(format!("invalid WebSocket URL: {}", e)),
+            ));
+        }
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h.to_string(),
+        None => {
+            return WsAttempt::Permanent(PipelineFailure::new(
+                req.provider_name.clone(),
+                req.phase,
+                attempt_num,
+                max_attempts,
+                req.url.clone(),
+                PipelineFailureKind::Decode("WebSocket URL is missing a host component".into()),
+            ));
+        }
+    };
+
+    // Build the upgrade request.  Caller-supplied headers are
+    // applied verbatim AFTER the mandatory upgrade machinery so
+    // the caller can override anything (rare; typically just
+    // adds Authorization).
+    let mut builder = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(&req.url)
+        .header("Host", &host)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header(
+            "Sec-WebSocket-Key",
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        );
+    for (name, value) in &req.headers {
+        builder = builder.header(name, value);
+    }
+    let request = match builder.body(()) {
+        Ok(r) => r,
+        Err(e) => {
+            return WsAttempt::Permanent(PipelineFailure::new(
+                req.provider_name.clone(),
+                req.phase,
+                attempt_num,
+                max_attempts,
+                req.url.clone(),
+                PipelineFailureKind::Decode(format!("WebSocket request build failed: {}", e)),
+            ));
+        }
+    };
+
+    let connect_fut = tokio_tungstenite::connect_async(request);
+    let capped = tokio::time::timeout(connect_budget, connect_fut);
+
+    let outcome = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return WsAttempt::Cancelled(build_cancellation_failure(
+                req, attempt_num, max_attempts,
+            ));
+        }
+        result = capped => result,
+    };
+
+    match outcome {
+        Err(_elapsed) => WsAttempt::ConnectionRetryable(PipelineFailure::new(
+            req.provider_name.clone(),
+            req.phase,
+            attempt_num,
+            max_attempts,
+            req.url.clone(),
+            PipelineFailureKind::Network {
+                kind: NetworkKind::Connect,
+                timer: Some(TimerLabel::from_duration("connect_timeout", connect_budget)),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "WebSocket upgrade did not complete within {}s",
+                        connect_budget.as_secs()
+                    ),
+                )),
+            },
+        )),
+        Ok(Ok((stream, _response))) => WsAttempt::Success(stream),
+        Ok(Err(err)) => {
+            // tungstenite errors: classify into connect-retryable
+            // (network / IO / TLS) vs permanent (HTTP 4xx, protocol
+            // violation, decode).
+            let is_connect_class = matches!(
+                err,
+                tokio_tungstenite::tungstenite::Error::Io(_)
+                    | tokio_tungstenite::tungstenite::Error::Tls(_)
+                    | tokio_tungstenite::tungstenite::Error::ConnectionClosed
+                    | tokio_tungstenite::tungstenite::Error::AlreadyClosed
+            );
+            let pf = PipelineFailure::new(
+                req.provider_name.clone(),
+                req.phase,
+                attempt_num,
+                max_attempts,
+                req.url.clone(),
+                PipelineFailureKind::Network {
+                    kind: if is_connect_class {
+                        NetworkKind::Connect
+                    } else {
+                        NetworkKind::Other
+                    },
+                    timer: Some(TimerLabel::from_duration("connect_timeout", connect_budget)),
+                    source: Box::new(std::io::Error::other(err.to_string())),
+                },
+            );
+            if is_connect_class {
+                WsAttempt::ConnectionRetryable(pf)
+            } else {
+                WsAttempt::Permanent(pf)
+            }
+        }
+    }
 }
