@@ -1059,6 +1059,14 @@ pub(super) async fn pick_with_streaming_gtk(
         // Placed in the leading slot of the row's hbox — same
         // position on every row; icon toggles between "T" (no
         // transcription yet) and "↻" (retry existing result).
+        //
+        // The button captures the row's `is_primary` flag in
+        // addition to (provider, model, streaming) so the click
+        // handler resolves to THIS row even when a non-primary
+        // candidate above shares the same (provider, model,
+        // streaming) tuple (e.g. a cached primary entry plus a
+        // deferred candidate for the same model — clicking T on
+        // the deferred row would otherwise spin the primary row).
         let make_action_button = {
             let retry_tx = retry_tx.clone();
             let cells_for_btn = Rc::clone(&transcript_cells);
@@ -1068,7 +1076,11 @@ pub(super) async fn pick_with_streaming_gtk(
             let deferred_for_btn = Rc::clone(&deferred_indices);
             let buttons_for_btn = Rc::clone(&action_buttons);
             let has_tx_for_btn = Rc::clone(&has_transcription);
-            move |provider: Provider, model: String, streaming: bool| -> gtk4::Button {
+            move |provider: Provider,
+                  model: String,
+                  streaming: bool,
+                  is_primary_row: bool|
+                  -> gtk4::Button {
                 let btn = gtk4::Button::with_label("T");
                 btn.set_tooltip_text(Some("Transcribe with this model"));
                 btn.add_css_class("action-btn");
@@ -1106,8 +1118,11 @@ pub(super) async fn pick_with_streaming_gtk(
 
                         let idx = {
                             let cands = cands_ref.borrow();
-                            cands.iter().position(|(p, m, _, _, _, s, _, _)| {
-                                *p == provider && *m == model && *s == streaming
+                            cands.iter().position(|(p, m, _, prim, _, s, _, _)| {
+                                *p == provider
+                                    && *m == model
+                                    && *s == streaming
+                                    && *prim == is_primary_row
                             })
                         };
                         let Some(idx) = idx else {
@@ -1221,7 +1236,7 @@ pub(super) async fn pick_with_streaming_gtk(
             // "↻" (retry an existing one), and "✕" (stop an
             // in-flight request).  Always sensitive — in-flight
             // rows route the click to SIGUSR1.
-            let action_btn = make_action_button(*provider, model.clone(), *streaming);
+            let action_btn = make_action_button(*provider, model.clone(), *streaming, is_primary);
             match kind {
                 RowKind::PendingBatch | RowKind::PendingRealtime => {
                     action_btn.set_sensitive(true);

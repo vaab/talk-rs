@@ -3308,6 +3308,7 @@ mod tests {
     fn phase_advance_retry_during_validating_stays_validating() {
         use std::time::Instant;
         let after = Phase::Validating.advance(&TranscriptionEvent::RetryScheduled {
+            kind: crate::telemetry::RetryKind::Connection,
             attempt: 2,
             max: 5,
             reason: "timeout".into(),
@@ -3323,6 +3324,7 @@ mod tests {
     fn phase_advance_retry_outside_validating_returns_to_connecting() {
         use std::time::Instant;
         let after = Phase::Receiving.advance(&TranscriptionEvent::RetryScheduled {
+            kind: crate::telemetry::RetryKind::Connection,
             attempt: 2,
             max: 5,
             reason: "timeout".into(),

@@ -306,6 +306,7 @@ pub async fn http_request(
                 .map(|f| f.to_string())
                 .unwrap_or_else(|| "connection failed".into());
             sink.emit(TranscriptionEvent::RetryScheduled {
+                kind: crate::telemetry::RetryKind::Connection,
                 attempt: idx as u32,
                 max: max_connection_attempts.saturating_sub(1),
                 reason,
@@ -364,6 +365,7 @@ pub async fn http_request(
                 }
                 let reason = pf.to_string();
                 sink.emit(TranscriptionEvent::RetryScheduled {
+                    kind: crate::telemetry::RetryKind::Data,
                     attempt: data_retries_used,
                     max: DATA_MAX_ATTEMPTS.saturating_sub(1),
                     reason,
@@ -752,6 +754,7 @@ pub async fn ws_upgrade(
                 .map(|f| f.to_string())
                 .unwrap_or_else(|| "ws connection failed".into());
             sink.emit(TranscriptionEvent::RetryScheduled {
+                kind: crate::telemetry::RetryKind::Connection,
                 attempt: idx as u32,
                 max: max_connection_attempts.saturating_sub(1),
                 reason,
