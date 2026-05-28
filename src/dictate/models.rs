@@ -38,7 +38,7 @@ pub(super) fn resolve_model(
                     .openai
                     .as_ref()
                     .map(|c| c.realtime_model.clone())
-                    .unwrap_or_else(|| "gpt-4o-mini-transcribe".to_string())
+                    .unwrap_or_else(|| "gpt-realtime-whisper".to_string())
             } else {
                 config
                     .providers
@@ -66,7 +66,14 @@ const MISTRAL_TRANSCRIPTION_MODELS: &[&str] = &["voxtral-mini-2507", "voxtral-mi
 const MISTRAL_REALTIME_MODELS: &[&str] = &["voxtral-mini-transcribe-realtime-2602"];
 
 /// Known OpenAI models that support realtime (WebSocket) transcription.
-const OPENAI_REALTIME_MODELS: &[&str] = &["gpt-4o-mini-transcribe", "gpt-4o-transcribe"];
+///
+/// After the 2026-02-27 Realtime API GA cutover, the historical
+/// list ``["gpt-4o-mini-transcribe", "gpt-4o-transcribe"]`` is
+/// no longer accepted by the GA endpoint — those names return
+/// ``invalid_model`` from the realtime transcription path.  The
+/// GA model for streaming transcription is
+/// ``"gpt-realtime-whisper"``.
+const OPENAI_REALTIME_MODELS: &[&str] = &["gpt-realtime-whisper"];
 
 /// Push all known realtime transcription models for `provider` into
 /// `out`.  The third element of each tuple is `true` (streaming).
