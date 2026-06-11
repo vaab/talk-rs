@@ -86,6 +86,10 @@ happening.
   speaking again (~--retry-last~).
 - *Recordings browser* -- ~record --ui~ opens a GTK4 window listing
   all recordings (OGG from ~output_dir~) and dictation cache (OGG).
+  Imported audio dropped into ~output_dir~ -- ~.m4a~, ~.mp4~, or
+  ~.aac~ (e.g. iPhone voice memos) -- is listed and playable
+  alongside native OGG recordings, with the same waterfall and
+  transcription workflow.
   Play, delete, open in the file manager, or transcribe on demand.
   A waterfall spectrogram is shown for every recording, even those
   without transcripts; sections auto-refresh via inotify when files
@@ -288,6 +292,7 @@ Transcribe an existing audio file:
 talk-rs transcribe recording.ogg                # print to stdout
 talk-rs transcribe recording.ogg output.txt     # write to file
 talk-rs transcribe recording.ogg --provider openai
+talk-rs transcribe voice-memo.m4a               # imported m4a also works
 #+end_src
 
 Options:
@@ -297,6 +302,25 @@ Options:
 | ~--provider~ | Choose ~mistral~ or ~openai~                 |
 | ~--model~    | Override model for this invocation            |
 | ~--diarize~  | Enable speaker diarization (tag by speaker)  |
+
+*** Supported input audio formats
+
+Commands that read audio from disk -- ~transcribe~,
+~dictate --input-audio-file~, ~dictate --retry-last~, and the
+~record --ui~ recordings browser -- accept the following formats:
+
+| Extension      | Container / codec  | How it is handled                                          |
+|----------------+--------------------+------------------------------------------------------------|
+| ~.ogg~         | Ogg Opus           | Native format written by ~talk-rs record~                  |
+| ~.m4a~ / ~.mp4~ | MP4 / AAC          | Decoded via [[https://github.com/pdeljanov/Symphonia][symphonia]]; ideal for iPhone voice memos and similar imports |
+| ~.aac~         | Raw AAC stream     | Decoded via symphonia                                      |
+| ~.wav~         | 16-bit PCM         | Decoded directly; primarily used for legacy cache entries |
+
+Imported files keep their original extension on upload, so the
+~transcribe~ command sends ~.m4a~ to the provider as-is -- both
+Mistral Voxtral and OpenAI Whisper accept these natively. Playback
+and waterfall spectrograms in the records browser work for every
+listed format.
 
 ** GNOME keyboard shortcut
 

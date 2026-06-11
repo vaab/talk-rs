@@ -43,6 +43,23 @@
 use std::time::Instant;
 use tokio::sync::broadcast;
 
+/// Distinguishes the two independently-budgeted retry concerns
+/// the transport tracks: connection-phase (DNS / TCP / TLS) and
+/// data-phase (server-side transient errors after the connection
+/// was established).  Carried on
+/// [`TranscriptionEvent::RetryScheduled`] so consumers can label
+/// `connect retry N/M` separately from `server retry N/M` instead
+/// of an ambiguous `retry N/M`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryKind {
+    /// Retry of the TCP / TLS / DNS connection phase.  Grows the
+    /// per-attempt connect budget on each retry.
+    Connection,
+    /// Retry after the connection was established and the server
+    /// returned a transient failure (5xx, decode error mid-body).
+    Data,
+}
+
 /// A single raw event from the transcription pipeline.
 ///
 /// Each variant represents one fact about what happened at a given
@@ -122,13 +139,35 @@ pub enum TranscriptionEvent {
 
     /// A retry attempt is being scheduled after a previous failure.
     /// `attempt` is 1-indexed (`1` for the first retry); `max` is
-    /// the configured maximum.
+    /// the configured maximum.  `kind` distinguishes the two
+    /// independently-budgeted retry concerns the transport tracks:
+    ///
+    /// - [`RetryKind::Connection`] — TCP / TLS / DNS retry with
+    ///   growing budget `[2, 5, 8, 11, 15]` seconds.  Picker UI
+    ///   should render as `connect retry N/M…`.
+    /// - [`RetryKind::Data`] — server returned a transient 5xx
+    ///   after the connection was established.  Picker UI should
+    ///   render as `server retry N/M…`.
     RetryScheduled {
+        kind: RetryKind,
         attempt: u32,
         max: u32,
         reason: String,
         t: Instant,
     },
+
+    /// Free-form status update for phases that do not map onto a
+    /// structured event (typically post-upgrade WS session
+    /// lifecycle: ``session handshake…``, ``session ready,
+    /// awaiting audio…``, ``streaming audio…``).
+    ///
+    /// Producers should emit this BEFORE any visible action that
+    /// would otherwise leave the UI silent.  Consumers (picker,
+    /// overlay) treat the string as the row's current status
+    /// label.  The message is replaced by the next structured
+    /// event (a fresh ``Status`` or, terminally, a transcript
+    /// text update).
+    Status { message: String, t: Instant },
 
     /// Paste phase started (keystroke / clipboard injection to the
     /// target application).
@@ -392,6 +431,7 @@ mod tests {
                 t: Instant::now(),
             },
             TranscriptionEvent::RetryScheduled {
+                kind: RetryKind::Connection,
                 attempt: 1,
                 max: 5,
                 reason: "timeout".to_string(),

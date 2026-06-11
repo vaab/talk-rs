@@ -158,7 +158,13 @@ pub struct OpenAIConfig {
     #[serde(default = "default_openai_model")]
     pub model: String,
 
-    /// Model name for realtime transcription (defaults to "gpt-4o-mini-transcribe").
+    /// Model name for realtime transcription (defaults to
+    /// ``"gpt-realtime-whisper"``).  The historical default,
+    /// ``"gpt-4o-mini-transcribe"``, was rejected by the GA
+    /// endpoint after the 2026-02-27 Realtime API GA cutover:
+    /// the server replies ``invalid_model``.  ``gpt-realtime-
+    /// whisper`` is the official transcription model for the GA
+    /// API.
     #[serde(default = "default_openai_realtime_model")]
     pub realtime_model: String,
 }
@@ -168,7 +174,7 @@ fn default_openai_model() -> String {
 }
 
 fn default_openai_realtime_model() -> String {
-    "gpt-4o-mini-transcribe".to_string()
+    "gpt-realtime-whisper".to_string()
 }
 
 /// Transcription defaults.

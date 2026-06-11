@@ -534,6 +534,20 @@ fn model_lock_path(
     Ok(dir.join(model_lock_filename(stem, provider, model, realtime)))
 }
 
+/// Public wrapper for [`model_lock_path`] used by
+/// [`crate::transcription::jobs`].  Exposes the lock-path
+/// computation so the jobs module can write the YAML payload at
+/// the same location the legacy `acquire_model_lock` would have
+/// used.
+pub fn model_lock_path_public(
+    audio_path: &Path,
+    provider: Provider,
+    model: &str,
+    realtime: bool,
+) -> Result<PathBuf, TalkError> {
+    model_lock_path(audio_path, provider, model, realtime)
+}
+
 /// Acquire the per-model lock for a (recording, provider, model, mode)
 /// tuple.  Returns `Err(TalkError::ModelInProgress)` if the lock is
 /// already held by another process.

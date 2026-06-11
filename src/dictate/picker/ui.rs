@@ -103,6 +103,12 @@ pub(super) enum PickerMessage {
     CandidateStatus {
         provider: Provider,
         model: String,
+        /// Whether this status is for the streaming (realtime) row
+        /// or the batch row.  Required for picker row disambiguation
+        /// when both rows exist for the same (provider, model) pair
+        /// — without this the status would race to whichever row
+        /// `position()` finds first.
+        streaming: bool,
         status_text: String,
     },
 }
@@ -1029,7 +1035,8 @@ pub(super) async fn pick_with_streaming_gtk(
         // Flip the action button's icon + tooltip based on whether the
         // row currently holds a (non-empty) transcript.  "T" means
         // "transcribe this (first time)"; "↻" means "retry / re-run
-        // the existing transcription".
+        // the existing transcription"; "✕" means "stop the in-flight
+        // request".
         fn set_action_icon(btn: &gtk4::Button, has_transcript: bool) {
             use gtk4::prelude::*;
             if has_transcript {
@@ -1041,12 +1048,31 @@ pub(super) async fn pick_with_streaming_gtk(
             }
         }
 
+        /// Flip the action button into Stop mode for the duration
+        /// of an in-flight request.  Click handlers for the row
+        /// dispatch on the current label to choose between
+        /// triggering a (re-)transcription and cancelling the
+        /// in-flight one.
+        fn set_action_icon_stop(btn: &gtk4::Button) {
+            use gtk4::prelude::*;
+            btn.set_label("✕");
+            btn.set_tooltip_text(Some("Stop in-flight transcription"));
+        }
+
         // Helper: build the unified action button for a given row.
         // Wires a click handler that resets the row to pending and
         // sends a (provider, model, streaming) on the retry channel.
         // Placed in the leading slot of the row's hbox — same
         // position on every row; icon toggles between "T" (no
         // transcription yet) and "↻" (retry existing result).
+        //
+        // The button captures the row's `is_primary` flag in
+        // addition to (provider, model, streaming) so the click
+        // handler resolves to THIS row even when a non-primary
+        // candidate above shares the same (provider, model,
+        // streaming) tuple (e.g. a cached primary entry plus a
+        // deferred candidate for the same model — clicking T on
+        // the deferred row would otherwise spin the primary row).
         let make_action_button = {
             let retry_tx = retry_tx.clone();
             let cells_for_btn = Rc::clone(&transcript_cells);
@@ -1056,7 +1082,12 @@ pub(super) async fn pick_with_streaming_gtk(
             let deferred_for_btn = Rc::clone(&deferred_indices);
             let buttons_for_btn = Rc::clone(&action_buttons);
             let has_tx_for_btn = Rc::clone(&has_transcription);
-            move |provider: Provider, model: String, streaming: bool| -> gtk4::Button {
+            move |provider: Provider,
+                  model: String,
+                  streaming: bool,
+                  is_primary_row: bool,
+                  row_idx_at_create: usize|
+                  -> gtk4::Button {
                 let btn = gtk4::Button::with_label("T");
                 btn.set_tooltip_text(Some("Transcribe with this model"));
                 btn.add_css_class("action-btn");
@@ -1071,12 +1102,38 @@ pub(super) async fn pick_with_streaming_gtk(
                     let buttons_ref = Rc::clone(&buttons_for_btn);
                     let has_tx_ref = Rc::clone(&has_tx_for_btn);
                     btn.connect_clicked(move |clicked| {
+                        use gtk4::prelude::*;
+                        log::debug!(
+                            "picker click: provider={} model={} streaming={} is_primary={} row_idx_at_create={}",
+                            provider, model, streaming, is_primary_row, row_idx_at_create,
+                        );
+
+                        // Stop mode: route the click to SIGUSR1 on
+                        // our own PID, which fans out via the
+                        // `jobs` SIGUSR1 handler to every
+                        // registered in-flight token.
+                        if clicked.label().as_deref() == Some("✕") {
+                            use nix::sys::signal::{kill, Signal};
+                            use nix::unistd::Pid;
+                            let pid = Pid::from_raw(std::process::id() as i32);
+                            if let Err(e) = kill(pid, Signal::SIGUSR1) {
+                                log::warn!("picker: failed to send SIGUSR1: {}", e);
+                            } else {
+                                log::info!("picker: Stop clicked, SIGUSR1 sent");
+                            }
+                            return;
+                        }
+
                         let idx = {
                             let cands = cands_ref.borrow();
-                            cands.iter().position(|(p, m, _, _, _, s, _, _)| {
-                                *p == provider && *m == model && *s == streaming
+                            cands.iter().position(|(p, m, _, prim, _, s, _, _)| {
+                                *p == provider
+                                    && *m == model
+                                    && *s == streaming
+                                    && *prim == is_primary_row
                             })
                         };
+                        log::debug!("picker click resolved idx={:?}", idx);
                         let Some(idx) = idx else {
                             return;
                         };
@@ -1095,8 +1152,6 @@ pub(super) async fn pick_with_streaming_gtk(
                         }
                         raw_ref.borrow_mut()[idx] = String::new();
                         deferred_ref.borrow_mut().remove(&idx);
-                        // Row no longer holds a transcription until a
-                        // new result arrives.
                         if let Some(flag) = has_tx_ref.borrow_mut().get_mut(idx) {
                             *flag = false;
                         }
@@ -1122,18 +1177,13 @@ pub(super) async fn pick_with_streaming_gtk(
                             }
                         }
 
-                        // Disable the clicked button while in flight
-                        // and flip the icon back to "T" — the row no
-                        // longer has a transcript.  The poll loop
-                        // re-enables + re-flips it when the result
-                        // (or error) arrives.  Also keep `buttons_ref`
-                        // consistent so spinner-to-result transitions
-                        // find the right handle.
-                        clicked.set_sensitive(false);
-                        set_action_icon(clicked, false);
+                        // Flip the action button to Stop mode for
+                        // the duration of the in-flight request.
+                        // The poll loop flips it back to T / ↻
+                        // when the result (or error) arrives.
+                        set_action_icon_stop(clicked);
                         if let Some(btn) = buttons_ref.borrow().get(idx) {
-                            btn.set_sensitive(false);
-                            set_action_icon(btn, false);
+                            set_action_icon_stop(btn);
                         }
 
                         let _ = tx.send((provider, model.clone(), streaming));
@@ -1191,14 +1241,16 @@ pub(super) async fn pick_with_streaming_gtk(
             };
 
             // Unified action button: always present, same position
-            // (leftmost), icon toggles between "T" (no transcript)
-            // and "↻" (retry an existing one).  Sensitive only when
-            // idle (not in flight).
-            let action_btn = make_action_button(*provider, model.clone(), *streaming);
+            // (leftmost), icon toggles between "T" (no transcript),
+            // "↻" (retry an existing one), and "✕" (stop an
+            // in-flight request).  Always sensitive — in-flight
+            // rows route the click to SIGUSR1.
+            let action_btn =
+                make_action_button(*provider, model.clone(), *streaming, is_primary, row_idx);
             match kind {
                 RowKind::PendingBatch | RowKind::PendingRealtime => {
-                    action_btn.set_sensitive(false);
-                    set_action_icon(&action_btn, false);
+                    action_btn.set_sensitive(true);
+                    set_action_icon_stop(&action_btn);
                 }
                 RowKind::Cached { text, .. } => {
                     action_btn.set_sensitive(true);
@@ -1749,17 +1801,20 @@ pub(super) async fn pick_with_streaming_gtk(
                         Ok(PickerMessage::CandidateStatus {
                             provider,
                             model,
+                            streaming,
                             status_text,
                         }) => {
-                            // Find the row by (provider, model) — only
-                            // batch rows ever receive `CandidateStatus`,
-                            // and we explicitly match the non-streaming
-                            // row to avoid colliding with a parallel
-                            // realtime row of the same provider/model.
+                            // Match on (provider, model, streaming).
+                            // Step 10 of the transport-consolidation
+                            // plan wired the realtime path's sink so
+                            // both batch AND realtime rows receive
+                            // status updates; the `streaming` flag
+                            // disambiguates them when both rows exist
+                            // for the same (provider, model) pair.
                             let idx = {
                                 let cands = cands.borrow();
                                 cands.iter().position(|(p, m, _, _, _, s, _, _)| {
-                                    *p == provider && *m == model && !*s
+                                    *p == provider && *m == model && *s == streaming
                                 })
                             };
                             if let Some(idx) = idx {
@@ -1936,7 +1991,14 @@ pub(super) async fn pick_with_streaming_gtk(
                 ))));
                 return;
             };
-            run_realtime_transcription(transcriber, samples, tx, provider, model).await;
+            // The cancel token is fresh per spawn site; the picker
+            // GTK Stop button (Step 12b — follow-up) will wire a
+            // per-row token via a message channel.  For now the
+            // transport layer accepts the token and respects it,
+            // unlocking cross-process cancellation via the jobs
+            // module (see also `picker/mod.rs::register_local`).
+            let cancel = tokio_util::sync::CancellationToken::new();
+            run_realtime_transcription(transcriber, samples, tx, provider, model, cancel).await;
         });
     }
 
@@ -1955,6 +2017,7 @@ pub(super) async fn pick_with_streaming_gtk(
                     provider,
                     model,
                     config.clone(),
+                    tokio_util::sync::CancellationToken::new(),
                 );
             }
             drop(tx);
@@ -2000,12 +2063,14 @@ pub(super) async fn pick_with_streaming_gtk(
                             let tx = tx.clone();
                             let model_clone = model.clone();
                             tokio::spawn(async move {
+                                let cancel = tokio_util::sync::CancellationToken::new();
                                 run_realtime_transcription(
                                     transcriber,
                                     samples,
                                     tx,
                                     provider,
                                     model_clone,
+                                    cancel,
                                 )
                                 .await;
                             });
@@ -2031,6 +2096,7 @@ pub(super) async fn pick_with_streaming_gtk(
                         provider,
                         model,
                         config.clone(),
+                        tokio_util::sync::CancellationToken::new(),
                     );
                     while (tasks.join_next().await).is_some() {}
                 }

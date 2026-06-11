@@ -120,6 +120,8 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
             transcription::TranscribeOptions {
                 allow_api: false,
                 policy: transcription::RequestTimeoutPolicy::Proportional,
+                cancel_token: None,
+                skip_legacy_lock: false,
             },
             &sink,
         )

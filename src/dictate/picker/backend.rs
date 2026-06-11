@@ -56,22 +56,30 @@ pub(super) struct PickerStatusSink {
     tx: std::sync::mpsc::Sender<PickerMessage>,
     provider: Provider,
     model: String,
+    /// Whether this sink belongs to the streaming (realtime) row or
+    /// the batch row.  Carried on every emitted
+    /// [`PickerMessage::CandidateStatus`] so the picker UI's
+    /// row-matcher can disambiguate when both rows exist for the
+    /// same (provider, model) pair.
+    streaming: bool,
     last: Mutex<Option<String>>,
 }
 
 impl PickerStatusSink {
     /// Build a new sink for the given candidate row.  `tx` is the
-    /// shared GTK channel; `provider`/`model` identify which row
-    /// the status updates belong to.
+    /// shared GTK channel; `provider`/`model`/`streaming` identify
+    /// which row the status updates belong to.
     pub(super) fn new(
         tx: std::sync::mpsc::Sender<PickerMessage>,
         provider: Provider,
         model: String,
+        streaming: bool,
     ) -> Self {
         Self {
             tx,
             provider,
             model,
+            streaming,
             last: Mutex::new(None),
         }
     }
@@ -80,11 +88,6 @@ impl PickerStatusSink {
     /// against the last emitted string.  Errors on a closed channel
     /// are silently dropped — the picker may have already closed.
     fn push(&self, status_text: String) {
-        // Lock guard: identical-string dedup.  If the string is
-        // unchanged, do nothing.  Errors locking the mutex (e.g.
-        // poisoning from a panicking peer) fall through to a
-        // best-effort send — losing a single status update is
-        // strictly better than panicking the producer.
         if let Ok(mut last) = self.last.lock() {
             if last.as_deref() == Some(status_text.as_str()) {
                 return;
@@ -94,6 +97,7 @@ impl PickerStatusSink {
         let _ = self.tx.send(PickerMessage::CandidateStatus {
             provider: self.provider,
             model: self.model.clone(),
+            streaming: self.streaming,
             status_text,
         });
     }
@@ -115,9 +119,22 @@ impl TelemetrySink for PickerStatusSink {
             PipelineEvent::ResponseHeaders { status, .. } if (200..300).contains(&status) => {
                 self.push("transcribing…".to_string())
             }
-            PipelineEvent::RetryScheduled { attempt, max, .. } => {
-                self.push(format!("retry {}/{}…", attempt, max))
+            PipelineEvent::RetryScheduled {
+                kind, attempt, max, ..
+            } => {
+                let label = match kind {
+                    crate::telemetry::RetryKind::Connection => "connect retry",
+                    crate::telemetry::RetryKind::Data => "server retry",
+                };
+                self.push(format!("{} {}/{}…", label, attempt, max))
             }
+            // Free-form status: pass the producer's message
+            // through verbatim.  Used by the realtime path for
+            // post-upgrade phases that have no structured event
+            // (session handshake, awaiting audio, etc.) — see
+            // `realtime.rs` / `openai_realtime.rs` for emission
+            // sites.
+            PipelineEvent::Status { message, .. } => self.push(message),
             // All other events (progress, paste, terminal events,
             // non-2xx response headers) are dropped — phase
             // transitions + retry attempts only.
@@ -137,13 +154,31 @@ const REALTIME_FEED_CHUNK: usize = 480;
 /// On success the final text is sent as a [`PickerMessage::Candidate`];
 /// on error an error candidate is sent instead.  Intermediate text
 /// updates are forwarded as [`PickerMessage::StreamUpdate`].
+///
+/// Before connecting, attaches a [`PickerStatusSink`] to the
+/// transcriber so the WS-upgrade phase (and its growing-budget
+/// retries) reach the row's status column.  Without this hop, the
+/// row would sit in an empty spinner state for up to 41s before
+/// the transport surfaces a connection error — see plan section
+/// Step 8 for the diagnosis.
 pub(super) async fn run_realtime_transcription(
-    transcriber: Box<dyn RealtimeTranscriber>,
+    mut transcriber: Box<dyn RealtimeTranscriber>,
     samples: std::sync::Arc<Vec<i16>>,
     tx: std::sync::mpsc::Sender<PickerMessage>,
     provider: Provider,
     model: String,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) {
+    // Attach the row's status sink BEFORE the WS upgrade so
+    // connecting / retry events reach the UI.  `streaming=true`
+    // tags every emitted `CandidateStatus` so the picker matches
+    // the realtime row, not the batch row of the same model.
+    let status_sink: std::sync::Arc<dyn TelemetrySink> = std::sync::Arc::new(
+        PickerStatusSink::new(tx.clone(), provider, model.clone(), true),
+    );
+    transcriber.set_sink(status_sink);
+    transcriber.set_cancel_token(cancel_token);
+
     // Connect to the realtime WebSocket.
     let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
     let event_rx = match transcriber.transcribe_realtime(audio_rx).await {
@@ -287,10 +322,40 @@ pub(super) fn spawn_transcription(
     provider: Provider,
     model: String,
     config: std::sync::Arc<Config>,
+    _ignored_cancel: tokio_util::sync::CancellationToken,
 ) {
-    let sink: std::sync::Arc<dyn TelemetrySink> =
-        std::sync::Arc::new(PickerStatusSink::new(tx.clone(), provider, model.clone()));
+    // `streaming=false` tags this sink for the batch row.
+    let sink: std::sync::Arc<dyn TelemetrySink> = std::sync::Arc::new(PickerStatusSink::new(
+        tx.clone(),
+        provider,
+        model.clone(),
+        false,
+    ));
     tasks.spawn(async move {
+        // Register this in-flight transcription with the jobs
+        // module.  This (a) writes a YAML lock file describing
+        // us so another talk-rs process can cancel us via
+        // `cancel_remote`, and (b) installs a SIGUSR1 handler
+        // that fires `local_job.cancel_token()` when a Stop
+        // button click in the picker GTK sends SIGUSR1 to our
+        // own PID.
+        let local_job =
+            match crate::transcription::jobs::register_local(&audio, provider, &model, false) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    log::warn!(
+                        "picker: failed to register job for {}:{}: {}",
+                        provider,
+                        model,
+                        e
+                    );
+                    None
+                }
+            };
+        let cancel_token = local_job
+            .as_ref()
+            .map(|j| j.cancel_token())
+            .unwrap_or_default();
         let msg = match crate::transcription::transcribe_audio(
             &audio,
             config.as_ref(),
@@ -300,6 +365,12 @@ pub(super) fn spawn_transcription(
             crate::transcription::TranscribeOptions {
                 allow_api: true,
                 policy: crate::transcription::RequestTimeoutPolicy::UserAttended,
+                cancel_token: Some(cancel_token),
+                // We registered via `register_local` above, which
+                // wrote the lock file with the YAML payload.
+                // `transcribe_audio` must not race us on the same
+                // file path.
+                skip_legacy_lock: local_job.is_some(),
             },
             &sink,
         )
@@ -326,6 +397,11 @@ pub(super) fn spawn_transcription(
                 )))
             }
         };
+        // Drop the LocalJob explicitly so the lock file is
+        // removed before we ack the result.  Without this,
+        // an immediate retry would race against the still-held
+        // lock.
+        drop(local_job);
         let _ = tx.send(msg);
     });
 }
@@ -348,6 +424,7 @@ mod tests {
                     provider,
                     model,
                     status_text,
+                    ..
                 } => Some((provider, model, status_text)),
                 _ => None,
             });
@@ -362,7 +439,12 @@ mod tests {
     #[test]
     fn picker_status_sink_translates_phase_transitions() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral-mini-2602".to_string());
+        let sink = PickerStatusSink::new(
+            tx,
+            Provider::Mistral,
+            "voxtral-mini-2602".to_string(),
+            false,
+        );
 
         let now = Instant::now();
         // Cache-miss path: preflight events come first.
@@ -436,7 +518,7 @@ mod tests {
     #[test]
     fn picker_status_sink_cache_hit_starts_at_connecting() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string(), false);
 
         let now = Instant::now();
         // No PreflightStarted / PreflightCompleted — cache hit.
@@ -478,7 +560,7 @@ mod tests {
     #[test]
     fn picker_status_sink_preflight_completed_is_silent() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string(), false);
 
         let now = Instant::now();
         sink.emit(PipelineEvent::PreflightStarted { t: now });
@@ -508,7 +590,7 @@ mod tests {
     #[test]
     fn picker_status_sink_dedups_repeated_phase() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string(), false);
 
         let now = Instant::now();
         sink.emit(PipelineEvent::RequestStarted {
@@ -529,24 +611,34 @@ mod tests {
     }
 
     /// Spec: retry events surface attempt/max in the status string,
-    /// in `retry N/M…` form.
+    /// in `connect retry N/M…` / `server retry N/M…` form.
     #[test]
     fn picker_status_sink_formats_retry_attempts() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::OpenAI, "whisper-1".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::OpenAI, "whisper-1".to_string(), false);
 
         let now = Instant::now();
         sink.emit(PipelineEvent::RetryScheduled {
+            kind: crate::telemetry::RetryKind::Connection,
             attempt: 2,
             max: 5,
             reason: "transient".into(),
             t: now,
         });
+        sink.emit(PipelineEvent::RetryScheduled {
+            kind: crate::telemetry::RetryKind::Data,
+            attempt: 1,
+            max: 3,
+            reason: "5xx".into(),
+            t: now,
+        });
 
         let drained = drain_status(&rx);
-        assert_eq!(drained.len(), 1);
-        let (_, _, s) = drained[0].as_ref().expect("status message");
-        assert_eq!(s, "retry 2/5…");
+        let strings: Vec<&str> = drained
+            .iter()
+            .filter_map(|o| o.as_ref().map(|(_, _, s)| s.as_str()))
+            .collect();
+        assert_eq!(strings, vec!["connect retry 2/5…", "server retry 1/3…"]);
     }
 
     /// Spec: non-2xx response headers do NOT produce a
@@ -556,7 +648,7 @@ mod tests {
     #[test]
     fn picker_status_sink_drops_non_2xx_response_headers() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string());
+        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral".to_string(), false);
 
         let now = Instant::now();
         sink.emit(PipelineEvent::ResponseHeaders {
@@ -582,7 +674,12 @@ mod tests {
     #[test]
     fn picker_status_sink_preserves_row_identity() {
         let (tx, rx) = std::sync::mpsc::channel::<PickerMessage>();
-        let sink = PickerStatusSink::new(tx, Provider::Mistral, "voxtral-mini-2602".to_string());
+        let sink = PickerStatusSink::new(
+            tx,
+            Provider::Mistral,
+            "voxtral-mini-2602".to_string(),
+            false,
+        );
 
         let now = Instant::now();
         sink.emit(PipelineEvent::RequestStarted {
