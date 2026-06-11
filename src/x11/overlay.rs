@@ -2031,8 +2031,20 @@ fn overlay_thread(
         // A dead or missing audio device produces perfectly uniform
         // samples (e.g. constant -1.0 or all zeros) with variance ≈ 0.
         // A real microphone always has random noise (variance > 1e-10).
+        //
+        // IMPORTANT: when auto-pause is active (`auto_paused == true`),
+        // the recording pipeline is paused and the ring buffer is not
+        // being fed fresh audio data.  This produces a stale buffer
+        // with variance ≈ 0, which would falsely trigger the dead-signal
+        // detector and create an oscillation cycle:
+        //   auto-pause → dead-signal → resume → auto-pause → ...
+        // We therefore skip dead-signal detection while auto-paused.
         let was_no_sound = no_sound_active;
-        if frame_variance < DEAD_SIGNAL_VARIANCE_CEIL {
+        if auto_paused {
+            dead_signal_frames = 0;
+            no_sound_active = false;
+            silence_notified = false;
+        } else if frame_variance < DEAD_SIGNAL_VARIANCE_CEIL {
             dead_signal_frames = dead_signal_frames.saturating_add(1);
         } else {
             if no_sound_active {
@@ -3471,5 +3483,164 @@ mod tests {
     /// environments without DejaVu / Liberation / Noto).
     fn decode_font_or_skip() -> Option<fontdue::Font> {
         super::super::render_util::load_system_font(RETRY_COUNTER_FONT_SIZE)
+    }
+
+    // ── Dead-signal / auto-pause interaction ──────────────────────────
+
+    /// Simulate the dead-signal + auto-pause state machine over a
+    /// series of render frames.  Replicates the logic from
+    /// `overlay_thread` (lines ~2034–2141) so we can unit-test the
+    /// interaction between the two detectors without an X11 display.
+    ///
+    /// Returns a list of `(no_sound_active, auto_paused)` after each
+    /// frame — used to detect the oscillation cycle where auto-pause
+    /// triggers dead-signal, which resets auto-pause, which resumes
+    /// audio, which clears dead-signal, which lets auto-pause trigger
+    /// again.
+    fn simulate_audio_monitor(
+        auto_pause_enabled: bool,
+        frames: &[(f32, f32)], // (rms, variance) per frame
+    ) -> Vec<(bool, bool)> {
+        const DEAD_SIGNAL_VARIANCE_CEIL: f32 = 1e-10;
+        const DEAD_SIGNAL_TRIGGER_FRAMES: u32 = 30;
+        const AUTOPAUSE_RMS_THRESHOLD: f32 = 0.003;
+        const AUTOPAUSE_TRIGGER_FRAMES: u32 = 15;
+
+        let mut dead_signal_frames: u32 = 0;
+        let mut no_sound_active: bool = false;
+        let mut auto_paused: bool = false;
+        let mut quiet_frames: u32 = 0;
+
+        let mut results = Vec::with_capacity(frames.len());
+
+        for &(frame_rms, frame_variance) in frames {
+            // ── Dead-signal detection ──
+            // When auto-pause is already active, skip dead-signal
+            // detection: the paused pipeline creates stale ring-buffer
+            // data (variance ≈ 0), which would falsely trigger the
+            // dead-signal detector and create an oscillation cycle:
+            //   auto-pause → dead-signal → resume → auto-pause → ...
+            if auto_paused {
+                dead_signal_frames = 0;
+                no_sound_active = false;
+            } else if frame_variance < DEAD_SIGNAL_VARIANCE_CEIL {
+                dead_signal_frames = dead_signal_frames.saturating_add(1);
+            } else {
+                dead_signal_frames = 0;
+                no_sound_active = false;
+            }
+            if dead_signal_frames >= DEAD_SIGNAL_TRIGGER_FRAMES {
+                no_sound_active = true;
+            }
+
+            // ── Auto-pause detection ──
+            if auto_pause_enabled && !no_sound_active {
+                if frame_rms < AUTOPAUSE_RMS_THRESHOLD {
+                    quiet_frames = quiet_frames.saturating_add(1);
+                } else {
+                    quiet_frames = 0;
+                    auto_paused = false;
+                }
+                if quiet_frames >= AUTOPAUSE_TRIGGER_FRAMES && !auto_paused {
+                    auto_paused = true;
+                }
+            } else if !auto_pause_enabled {
+                quiet_frames = 0;
+            } else {
+                // Dead signal takes priority — reset auto-pause state.
+                quiet_frames = 0;
+                auto_paused = false;
+            }
+
+            results.push((no_sound_active, auto_paused));
+        }
+
+        results
+    }
+
+    #[test]
+    fn auto_pause_oscillates_with_dead_signal() {
+        // Simulate a user who has stopped speaking: the mic produces
+        // near-zero audio (low RMS → triggers auto-pause) and the
+        // paused pipeline produces stale ring-buffer data (zero variance
+        // → triggers dead-signal detector).
+        //
+        // With the bug, dead-signal fires 30 frames after auto-pause,
+        // which resets auto-pause, which resumes the pipeline, which
+        // clears dead-signal — then the cycle repeats.
+        //
+        // With the fix, dead-signal is suppressed while auto_paused is
+        // true, so the cycle never starts.
+
+        let mut results = simulate_audio_monitor(
+            true, // auto-pause enabled
+            &[(0.00001, 0.0); 100], // 100 frames of silence + zero variance
+        );
+
+        // Track oscillation: count how many times no_sound toggles on.
+        let mut dead_signal_ons = 0;
+        let mut prev_no_sound = false;
+        for &(no_sound, _) in &results {
+            if no_sound && !prev_no_sound {
+                dead_signal_ons += 1;
+            }
+            prev_no_sound = no_sound;
+        }
+
+        // With the bug, dead-signal triggers repeatedly (>1 time).
+        // With the fix, dead-signal should never trigger (0 times).
+        assert_eq!(
+            dead_signal_ons, 0,
+            "dead-signal should not activate during auto-pause, \
+             but it activated {} times (oscillation bug)",
+            dead_signal_ons
+        );
+
+        // Sanity: auto-pause should have activated at least once.
+        let any_auto_pause = results.iter().any(|&(_, ap)| ap);
+        assert!(any_auto_pause, "auto-pause should have activated during silence");
+    }
+
+    #[test]
+    fn dead_signal_still_works_without_auto_pause() {
+        // When auto-pause is disabled, dead-signal detection should
+        // still work normally — this test ensures we don't break it.
+
+        let results = simulate_audio_monitor(
+            false, // auto-pause disabled
+            &[(0.00001, 0.0); 60], // 60 frames of zero variance
+        );
+
+        // Dead-signal triggers after 30 consecutive low-variance frames
+        // (index 29, the 30th zero-variance frame).
+        for (i, &(no_sound, auto_paused)) in results.iter().enumerate() {
+            assert!(!auto_paused, "auto-pause should not activate (disabled)");
+            if i < 29 {
+                assert!(!no_sound, "no dead-signal before frame 30 (i={})", i);
+            } else {
+                assert!(no_sound, "dead-signal should be active from frame 30 (i={})", i);
+            }
+        }
+    }
+
+    #[test]
+    fn dead_signal_recovers_when_audio_returns() {
+        // Dead-signal triggers, then real audio returns — should recover.
+
+        let mut frames: Vec<(f32, f32)> = vec![(0.5, 0.0); 35]; // high RMS but dead (zero variance)
+        frames.extend_from_slice(&[(0.5, 0.001); 10]); // audio returns
+
+        let results = simulate_audio_monitor(true, &frames);
+
+        // Dead-signal triggers at frame 29 (30th zero-variance frame).
+        // Audio returns at frame 35 → dead-signal clears from frame 35.
+        for (i, &(no_sound, _)) in results.iter().enumerate() {
+            if i >= 29 && i < 35 {
+                assert!(no_sound, "dead-signal should be active while variance=0 (i={})", i);
+            }
+            if i >= 35 {
+                assert!(!no_sound, "dead-signal should clear when audio resumes (i={})", i);
+            }
+        }
     }
 }
