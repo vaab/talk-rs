@@ -294,6 +294,37 @@ struct RgbaImage {
     data: Vec<u8>,
 }
 
+/// Return `true` when `samples` carry the "stuck at the rail"
+/// signature of a dead / disconnected audio device: a perfectly
+/// constant frame (max−min within `flat_eps`) pinned near the i16 rail
+/// (peak magnitude at or above `rail_floor`).
+///
+/// Samples are normalized f32 in `[-1.0, 1.0]` (i16 / 32768), so a
+/// disconnected device that emits constant `i16::MIN` (-32768) appears
+/// here as constant `-1.0`.
+///
+/// Crucially, benign silence is NOT flagged: a constant-zero frame
+/// (e.g. the exact-zero digital silence a Bluetooth HFP mic emits
+/// between speech) is flat but far below `rail_floor`, so it returns
+/// `false`.  An empty slice returns `false`.
+fn is_stuck_at_rail(samples: &[f32], rail_floor: f32, flat_eps: f32) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &s in samples {
+        if s < lo {
+            lo = s;
+        }
+        if s > hi {
+            hi = s;
+        }
+    }
+    let flat = (hi - lo) <= flat_eps;
+    let near_rail = lo.abs().max(hi.abs()) >= rail_floor;
+    flat && near_rail
+}
+
 /// Decode an embedded PNG into RGBA pixels.
 fn decode_png(bytes: &[u8]) -> Result<RgbaImage, TalkError> {
     let decoder = png::Decoder::new(bytes);
@@ -1616,15 +1647,30 @@ fn overlay_thread(
     let mut centered_gc: Option<u32> = None;
 
     // ── Dead-signal detection state ─────────────────────────────────
-    // Detect a dead/missing audio device by checking sample variance.
-    // A real microphone always produces nonzero variance (thermal and
-    // quantization noise), even in a silent room (~6e-10 measured).
-    // A dead device produces perfectly uniform samples (variance = 0):
-    // e.g. constant i16::MIN (-32768 → -1.0f32) or all zeros.
+    // Detect a dead/missing audio device by its "stuck at the rail"
+    // signature: a disconnected device pins every sample at i16::MIN
+    // (-32768 → -1.0f32), i.e. a perfectly constant frame at maximum
+    // magnitude.  We flag NO SOUND only for that case.
+    //
+    // This deliberately does NOT key on low variance / silence: some
+    // microphones (notably Bluetooth HFP) emit exact-zero digital
+    // silence between speech (variance == 0, magnitude 0).  Treating
+    // that as "dead" produced spurious NO SOUND warnings whenever the
+    // user paused talking.  A constant-zero frame is benign silence
+    // (handled by auto-pause); only a constant frame *near the rail*
+    // is a dead device.
     let mut dead_signal_frames: u32 = 0;
     let mut no_sound_active: bool = false;
     let mut silence_notified: bool = false;
-    const DEAD_SIGNAL_VARIANCE_CEIL: f32 = 1e-10; // ~6× below real mic noise floor
+    // Magnitude (normalized, 0.0–1.0) at/above which a *constant* frame
+    // is considered stuck at the i16 rail.  30000/32768 ≈ 0.915; a real
+    // signal essentially never holds a single value this large across
+    // an entire frame.
+    const DEAD_SIGNAL_RAIL_FLOOR: f32 = 0.9;
+    // Spread (max−min) below which a frame counts as "constant".  Uses
+    // a tiny epsilon rather than exact equality to tolerate any f32
+    // conversion noise; a stuck rail has spread 0.0.
+    const DEAD_SIGNAL_FLAT_EPS: f32 = 1e-6;
     const DEAD_SIGNAL_TRIGGER_FRAMES: u32 = 30; // 0.5s grace for PipeWire to fill the ring buffer
 
     // ── Auto-pause state ─────────────────────────────────────────────
@@ -1992,21 +2038,21 @@ fn overlay_thread(
 
         // ── Read audio and compute visualization frame ──────
 
-        let (frame_rms, magnitudes, frame_variance) = {
+        let (frame_rms, magnitudes, frame_stuck_at_rail) = {
             let samples = ring
                 .lock()
                 .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
                 .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)]);
             let rms_slice = &samples[samples.len().saturating_sub(rms_chunk.max(1))..];
             let fr = rms(rms_slice);
-            // Compute sample variance to distinguish a dead device
-            // (constant signal, variance ≈ 0) from a real microphone
-            // (random noise, variance > 0 even when quiet).
-            let n = rms_slice.len().max(1) as f32;
-            let mean = rms_slice.iter().sum::<f32>() / n;
-            let var = rms_slice.iter().map(|s| (s - mean).powi(2)).sum::<f32>() / n;
+            // Detect the "stuck at the rail" signature of a dead /
+            // disconnected device: a perfectly constant frame pinned
+            // near the i16 rail (|sample| ≈ 1.0).  This avoids the old
+            // variance heuristic, which mis-flagged the exact-zero
+            // digital silence from Bluetooth HFP mics as a dead device.
+            let stuck = is_stuck_at_rail(rms_slice, DEAD_SIGNAL_RAIL_FLOOR, DEAD_SIGNAL_FLAT_EPS);
             let mags = compute_spectrum(&samples);
-            (fr, mags, var)
+            (fr, mags, stuck)
         };
 
         // Update RMS peak (fast attack, slow decay).
@@ -2021,31 +2067,38 @@ fn overlay_thread(
         if diag_frame_counter >= DIAG_LOG_INTERVAL {
             diag_frame_counter = 0;
             log::debug!(
-                "[audio-diag] rms={:.6} variance={:.10}",
+                "[audio-diag] rms={:.6} stuck_at_rail={}",
                 frame_rms,
-                frame_variance,
+                frame_stuck_at_rail,
             );
         }
 
         // ── Dead-signal detection ────────────────────────────
-        // A dead or missing audio device produces perfectly uniform
-        // samples (e.g. constant -1.0 or all zeros) with variance ≈ 0.
-        // A real microphone always has random noise (variance > 1e-10).
+        // A dead / disconnected device pins every sample at the i16
+        // rail (constant ≈ -1.0): a flat frame at maximum magnitude.
+        // Only that signature counts as a dead device.  Benign silence
+        // (constant zero from an HFP mic, or a quiet room) is NOT dead.
         let was_no_sound = no_sound_active;
-        if frame_variance < DEAD_SIGNAL_VARIANCE_CEIL {
+        if frame_stuck_at_rail {
             dead_signal_frames = dead_signal_frames.saturating_add(1);
         } else {
             if no_sound_active {
                 if let Some(ref tx) = silence_tx {
                     let _ = tx.send(false);
                 }
-                // Resume the recording pipeline — real audio is back.
+                // Resume the recording pipeline — the device is back.
                 pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
             }
             dead_signal_frames = 0;
             no_sound_active = false;
             silence_notified = false;
-            // We saw a frame with real audio variance.
+        }
+        // Mark the session as having captured real audio when the frame
+        // carries actual signal (RMS above the auto-pause noise floor).
+        // This is intentionally NOT set for silent-but-live frames so
+        // the "skip transcription if nothing was ever spoken" guard in
+        // streaming.rs keeps working.
+        if frame_rms >= AUTOPAUSE_RMS_THRESHOLD {
             had_live_audio.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         if dead_signal_frames >= DEAD_SIGNAL_TRIGGER_FRAMES {
@@ -2762,6 +2815,71 @@ fn destroy_current(conn: &impl Connection, window: &mut Option<u32>, gc: &mut Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Dead-signal (stuck-at-rail) detection ────────────────────────
+    //
+    // These mirror the production constants used by `run_overlay_loop`.
+    // Samples are normalized f32 (i16 / 32768); a disconnected device
+    // emits constant i16::MIN (-32768) → -1.0.
+    const RAIL_FLOOR: f32 = 0.9;
+    const FLAT_EPS: f32 = 1e-6;
+
+    #[test]
+    fn stuck_at_rail_detects_disconnected_device() {
+        // Real-world signature: every sample pinned at -32768 → -1.0.
+        let frame = vec![-1.0f32; 266];
+        assert!(is_stuck_at_rail(&frame, RAIL_FLOOR, FLAT_EPS));
+    }
+
+    #[test]
+    fn stuck_at_rail_detects_positive_rail() {
+        // A device stuck at the positive rail (+32767 → ~1.0) is dead
+        // just the same.
+        let frame = vec![1.0f32; 266];
+        assert!(is_stuck_at_rail(&frame, RAIL_FLOOR, FLAT_EPS));
+    }
+
+    #[test]
+    fn stuck_at_rail_ignores_zero_silence() {
+        // Exact-zero digital silence (Bluetooth HFP between speech) is
+        // flat but at magnitude 0 — must NOT be flagged as dead.
+        let frame = vec![0.0f32; 266];
+        assert!(!is_stuck_at_rail(&frame, RAIL_FLOOR, FLAT_EPS));
+    }
+
+    #[test]
+    fn stuck_at_rail_ignores_quiet_noise_floor() {
+        // An analog / old HFP mic in a quiet room: tiny fluctuating
+        // noise floor (peaks ~8–10 in i16 ≈ 0.0003 normalized).  Flat?
+        // No — it varies — and far from the rail.  Not dead.
+        let frame: Vec<f32> = (0..266)
+            .map(|i| if i % 2 == 0 { 8.0 } else { -10.0 } / 32768.0)
+            .collect();
+        assert!(!is_stuck_at_rail(&frame, RAIL_FLOOR, FLAT_EPS));
+    }
+
+    #[test]
+    fn stuck_at_rail_ignores_loud_speech() {
+        // Loud speech can momentarily hit the rail on a few samples,
+        // but it is not *constant* — spread is large.  Not dead.
+        let frame: Vec<f32> = (0..266)
+            .map(|i| if i % 3 == 0 { 1.0 } else { -0.5 })
+            .collect();
+        assert!(!is_stuck_at_rail(&frame, RAIL_FLOOR, FLAT_EPS));
+    }
+
+    #[test]
+    fn stuck_at_rail_ignores_constant_midlevel() {
+        // A constant non-rail DC offset (e.g. 0.5) is flat but not near
+        // the rail — treated as benign, not a dead device.
+        let frame = vec![0.5f32; 266];
+        assert!(!is_stuck_at_rail(&frame, RAIL_FLOOR, FLAT_EPS));
+    }
+
+    #[test]
+    fn stuck_at_rail_empty_is_not_dead() {
+        assert!(!is_stuck_at_rail(&[], RAIL_FLOOR, FLAT_EPS));
+    }
 
     // ── PNG decoding ─────────────────────────────────────────────────
 
