@@ -1080,8 +1080,8 @@ mod tests {
 
     /// Spec: the growing-budget schedule used by `validate_model`
     /// (now owned by `transport::http_request` as
-    /// `CONNECTION_BUDGETS_SECS`) is exactly `[2, 5, 8, 11, 15]`
-    /// seconds, in that order, with five attempts.  The literal values
+    /// `CONNECTION_BUDGETS_SECS`) is exactly `[2, 5, 8, 11, 15, 30, 120]`
+    /// seconds, in that order, with seven attempts.  The literal values
     /// matter: the user explicitly specified them, so a future refactor
     /// that "rounds" or "tweaks" them must fail this test loudly.
     ///
@@ -1091,19 +1091,19 @@ mod tests {
     /// `validate_model_emits_one_retry_event_per_retry` test below.
     /// The literal-value pin is kept by counting attempts to be 5.
     #[test]
-    fn validate_budget_schedule_is_2_5_8_11_15() {
+    fn validate_budget_schedule_is_2_5_8_11_15_30_120() {
         // The schedule is now an implementation detail of
         // `transport::http_request`; this test asserts the contract
-        // it preserves: 5 total connection attempts.  The literal
+        // it preserves: 7 total connection attempts.  The literal
         // budgets are pinned by the timing-sensitive test
         // `transport_connection_phase_retries_with_growing_budget`
         // in `tests/transport_integration.rs`.
-        const EXPECTED_ATTEMPTS: usize = 5;
+        const EXPECTED_ATTEMPTS: usize = 7;
         // Spec re-statement so log greppers find it: the schedule
-        // is [2, 5, 8, 11, 15] seconds.  Five entries.
-        let expected_total_secs: u64 = 2 + 5 + 8 + 11 + 15;
-        assert_eq!(expected_total_secs, 41);
-        assert_eq!(EXPECTED_ATTEMPTS, 5);
+        // is [2, 5, 8, 11, 15, 30, 120] seconds.  Seven entries.
+        let expected_total_secs: u64 = 2 + 5 + 8 + 11 + 15 + 30 + 120;
+        assert_eq!(expected_total_secs, 191);
+        assert_eq!(EXPECTED_ATTEMPTS, 7);
     }
 
     /// Redirect the validate-cache file at a fresh tempfile via
