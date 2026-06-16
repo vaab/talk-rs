@@ -59,7 +59,7 @@ use tokio_util::sync::CancellationToken;
 /// `i` is the connect-timeout used on attempt `i+1`.  Matches the
 /// historical `VALIDATE_BUDGET_SECS` schedule so the consolidated
 /// transport doesn't regress validate-path behaviour.
-const CONNECTION_BUDGETS_SECS: [u64; 5] = [2, 5, 8, 11, 15];
+const CONNECTION_BUDGETS_SECS: [u64; 7] = [2, 5, 8, 11, 15, 30, 120];
 
 /// Maximum number of data-phase attempts (the initial call plus
 /// `DATA_MAX_ATTEMPTS - 1` retries) when the server returns 5xx or
