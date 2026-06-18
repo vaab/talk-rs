@@ -399,28 +399,10 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
     ) -> Result<TranscriptionResult, TalkError> {
         let (audio_bytes, file_name) = match body {
             TranscriptionBody::File(path) => {
-                if !path.exists() {
-                    return Err(TalkError::Transcription(format!(
-                        "Audio file not found: {}",
-                        path.display()
-                    )));
-                }
-
-                use tokio::io::AsyncReadExt;
-
-                let mut file = tokio::fs::File::open(&path).await.map_err(|err| {
-                    TalkError::Transcription(format!("Failed to open audio file: {}", err))
-                })?;
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).await.map_err(|err| {
-                    TalkError::Transcription(format!("Failed to read audio file: {}", err))
-                })?;
-                let file_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("audio.wav")
-                    .to_string();
-                (bytes, file_name)
+                // Always normalize to 16 kHz mono OGG before upload —
+                // both providers downsample to 16 kHz mono internally,
+                // so sending anything richer is pure waste.
+                super::normalize_file_for_upload(&path)?
             }
             TranscriptionBody::Stream {
                 mut chunks,
