@@ -16,6 +16,10 @@ pub struct Config {
     ///
     /// The `record` command saves files here by default when no explicit
     /// output path is given.
+    ///
+    /// Must be an absolute path: a relative value would resolve against
+    /// the (unpredictable) process working directory at runtime, so it
+    /// is rejected during validation.
     pub output_dir: PathBuf,
 
     /// Transcription providers configuration.
@@ -474,6 +478,20 @@ fn validate_config(config: &Config) -> Result<(), TalkError> {
         return Err(TalkError::Config("output_dir is required".to_string()));
     }
 
+    // `output_dir` must be absolute.  A relative path would resolve
+    // against the process working directory at runtime, which is
+    // unpredictable — the toggle daemon spawns with an inherited (and
+    // effectively arbitrary) CWD, so recordings could land anywhere.
+    // The documented contract (config.example.yaml / README) requires
+    // an absolute path; enforce it here with a clear error rather than
+    // failing silently later.
+    if !config.output_dir.is_absolute() {
+        return Err(TalkError::Config(format!(
+            "output_dir must be an absolute path, got '{}'",
+            config.output_dir.display()
+        )));
+    }
+
     // Provider API keys are validated lazily — only when a provider is
     // actually used via the factory function.  This allows configs that
     // only define one provider to work without filling in keys for the
@@ -657,6 +675,68 @@ providers: {}
             Ok(_) => Err("Expected empty output_dir to fail".into()),
             Err(err) => {
                 assert!(err.to_string().contains("output_dir is required"));
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_config_relative_output_dir_rejected() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        // A relative output_dir must be rejected: it would otherwise
+        // resolve against the process working directory at runtime
+        // (unpredictable for the toggle daemon).  The documentation in
+        // config.example.yaml / README states an absolute path is
+        // required, so validation must enforce it.
+        let yaml = r#"
+output_dir: relative/path
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        let result = Config::load(Some(file.path()));
+        match result {
+            Ok(_) => Err("Expected relative output_dir to fail".into()),
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("absolute"),
+                    "error should mention 'absolute', got: {}",
+                    err
+                );
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_config_relative_output_dir_via_env_rejected() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        // An absolute path in the file is overridden by a relative one
+        // from the environment; the override must also be rejected.
+        let _set_dir = EnvGuard::set("TALK_RS_OUTPUT_DIR", "relative/from/env")?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        let result = Config::load(Some(file.path()));
+        match result {
+            Ok(_) => Err("Expected relative output_dir from env to fail".into()),
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("absolute"),
+                    "error should mention 'absolute', got: {}",
+                    err
+                );
                 Ok(())
             }
         }
