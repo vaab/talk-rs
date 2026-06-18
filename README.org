@@ -202,6 +202,15 @@ providers:
 | ~indicators.mono~                  | ~false~                   | Monochrome visualizer (also ~--mono~) |
 | ~paste.chunk_chars~                | ~150~                     | Max chars per paste chunk (~0~ disables chunking; also ~--no-chunk-paste~) |
 | ~audio.bt_auto_switch~             | ~true~                    | Auto-switch a connected Bluetooth headset to HFP for the duration of a recording, then restore (also ~--no-bt-auto-switch~; env ~TALK_RS_AUDIO_BT_AUTO_SWITCH~) |
+| ~recording.sample_rate~            | ~48000~                   | Sample rate (Hz) of the ~record~ command's ~.ogg~ output (env ~TALK_RS_RECORDING_SAMPLE_RATE~) |
+| ~recording.channels~               | ~1~                       | Channels for ~record~ output: ~1~ mono, ~2~ stereo (env ~TALK_RS_RECORDING_CHANNELS~) |
+| ~recording.bitrate~                | ~128000~                  | Opus bitrate (bps) of the ~record~ command's ~.ogg~ output (env ~TALK_RS_RECORDING_BITRATE~) |
+
+The ~recording.*~ settings control the quality of recordings meant
+for a *human* to listen to or share.  They are independent of
+transcription: audio sent to the providers is always downsampled to
+16 kHz mono internally (both Voxtral and Whisper operate at 16 kHz),
+so these knobs do not affect transcription accuracy or upload size.
 
 *** Environment overrides
 

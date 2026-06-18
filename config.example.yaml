@@ -11,6 +11,22 @@
 # is expanded to your home directory.
 output_dir: <PLACEHOLDER>
 
+# Optional: Recording quality for the `record` command's .ogg output.
+#
+# These settings control the quality of recordings meant for a HUMAN
+# to listen to / share.  They are independent of transcription: audio
+# sent to the transcription providers is always downsampled to 16 kHz
+# mono internally (both Voxtral and Whisper operate at 16 kHz), so
+# these knobs do NOT affect transcription accuracy or upload size.
+#
+# Defaults (used when this section is omitted): 48 kHz, mono, 128 kbps.
+# Also overridable via TALK_RS_RECORDING_SAMPLE_RATE /
+# TALK_RS_RECORDING_CHANNELS / TALK_RS_RECORDING_BITRATE env vars.
+# recording:
+#   sample_rate: 48000   # Hz (48000 = full-band, no resampling)
+#   channels: 1          # 1 = mono (recommended for voice), 2 = stereo
+#   bitrate: 128000      # bps (Opus; 128 kbps is transparent for voice)
+
 # Required: Transcription Providers Configuration
 # Configure at least one provider (Mistral or OpenAI)
 providers:

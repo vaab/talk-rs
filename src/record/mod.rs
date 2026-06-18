@@ -9,8 +9,8 @@ pub(crate) mod player;
 pub(crate) mod ui;
 
 use crate::audio::bt_profile;
-use crate::audio::cpal_capture::CpalCapture;
 use crate::audio::monitor_capture::MonitorCapture;
+use crate::audio::pipewire_capture::PipeWireCapture;
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
 use crate::config::{AudioConfig, Config};
 use crate::error::TalkError;
@@ -71,7 +71,10 @@ pub fn parse_args(args: &[String]) -> Result<PathBuf, TalkError> {
 fn create_writer(path: &Path, config: AudioConfig) -> Result<Box<dyn AudioWriter>, TalkError> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("wav") => Ok(Box::new(WavWriter::new(config))),
-        _ => Ok(Box::new(OggOpusWriter::new(config)?)),
+        // Human-facing recordings use Opus `Application::Audio` for
+        // fuller fidelity (vs the speech-optimised Voip mode used by
+        // the transcription path).
+        _ => Ok(Box::new(OggOpusWriter::new_for_recording(config)?)),
     }
 }
 
@@ -126,17 +129,39 @@ pub async fn record(
         bt_profile::HeadsetGuard::new(saved)
     };
 
-    // Initialize audio capture
+    // Resolve the human-facing recording quality (sample rate /
+    // channels / bitrate).  This is intentionally NOT `AudioConfig::new()`
+    // (the 16 kHz transcription profile): the `record` command produces
+    // a file for a human to listen to, so it uses the configurable
+    // `recording:` section, defaulting to 48 kHz mono 128 kbps.
+    let recording_config = config_for_bt
+        .as_ref()
+        .and_then(|c| c.recording.clone())
+        .unwrap_or_default();
+    let audio_config = recording_config.resolved();
+    log::info!(
+        "recording quality: {} Hz, {} channel(s), {} bps",
+        audio_config.sample_rate,
+        audio_config.channels,
+        audio_config.bitrate
+    );
+
+    // Initialize audio capture.  Use PipeWire for both mic-only and
+    // mic+monitor: it negotiates the requested rate/channels with the
+    // device (duplicating a mono source to stereo when asked), which
+    // makes a 48 kHz stereo request robust even on mono-only mics —
+    // unlike the strict exact-match CpalCapture used previously.
     let mut capture: Box<dyn AudioCapture> = if monitor {
         log::info!("recording with mic+monitor (PipeWire)");
-        Box::new(MonitorCapture::new(AudioConfig::new()))
+        Box::new(MonitorCapture::new(audio_config.clone()))
     } else {
-        Box::new(CpalCapture::new(AudioConfig::new()))
+        log::info!("recording with mic (PipeWire)");
+        Box::new(PipeWireCapture::new(audio_config.clone()))
     };
     let mut rx = capture.start()?;
 
     // Initialize audio writer
-    let mut writer = create_writer(&output_path, AudioConfig::new())?;
+    let mut writer = create_writer(&output_path, audio_config.clone())?;
     let is_wav = matches!(
         output_path.extension().and_then(|e| e.to_str()),
         Some("wav")

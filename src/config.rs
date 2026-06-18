@@ -43,6 +43,20 @@ pub struct Config {
     /// be read from `config.yaml`.
     #[serde(default)]
     pub audio: Option<AudioSettings>,
+
+    /// Optional human-facing recording-quality settings for the
+    /// `record` command's `.ogg` output.
+    ///
+    /// This is deliberately separate from [`AudioConfig`]: that struct
+    /// holds the *internal* characteristics required by the
+    /// transcription providers (16 kHz mono — both Voxtral and Whisper
+    /// downsample to 16 kHz mono internally), which are an
+    /// implementation detail and must NOT be user-tunable.  This
+    /// section, by contrast, controls the quality of recordings meant
+    /// for a human to listen to / share, where higher fidelity is a
+    /// legitimate preference.
+    #[serde(default)]
+    pub recording: Option<RecordingConfig>,
 }
 
 /// User-facing audio settings (loaded from `config.yaml`).
@@ -63,6 +77,56 @@ impl AudioSettings {
     /// Resolved value of `bt_auto_switch`: `true` if unset (default-on).
     pub fn bt_auto_switch_enabled(&self) -> bool {
         self.bt_auto_switch.unwrap_or(true)
+    }
+}
+
+/// Default sample rate for human-facing recordings (48 kHz, full-band
+/// Opus, matches the PipeWire native rate so no resampling is needed).
+pub const DEFAULT_RECORDING_SAMPLE_RATE: u32 = 48_000;
+/// Default channel count for human-facing recordings (mono).  Most
+/// dictation microphones are physically mono, and the transcription
+/// providers downmix to mono regardless; stereo can be opted into for
+/// genuine stereo sources.
+pub const DEFAULT_RECORDING_CHANNELS: u8 = 1;
+/// Default Opus bitrate for human-facing recordings (128 kbps —
+/// transparent quality for voice and comfortable headroom for
+/// music / ambient content).
+pub const DEFAULT_RECORDING_BITRATE: u32 = 128_000;
+
+/// Human-facing recording-quality settings (loaded from `config.yaml`).
+///
+/// Controls the `record` command's `.ogg` output.  Every field is
+/// optional and falls back to a fidelity-oriented default; see
+/// [`RecordingConfig::resolved`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RecordingConfig {
+    /// Sample rate in Hz for the recorded `.ogg`.  Default: 48000.
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+
+    /// Channel count for the recorded `.ogg` (1 = mono, 2 = stereo).
+    /// Default: 1 (mono).
+    #[serde(default)]
+    pub channels: Option<u8>,
+
+    /// Opus bitrate in bps for the recorded `.ogg`.  Default: 128000.
+    #[serde(default)]
+    pub bitrate: Option<u32>,
+}
+
+impl RecordingConfig {
+    /// Resolve the recording quality into a concrete [`AudioConfig`],
+    /// applying fidelity-oriented defaults for any unset field.
+    ///
+    /// Unlike [`AudioConfig::new`] (the hardcoded 16 kHz mono
+    /// transcription profile), this produces the *human-facing*
+    /// recording profile.
+    pub fn resolved(&self) -> AudioConfig {
+        AudioConfig {
+            sample_rate: self.sample_rate.unwrap_or(DEFAULT_RECORDING_SAMPLE_RATE),
+            channels: self.channels.unwrap_or(DEFAULT_RECORDING_CHANNELS),
+            bitrate: self.bitrate.unwrap_or(DEFAULT_RECORDING_BITRATE),
+        }
     }
 }
 
@@ -432,6 +496,37 @@ impl Config {
             audio.bt_auto_switch = Some(parsed);
         }
 
+        // Recording-quality env var overrides (human-facing `record`
+        // output).  Each parses to its numeric type and is stored on
+        // the `recording` section, which is created on demand.
+        if let Some(value) = env_var_string("TALK_RS_RECORDING_SAMPLE_RATE")? {
+            let parsed = parse_u32_env("TALK_RS_RECORDING_SAMPLE_RATE", &value)?;
+            let rec = config
+                .recording
+                .get_or_insert_with(RecordingConfig::default);
+            rec.sample_rate = Some(parsed);
+        }
+        if let Some(value) = env_var_string("TALK_RS_RECORDING_CHANNELS")? {
+            let parsed = parse_u32_env("TALK_RS_RECORDING_CHANNELS", &value)?;
+            let channels = u8::try_from(parsed).map_err(|_| {
+                TalkError::Config(format!(
+                    "TALK_RS_RECORDING_CHANNELS must be 1 or 2, got '{}'",
+                    value
+                ))
+            })?;
+            let rec = config
+                .recording
+                .get_or_insert_with(RecordingConfig::default);
+            rec.channels = Some(channels);
+        }
+        if let Some(value) = env_var_string("TALK_RS_RECORDING_BITRATE")? {
+            let parsed = parse_u32_env("TALK_RS_RECORDING_BITRATE", &value)?;
+            let rec = config
+                .recording
+                .get_or_insert_with(RecordingConfig::default);
+            rec.bitrate = Some(parsed);
+        }
+
         // Mistral env var overrides (only when the section exists).
         if let Some(ref mut mistral) = config.providers.mistral {
             if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
@@ -518,6 +613,17 @@ fn parse_bool_env(value: &str) -> Option<bool> {
         "false" | "no" | "0" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// Parse an unsigned-integer env var value, producing a clear config
+/// error (naming the variable) on failure.
+fn parse_u32_env(key: &str, value: &str) -> Result<u32, TalkError> {
+    value.trim().parse::<u32>().map_err(|_| {
+        TalkError::Config(format!(
+            "{} must be a positive integer, got '{}'",
+            key, value
+        ))
+    })
 }
 
 fn validate_config(config: &Config) -> Result<(), TalkError> {
@@ -607,6 +713,9 @@ mod tests {
     fn clear_all_provider_env_vars() -> Result<Vec<EnvGuard>, Box<dyn Error>> {
         Ok(vec![
             EnvGuard::clear("TALK_RS_OUTPUT_DIR")?,
+            EnvGuard::clear("TALK_RS_RECORDING_SAMPLE_RATE")?,
+            EnvGuard::clear("TALK_RS_RECORDING_CHANNELS")?,
+            EnvGuard::clear("TALK_RS_RECORDING_BITRATE")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_URL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?,
@@ -1038,6 +1147,137 @@ paste:
         let paste = config.paste.as_ref().expect("paste section present");
         assert_eq!(paste.chunk_chars, 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_recording_defaults_when_absent() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        // No `recording:` section → fidelity-oriented defaults:
+        // 48 kHz, mono, 128 kbps.  This is the human-facing profile,
+        // explicitly distinct from the 16 kHz transcription profile.
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let resolved = config.recording.clone().unwrap_or_default().resolved();
+        assert_eq!(resolved.sample_rate, 48_000);
+        assert_eq!(resolved.channels, 1);
+        assert_eq!(resolved.bitrate, 128_000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_recording_parsed_from_yaml() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+recording:
+  sample_rate: 24000
+  channels: 2
+  bitrate: 96000
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let rec = config
+            .recording
+            .as_ref()
+            .expect("recording section present");
+        let resolved = rec.resolved();
+        assert_eq!(resolved.sample_rate, 24_000);
+        assert_eq!(resolved.channels, 2);
+        assert_eq!(resolved.bitrate, 96_000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_recording_partial_yaml_fills_defaults() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        // Only `channels` set → the other two fields fall back to
+        // their defaults.
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+recording:
+  channels: 2
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let resolved = config.recording.as_ref().expect("recording").resolved();
+        assert_eq!(resolved.sample_rate, 48_000); // default
+        assert_eq!(resolved.channels, 2); // from yaml
+        assert_eq!(resolved.bitrate, 128_000); // default
+        Ok(())
+    }
+
+    #[test]
+    fn test_recording_env_overrides() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _r = EnvGuard::set("TALK_RS_RECORDING_SAMPLE_RATE", "32000")?;
+        let _c = EnvGuard::set("TALK_RS_RECORDING_CHANNELS", "2")?;
+        let _b = EnvGuard::set("TALK_RS_RECORDING_BITRATE", "64000")?;
+
+        // The env vars must override even when no `recording:` section
+        // exists in the file (the section is created on demand).
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let resolved = config.recording.as_ref().expect("recording").resolved();
+        assert_eq!(resolved.sample_rate, 32_000);
+        assert_eq!(resolved.channels, 2);
+        assert_eq!(resolved.bitrate, 64_000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_recording_env_invalid_channels_rejected() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _c = EnvGuard::set("TALK_RS_RECORDING_CHANNELS", "not-a-number")?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        match Config::load(Some(file.path())) {
+            Ok(_) => Err("expected invalid channels env to fail".into()),
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("TALK_RS_RECORDING_CHANNELS"),
+                    "error should name the variable, got: {}",
+                    err
+                );
+                Ok(())
+            }
+        }
     }
 
     #[test]

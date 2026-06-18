@@ -73,7 +73,32 @@ unsafe impl Send for OggOpusWriter {}
 
 impl OggOpusWriter {
     /// Create a new OGG/Opus writer with the given audio configuration.
+    ///
+    /// Uses Opus `Application::Voip`, optimised for speech intelligibility.
+    /// This is the right choice for the transcription / dictation paths
+    /// (16 kHz mono).  For human-facing recordings that may contain
+    /// music or ambient sound, prefer [`OggOpusWriter::new_for_recording`].
     pub fn new(config: AudioConfig) -> Result<Self, TalkError> {
+        Self::new_with_application(config, opus::Application::Voip)
+    }
+
+    /// Create a new OGG/Opus writer tuned for human-facing recordings.
+    ///
+    /// Uses Opus `Application::Audio`, which preserves more fidelity
+    /// across the full spectrum (music, ambient, non-speech) than the
+    /// speech-optimised `Voip` mode.  Used by the `record` command.
+    pub fn new_for_recording(config: AudioConfig) -> Result<Self, TalkError> {
+        Self::new_with_application(config, opus::Application::Audio)
+    }
+
+    /// Create a new OGG/Opus writer with an explicit Opus application
+    /// mode.  See [`OggOpusWriter::new`] (Voip) and
+    /// [`OggOpusWriter::new_for_recording`] (Audio) for the two
+    /// intended call sites.
+    pub fn new_with_application(
+        config: AudioConfig,
+        application: opus::Application,
+    ) -> Result<Self, TalkError> {
         let opus_channels = match config.channels {
             1 => opus::Channels::Mono,
             2 => opus::Channels::Stereo,
@@ -85,9 +110,8 @@ impl OggOpusWriter {
             }
         };
 
-        let mut encoder =
-            opus::Encoder::new(config.sample_rate, opus_channels, opus::Application::Voip)
-                .map_err(|e| TalkError::Audio(format!("Failed to create Opus encoder: {e}")))?;
+        let mut encoder = opus::Encoder::new(config.sample_rate, opus_channels, application)
+            .map_err(|e| TalkError::Audio(format!("Failed to create Opus encoder: {e}")))?;
 
         encoder
             .set_bitrate(opus::Bitrate::Bits(config.bitrate as i32))
