@@ -3,7 +3,7 @@
 //! Config is stored in ~/.config/talk-rs/config.yaml
 
 use crate::error::TalkError;
-use directories::ProjectDirs;
+use directories::{ProjectDirs, UserDirs};
 use serde::Deserialize;
 use std::env;
 use std::fs;
@@ -317,6 +317,47 @@ fn default_paste_chunk_chars() -> usize {
     150
 }
 
+/// Expand a leading `~` (or `~/…`) in a path to the user's home
+/// directory.
+///
+/// Only a tilde that is the *first* path component is expanded:
+/// - `~`            → `$HOME`
+/// - `~/foo/bar`    → `$HOME/foo/bar`
+///
+/// A tilde anywhere else (e.g. `/tmp/~/x`) is left untouched, and so
+/// is the `~user` form (expanding another user's home would require a
+/// passwd lookup we deliberately do not perform).  Paths without a
+/// leading tilde are returned unchanged.
+fn expand_tilde(path: &Path) -> Result<PathBuf, TalkError> {
+    let mut components = path.components();
+    let first = match components.next() {
+        Some(std::path::Component::Normal(part)) => part,
+        // Absolute, root, `.`, `..`, etc. — nothing to expand.
+        _ => return Ok(path.to_path_buf()),
+    };
+
+    if first != "~" {
+        // Includes the `~user` form (e.g. `~alice`): not expanded.
+        return Ok(path.to_path_buf());
+    }
+
+    let home = UserDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .ok_or_else(|| {
+            TalkError::Config(
+                "Could not determine home directory to expand '~' in output_dir".to_string(),
+            )
+        })?;
+
+    // Re-attach the remainder (everything after the leading `~`).
+    let rest = components.as_path();
+    if rest.as_os_str().is_empty() {
+        Ok(home)
+    } else {
+        Ok(home.join(rest))
+    }
+}
+
 /// Get the config directory (~/.config/talk-rs/).
 pub fn config_dir() -> Result<PathBuf, TalkError> {
     ProjectDirs::from("org", "kalysto", "talk-rs")
@@ -445,6 +486,12 @@ impl Config {
                 });
             }
         }
+
+        // Expand a leading `~` in `output_dir` (from the file or the
+        // TALK_RS_OUTPUT_DIR override) before validating, so the
+        // documented `~/talk-rs-output` form resolves to an absolute
+        // path under $HOME instead of a literal relative `~` directory.
+        config.output_dir = expand_tilde(&config.output_dir)?;
 
         validate_config(&config)?;
 
@@ -740,6 +787,98 @@ providers:
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn test_config_tilde_output_dir_expanded() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let home = directories::UserDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .ok_or("home dir unavailable")?;
+
+        // `~/talk-rs-output` (the README minimal example) must expand to
+        // an absolute path under $HOME, not be treated as a literal
+        // relative directory named `~`.
+        let yaml = r#"
+output_dir: ~/talk-rs-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(config.output_dir, home.join("talk-rs-output"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_bare_tilde_output_dir_expanded() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let home = directories::UserDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .ok_or("home dir unavailable")?;
+
+        // A bare `~` expands to $HOME itself.
+        let yaml = r#"
+output_dir: ~
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(config.output_dir, home);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_tilde_output_dir_via_env_expanded() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let home = directories::UserDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .ok_or("home dir unavailable")?;
+        let _set_dir = EnvGuard::set("TALK_RS_OUTPUT_DIR", "~/from-env")?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(config.output_dir, home.join("from-env"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_non_leading_tilde_not_expanded() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        // A tilde that is not the leading path component must be left
+        // untouched.  `/tmp/~/x` is absolute and already valid, so the
+        // value must pass through verbatim (no home substitution).
+        let yaml = r#"
+output_dir: /tmp/~/x
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(config.output_dir, PathBuf::from("/tmp/~/x"));
+        Ok(())
     }
 
     #[test]

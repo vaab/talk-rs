@@ -181,7 +181,7 @@ providers:
 
 | Field                        | Description                                          |
 |------------------------------+------------------------------------------------------|
-| ~output_dir~                 | Absolute path to a writable directory for recordings |
+| ~output_dir~                 | Absolute path to a writable directory for recordings (a leading ~~~ is expanded to your home) |
 | ~providers.mistral.api_key~  | Mistral API key (if using Mistral)                   |
 | ~providers.openai.api_key~   | OpenAI API key (if using OpenAI)                     |
 
