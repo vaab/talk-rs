@@ -7,7 +7,8 @@
 
 # Required: Output directory for recordings, screenshots, and clipboard saves.
 # The `record` command saves recordings here by default (memo-YYYY-MM-DD-HH-MM-SS.ogg).
-# Must be an absolute path that exists and is writable.
+# Must be an absolute path that is writable.  A leading `~` (or `~/`)
+# is expanded to your home directory.
 output_dir: <PLACEHOLDER>
 
 # Required: Transcription Providers Configuration
