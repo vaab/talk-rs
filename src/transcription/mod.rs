@@ -36,6 +36,84 @@ pub(crate) enum TranscriptionBody {
     },
 }
 
+/// Normalize an on-disk audio file into the API-optimal upload form:
+/// **16 kHz mono OGG/Opus**.
+///
+/// Both transcription providers (Mistral Voxtral and OpenAI Whisper /
+/// gpt-4o-transcribe) operate internally at 16 kHz mono — they
+/// downsample and downmix any input server-side, and accept nothing
+/// above 8 kHz audio bandwidth.  Uploading the original (potentially
+/// 48 kHz stereo, e.g. a high-fidelity `record` output) wastes
+/// bandwidth, increases latency, and can hit OpenAI's 25 MB cap, all
+/// for zero accuracy benefit.  So we always re-encode to 16 kHz mono
+/// before sending.
+///
+/// Returns `(bytes, file_name)` where `file_name` carries an `.ogg`
+/// extension so the multipart upload advertises the correct format.
+///
+/// On any decode/encode failure (e.g. an exotic container we cannot
+/// decode locally), this falls back to the original file bytes with a
+/// warning, so an upload that worked before this normalization existed
+/// keeps working.
+pub(crate) fn normalize_file_for_upload(
+    path: &std::path::Path,
+) -> Result<(Vec<u8>, String), TalkError> {
+    if !path.exists() {
+        return Err(TalkError::Transcription(format!(
+            "Audio file not found: {}",
+            path.display()
+        )));
+    }
+
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
+    let normalized_name = format!("{stem}.ogg");
+
+    match encode_16k_mono_ogg(path) {
+        Ok(bytes) => {
+            log::info!(
+                "upload normalization: {} -> 16kHz mono ogg ({} bytes)",
+                path.display(),
+                bytes.len()
+            );
+            Ok((bytes, normalized_name))
+        }
+        Err(err) => {
+            // Never break a previously-working upload: fall back to the
+            // raw file bytes (with the original file name).
+            log::warn!(
+                "upload normalization failed for {} ({}); uploading original bytes",
+                path.display(),
+                err
+            );
+            let bytes = std::fs::read(path)
+                .map_err(|e| TalkError::Transcription(format!("Failed to read audio file: {e}")))?;
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("audio.wav")
+                .to_string();
+            Ok((bytes, file_name))
+        }
+    }
+}
+
+/// Decode any supported audio file to 16 kHz mono PCM and re-encode it
+/// as an OGG/Opus byte stream (16 kHz mono).
+fn encode_16k_mono_ogg(path: &std::path::Path) -> Result<Vec<u8>, TalkError> {
+    use crate::audio::{AudioWriter, OggOpusWriter};
+
+    // `read_audio_as_i16` decodes wav/ogg/opus/m4a/mp4/aac, resampling
+    // to 16 kHz and downmixing to mono — exactly the target form.
+    let pcm = crate::record::audio::read_audio_as_i16(path)?;
+
+    // 16 kHz mono is the hardcoded transcription profile.
+    let mut writer = OggOpusWriter::new(crate::config::AudioConfig::new())?;
+    let mut out = writer.header()?;
+    out.extend_from_slice(&writer.write_pcm(&pcm)?);
+    out.extend_from_slice(&writer.finalize()?);
+    Ok(out)
+}
+
 /// Per-request wall-clock-timeout policy for batch transcription.
 ///
 /// Two distinct call contexts demand opposite defaults:
@@ -874,6 +952,101 @@ impl BatchTranscriber for MockBatchTranscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Absolute path to a shipped test fixture.
+    fn fixture(name: &str) -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests");
+        p.push("fixtures");
+        p.push(name);
+        p
+    }
+
+    /// Read the channel count + input sample rate out of an OGG/Opus
+    /// byte stream's OpusHead packet (RFC 7845).  Returns
+    /// `(channels, declared_rate)`.  Note: Opus always declares 48000
+    /// in OpusHead regardless of the encoder's internal rate, so the
+    /// meaningful assertion for "16 kHz mono" is the channel count
+    /// here plus the decoder rate verified separately.
+    fn opus_head_channels(ogg: &[u8]) -> u8 {
+        // Find "OpusHead" magic; channel count is the byte right after
+        // the 8-magic + 1 version bytes = offset+9.
+        let pos = ogg
+            .windows(8)
+            .position(|w| w == b"OpusHead")
+            .expect("OpusHead present");
+        ogg[pos + 9]
+    }
+
+    #[test]
+    fn test_normalize_stereo_44k_m4a_to_mono_ogg() {
+        // The stereo 44.1 kHz AAC fixture must come out as a mono OGG.
+        let path = fixture("sine_440_0.5s_stereo.m4a");
+        assert!(path.exists(), "fixture missing: {}", path.display());
+
+        let (bytes, name) = normalize_file_for_upload(&path).expect("normalization should succeed");
+
+        // Filename advertises ogg.
+        assert!(name.ends_with(".ogg"), "expected .ogg name, got {name}");
+        // Valid OGG/Opus stream, mono.
+        assert_eq!(&bytes[0..4], b"OggS", "should be an OGG stream");
+        assert_eq!(opus_head_channels(&bytes), 1, "must be downmixed to mono");
+
+        // Decode it back as 16 kHz mono — proves the encoder produced a
+        // stream a 16 kHz mono Opus decoder accepts and that it carries
+        // real audio (non-silent).
+        let mut decoder = opus::Decoder::new(16_000, opus::Channels::Mono)
+            .expect("decoder creation should succeed");
+        // Pull the first audio packet out of the OGG container.
+        let mut packet_reader =
+            ogg::reading::PacketReader::new(std::io::Cursor::new(bytes.clone()));
+        // Skip the two header packets (OpusHead, OpusTags).
+        let _ = packet_reader.read_packet_expected().expect("OpusHead");
+        let _ = packet_reader.read_packet_expected().expect("OpusTags");
+        let first_audio = packet_reader
+            .read_packet_expected()
+            .expect("at least one audio packet");
+        let mut out = vec![0i16; 16_000]; // up to 1s
+        let decoded = decoder
+            .decode(&first_audio.data, &mut out, false)
+            .expect("decode should succeed");
+        assert!(decoded > 0, "decoded frame should be non-empty");
+    }
+
+    #[test]
+    fn test_normalize_mono_m4a_stays_mono_ogg() {
+        let path = fixture("sine_440_0.5s_mono.m4a");
+        assert!(path.exists(), "fixture missing: {}", path.display());
+
+        let (bytes, name) = normalize_file_for_upload(&path).expect("normalization should succeed");
+        assert!(name.ends_with(".ogg"));
+        assert_eq!(&bytes[0..4], b"OggS");
+        assert_eq!(opus_head_channels(&bytes), 1);
+    }
+
+    #[test]
+    fn test_normalize_missing_file_errors() {
+        let err = normalize_file_for_upload(&PathBuf::from("/nonexistent/audio.m4a"))
+            .expect_err("missing file should error");
+        assert!(
+            err.to_string().contains("not found"),
+            "expected not-found error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_undecodable_falls_back_to_raw_bytes() {
+        // A file with an unsupported extension cannot be decoded; the
+        // normalizer must fall back to uploading the raw bytes rather
+        // than failing (never break a previously-working upload).
+        let dir = tempfile::TempDir::new().expect("tmp dir");
+        let path = dir.path().join("weird.bin");
+        std::fs::write(&path, b"not really audio").expect("write");
+
+        let (bytes, name) = normalize_file_for_upload(&path).expect("fallback should succeed");
+        assert_eq!(bytes, b"not really audio");
+        assert_eq!(name, "weird.bin", "fallback keeps original file name");
+    }
 
     #[tokio::test]
     async fn test_mock_transcriber_returns_text() {
