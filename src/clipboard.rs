@@ -42,6 +42,21 @@ impl X11Clipboard {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Number of times a paste target has fetched the content set by
+    /// the most recent [`set_text`](Clipboard::set_text) call.
+    ///
+    /// Returns `0` when no content is currently being served, or when
+    /// the serve handle has been dropped.  Used by the paste path for
+    /// `-vvv` diagnostics: a count of `0` after a paste keystroke
+    /// means the target never actually pulled the offered text.
+    pub fn last_served_count(&self) -> u32 {
+        self.serve_handle
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|h| h.served_count()))
+            .unwrap_or(0)
+    }
 }
 
 #[async_trait]
@@ -52,10 +67,13 @@ impl Clipboard for X11Clipboard {
             .map_err(|e| TalkError::Clipboard(format!("clipboard task panicked: {e}")))?;
 
         // Empty/missing clipboard is not an error — return empty string.
-        Ok(result.unwrap_or_default())
+        let text = result.unwrap_or_default();
+        log::trace!("clipboard get_text -> {}", crate::paste::log_preview(&text),);
+        Ok(text)
     }
 
     async fn set_text(&self, text: &str) -> Result<(), TalkError> {
+        log::trace!("clipboard set_text <- {}", crate::paste::log_preview(text),);
         // Claim ownership FIRST.  The X server sends SelectionClear to
         // the previous owner, letting its serve thread finish any
         // pending request before exiting — no aggressive kill needed.
