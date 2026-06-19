@@ -584,6 +584,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // Save clipboard and focus target window before recording starts
         let rt_clipboard = X11Clipboard::new();
         let saved_clipboard = rt_clipboard.get_text().await.ok();
+        log::trace!(
+            "paste(realtime): saved original clipboard = {}",
+            saved_clipboard
+                .as_deref()
+                .map(crate::paste::log_preview)
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
         if let Some(ref wid) = target_window {
             log::debug!("pre-focusing target window: {}", wid);
             if !focus_window(wid).await {
@@ -596,25 +603,47 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         let (seg_tx, mut seg_rx) = tokio::sync::mpsc::channel::<String>(32);
 
         // Spawn paste consumer: each segment is pasted immediately
+        let rt_shortcut = paste_shortcut;
         let paste_task = tokio::spawn(async move {
             let paste_clip = X11Clipboard::new();
             let mut is_first = true;
+            let mut seg_idx = 0usize;
             while let Some(segment) = seg_rx.recv().await {
+                seg_idx += 1;
                 let paste_text = if is_first {
                     is_first = false;
                     segment
                 } else {
                     format!(" {}", segment)
                 };
+                log::trace!(
+                    "paste(realtime): segment {} <- {}",
+                    seg_idx,
+                    crate::paste::log_preview(&paste_text),
+                );
                 if let Err(e) = paste_clip.set_text(&paste_text).await {
                     log::warn!("per-segment clipboard set failed: {}", e);
                     continue;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                if let Err(e) = simulate_paste(paste_shortcut.clone()).await {
+                if let Err(e) = simulate_paste(rt_shortcut).await {
                     log::warn!("per-segment paste failed: {}", e);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                let served = paste_clip.last_served_count();
+                if served == 0 {
+                    log::trace!(
+                        "paste(realtime): segment {} pasted but served_count=0 \
+                         (target did NOT fetch our clipboard — check shortcut/focus)",
+                        seg_idx,
+                    );
+                } else {
+                    log::trace!(
+                        "paste(realtime): segment {} consumed (served_count={})",
+                        seg_idx,
+                        served,
+                    );
+                }
             }
         });
 
@@ -654,6 +683,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if let Some(saved) = saved_clipboard {
             log::debug!("restoring original clipboard");
+            log::trace!(
+                "paste(realtime): restoring original clipboard = {}",
+                crate::paste::log_preview(&saved),
+            );
             let _ = rt_clipboard.set_text(&saved).await;
         }
 

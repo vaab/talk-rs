@@ -5,7 +5,7 @@
 //! background thread that serves `SelectionRequest` events so the
 //! paste target can retrieve the data.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,12 @@ const GRACE_PERIOD: Duration = Duration::from_millis(200);
 pub struct ClipboardServeHandle {
     stop: Arc<AtomicBool>,
     skip_grace: Arc<AtomicBool>,
+    /// Number of `SelectionRequest`s for `UTF8_STRING` answered so
+    /// far — i.e. how many times a paste target actually fetched the
+    /// text we offered.  The key diagnostic signal: `0` means the
+    /// paste keystroke never resulted in the target asking us for the
+    /// content (wrong selection, lost focus, or shortcut mismatch).
+    served: Arc<AtomicU32>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -41,6 +47,14 @@ impl ClipboardServeHandle {
     pub fn stop_now(&self) {
         self.skip_grace.store(true, Ordering::Relaxed);
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// How many `UTF8_STRING` `SelectionRequest`s this handle has
+    /// answered — i.e. how many times a paste target actually pulled
+    /// the offered text.  Used for paste diagnostics (gated behind
+    /// `-vvv` trace logging at the call sites).
+    pub fn served_count(&self) -> u32 {
+        self.served.load(Ordering::Relaxed)
     }
 }
 
@@ -176,8 +190,10 @@ pub fn x11_clipboard_set(text: &str) -> Option<ClipboardServeHandle> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let skip_grace = Arc::new(AtomicBool::new(false));
+    let served = Arc::new(AtomicU32::new(0));
     let stop2 = Arc::clone(&stop);
     let skip2 = Arc::clone(&skip_grace);
+    let served2 = Arc::clone(&served);
     let text = text.to_string();
 
     let atoms = Atoms {
@@ -187,7 +203,7 @@ pub fn x11_clipboard_set(text: &str) -> Option<ClipboardServeHandle> {
     };
 
     let handle = std::thread::spawn(move || {
-        serve_loop(&conn, &atoms, &text, &stop2, &skip2);
+        serve_loop(&conn, &atoms, &text, &stop2, &skip2, &served2);
         let _ = conn.destroy_window(window);
         let _ = conn.flush();
     });
@@ -195,6 +211,7 @@ pub fn x11_clipboard_set(text: &str) -> Option<ClipboardServeHandle> {
     Some(ClipboardServeHandle {
         stop,
         skip_grace,
+        served,
         handle: Some(handle),
     })
 }
@@ -223,6 +240,7 @@ fn serve_loop(
     text: &str,
     stop: &AtomicBool,
     skip_grace: &AtomicBool,
+    served: &AtomicU32,
 ) {
     let deadline = Instant::now() + DEFAULT_SERVE_DURATION;
 
@@ -233,7 +251,7 @@ fn serve_loop(
             if !skip_grace.load(Ordering::Relaxed) {
                 let grace_end = Instant::now() + GRACE_PERIOD;
                 while Instant::now() < grace_end {
-                    poll_and_serve(conn, atoms, text);
+                    poll_and_serve(conn, atoms, text, served);
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
@@ -242,7 +260,7 @@ fn serve_loop(
 
         match conn.poll_for_event() {
             Ok(Some(Event::SelectionRequest(req))) if req.selection == atoms.clipboard => {
-                serve_request(conn, &req, text, atoms);
+                serve_request(conn, &req, text, atoms, served);
             }
             Ok(Some(Event::SelectionClear(ev))) if ev.selection == atoms.clipboard => {
                 // Another app took ownership — exit immediately.
@@ -257,16 +275,22 @@ fn serve_loop(
 }
 
 /// One non-blocking poll-and-serve cycle (used during grace period).
-fn poll_and_serve(conn: &RustConnection, atoms: &Atoms, text: &str) {
+fn poll_and_serve(conn: &RustConnection, atoms: &Atoms, text: &str, served: &AtomicU32) {
     if let Ok(Some(Event::SelectionRequest(req))) = conn.poll_for_event() {
         if req.selection == atoms.clipboard {
-            serve_request(conn, &req, text, atoms);
+            serve_request(conn, &req, text, atoms, served);
         }
     }
 }
 
 /// Respond to a single `SelectionRequest`.
-fn serve_request(conn: &RustConnection, req: &SelectionRequestEvent, text: &str, atoms: &Atoms) {
+fn serve_request(
+    conn: &RustConnection,
+    req: &SelectionRequestEvent,
+    text: &str,
+    atoms: &Atoms,
+    served: &AtomicU32,
+) {
     // Per ICCCM, if property is None use target as fallback.
     let prop = if req.property == 0u32 {
         req.target
@@ -287,14 +311,29 @@ fn serve_request(conn: &RustConnection, req: &SelectionRequestEvent, text: &str,
         .is_ok()
     } else if req.target == atoms.utf8_string {
         // Provide the text.
-        conn.change_property8(
-            PropMode::REPLACE,
-            req.requestor,
-            prop,
-            atoms.utf8_string,
-            text.as_bytes(),
-        )
-        .is_ok()
+        let wrote = conn
+            .change_property8(
+                PropMode::REPLACE,
+                req.requestor,
+                prop,
+                atoms.utf8_string,
+                text.as_bytes(),
+            )
+            .is_ok();
+        if wrote {
+            // Record that a paste target actually fetched our text.
+            // This is the key paste-diagnostic signal (see
+            // `ClipboardServeHandle::served_count`).
+            let n = served.fetch_add(1, Ordering::Relaxed) + 1;
+            log::trace!(
+                "clipboard serve: answered UTF8_STRING request \
+                 from requestor {} ({} bytes, served #{})",
+                req.requestor,
+                text.len(),
+                n,
+            );
+        }
+        wrote
     } else {
         false
     };
