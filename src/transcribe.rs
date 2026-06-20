@@ -64,6 +64,15 @@ pub async fn transcribe(
         .or_else(|| config.transcription.as_ref().map(|t| t.default_provider))
         .unwrap_or(Provider::Mistral);
 
+    // Parakeet is a local backend whose model must be downloaded once.
+    // The transcribe pipeline never downloads silently, so obtain
+    // consent here (TTY prompt, or stderr-log + proceed when piped)
+    // before transcription reaches `validate`.  No-op once installed.
+    #[cfg(feature = "parakeet")]
+    if provider == Provider::Parakeet {
+        crate::transcription::parakeet::consent::ensure_with_cli_consent(&config).await?;
+    }
+
     let specific_options = cli_provider.is_some() || cli_model.is_some() || diarize;
     let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
         std::sync::Arc::new(crate::telemetry::NoOpSink);

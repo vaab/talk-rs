@@ -291,6 +291,15 @@ pub(super) async fn pick_with_streaming_gtk(
     // Check before spawn_blocking moves deferred_candidates.
     let has_deferred_realtime = deferred_candidates.iter().any(|(_, _, s)| *s);
 
+    // Clone the config Arc for the GTK thread: the per-row "T" click
+    // handler may need to gate Parakeet on a download-consent dialog,
+    // which calls `consent::resolve` on the config.  Only the
+    // `parakeet` feature reads it, so gate the clone to avoid an
+    // unused-binding warning on lean builds.  The original `config`
+    // is consumed by the async transcription tasks below.
+    #[cfg(feature = "parakeet")]
+    let config_for_gtk = config.clone();
+
     // ── GTK window ──────────────────────────────────────────────
     let gtk_handle = tokio::task::spawn_blocking(move || -> Result<(), TalkError> {
         use gtk4::glib;
@@ -1082,6 +1091,17 @@ pub(super) async fn pick_with_streaming_gtk(
             let deferred_for_btn = Rc::clone(&deferred_indices);
             let buttons_for_btn = Rc::clone(&action_buttons);
             let has_tx_for_btn = Rc::clone(&has_transcription);
+            // Captured by every per-row click handler: the picker
+            // window is the AlertDialog parent for the Parakeet
+            // download-consent prompt; the config drives the
+            // `consent::resolve` presence check.  Only the
+            // `parakeet` feature ever reads these, but they live at
+            // factory scope unconditionally so the closure shape
+            // stays identical across cfg flavours.
+            #[cfg(feature = "parakeet")]
+            let window_for_btn = window.clone();
+            #[cfg(feature = "parakeet")]
+            let config_for_btn = config_for_gtk.clone();
             move |provider: Provider,
                   model: String,
                   streaming: bool,
@@ -1101,6 +1121,14 @@ pub(super) async fn pick_with_streaming_gtk(
                     let deferred_ref = Rc::clone(&deferred_for_btn);
                     let buttons_ref = Rc::clone(&buttons_for_btn);
                     let has_tx_ref = Rc::clone(&has_tx_for_btn);
+                    // Both bindings only feed the Parakeet
+                    // download-consent gate below; the factory-scope
+                    // captures are already cfg-gated, so just clone
+                    // here under the same gate.
+                    #[cfg(feature = "parakeet")]
+                    let window_ref = window_for_btn.clone();
+                    #[cfg(feature = "parakeet")]
+                    let config_ref = config_for_btn.clone();
                     btn.connect_clicked(move |clicked| {
                         use gtk4::prelude::*;
                         log::debug!(
@@ -1137,56 +1165,158 @@ pub(super) async fn pick_with_streaming_gtk(
                         let Some(idx) = idx else {
                             return;
                         };
-                        // Reset row state: clear text, errors, segments,
-                        // diff baseline, and the deferred flag.
-                        {
-                            let mut cands = cands_ref.borrow_mut();
-                            if let Some((_, _, text, _, is_error, _, segments, meta)) =
-                                cands.get_mut(idx)
-                            {
-                                text.clear();
-                                *is_error = false;
-                                *segments = None;
-                                *meta = TranscriptionMetadata::default();
+
+                        // The post-consent action: reset the row,
+                        // swap to spinner / streaming label, flip
+                        // the button to Stop mode, and hand off to
+                        // the async retry listener.  Wrapped in a
+                        // local `FnOnce` so it can be invoked either
+                        // directly (no consent needed) or from the
+                        // Parakeet AlertDialog callback (after the
+                        // user confirms the download).
+                        let do_transcribe = {
+                            let cells_ref = Rc::clone(&cells_ref);
+                            let labels_ref = Rc::clone(&labels_ref);
+                            let raw_ref = Rc::clone(&raw_ref);
+                            let cands_ref = Rc::clone(&cands_ref);
+                            let deferred_ref = Rc::clone(&deferred_ref);
+                            let buttons_ref = Rc::clone(&buttons_ref);
+                            let has_tx_ref = Rc::clone(&has_tx_ref);
+                            let tx = tx.clone();
+                            let model = model.clone();
+                            let clicked = clicked.clone();
+                            move || {
+                                // Reset row state: clear text, errors,
+                                // segments, diff baseline, and the
+                                // deferred flag.
+                                {
+                                    let mut cands = cands_ref.borrow_mut();
+                                    if let Some((
+                                        _,
+                                        _,
+                                        text,
+                                        _,
+                                        is_error,
+                                        _,
+                                        segments,
+                                        meta,
+                                    )) = cands.get_mut(idx)
+                                    {
+                                        text.clear();
+                                        *is_error = false;
+                                        *segments = None;
+                                        *meta = TranscriptionMetadata::default();
+                                    }
+                                }
+                                raw_ref.borrow_mut()[idx] = String::new();
+                                deferred_ref.borrow_mut().remove(&idx);
+                                if let Some(flag) = has_tx_ref.borrow_mut().get_mut(idx) {
+                                    *flag = false;
+                                }
+
+                                // Swap the transcript cell to a spinner
+                                // (batch) or empty streaming label
+                                // (realtime).
+                                {
+                                    let cells = cells_ref.borrow();
+                                    if let Some(cell) = cells.get(idx) {
+                                        while let Some(child) = cell.first_child() {
+                                            cell.remove(&child);
+                                        }
+                                        if streaming {
+                                            let label = make_transcript_label("");
+                                            cell.append(&label);
+                                            labels_ref.borrow_mut()[idx] = Some(label);
+                                        } else {
+                                            let spinner = gtk4::Spinner::new();
+                                            spinner.start();
+                                            cell.append(&spinner);
+                                            labels_ref.borrow_mut()[idx] = None;
+                                        }
+                                    }
+                                }
+
+                                // Flip the action button to Stop mode
+                                // for the duration of the in-flight
+                                // request.  The poll loop flips it
+                                // back to T / ↻ when the result
+                                // (or error) arrives.
+                                set_action_icon_stop(&clicked);
+                                if let Some(btn) = buttons_ref.borrow().get(idx) {
+                                    set_action_icon_stop(btn);
+                                }
+
+                                let _ = tx.send((provider, model.clone(), streaming));
+                            }
+                        };
+
+                        // Parakeet download-consent gate.  When the
+                        // user clicks "T" on a Parakeet row and the
+                        // model files are not on disk, show a modal
+                        // AlertDialog asking permission to fetch
+                        // ~640 MB before any download / transcription
+                        // runs.  Cancel is a clean no-op (no row
+                        // reset, no Stop-mode flip, no `tx.send`);
+                        // Download triggers `do_transcribe` and the
+                        // async retry listener performs the download
+                        // before the actual transcription.
+                        //
+                        // Sitting BEFORE the row-state reset and
+                        // spinner swap, so Cancel leaves the row
+                        // exactly as it was — the button stays "T"
+                        // and the transcript cell keeps its prior
+                        // content.
+                        #[cfg(feature = "parakeet")]
+                        if provider == Provider::Parakeet {
+                            let needs_consent = matches!(
+                                crate::transcription::parakeet::consent::resolve(
+                                    config_ref.as_ref(),
+                                ),
+                                Ok(ref st) if !st.present,
+                            );
+                            if needs_consent {
+                                log::info!(
+                                    "picker: Parakeet model absent — prompting for download consent",
+                                );
+                                let dialog = gtk4::AlertDialog::builder()
+                                    .modal(true)
+                                    .message("Download Parakeet speech model?")
+                                    .detail(
+                                        "The local Parakeet model (~640 MB) is not installed. \
+                                         Download it now?",
+                                    )
+                                    .buttons(["Cancel", "Download"])
+                                    .default_button(1)
+                                    .cancel_button(0)
+                                    .build();
+                                dialog.choose(
+                                    Some(&window_ref),
+                                    None::<&gtk4::gio::Cancellable>,
+                                    move |res| match res {
+                                        Ok(1) => {
+                                            log::info!(
+                                                "picker: Parakeet download consent granted",
+                                            );
+                                            do_transcribe();
+                                        }
+                                        Ok(_) => {
+                                            log::info!(
+                                                "picker: Parakeet download declined — aborting click",
+                                            );
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "picker: Parakeet consent dialog failed: {} — aborting click",
+                                                e,
+                                            );
+                                        }
+                                    },
+                                );
+                                return;
                             }
                         }
-                        raw_ref.borrow_mut()[idx] = String::new();
-                        deferred_ref.borrow_mut().remove(&idx);
-                        if let Some(flag) = has_tx_ref.borrow_mut().get_mut(idx) {
-                            *flag = false;
-                        }
 
-                        // Swap the transcript cell to a spinner (batch)
-                        // or empty streaming label (realtime).
-                        {
-                            let cells = cells_ref.borrow();
-                            if let Some(cell) = cells.get(idx) {
-                                while let Some(child) = cell.first_child() {
-                                    cell.remove(&child);
-                                }
-                                if streaming {
-                                    let label = make_transcript_label("");
-                                    cell.append(&label);
-                                    labels_ref.borrow_mut()[idx] = Some(label);
-                                } else {
-                                    let spinner = gtk4::Spinner::new();
-                                    spinner.start();
-                                    cell.append(&spinner);
-                                    labels_ref.borrow_mut()[idx] = None;
-                                }
-                            }
-                        }
-
-                        // Flip the action button to Stop mode for
-                        // the duration of the in-flight request.
-                        // The poll loop flips it back to T / ↻
-                        // when the result (or error) arrives.
-                        set_action_icon_stop(clicked);
-                        if let Some(btn) = buttons_ref.borrow().get(idx) {
-                            set_action_icon_stop(btn);
-                        }
-
-                        let _ = tx.send((provider, model.clone(), streaming));
+                        do_transcribe();
                     });
                 }
                 btn
@@ -2088,6 +2218,48 @@ pub(super) async fn pick_with_streaming_gtk(
                         }
                     }
                 } else {
+                    // Parakeet download-on-demand.  The GTK click
+                    // handler already obtained explicit user consent
+                    // via the AlertDialog before sending us this
+                    // (provider, model) pair, so it is safe to fetch
+                    // the model files here without prompting again.
+                    // The actual transcription via `spawn_transcription`
+                    // calls `model::ensure_present` internally and
+                    // would error otherwise — by downloading first we
+                    // turn that would-be error into a successful
+                    // transcription.  Done on the async listener
+                    // task (not the GTK thread) so the UI stays
+                    // responsive while the ~640 MB download runs.
+                    #[cfg(feature = "parakeet")]
+                    if provider == Provider::Parakeet {
+                        use crate::transcription::parakeet::{consent, model as parakeet_model};
+                        match consent::resolve(config.as_ref()) {
+                            Ok(st) if !st.present => {
+                                log::info!(
+                                    "picker: downloading Parakeet model to {} (consent given via dialog)",
+                                    st.model_dir.display(),
+                                );
+                                if let Err(e) =
+                                    parakeet_model::download_model(&st.model_dir, st.variant).await
+                                {
+                                    log::warn!("picker: Parakeet model download failed: {}", e);
+                                    let _ = tx.send(PickerMessage::Candidate(Box::new(
+                                        PickerCandidate::error(
+                                            provider,
+                                            model.clone(),
+                                            format!("{e}"),
+                                            false,
+                                        ),
+                                    )));
+                                    continue;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::warn!("picker: Parakeet consent resolve failed: {}", e);
+                            }
+                        }
+                    }
                     let mut tasks = tokio::task::JoinSet::new();
                     spawn_transcription(
                         &mut tasks,

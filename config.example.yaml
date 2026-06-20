@@ -58,7 +58,21 @@ providers:
   #   model: whisper-1                          # batch model (whisper-1, gpt-4o-transcribe)
   #   realtime_model: gpt-4o-mini-transcribe    # realtime WebSocket model
 
-# Optional: Default provider when --provider is not specified
+  # Parakeet local backend (on-device, offline, CPU). No API key.
+  # NVIDIA Parakeet TDT 0.6b v3, 25 European languages incl. French.
+  # The model (~640 MB INT8) auto-downloads on first use into
+  # ~/.local/share/talk-rs/models/parakeet-tdt-0.6b-v3-int8/ and is
+  # cached forever after (fully offline thereafter).
+  # Requires the `parakeet` build feature (enabled by default; drop
+  # via `cargo build --release --no-default-features`).
+  # parakeet:
+  #   variant: int8          # int8 (default, ~640 MB) — fp32 not yet available as a prebuilt download
+  #   # model_dir: ~/.local/share/talk-rs/models/parakeet-tdt-0.6b-v3-int8   # override cache location
+  #   num_threads: 2         # decode threads (default 2)
+  #   # model: parakeet-tdt-0.6b-v3-int8   # logical name surfaced in cache keys / metadata
+
+# Optional: Default provider when --provider is not specified.
+# Valid values: mistral, openai, parakeet.
 # transcription:
 #   default_provider: mistral
 

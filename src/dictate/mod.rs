@@ -445,6 +445,31 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     };
 
+    // Parakeet is a local backend whose model must be downloaded once
+    // (~640 MB).  The transcribe pipeline never downloads silently, so
+    // for the toggle/dictate flow we download it HERE — before
+    // recording starts — showing a "downloading model" badge.  For
+    // this non-interactive surface, selecting the Parakeet provider is
+    // the consent (user-confirmed).  No-op once the model is installed.
+    #[cfg(feature = "parakeet")]
+    if provider == Provider::Parakeet {
+        let status = crate::transcription::parakeet::consent::resolve(&config)?;
+        if !status.present {
+            if let Some(ref o) = overlay {
+                o.show(IndicatorKind::DownloadingModel);
+            }
+            log::info!(
+                "parakeet model not found at {}; downloading before recording",
+                status.model_dir.display()
+            );
+            crate::transcription::parakeet::model::download_model(
+                &status.model_dir,
+                status.variant,
+            )
+            .await?;
+        }
+    }
+
     // Show recording indicator
     if let Some(ref o) = overlay {
         log::debug!("showing recording overlay");

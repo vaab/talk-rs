@@ -160,6 +160,15 @@ pub enum IndicatorKind {
     Recording,
     /// Blue badge shown during transcription (static PNG).
     Transcribing,
+    /// Badge shown while the local speech model is downloading.
+    ///
+    /// Rendered as a static "DOWNLOADING MODEL" text badge using the
+    /// same mechanism as [`IndicatorKind::Transcribing`] — the
+    /// recording-loop render path with a dimmed
+    /// waterfall/amplitude/spectrum background and a static text
+    /// overlay on top.  The three states (Recording, Transcribing,
+    /// DownloadingModel) are mutually exclusive.
+    DownloadingModel,
 }
 
 /// Commands sent from the main thread to the overlay thread.
@@ -1284,6 +1293,25 @@ fn render_transcribing_text(
     render_badge_text(pb, font, "TRANSCRIBING", color, x0, y0, w, h);
 }
 
+/// Render "DOWNLOADING MODEL" text, centred in the SPEC area.
+///
+/// Same rendering path as [`render_transcribing_text`]; reuses the
+/// light-blue colour so the static-badge family stays
+/// theme-consistent.  Used while the local speech model is
+/// downloading (a one-time, multi-second operation that blocks the
+/// first recording).
+fn render_downloading_text(
+    pb: &mut PixelBuffer,
+    font: &fontdue::Font,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) {
+    let color: [u8; 4] = [0xFF, 0xCC, 0x66, 0xFF]; // light blue BGRA
+    render_badge_text(pb, font, "DOWNLOADING MODEL", color, x0, y0, w, h);
+}
+
 /// Font size for the retry-attempt counter.  Smaller than the
 /// `TRANSCRIBING`/`LISTENING` badge text so it doesn't compete
 /// for attention; large enough that "1"–"5" remain legible
@@ -1728,6 +1756,14 @@ fn overlay_thread(
     // colour layer shows the HTTP lifecycle on top.
     let mut is_transcribing: bool = false;
 
+    // True while the local speech model is downloading (one-time,
+    // multi-second operation that blocks the first recording).
+    // Mutually exclusive with `is_transcribing` and live recording:
+    // the render path treats it identically to `is_transcribing`
+    // (dimmed background + static text overlay) but draws
+    // "DOWNLOADING MODEL" instead of "TRANSCRIBING".
+    let mut is_downloading: bool = false;
+
     // ── Byte throughput state (Layer 3b) ─────────────────────────
     //
     // Three independent tracks that can overlap in streaming mode:
@@ -1824,6 +1860,7 @@ fn overlay_thread(
                     current_gc = Some(gc);
                     is_recording = true;
                     is_transcribing = false;
+                    is_downloading = false;
                     spectrogram_history.clear();
                     phase_history.clear();
                     upload_history.clear();
@@ -1860,6 +1897,7 @@ fn overlay_thread(
                 Command::Show(IndicatorKind::Transcribing) => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
+                    is_downloading = false;
                     show_transcribing(
                         &conn,
                         screen,
@@ -1870,6 +1908,88 @@ fn overlay_thread(
                         mon_w,
                         &mut current_window,
                     )?;
+                }
+
+                Command::Show(IndicatorKind::DownloadingModel) => {
+                    // Mirror Show(Recording)'s window-creation path so the
+                    // 60 fps render loop kicks in and draws the
+                    // "DOWNLOADING MODEL" static text badge.  The three
+                    // states (Recording / Transcribing / DownloadingModel)
+                    // are mutually exclusive flags inside the render
+                    // loop; here we set is_downloading=true and
+                    // is_transcribing=false.
+                    destroy_current(&conn, &mut current_window, &mut current_gc);
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
+
+                    let badge_x = mon_x + (mon_w as i16 / 2) - (BADGE_W as i16 / 2);
+                    let badge_y = mon_y + 4;
+
+                    let win = if let Some(ref ctx) = argb_ctx {
+                        // 32-bit ARGB window with shape mask for rounded corners.
+                        let w = create_argb_overlay_window(
+                            &conn, root, ctx, badge_x, badge_y, BADGE_W, BADGE_H,
+                        )?;
+                        apply_rounded_shape(&conn, w, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+                        w
+                    } else {
+                        // Fallback: opaque window with shape mask.
+                        let w = create_overlay_window(
+                            &conn, screen, root, badge_x, badge_y, BADGE_W, BADGE_H,
+                        )?;
+                        apply_rounded_shape(&conn, w, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+                        w
+                    };
+
+                    conn.map_window(win)
+                        .map_err(|e| TalkError::Config(format!("X11 map_window failed: {}", e)))?;
+                    conn.sync()
+                        .map_err(|e| TalkError::Config(format!("X11 sync failed: {}", e)))?;
+
+                    let gc = conn
+                        .generate_id()
+                        .map_err(|e| TalkError::Config(format!("X11 generate_id: {}", e)))?;
+                    conn.create_gc(gc, win, &CreateGCAux::new())
+                        .map_err(|e| TalkError::Config(format!("X11 create_gc: {}", e)))?;
+
+                    conn.flush()
+                        .map_err(|e| TalkError::Config(format!("X11 flush: {}", e)))?;
+
+                    current_window = Some(win);
+                    current_gc = Some(gc);
+                    is_recording = true;
+                    is_transcribing = false;
+                    is_downloading = true;
+                    spectrogram_history.clear();
+                    phase_history.clear();
+                    upload_history.clear();
+                    download_history.clear();
+                    paste_history.clear();
+                    current_upload_bytes = 0;
+                    prev_upload_bytes = 0;
+                    upload_peak_delta = 1;
+                    current_download_bytes = 0;
+                    prev_download_bytes = 0;
+                    download_peak_delta = 1;
+                    current_paste_chars = 0;
+                    prev_paste_chars = 0;
+                    paste_peak_delta = 1;
+                    columns_pushed_total = 0;
+                    current_phase = Phase::Idle;
+                    current_retry = None;
+                    rms_peak = PEAK_FLOOR;
+                    spec_peak = PEAK_FLOOR;
+                    spectrum_peak = PEAK_FLOOR;
+                    amp_peak = PEAK_FLOOR;
+                    amp_history.clear();
+                    amp_history.resize(amp_max_frames, 0.0);
+                    effective_freq_max = FREQ_INITIAL_MAX;
+                    dead_signal_frames = 0;
+                    no_sound_active = false;
+                    silence_notified = false;
+                    quiet_frames = 0;
+                    auto_paused = false;
+                    pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    had_live_audio.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 Command::Hide => {
@@ -1897,6 +2017,7 @@ fn overlay_thread(
             match rx.try_recv() {
                 Ok(Command::Show(IndicatorKind::Recording)) => {
                     is_transcribing = false;
+                    is_downloading = false;
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
                     spectrogram_history.clear();
                     phase_history.clear();
@@ -1937,6 +2058,18 @@ fn overlay_thread(
                     // recording has stopped), and the phase colour
                     // layer renders the HTTP lifecycle on top.
                     is_transcribing = true;
+                    is_downloading = false;
+                    destroy_current(&conn, &mut centered_window, &mut centered_gc);
+                }
+                Ok(Command::Show(IndicatorKind::DownloadingModel)) => {
+                    // Mutually exclusive with the other two states:
+                    // the render loop keeps running, the waterfall
+                    // keeps scrolling with empty columns, and the
+                    // static "DOWNLOADING MODEL" text overlay takes
+                    // the place of "TRANSCRIBING" for the duration
+                    // of the model download.
+                    is_transcribing = false;
+                    is_downloading = true;
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
                 }
                 Ok(Command::Hide) => {
@@ -2260,13 +2393,13 @@ fn overlay_thread(
         // regardless so the phase line and throughput bars continue
         // to advance on the time axis.
         if column_frame_counter.is_multiple_of(COLUMN_PERIOD_FRAMES)
-            && (!no_sound_active || is_transcribing)
+            && (!no_sound_active || is_transcribing || is_downloading)
         {
             if let Some(mode) = viz {
                 use crate::config::VizMode;
                 match mode {
                     VizMode::Waterfall => {
-                        let column = if auto_paused || is_transcribing {
+                        let column = if auto_paused || is_transcribing || is_downloading {
                             // Empty column → no visible content, but the
                             // column still advances so the time axis
                             // keeps moving and the spectrogram "hole"
@@ -2286,9 +2419,10 @@ fn overlay_thread(
                         }
                     }
                     VizMode::Amplitude => {
-                        // 0.0 during pause / transcribing so the
-                        // history also shows a visible gap.
-                        let val = if auto_paused || is_transcribing {
+                        // 0.0 during pause / transcribing /
+                        // model-download so the history also shows
+                        // a visible gap.
+                        let val = if auto_paused || is_transcribing || is_downloading {
                             0.0
                         } else {
                             frame_rms
@@ -2355,13 +2489,15 @@ fn overlay_thread(
         pb.clear(BG_COLOR);
         draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
 
-        // Transcribing takes priority over the dead-signal (NO SOUND)
+        // Transcribing (and the mutually-exclusive "downloading model"
+        // sibling) takes priority over the dead-signal (NO SOUND)
         // branch: after capture.stop() the audio ring buffer goes
         // stale and the dead-signal detector fires, but we WANT to
         // keep rendering the waterfall + phase line + throughput bars
         // rather than showing the NO SOUND prohibit icon.
-        if is_transcribing {
-            // ── TRANSCRIBING mode: dimmed waterfall + phase ───
+        if is_transcribing || is_downloading {
+            // ── TRANSCRIBING / DOWNLOADING MODEL mode:
+            //    dimmed waterfall + phase ──────────────────────
             //
             // Same visual treatment as auto-pause (dimmed waterfall
             // keeps scrolling, empty columns create the "hole")
@@ -2436,25 +2572,35 @@ fn overlay_thread(
                 download_peak_delta,
                 paste_peak_delta,
             );
-            // "TRANSCRIBING" text over the dimmed waterfall (same
-            // pattern as "LISTENING" during auto-pause).
+            // "TRANSCRIBING" / "DOWNLOADING MODEL" text over the
+            // dimmed waterfall (same pattern as "LISTENING" during
+            // auto-pause).  The three flags is_recording (live),
+            // is_transcribing, and is_downloading are mutually
+            // exclusive; only one static-badge text fires here.
             if let Some(ref f) = badge_font {
-                render_transcribing_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
-                // Retry-attempt indicator (1, 2, 3, …) drawn small
-                // at the top-left of the SPEC area so it doesn't
-                // collide with the centered TRANSCRIBING text.
-                // Opacity follows the current phase: dimmed during
-                // validation, full during transcription retries.
-                if let Some((attempt, max)) = current_retry {
-                    render_retry_counter(
-                        &mut pb,
-                        f,
-                        SPEC_LEFT + 2,
-                        SPEC_TOP + PHASE_LINE_HEIGHT,
-                        attempt,
-                        max,
-                        current_phase.opacity(),
-                    );
+                if is_downloading {
+                    render_downloading_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+                } else {
+                    render_transcribing_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+                    // Retry-attempt indicator (1, 2, 3, …) drawn
+                    // small at the top-left of the SPEC area so it
+                    // doesn't collide with the centered TRANSCRIBING
+                    // text.  Opacity follows the current phase:
+                    // dimmed during validation, full during
+                    // transcription retries.  Only meaningful while
+                    // actually transcribing — the model-download
+                    // phase has no retry counter.
+                    if let Some((attempt, max)) = current_retry {
+                        render_retry_counter(
+                            &mut pb,
+                            f,
+                            SPEC_LEFT + 2,
+                            SPEC_TOP + PHASE_LINE_HEIGHT,
+                            attempt,
+                            max,
+                            current_phase.opacity(),
+                        );
+                    }
                 }
             }
         } else if no_sound_active {
@@ -3300,6 +3446,11 @@ mod tests {
         let b = a;
         assert_eq!(a, b);
         assert_ne!(IndicatorKind::Recording, IndicatorKind::Transcribing);
+        assert_ne!(IndicatorKind::Recording, IndicatorKind::DownloadingModel);
+        assert_ne!(IndicatorKind::Transcribing, IndicatorKind::DownloadingModel);
+        let c = IndicatorKind::DownloadingModel;
+        let d = c;
+        assert_eq!(c, d);
     }
 
     // ── Border rendering ───────────────────────────────────────────────

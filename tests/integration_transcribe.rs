@@ -117,6 +117,7 @@ async fn test_transcribe_audio_cache_only_on_missing_entry() {
         providers: ProvidersConfig {
             mistral: Some(config),
             openai: None,
+            parakeet: None,
         },
         indicators: None,
         transcription: None,
@@ -198,6 +199,7 @@ async fn test_mistral_transcriber_real_api() {
         providers: ProvidersConfig {
             mistral: Some(mistral_config),
             openai: None,
+            parakeet: None,
         },
         indicators: None,
         transcription: None,

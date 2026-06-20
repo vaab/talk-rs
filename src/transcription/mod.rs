@@ -192,12 +192,16 @@ pub mod mistral;
 pub mod model_suggestions;
 pub mod openai;
 pub mod openai_realtime;
+#[cfg(feature = "parakeet")]
+pub mod parakeet;
 pub mod realtime;
 pub mod transport;
 
 pub use mistral::MistralBatchTranscriber;
 pub use openai::OpenAIBatchTranscriber;
 pub use openai_realtime::OpenAIRealtimeTranscriber;
+#[cfg(feature = "parakeet")]
+pub use parakeet::ParakeetBatchTranscriber;
 pub use realtime::{MistralRealtimeTranscriber, TranscriptionEvent};
 
 /// Result type for transcription operations.
@@ -525,6 +529,8 @@ pub fn is_model_error(provider: Provider, error: &TalkError) -> bool {
     match provider {
         Provider::Mistral => mistral::is_model_error(error),
         Provider::OpenAI => openai::is_model_error(error),
+        // Parakeet is a local backend — no remote model-rejection concept.
+        Provider::Parakeet => false,
     }
 }
 
@@ -556,6 +562,9 @@ pub async fn enrich_model_error(
             let api_base = cfg.url.as_deref().unwrap_or(openai::API_BASE);
             openai::enrich_model_error(error, &cfg.api_key, model_name, api_base).await
         }
+        // Parakeet is local; no API model catalog to enrich against —
+        // pass the error through unchanged.
+        Provider::Parakeet => error,
     }
 }
 
@@ -612,6 +621,28 @@ pub(crate) fn create_batch_transcriber(
             }
             Ok(Box::new(OpenAIBatchTranscriber::with_policy(cfg, policy)?))
         }
+        // Phase 3: local Parakeet backend.  Construction is cheap
+        // (path resolution only); the heavy model load happens on
+        // first `fetch_transcription`.  `validate` only CHECKS model
+        // presence (model::ensure_present) — it never downloads.  The
+        // download is an explicit, consented step driven by each entry
+        // surface (CLI / toggle / picker) before transcription begins.
+        #[cfg(feature = "parakeet")]
+        Provider::Parakeet => {
+            let mut cfg = config.providers.parakeet.clone().unwrap_or_default();
+            if let Some(m) = model {
+                cfg.model = Some(m.to_string());
+            }
+            Ok(Box::new(ParakeetBatchTranscriber::with_policy(
+                cfg, policy,
+            )?))
+        }
+        #[cfg(not(feature = "parakeet"))]
+        Provider::Parakeet => Err(TalkError::Config(
+            "talk-rs was built without the 'parakeet' feature; rebuild without \
+             --no-default-features to enable the local Parakeet backend"
+                .to_string(),
+        )),
     }
 }
 
@@ -862,6 +893,12 @@ fn resolve_effective_model(config: &Config, provider: Provider, model: Option<&s
             .as_ref()
             .map(|c| c.model.clone())
             .unwrap_or_else(|| "whisper-1".to_string()),
+        Provider::Parakeet => config
+            .providers
+            .parakeet
+            .as_ref()
+            .map(|c| c.resolved_model_name())
+            .unwrap_or_else(|| "parakeet-tdt-0.6b-v3-int8".to_string()),
     }
 }
 
@@ -904,6 +941,11 @@ pub(crate) fn create_realtime_transcriber(
             }
             Ok(Box::new(OpenAIRealtimeTranscriber::new(cfg)))
         }
+        // Parakeet is batch-only; reject realtime selection cleanly.
+        Provider::Parakeet => Err(TalkError::Config(
+            "parakeet provider has no realtime mode; use batch transcription (omit --realtime)"
+                .to_string(),
+        )),
     }
 }
 
@@ -1440,5 +1482,50 @@ providers:
         )
         .await;
         assert_eq!(result.unwrap(), "x");
+    }
+
+    /// Factory wiring: with the `parakeet` feature enabled (the
+    /// default), `create_batch_transcriber(.., Provider::Parakeet, ..)`
+    /// must return `Ok(boxed)` without touching the filesystem or the
+    /// network.  The expensive model load is deferred to
+    /// `validate` / `fetch_transcription`.
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn create_batch_transcriber_parakeet_constructs_without_io() {
+        use crate::config::{ParakeetConfig, ParakeetVariant, ProvidersConfig};
+
+        let tmp = tempfile::TempDir::new().expect("tmp dir");
+        let parakeet_cfg = ParakeetConfig {
+            variant: ParakeetVariant::Int8,
+            // Empty dir — must NOT error at construction time.
+            model_dir: Some(tmp.path().to_path_buf()),
+            num_threads: 1,
+            model: None,
+        };
+        let config = Config {
+            output_dir: tmp.path().to_path_buf(),
+            providers: ProvidersConfig {
+                mistral: None,
+                openai: None,
+                parakeet: Some(parakeet_cfg),
+            },
+            indicators: None,
+            transcription: None,
+            paste: None,
+            audio: None,
+            recording: None,
+        };
+
+        let t = create_batch_transcriber(
+            &config,
+            Provider::Parakeet,
+            None,
+            false,
+            RequestTimeoutPolicy::Proportional,
+        )
+        .expect("parakeet construction must succeed");
+        // We only need to confirm the boxed value exists — the
+        // concrete type stays private behind the trait.
+        let _: Box<dyn BatchTranscriber> = t;
     }
 }

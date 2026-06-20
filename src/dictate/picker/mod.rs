@@ -222,6 +222,43 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
             deferred.push((p, m, s));
         }
     }
+
+    // Parakeet immediate-default fallback.  When the default model
+    // is Parakeet and its files are not on disk, demote the
+    // candidate from the immediate batch to the deferred list — so
+    // the picker opens with a clickable "T" row instead of
+    // auto-firing a transcription that would just error out (the
+    // pipeline NEVER downloads silently).  The user then clicks T
+    // and the picker's GTK click handler shows the consent
+    // AlertDialog before the async retry listener fetches the model
+    // and runs the transcription.  This keeps "open the picker" a
+    // non-intrusive action (no auto-dialog at open) while still
+    // surfacing the model as a first-class candidate.
+    #[cfg(feature = "parakeet")]
+    {
+        let mut i = 0;
+        while i < default_filtered.len() {
+            if default_filtered[i].0 == Provider::Parakeet {
+                let present = crate::transcription::parakeet::consent::resolve(config.as_ref())
+                    .map(|s| s.present)
+                    .unwrap_or(true); // resolve failed → let the
+                                      // transcribe path surface a
+                                      // clean error instead of
+                                      // silently deferring.
+                if !present {
+                    let cand = default_filtered.remove(i);
+                    log::debug!(
+                        "picker: default Parakeet model {} absent — deferring until user clicks T",
+                        cand.1,
+                    );
+                    deferred.push(cand);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
     log::debug!(
         "picker: {} immediate, {} deferred",
         default_filtered.len(),
