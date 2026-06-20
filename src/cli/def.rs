@@ -43,7 +43,7 @@ pub enum Commands {
         /// Output file path (optional, defaults to stdout)
         #[arg(value_name = "OUTPUT")]
         output: Option<String>,
-        /// Transcription provider (mistral or openai)
+        /// Transcription provider (mistral, openai, or parakeet)
         #[arg(long, value_parser = clap::value_parser!(Provider))]
         provider: Option<Provider>,
         /// Model name (overrides config default for the chosen provider)
@@ -76,7 +76,7 @@ pub enum Commands {
         /// Delete previous pasted text length before inserting selected text
         #[arg(long)]
         replace_last_paste: bool,
-        /// Transcription provider (mistral or openai)
+        /// Transcription provider (mistral, openai, or parakeet)
         #[arg(long, value_parser = clap::value_parser!(Provider))]
         provider: Option<Provider>,
         /// Model name (overrides config default for the chosen provider)

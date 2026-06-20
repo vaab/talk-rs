@@ -59,6 +59,24 @@ gdk4-x11 = "0.8"
 dark-light = "2.0"
 dissimilar = "1"
 fs2 = "0.4.3"
+# Local ASR backend (Parakeet TDT via ONNX Runtime, CPU).  Phase 0
+# verified that a bare `sherpa-onnx = "1.13"` already static-links the
+# prebuilt C++ archive (no runtime .so, ~10 s build); keeping default
+# features so the static-binary download is not disabled.  `tar` /
+# `bzip2` are used by the model-download path landed in a later
+# phase — declared here so the `parakeet` feature is self-contained
+# once that lands.
+sherpa-onnx = { version = "1.13", optional = true }
+tar = { version = "0.4", optional = true }
+bzip2 = { version = "0.4", optional = true }
+
+[features]
+# `parakeet` is ON by default: prebuilt binaries ship the local
+# backend working out-of-the-box.  Build with
+# `--no-default-features` to drop the static sherpa-onnx C++ lib
+# (smaller binary, cloud providers only).
+default = ["parakeet"]
+parakeet = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
 
 [dev-dependencies]
 assert_cmd = "2"

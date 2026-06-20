@@ -139,6 +139,14 @@ pub enum Provider {
     /// OpenAI Whisper / GPT-4o transcription.
     #[serde(alias = "openai")]
     OpenAI,
+    /// Local Parakeet TDT (ONNX, CPU).  Unlike [`Provider::Mistral`]
+    /// and [`Provider::OpenAI`] (remote APIs keyed by `api_key`),
+    /// Parakeet runs on-device and is keyed by model files on disk —
+    /// the deliberate local-vs-remote divergence in the provider
+    /// abstraction (see `parakeet-local-backend.md`).  Always present
+    /// regardless of the `parakeet` build feature so a config with
+    /// `provider: parakeet` always parses.
+    Parakeet,
 }
 
 impl std::fmt::Display for Provider {
@@ -146,6 +154,7 @@ impl std::fmt::Display for Provider {
         match self {
             Provider::Mistral => write!(f, "mistral"),
             Provider::OpenAI => write!(f, "openai"),
+            Provider::Parakeet => write!(f, "parakeet"),
         }
     }
 }
@@ -157,8 +166,9 @@ impl std::str::FromStr for Provider {
         match s.to_lowercase().as_str() {
             "mistral" => Ok(Provider::Mistral),
             "openai" => Ok(Provider::OpenAI),
+            "parakeet" => Ok(Provider::Parakeet),
             other => Err(format!(
-                "unknown provider '{}' (expected 'mistral' or 'openai')",
+                "unknown provider '{}' (expected 'mistral', 'openai', or 'parakeet')",
                 other
             )),
         }
@@ -175,6 +185,12 @@ pub struct ProvidersConfig {
     /// OpenAI API configuration (optional — only required when using OpenAI).
     #[serde(default)]
     pub openai: Option<OpenAIConfig>,
+
+    /// Local Parakeet configuration (optional — only required when
+    /// using the Parakeet provider; defaults are usable when present
+    /// as an empty `parakeet: {}` block).
+    #[serde(default)]
+    pub parakeet: Option<ParakeetConfig>,
 }
 
 /// Mistral API configuration.
@@ -243,6 +259,127 @@ fn default_openai_model() -> String {
 
 fn default_openai_realtime_model() -> String {
     "gpt-realtime-whisper".to_string()
+}
+
+/// Parakeet quantization variant.
+///
+/// Selects which prebuilt model tarball is fetched (in later phases)
+/// and which on-disk filenames are expected.  `int8` is the
+/// recommended CPU-friendly default; `fp32` is the higher-fidelity,
+/// much larger option.  Both names match the sherpa-onnx release
+/// asset naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParakeetVariant {
+    /// INT8 quantized (~640 MB).  Recommended; CPU-friendly.
+    #[default]
+    Int8,
+    /// FP32 full precision (~2.3 GB).  Higher fidelity, much larger.
+    Fp32,
+}
+
+impl std::fmt::Display for ParakeetVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParakeetVariant::Int8 => write!(f, "int8"),
+            ParakeetVariant::Fp32 => write!(f, "fp32"),
+        }
+    }
+}
+
+impl std::str::FromStr for ParakeetVariant {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "int8" => Ok(ParakeetVariant::Int8),
+            "fp32" => Ok(ParakeetVariant::Fp32),
+            other => Err(format!(
+                "unknown parakeet variant '{}' (expected 'int8' or 'fp32')",
+                other
+            )),
+        }
+    }
+}
+
+/// Local Parakeet backend configuration.
+///
+/// Unlike [`MistralConfig`] / [`OpenAIConfig`] (remote APIs keyed by
+/// `api_key`), Parakeet runs on-device: it is keyed by **model files
+/// on disk**.  This is the deliberate local-vs-remote divergence in
+/// the provider abstraction — see plan
+/// `parakeet-local-backend.md`.  Every field is optional; the
+/// default-constructed value is a usable INT8 configuration that
+/// resolves its model directory to the XDG data dir.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ParakeetConfig {
+    /// Quantization variant.  `int8` (default) or `fp32`.  Selects
+    /// which model tarball is fetched (in later phases) and which
+    /// on-disk filenames are expected.
+    #[serde(default)]
+    pub variant: ParakeetVariant,
+
+    /// Directory holding the model files
+    /// (encoder/decoder/joiner + tokens.txt).  Defaults to the XDG
+    /// data dir, suffixed by variant:
+    /// `~/.local/share/talk-rs/models/parakeet-tdt-0.6b-v3-<variant>`.
+    #[serde(default)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Decode threads.  Default: 2.
+    #[serde(default = "default_parakeet_threads")]
+    pub num_threads: i32,
+
+    /// Logical model name surfaced in cache keys / metadata.
+    /// Defaults to `parakeet-tdt-0.6b-v3-<variant>`.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+fn default_parakeet_threads() -> i32 {
+    2
+}
+
+impl ParakeetConfig {
+    /// Resolved variant (the field, with `Default` falling back to
+    /// `Int8` when the YAML omits it).
+    pub fn resolved_variant(&self) -> ParakeetVariant {
+        self.variant
+    }
+
+    /// Resolved on-disk model directory.
+    ///
+    /// Pure path computation — does NOT touch the filesystem.  Returns
+    /// the user-supplied `model_dir` verbatim when present, else
+    /// constructs the XDG default
+    /// `<data_dir>/models/parakeet-tdt-0.6b-v3-<variant>` (so the
+    /// `int8` and `fp32` caches never collide).  Returns a
+    /// [`TalkError::Config`] when the XDG data dir cannot be resolved,
+    /// mirroring [`config_dir`].
+    pub fn resolved_model_dir(&self) -> Result<PathBuf, TalkError> {
+        if let Some(ref dir) = self.model_dir {
+            return Ok(dir.clone());
+        }
+        let data_dir = ProjectDirs::from("org", "kalysto", "talk-rs")
+            .map(|dirs| dirs.data_dir().to_path_buf())
+            .ok_or_else(|| {
+                TalkError::Config(
+                    "Could not determine data directory for parakeet model_dir".to_string(),
+                )
+            })?;
+        Ok(data_dir
+            .join("models")
+            .join(format!("parakeet-tdt-0.6b-v3-{}", self.variant)))
+    }
+
+    /// Resolved logical model name surfaced in cache keys / metadata.
+    /// Returns `model` when set, else `parakeet-tdt-0.6b-v3-<variant>`.
+    pub fn resolved_model_name(&self) -> String {
+        if let Some(ref m) = self.model {
+            return m.clone();
+        }
+        format!("parakeet-tdt-0.6b-v3-{}", self.variant)
+    }
 }
 
 /// Transcription defaults.
@@ -450,6 +587,10 @@ impl Config {
     /// - TALK_RS_PROVIDERS_OPENAI_URL
     /// - TALK_RS_PROVIDERS_OPENAI_MODEL
     /// - TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL
+    /// - TALK_RS_PROVIDERS_PARAKEET_VARIANT
+    /// - TALK_RS_PROVIDERS_PARAKEET_MODEL_DIR
+    /// - TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS
+    /// - TALK_RS_PROVIDERS_PARAKEET_MODEL
     pub fn load(path: Option<&Path>) -> Result<Self, TalkError> {
         let config_path = match path {
             Some(path) => path.to_path_buf(),
@@ -578,6 +719,67 @@ impl Config {
                         .unwrap_or_else(default_openai_model),
                     realtime_model: env_var_string("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?
                         .unwrap_or_else(default_openai_realtime_model),
+                });
+            }
+        }
+
+        // Parakeet env var overrides (only when the section exists).
+        if let Some(ref mut parakeet) = config.providers.parakeet {
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_PARAKEET_VARIANT")? {
+                let variant: ParakeetVariant = value.parse().map_err(TalkError::Config)?;
+                parakeet.variant = variant;
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_PARAKEET_MODEL_DIR")? {
+                parakeet.model_dir = Some(PathBuf::from(value));
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS")? {
+                let parsed = parse_u32_env("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS", &value)?;
+                parakeet.num_threads = i32::try_from(parsed).map_err(|_| {
+                    TalkError::Config(format!(
+                        "TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS must fit in i32, got '{}'",
+                        value
+                    ))
+                })?;
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_PARAKEET_MODEL")? {
+                parakeet.model = Some(value);
+            }
+        } else {
+            // Allow creating the Parakeet section purely from env vars.
+            // Any one of the four knobs (variant / model_dir /
+            // num_threads / model) materialises the section, with
+            // defaults for whichever knobs are unset — mirrors the
+            // Mistral / OpenAI "create purely from env" branches.
+            let variant_env = env_var_string("TALK_RS_PROVIDERS_PARAKEET_VARIANT")?;
+            let model_dir_env = env_var_string("TALK_RS_PROVIDERS_PARAKEET_MODEL_DIR")?;
+            let num_threads_env = env_var_string("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS")?;
+            let model_env = env_var_string("TALK_RS_PROVIDERS_PARAKEET_MODEL")?;
+            if variant_env.is_some()
+                || model_dir_env.is_some()
+                || num_threads_env.is_some()
+                || model_env.is_some()
+            {
+                let variant = match variant_env {
+                    Some(v) => v.parse::<ParakeetVariant>().map_err(TalkError::Config)?,
+                    None => ParakeetVariant::default(),
+                };
+                let num_threads = match num_threads_env {
+                    Some(v) => {
+                        let parsed = parse_u32_env("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS", &v)?;
+                        i32::try_from(parsed).map_err(|_| {
+                            TalkError::Config(format!(
+                                "TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS must fit in i32, got '{}'",
+                                v
+                            ))
+                        })?
+                    }
+                    None => default_parakeet_threads(),
+                };
+                config.providers.parakeet = Some(ParakeetConfig {
+                    variant,
+                    model_dir: model_dir_env.map(PathBuf::from),
+                    num_threads,
+                    model: model_env,
                 });
             }
         }
@@ -724,6 +926,10 @@ mod tests {
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_URL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_MODEL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_VARIANT")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_MODEL_DIR")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_MODEL")?,
         ])
     }
 
@@ -1349,6 +1555,325 @@ providers:
         let m = config.providers.mistral.as_ref().expect("mistral present");
         assert_eq!(m.url.as_deref(), Some("https://env-mistral.example.com"));
         Ok(())
+    }
+
+    // ── Parakeet provider (Phase 1: config only) ───────────────────
+
+    #[test]
+    fn test_parakeet_section_parsed_from_yaml() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  parakeet:
+    variant: fp32
+    num_threads: 4
+    model: my-parakeet-build
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let p = config
+            .providers
+            .parakeet
+            .as_ref()
+            .ok_or("parakeet section present")?;
+        assert_eq!(p.variant, ParakeetVariant::Fp32);
+        assert_eq!(p.num_threads, 4);
+        assert_eq!(p.model.as_deref(), Some("my-parakeet-build"));
+        assert!(p.model_dir.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_parakeet_section_absent_gives_none() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        assert!(config.providers.parakeet.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_parakeet_defaults_with_empty_block() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        // `parakeet: {}` materialises the section with all defaults:
+        // int8 variant, 2 decode threads, no explicit model_dir/model.
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  parakeet: {}
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let p = config
+            .providers
+            .parakeet
+            .as_ref()
+            .ok_or("parakeet present")?;
+        assert_eq!(p.variant, ParakeetVariant::Int8);
+        assert_eq!(p.num_threads, 2);
+        assert!(p.model.is_none());
+        assert!(p.model_dir.is_none());
+        assert_eq!(p.resolved_variant(), ParakeetVariant::Int8);
+        assert_eq!(p.resolved_model_name(), "parakeet-tdt-0.6b-v3-int8");
+        let dir = p.resolved_model_dir()?;
+        let s = dir.to_string_lossy();
+        assert!(
+            s.ends_with("models/parakeet-tdt-0.6b-v3-int8"),
+            "expected default model_dir to end with models/parakeet-tdt-0.6b-v3-int8, got: {}",
+            s
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parakeet_resolved_model_dir_user_override() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  parakeet:
+    model_dir: /opt/models/my-parakeet
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let p = config
+            .providers
+            .parakeet
+            .as_ref()
+            .ok_or("parakeet present")?;
+        assert_eq!(
+            p.resolved_model_dir()?,
+            PathBuf::from("/opt/models/my-parakeet")
+        );
+        // resolved_model_name still derives from the variant when the
+        // explicit `model` field is unset, even when model_dir is.
+        assert_eq!(p.resolved_model_name(), "parakeet-tdt-0.6b-v3-int8");
+        Ok(())
+    }
+
+    #[test]
+    fn test_parakeet_default_provider_resolves() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  parakeet: {}
+transcription:
+  default_provider: parakeet
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let t = config
+            .transcription
+            .as_ref()
+            .ok_or("transcription section")?;
+        assert_eq!(t.default_provider, Provider::Parakeet);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parakeet_env_overrides_existing_section() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _v = EnvGuard::set("TALK_RS_PROVIDERS_PARAKEET_VARIANT", "fp32")?;
+        let _t = EnvGuard::set("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS", "4")?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  parakeet:
+    variant: int8
+    num_threads: 2
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let p = config
+            .providers
+            .parakeet
+            .as_ref()
+            .ok_or("parakeet present")?;
+        assert_eq!(p.variant, ParakeetVariant::Fp32);
+        assert_eq!(p.num_threads, 4);
+        assert_eq!(p.resolved_model_name(), "parakeet-tdt-0.6b-v3-fp32");
+        let dir = p.resolved_model_dir()?;
+        assert!(dir
+            .to_string_lossy()
+            .ends_with("models/parakeet-tdt-0.6b-v3-fp32"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parakeet_env_creates_section_from_scratch() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _d = EnvGuard::set("TALK_RS_PROVIDERS_PARAKEET_MODEL_DIR", "/tmp/from-env")?;
+
+        // No parakeet section in YAML — created purely from env vars.
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let p = config
+            .providers
+            .parakeet
+            .as_ref()
+            .ok_or("parakeet section from env")?;
+        assert_eq!(p.variant, ParakeetVariant::Int8); // default
+        assert_eq!(p.num_threads, 2); // default
+        assert_eq!(p.model_dir.as_deref(), Some(Path::new("/tmp/from-env")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parakeet_env_invalid_variant_rejected() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _v = EnvGuard::set("TALK_RS_PROVIDERS_PARAKEET_VARIANT", "bogus")?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  parakeet: {}
+"#;
+        let file = write_config(yaml)?;
+
+        match Config::load(Some(file.path())) {
+            Ok(_) => Err("expected invalid variant env to fail".into()),
+            Err(err) => {
+                assert!(
+                    err.to_string().contains("bogus"),
+                    "error should name the bad value, got: {}",
+                    err
+                );
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_parakeet_env_invalid_num_threads_rejected() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _n = EnvGuard::set("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS", "not-a-number")?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  parakeet: {}
+"#;
+        let file = write_config(yaml)?;
+
+        match Config::load(Some(file.path())) {
+            Ok(_) => Err("expected invalid num_threads env to fail".into()),
+            Err(err) => {
+                assert!(
+                    err.to_string()
+                        .contains("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS"),
+                    "error should name the variable, got: {}",
+                    err
+                );
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_provider_from_str_includes_parakeet() {
+        assert_eq!(
+            "parakeet".parse::<Provider>().unwrap_or(Provider::Mistral),
+            Provider::Parakeet
+        );
+        assert_eq!(
+            "PARAKEET".parse::<Provider>().unwrap_or(Provider::Mistral),
+            Provider::Parakeet
+        );
+        // Existing providers still parse.
+        assert_eq!(
+            "mistral".parse::<Provider>().unwrap_or(Provider::OpenAI),
+            Provider::Mistral
+        );
+        assert_eq!(
+            "openai".parse::<Provider>().unwrap_or(Provider::Mistral),
+            Provider::OpenAI
+        );
+        // Unknown still errors AND mentions all three providers.
+        let err = "bogus".parse::<Provider>().err().unwrap_or_default();
+        assert!(err.contains("mistral"), "err missing mistral: {}", err);
+        assert!(err.contains("openai"), "err missing openai: {}", err);
+        assert!(err.contains("parakeet"), "err missing parakeet: {}", err);
+    }
+
+    #[test]
+    fn test_provider_display_includes_parakeet() {
+        assert_eq!(Provider::Mistral.to_string(), "mistral");
+        assert_eq!(Provider::OpenAI.to_string(), "openai");
+        assert_eq!(Provider::Parakeet.to_string(), "parakeet");
+    }
+
+    #[test]
+    fn test_parakeet_variant_from_str_and_display() {
+        assert_eq!(
+            "int8"
+                .parse::<ParakeetVariant>()
+                .unwrap_or(ParakeetVariant::Fp32),
+            ParakeetVariant::Int8
+        );
+        assert_eq!(
+            "INT8"
+                .parse::<ParakeetVariant>()
+                .unwrap_or(ParakeetVariant::Fp32),
+            ParakeetVariant::Int8
+        );
+        assert_eq!(
+            "fp32"
+                .parse::<ParakeetVariant>()
+                .unwrap_or(ParakeetVariant::Int8),
+            ParakeetVariant::Fp32
+        );
+        assert_eq!(ParakeetVariant::Int8.to_string(), "int8");
+        assert_eq!(ParakeetVariant::Fp32.to_string(), "fp32");
+        // Round-trip.
+        for v in [ParakeetVariant::Int8, ParakeetVariant::Fp32] {
+            let s = v.to_string();
+            let parsed = s.parse::<ParakeetVariant>().unwrap_or_else(|_| {
+                // Should never happen; choose opposite so assert fails loudly.
+                if v == ParakeetVariant::Int8 {
+                    ParakeetVariant::Fp32
+                } else {
+                    ParakeetVariant::Int8
+                }
+            });
+            assert_eq!(parsed, v);
+        }
+        // Invalid value errors with a helpful message.
+        let err = "bogus".parse::<ParakeetVariant>().err().unwrap_or_default();
+        assert!(err.contains("bogus"), "err missing 'bogus': {}", err);
+        assert!(err.contains("int8"), "err missing 'int8': {}", err);
+        assert!(err.contains("fp32"), "err missing 'fp32': {}", err);
     }
 
     #[test]

@@ -565,6 +565,10 @@ pub(crate) async fn dictate_realtime(
             usage_raw: None,
             unknown_event_types,
         })),
+        // Parakeet has no realtime mode; realtime code paths never
+        // dispatch here for Parakeet.  Unreachable in practice, but
+        // the match must be total.
+        Provider::Parakeet => None,
     };
 
     Ok(TranscriptionResult {
