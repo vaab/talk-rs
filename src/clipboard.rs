@@ -57,7 +57,46 @@ impl X11Clipboard {
             .and_then(|guard| guard.as_ref().map(|h| h.served_count()))
             .unwrap_or(0)
     }
+
+    /// Block until the served-count of the currently-offered content
+    /// exceeds `baseline`, or until `timeout` elapses — whichever
+    /// comes first.  Returns the final served count.
+    ///
+    /// Used by the paste pipeline to wait for the target window to
+    /// actually fetch the clipboard content before overwriting it
+    /// (next chunk or final restore).  Without this wait a fixed
+    /// sleep can race a slow paste target into pulling the WRONG
+    /// clipboard generation — leaking restored content into the
+    /// document and dropping the last chunk.
+    ///
+    /// Polls [`last_served_count`](Self::last_served_count) every
+    /// [`SERVED_POLL_INTERVAL_MS`] milliseconds.  Returns as soon as
+    /// the count crosses `baseline`; on timeout returns the
+    /// last-observed (possibly unchanged) count so the caller can
+    /// decide whether to emit a warning.
+    pub async fn wait_until_served(&self, baseline: u32, timeout: std::time::Duration) -> u32 {
+        let deadline = std::time::Instant::now() + timeout;
+        let poll = std::time::Duration::from_millis(SERVED_POLL_INTERVAL_MS);
+        loop {
+            let count = self.last_served_count();
+            if count > baseline {
+                return count;
+            }
+            if std::time::Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
 }
+
+/// Poll interval (ms) used by [`X11Clipboard::wait_until_served`].
+///
+/// Five milliseconds keeps the wait responsive without saturating the
+/// async runtime: a single `SelectionRequest` round-trip is typically
+/// served within a few milliseconds, so most waits resolve on the
+/// first or second poll.
+const SERVED_POLL_INTERVAL_MS: u64 = 5;
 
 #[async_trait]
 impl Clipboard for X11Clipboard {

@@ -105,6 +105,24 @@ indicators:
 #   # paste-summary behaviour.  Set to 0 to disable chunking (paste in
 #   # one shot).  Also overridden by --no-chunk-paste (which forces 0).
 #   chunk_chars: 150
+#
+#   # Milliseconds the clipboard content must remain unchanged before
+#   # the post-paste restore is allowed to overwrite it (default: 200).
+#   # Guards against a slow paste target re-fetching the clipboard
+#   # AFTER we've restored the user's saved value — which would leak
+#   # the restored content into the document and drop the last chunk.
+#   # Increase if pasting into a slow application (e.g. Electron apps
+#   # under load) still shows the previous clipboard leaking through.
+#   restore_settle_ms: 200
+#
+#   # Maximum milliseconds to wait between chunks for the paste target
+#   # to actually fetch the offered clipboard content (default: 400).
+#   # On timeout a WARN is logged (likely corruption — target never
+#   # pulled the chunk).  Also caps the total settle loop before the
+#   # final restore.  Raise alongside restore_settle_ms for very slow
+#   # targets; the wait short-circuits as soon as the fetch lands so a
+#   # higher cap costs nothing in the common case.
+#   chunk_fetch_timeout_ms: 400
 
 # Optional: Runtime Audio Settings
 # audio:

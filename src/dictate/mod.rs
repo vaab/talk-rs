@@ -96,7 +96,19 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     let paste_shortcut = config
         .paste
         .as_ref()
-        .map(|p| p.shortcut.clone())
+        .map(|p| p.shortcut)
+        .unwrap_or_default();
+
+    // Resolve paste timing from config (defaults: 200 / 400).  Threaded
+    // into `paste_text_to_target` and the realtime per-segment paste
+    // task so a slow target cannot race the next overwrite.
+    let paste_timing = config
+        .paste
+        .as_ref()
+        .map(|p| crate::paste::PasteTiming {
+            restore_settle_ms: p.restore_settle_ms,
+            chunk_fetch_timeout_ms: p.chunk_fetch_timeout_ms,
+        })
         .unwrap_or_default();
 
     // Determine target window: use --target-window arg (from daemon mode)
@@ -156,7 +168,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                 model: opts.model,
                 target_window,
                 paste_chunk_chars,
-                paste_shortcut: paste_shortcut.clone(),
+                paste_shortcut,
+                paste_timing,
             },
         )
         .await;
@@ -183,7 +196,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     paste_chunk_chars,
                     None,
                     &crate::telemetry::NoOpSink,
-                    paste_shortcut.clone(),
+                    paste_shortcut,
+                    paste_timing,
                 )
                 .await?;
                 let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
@@ -633,6 +647,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
         // Spawn paste consumer: each segment is pasted immediately
         let rt_shortcut = paste_shortcut;
+        let rt_chunk_fetch_timeout_ms = paste_timing.chunk_fetch_timeout_ms;
         let paste_task = tokio::spawn(async move {
             let paste_clip = X11Clipboard::new();
             let mut is_first = true;
@@ -658,13 +673,27 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                 if let Err(e) = simulate_paste(rt_shortcut).await {
                     log::warn!("per-segment paste failed: {}", e);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-                let served = paste_clip.last_served_count();
+                // Wait for the target to actually fetch our segment
+                // before the NEXT segment overwrites the clipboard.
+                // Fresh serve handle each set_text → baseline 0.
+                let served = paste_clip
+                    .wait_until_served(
+                        0,
+                        std::time::Duration::from_millis(rt_chunk_fetch_timeout_ms),
+                    )
+                    .await;
                 if served == 0 {
                     log::trace!(
                         "paste(realtime): segment {} pasted but served_count=0 \
                          (target did NOT fetch our clipboard — check shortcut/focus)",
                         seg_idx,
+                    );
+                    log::warn!(
+                        "paste(realtime): segment {} timed out after {} ms with \
+                         served_count=0 — target never fetched our clipboard, \
+                         likely paste corruption",
+                        seg_idx,
+                        rt_chunk_fetch_timeout_ms,
                     );
                 } else {
                     log::trace!(
@@ -708,8 +737,46 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             log::warn!("paste task error: {}", e);
         }
 
-        // Restore original clipboard
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Restore original clipboard: wait until the last segment's
+        // served count has been STABLE for `restore_settle_ms`
+        // (capped at `chunk_fetch_timeout_ms` total) before
+        // overwriting — a slow target re-fetching after the restore
+        // would otherwise leak the saved value into the document.
+        {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(paste_timing.chunk_fetch_timeout_ms);
+            let settle = std::time::Duration::from_millis(paste_timing.restore_settle_ms);
+            let poll = std::time::Duration::from_millis(5);
+            let mut last = rt_clipboard.last_served_count();
+            let mut stable_since = std::time::Instant::now();
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    log::warn!(
+                        "paste(realtime): pre-restore settle timed out after {} ms \
+                         (served_count={}) — proceeding anyway",
+                        paste_timing.chunk_fetch_timeout_ms,
+                        last,
+                    );
+                    break;
+                }
+                if now.duration_since(stable_since) >= settle {
+                    log::trace!(
+                        "paste(realtime): pre-restore settled (served_count={}, \
+                         stable for {} ms)",
+                        last,
+                        paste_timing.restore_settle_ms,
+                    );
+                    break;
+                }
+                tokio::time::sleep(poll).await;
+                let current = rt_clipboard.last_served_count();
+                if current != last {
+                    last = current;
+                    stable_since = std::time::Instant::now();
+                }
+            }
+        }
         if let Some(saved) = saved_clipboard {
             log::debug!("restoring original clipboard");
             log::trace!(
@@ -970,6 +1037,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             t_stop,
             &*sink,
             paste_shortcut,
+            paste_timing,
         )
         .await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);

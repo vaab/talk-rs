@@ -47,6 +47,38 @@ const FOCUS_MAX_RETRIES: u32 = 5;
 /// Initial delay between focus retry attempts (doubles each retry).
 const FOCUS_INITIAL_DELAY_MS: u64 = 50;
 
+/// Poll interval (ms) used by the pre-restore settle loop in
+/// [`paste_text_to_target`].  Five milliseconds matches
+/// [`crate::clipboard::X11Clipboard::wait_until_served`] and keeps
+/// the wait responsive without saturating the async runtime.
+const SETTLE_POLL_INTERVAL_MS: u64 = 5;
+
+/// Timing knobs for the paste pipeline.
+///
+/// Threaded into [`paste_text_to_target`] so the per-chunk fetch
+/// timeout and the pre-restore settle window can be tuned via
+/// `paste.chunk_fetch_timeout_ms` / `paste.restore_settle_ms` in
+/// the config without growing the call-site signature unboundedly.
+///
+/// `Default` matches the config defaults (200 / 400) so call sites
+/// without a loaded config — and tests — can fall back transparently.
+#[derive(Debug, Clone, Copy)]
+pub struct PasteTiming {
+    /// See `paste.restore_settle_ms`.
+    pub restore_settle_ms: u64,
+    /// See `paste.chunk_fetch_timeout_ms`.
+    pub chunk_fetch_timeout_ms: u64,
+}
+
+impl Default for PasteTiming {
+    fn default() -> Self {
+        Self {
+            restore_settle_ms: 200,
+            chunk_fetch_timeout_ms: 400,
+        }
+    }
+}
+
 /// Maximum number of characters per clipboard paste operation.
 ///
 /// When the text to paste exceeds this limit it is split into
@@ -149,6 +181,7 @@ pub fn split_into_char_chunks(text: &str, max_chars: usize) -> Vec<String> {
 ///
 /// When `chunk_chars` is `0`, the entire text is pasted in one shot.
 /// Otherwise it is split via [`split_into_char_chunks`].
+#[allow(clippy::too_many_arguments)]
 pub async fn paste_text_to_target(
     target_window: Option<&String>,
     text: &str,
@@ -157,6 +190,7 @@ pub async fn paste_text_to_target(
     t_stop: Option<std::time::Instant>,
     sink: &dyn crate::telemetry::TelemetrySink,
     shortcut: PasteShortcut,
+    timing: PasteTiming,
 ) -> Result<(), TalkError> {
     let clipboard = X11Clipboard::new();
     let total_chars = text.len() as u64;
@@ -206,6 +240,7 @@ pub async fn paste_text_to_target(
             &shortcut,
             &mut first_paste_logged,
             t_stop,
+            timing,
         )
         .await?;
         chars_pasted = total_chars;
@@ -228,6 +263,7 @@ pub async fn paste_text_to_target(
                 &shortcut,
                 &mut first_paste_logged,
                 t_stop,
+                timing,
             )
             .await?;
             chars_pasted += chunk.len() as u64;
@@ -239,9 +275,13 @@ pub async fn paste_text_to_target(
         }
     }
 
-    // Extra settle time before restoring the clipboard so the last
-    // paste has time to be consumed by the target application.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Settle before restoring: wait until the last chunk's served
+    // count has been STABLE for `restore_settle_ms`, capped at
+    // `chunk_fetch_timeout_ms` total.  This prevents a slow paste
+    // target from re-fetching the clipboard AFTER we've overwritten
+    // it with the saved value — which would leak the restored
+    // content into the document and drop the last chunk.
+    settle_before_restore(&clipboard, timing).await;
 
     if let Some(saved) = saved_clipboard {
         log::trace!(
@@ -270,6 +310,7 @@ async fn paste_one(
     shortcut: &PasteShortcut,
     first_paste_logged: &mut bool,
     t_stop: Option<std::time::Instant>,
+    timing: PasteTiming,
 ) -> Result<(), TalkError> {
     log::trace!(
         "paste: chunk {}/{} set, content={}",
@@ -315,19 +356,32 @@ async fn paste_one(
     }
 
     simulate_paste(*shortcut).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
 
-    // Served count: how many times the target fetched the offered
-    // text.  `0` here means the paste keystroke did NOT cause the
-    // target to pull our clipboard — i.e. wrong selection, lost focus,
-    // or a shortcut the app maps to a different paste source.
-    let served = clipboard.last_served_count();
+    // Wait for the target to actually fetch the offered clipboard
+    // content.  Each `set_text` spawns a FRESH serve handle whose
+    // counter starts at 0, so the baseline is 0 here.  On timeout
+    // the count is still 0 — i.e. the target never pulled our
+    // clipboard, which means the NEXT overwrite (chunk or restore)
+    // will silently corrupt the paste.
+    let served = clipboard
+        .wait_until_served(
+            0,
+            std::time::Duration::from_millis(timing.chunk_fetch_timeout_ms),
+        )
+        .await;
     if served == 0 {
         log::trace!(
             "paste: chunk {}/{} pasted but served_count=0 \
              (target did NOT fetch our clipboard — check shortcut/focus)",
             idx + 1,
             n_chunks,
+        );
+        log::warn!(
+            "paste: chunk {}/{} timed out after {} ms with served_count=0 — \
+             target never fetched our clipboard, likely paste corruption",
+            idx + 1,
+            n_chunks,
+            timing.chunk_fetch_timeout_ms,
         );
     } else {
         log::trace!(
@@ -339,6 +393,53 @@ async fn paste_one(
     }
 
     Ok(())
+}
+
+/// Block until the last-chunk served count has been STABLE for
+/// `timing.restore_settle_ms`, capped at `timing.chunk_fetch_timeout_ms`
+/// total wall-clock.
+///
+/// "Stable" means: the count observed at time `t` equals the count
+/// observed at `t + restore_settle_ms`.  Polls every
+/// [`SETTLE_POLL_INTERVAL_MS`].  This is the critical guard against
+/// the user's restored clipboard leaking into a slow paste target
+/// AFTER the last chunk — the symptom we set out to fix.
+async fn settle_before_restore(clipboard: &X11Clipboard, timing: PasteTiming) {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timing.chunk_fetch_timeout_ms);
+    let settle = std::time::Duration::from_millis(timing.restore_settle_ms);
+    let poll = std::time::Duration::from_millis(SETTLE_POLL_INTERVAL_MS);
+
+    let mut last = clipboard.last_served_count();
+    let mut stable_since = std::time::Instant::now();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            log::warn!(
+                "paste: pre-restore settle timed out after {} ms (served_count={}, \
+                 last change still within {} ms window) — proceeding anyway, \
+                 slow paste target may still re-fetch and corrupt the paste",
+                timing.chunk_fetch_timeout_ms,
+                last,
+                timing.restore_settle_ms,
+            );
+            return;
+        }
+        if now.duration_since(stable_since) >= settle {
+            log::trace!(
+                "paste: pre-restore settled (served_count={}, stable for {} ms)",
+                last,
+                timing.restore_settle_ms,
+            );
+            return;
+        }
+        tokio::time::sleep(poll).await;
+        let current = clipboard.last_served_count();
+        if current != last {
+            last = current;
+            stable_since = std::time::Instant::now();
+        }
+    }
 }
 
 /// Get the currently focused window ID via `_NET_ACTIVE_WINDOW`.

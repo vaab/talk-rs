@@ -512,10 +512,37 @@ pub struct PasteConfig {
     /// applications that don't support Shift+Insert / Ctrl+Shift+V.
     #[serde(default)]
     pub shortcut: PasteShortcut,
+
+    /// Milliseconds the clipboard content must remain unchanged
+    /// before the post-paste restore is allowed to overwrite it.
+    ///
+    /// Guards against a slow paste target re-fetching the clipboard
+    /// after we've already restored the user's saved content — which
+    /// would leak the restored value into the document and drop the
+    /// last chunk.  Default: 200.
+    #[serde(default = "default_paste_restore_settle_ms")]
+    pub restore_settle_ms: u64,
+
+    /// Maximum milliseconds to wait between chunks for the paste
+    /// target to fetch the offered clipboard content.
+    ///
+    /// On timeout a `WARN` is emitted (likely corruption — target
+    /// never actually pulled the chunk).  Also caps the total settle
+    /// loop before the final restore.  Default: 400.
+    #[serde(default = "default_paste_chunk_fetch_timeout_ms")]
+    pub chunk_fetch_timeout_ms: u64,
 }
 
 fn default_paste_chunk_chars() -> usize {
     150
+}
+
+fn default_paste_restore_settle_ms() -> u64 {
+    200
+}
+
+fn default_paste_chunk_fetch_timeout_ms() -> u64 {
+    400
 }
 
 /// Expand a leading `~` (or `~/…`) in a path to the user's home
@@ -1352,6 +1379,80 @@ paste:
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
         assert_eq!(paste.chunk_chars, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_restore_settle_ms_default() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste: {}
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        assert_eq!(paste.restore_settle_ms, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_restore_settle_ms_custom() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste:
+  restore_settle_ms: 500
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        assert_eq!(paste.restore_settle_ms, 500);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_chunk_fetch_timeout_ms_default() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste: {}
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        assert_eq!(paste.chunk_fetch_timeout_ms, 400);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_chunk_fetch_timeout_ms_custom() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste:
+  chunk_fetch_timeout_ms: 800
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        assert_eq!(paste.chunk_fetch_timeout_ms, 800);
         Ok(())
     }
 
