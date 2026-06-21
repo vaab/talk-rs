@@ -9,7 +9,7 @@ mod ui;
 
 use crate::config::{Config, PasteShortcut, Provider};
 use crate::error::TalkError;
-use crate::paste::paste_text_to_target;
+use crate::paste::{paste_text_to_target, PasteTiming};
 use crate::recording_cache;
 use crate::transcription::{self, RealtimeTranscriber};
 use crate::x11::x11_centre_and_raise;
@@ -29,6 +29,7 @@ pub(crate) struct PickParams {
     pub target_window: Option<String>,
     pub paste_chunk_chars: usize,
     pub paste_shortcut: PasteShortcut,
+    pub paste_timing: PasteTiming,
 }
 
 /// Run pick mode: show a GTK picker with cached and live transcriptions.
@@ -341,6 +342,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         None,
         &crate::telemetry::NoOpSink,
         params.paste_shortcut,
+        params.paste_timing,
     )
     .await?;
     let _ =
