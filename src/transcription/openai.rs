@@ -1,6 +1,6 @@
-//! OpenAI API batch transcription backend.
+//! OpenAI API one-shot transcription backend.
 //!
-//! This module provides a [`BatchTranscriber`] implementation that uses the
+//! This module provides a [`OneShotTranscriber`] implementation that uses the
 //! OpenAI API to transcribe audio files (Whisper, GPT-4o-transcribe, etc.).
 
 use crate::config::OpenAIConfig;
@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use super::transport::http::{parse_u64_field, proportional_timeout, ProgressBody};
 use super::transport::{self, Method, Request, RequestBody};
-use super::BatchTranscriber;
+use super::OneShotTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink};
 use tokio_util::sync::CancellationToken;
 
@@ -145,7 +145,7 @@ pub(crate) async fn validate_openai_model(
     .await
 }
 
-/// Batch transcriber implementation using the OpenAI API.
+/// One-shot transcriber implementation using the OpenAI API.
 ///
 /// This implementation sends audio files to the OpenAI API for transcription
 /// and parses the JSON response to extract the transcribed text.
@@ -153,7 +153,7 @@ pub(crate) async fn validate_openai_model(
 /// All network I/O funnels through
 /// [`super::transport::http_request`] — this struct no longer
 /// owns a `reqwest::Client` directly.
-pub struct OpenAIBatchTranscriber {
+pub struct OpenAIOneShotTranscriber {
     /// OpenAI API configuration (contains API key and model).
     config: OpenAIConfig,
     /// API endpoint URL (can be overridden for testing).
@@ -163,12 +163,12 @@ pub struct OpenAIBatchTranscriber {
     /// Telemetry event sink for HTTP lifecycle reporting.
     sink: Arc<dyn TelemetrySink>,
     /// Cancellation token wired into the transport's request loop.
-    /// See [`super::mistral::MistralBatchTranscriber::cancel_token`]
+    /// See [`super::mistral::MistralOneShotTranscriber::cancel_token`]
     /// for the wiring rationale.
     cancel_token: CancellationToken,
 }
 
-impl OpenAIBatchTranscriber {
+impl OpenAIOneShotTranscriber {
     /// Create a new OpenAI transcriber with the given configuration
     /// and the default
     /// [`RequestTimeoutPolicy::Proportional`] wall-clock policy.
@@ -366,7 +366,7 @@ impl OpenAIBatchTranscriber {
 }
 
 #[async_trait]
-impl BatchTranscriber for OpenAIBatchTranscriber {
+impl OneShotTranscriber for OpenAIOneShotTranscriber {
     fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
         self.sink = sink;
     }
@@ -404,7 +404,7 @@ impl BatchTranscriber for OpenAIBatchTranscriber {
                 // so sending anything richer is pure waste.
                 super::normalize_file_for_upload(&path)?
             }
-            TranscriptionBody::Stream {
+            TranscriptionBody::Pipe {
                 mut chunks,
                 file_name,
             } => {
@@ -436,7 +436,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::new(config).expect("build client");
+        let transcriber = OpenAIOneShotTranscriber::new(config).expect("build client");
         assert_eq!(
             transcriber.endpoint,
             "https://api.openai.com/v1/audio/transcriptions"
@@ -451,7 +451,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::new(config).expect("build client");
+        let transcriber = OpenAIOneShotTranscriber::new(config).expect("build client");
         assert_eq!(
             transcriber.endpoint,
             "https://custom.example.com/v1/audio/transcriptions"
@@ -466,7 +466,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::new(config).expect("build client");
+        let transcriber = OpenAIOneShotTranscriber::new(config).expect("build client");
         assert_eq!(
             transcriber.endpoint,
             "https://custom.example.com/v1/audio/transcriptions"
@@ -496,7 +496,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::with_endpoint(
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
         )
@@ -529,7 +529,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::with_endpoint(
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
         )
@@ -542,7 +542,7 @@ mod tests {
         });
 
         let result = transcriber
-            .fetch_transcription(TranscriptionBody::Stream {
+            .fetch_transcription(TranscriptionBody::Pipe {
                 chunks: rx,
                 file_name: "test.ogg".to_string(),
             })
@@ -588,7 +588,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::with_endpoint(
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
         )
@@ -630,7 +630,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::with_endpoint(
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
         )
@@ -652,7 +652,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::new(config).expect("build client");
+        let transcriber = OpenAIOneShotTranscriber::new(config).expect("build client");
 
         let result = transcriber
             .fetch_transcription(TranscriptionBody::File(std::path::PathBuf::from(
@@ -729,7 +729,7 @@ mod tests {
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
         };
-        let transcriber = OpenAIBatchTranscriber::with_endpoint(
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
         )

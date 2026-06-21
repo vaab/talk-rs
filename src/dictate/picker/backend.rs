@@ -1,7 +1,7 @@
 //! Async transcription backend for the picker.
 //!
 //! Contains the transcription helpers that run concurrently with the
-//! GTK picker window: batch task spawning, realtime WebSocket
+//! GTK picker window: one-shot task spawning, realtime WebSocket
 //! streaming, and WAV PCM reading.
 
 use super::ui::{PickerCandidate, PickerMessage};
@@ -17,7 +17,7 @@ use std::sync::Mutex;
 /// row status strings.
 ///
 /// One instance per in-flight candidate.  The sink is plugged in via
-/// [`crate::transcription::BatchTranscriber::set_sink`] before the
+/// [`crate::transcription::OneShotTranscriber::set_sink`] before the
 /// transcription request starts and forwards
 /// [`PickerMessage::CandidateStatus`] messages to the GTK channel as
 /// the request transitions between phases.
@@ -56,8 +56,8 @@ pub(super) struct PickerStatusSink {
     tx: std::sync::mpsc::Sender<PickerMessage>,
     provider: Provider,
     model: String,
-    /// Whether this sink belongs to the streaming (realtime) row or
-    /// the batch row.  Carried on every emitted
+    /// Whether this sink belongs to the realtime row or
+    /// the one-shot row.  Carried on every emitted
     /// [`PickerMessage::CandidateStatus`] so the picker UI's
     /// row-matcher can disambiguate when both rows exist for the
     /// same (provider, model) pair.
@@ -172,7 +172,7 @@ pub(super) async fn run_realtime_transcription(
     // Attach the row's status sink BEFORE the WS upgrade so
     // connecting / retry events reach the UI.  `streaming=true`
     // tags every emitted `CandidateStatus` so the picker matches
-    // the realtime row, not the batch row of the same model.
+    // the realtime row, not the one-shot row of the same model.
     let status_sink: std::sync::Arc<dyn TelemetrySink> = std::sync::Arc::new(
         PickerStatusSink::new(tx.clone(), provider, model.clone(), true),
     );
@@ -298,7 +298,7 @@ pub(super) async fn run_realtime_transcription(
     }
 }
 
-/// Spawn a single batch transcription task for one picker row.
+/// Spawn a single one-shot transcription task for one picker row.
 ///
 /// The picker is interactive — the user is watching the row and can
 /// dismiss the picker at any time — so the request runs under
@@ -324,7 +324,7 @@ pub(super) fn spawn_transcription(
     config: std::sync::Arc<Config>,
     _ignored_cancel: tokio_util::sync::CancellationToken,
 ) {
-    // `streaming=false` tags this sink for the batch row.
+    // `streaming=false` tags this sink for the one-shot row.
     let sink: std::sync::Arc<dyn TelemetrySink> = std::sync::Arc::new(PickerStatusSink::new(
         tx.clone(),
         provider,

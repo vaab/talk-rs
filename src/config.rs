@@ -238,7 +238,7 @@ pub struct OpenAIConfig {
     #[serde(default)]
     pub url: Option<String>,
 
-    /// Model name for batch transcription (defaults to "whisper-1").
+    /// Model name for one-shot transcription (defaults to "whisper-1").
     #[serde(default = "default_openai_model")]
     pub model: String,
 

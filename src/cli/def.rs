@@ -121,7 +121,7 @@ pub enum Commands {
         /// Use monochrome colors for the visualizer (theme-aware)
         #[arg(long)]
         mono: bool,
-        /// Audio format for batch uploads (wav or ogg)
+        /// Audio format for one-shot uploads (wav or ogg)
         #[arg(long, value_enum, default_value_t)]
         upload_format: crate::transcription::UploadFormat,
         /// Disable auto-switching of a Bluetooth headset to HFP for

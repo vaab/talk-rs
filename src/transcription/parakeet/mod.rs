@@ -6,16 +6,16 @@
 //!
 //! * [`model`] — presence check + auto-download + atomic extract of
 //!   the prebuilt sherpa-onnx Parakeet TDT v3 model.  Triggered from
-//!   [`BatchTranscriber::validate`] on first use.
+//!   [`OneShotTranscriber::validate`] on first use.
 //! * Config wiring ([`crate::config::ParakeetConfig`]) — resolves
 //!   the model directory, variant, and thread count from YAML +
 //!   environment.
 //!
 //! # Why a fresh recognizer per call (v1)
 //!
-//! The [`BatchTranscriber`] trait has no construction hook for the
+//! The [`OneShotTranscriber`] trait has no construction hook for the
 //! recognizer (its only state is the config), so we currently build
-//! the `OfflineRecognizer` inside [`ParakeetBatchTranscriber::fetch_transcription`].
+//! the `OfflineRecognizer` inside [`ParakeetOneShotTranscriber::fetch_transcription`].
 //! For the `dictate` workflow that runs one transcription per
 //! invocation, the ~1.7 s model-load cost is paid once per dictation
 //! and is acceptable.  A future optimisation is to cache the
@@ -42,4 +42,4 @@ pub mod model;
 mod transcriber;
 
 #[cfg(feature = "parakeet")]
-pub use transcriber::ParakeetBatchTranscriber;
+pub use transcriber::ParakeetOneShotTranscriber;

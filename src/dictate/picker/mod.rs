@@ -87,7 +87,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         log::debug!("  candidate: {}:{} (streaming={})", p, m, s);
     }
 
-    // Probe the per-model sidecar cache for each batch candidate via
+    // Probe the per-model sidecar cache for each one-shot candidate via
     // Layer 3 with `allow_api=false`.  Hits populate `all_entries`
     // (no spinner needed).  Misses return `CacheOnly` — those models
     // remain uncached and will be shown as deferred buttons or the
@@ -205,7 +205,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         false,
     );
     log::debug!(
-        "picker default model: {}:{} (batch)",
+        "picker default model: {}:{} (one-shot)",
         default_provider,
         default_model,
     );
@@ -225,7 +225,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
 
     // Parakeet immediate-default fallback.  When the default model
     // is Parakeet and its files are not on disk, demote the
-    // candidate from the immediate batch to the deferred list — so
+    // candidate from the immediate set to the deferred list — so
     // the picker opens with a clickable "T" row instead of
     // auto-firing a transcription that would just error out (the
     // pipeline NEVER downloads silently).  The user then clicks T
@@ -265,7 +265,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         deferred.len(),
     );
 
-    // Split default candidates into batch and realtime groups.
+    // Split default candidates into one-shot and realtime groups.
     let batch_filtered: Vec<(Provider, String)> = default_filtered
         .iter()
         .filter(|(_, _, s)| !s)

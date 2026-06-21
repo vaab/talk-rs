@@ -48,7 +48,7 @@ pub(super) fn resolve_model(
                     .unwrap_or_else(|| "whisper-1".to_string())
             }
         }
-        // Parakeet has only a batch model; the `realtime` flag is
+        // Parakeet has only a one-shot model; the `realtime` flag is
         // irrelevant.  Mirrors `ParakeetConfig::resolved_model_name`.
         Provider::Parakeet => config
             .providers
@@ -117,7 +117,7 @@ pub(super) fn build_retry_candidates(
 
     match cli_provider {
         Some(provider) => {
-            // Specific provider requested: add all known batch + realtime models.
+            // Specific provider requested: add all known one-shot + realtime models.
             add_known_models_with_streaming(&mut out, provider);
             add_known_realtime_models(&mut out, provider);
         }
@@ -167,7 +167,7 @@ pub(super) fn build_retry_candidates(
     out
 }
 
-/// Push all known batch transcription models for `provider` into `out`
+/// Push all known one-shot transcription models for `provider` into `out`
 /// as `(provider, model, streaming=false)` triples.
 fn add_known_models_with_streaming(out: &mut Vec<(Provider, String, bool)>, provider: Provider) {
     let models = match provider {

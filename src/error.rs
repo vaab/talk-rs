@@ -49,7 +49,7 @@ pub enum TalkError {
     ModelInProgress,
 
     /// Structured failure inside the HTTP transcription pipeline
-    /// (preflight `/v1/models` validation OR batch
+    /// (preflight `/v1/models` validation OR one-shot
     /// `/v1/audio/transcriptions` request).  Replaces the older
     /// `Config(String)` / `Transcription(String)` wrappings that
     /// flattened structured cause data into a single string.

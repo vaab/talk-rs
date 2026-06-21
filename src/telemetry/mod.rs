@@ -175,7 +175,7 @@ pub enum TranscriptionEvent {
 
     /// Another chunk of text was pasted into the target window.
     /// `chars_pasted` is cumulative; `total_chars` is the full
-    /// transcription length.  In streaming mode, paste chunks can
+    /// transcription length.  In realtime mode, paste chunks can
     /// overlap with upload / download activity.
     PasteProgress {
         chars_pasted: u64,

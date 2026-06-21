@@ -1766,7 +1766,7 @@ fn overlay_thread(
 
     // ── Byte throughput state (Layer 3b) ─────────────────────────
     //
-    // Three independent tracks that can overlap in streaming mode:
+    // Three independent tracks that can overlap during transcription:
     //   upload   — grows DOWN from the phase line (top of spec)
     //   download — grows UP from the bottom of the spec area
     //   paste    — grows UP from the bottom alongside download

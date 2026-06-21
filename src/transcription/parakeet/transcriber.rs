@@ -1,4 +1,4 @@
-//! Phase 3: `BatchTranscriber` implementation for local Parakeet
+//! Phase 3: `OneShotTranscriber` implementation for local Parakeet
 //! inference via sherpa-onnx.
 //!
 //! See the module-level docs on [`crate::transcription::parakeet`]
@@ -13,7 +13,7 @@ use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerM
 use crate::config::{ParakeetConfig, ParakeetVariant};
 use crate::error::TalkError;
 use crate::transcription::{
-    BatchTranscriber, RequestTimeoutPolicy, TranscriptionBody, TranscriptionResult,
+    OneShotTranscriber, RequestTimeoutPolicy, TranscriptionBody, TranscriptionResult,
 };
 
 use super::model;
@@ -57,18 +57,18 @@ fn pcm_i16_to_f32_normalised(samples: &[i16]) -> Vec<f32> {
     samples.iter().map(|&s| s as f32 / 32768.0).collect()
 }
 
-/// Local Parakeet TDT (ONNX, CPU) batch transcriber.
+/// Local Parakeet TDT (ONNX, CPU) one-shot transcriber.
 ///
 /// Construction is cheap (path resolution only); the heavy
 /// `OfflineRecognizer::create` happens lazily inside
 /// [`Self::fetch_transcription`].
-pub struct ParakeetBatchTranscriber {
+pub struct ParakeetOneShotTranscriber {
     model_dir: PathBuf,
     variant: ParakeetVariant,
     num_threads: i32,
 }
 
-impl ParakeetBatchTranscriber {
+impl ParakeetOneShotTranscriber {
     /// Build a transcriber from a parsed [`ParakeetConfig`].
     ///
     /// The `policy` argument exists for symmetry with the remote
@@ -103,7 +103,7 @@ impl ParakeetBatchTranscriber {
 }
 
 #[async_trait]
-impl BatchTranscriber for ParakeetBatchTranscriber {
+impl OneShotTranscriber for ParakeetOneShotTranscriber {
     /// Pre-flight: check the model is present on disk — **without
     /// downloading**.
     ///
@@ -133,7 +133,7 @@ impl BatchTranscriber for ParakeetBatchTranscriber {
                 // native format.  No further resampling needed.
                 crate::record::audio::read_audio_as_i16(&path)?
             }
-            TranscriptionBody::Stream {
+            TranscriptionBody::Pipe {
                 mut chunks,
                 file_name,
             } => {
@@ -372,7 +372,7 @@ mod tests {
             model: None,
         };
         let transcriber =
-            ParakeetBatchTranscriber::with_policy(cfg, RequestTimeoutPolicy::Proportional)
+            ParakeetOneShotTranscriber::with_policy(cfg, RequestTimeoutPolicy::Proportional)
                 .expect("with_policy must not touch the filesystem");
         assert_eq!(transcriber.num_threads, 1);
         assert_eq!(transcriber.variant, ParakeetVariant::Int8);
@@ -388,8 +388,8 @@ mod tests {
             num_threads: 2,
             model: None,
         };
-        let t =
-            ParakeetBatchTranscriber::with_policy(cfg, RequestTimeoutPolicy::Proportional).unwrap();
+        let t = ParakeetOneShotTranscriber::with_policy(cfg, RequestTimeoutPolicy::Proportional)
+            .unwrap();
         let paths = t.model_file_paths();
         assert!(paths[0].ends_with("encoder.int8.onnx"));
         assert!(paths[1].ends_with("decoder.int8.onnx"));

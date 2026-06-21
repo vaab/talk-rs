@@ -207,7 +207,7 @@ impl MistralRealtimeTranscriber {
 
     /// Return the realtime model name.
     ///
-    /// Uses `DEFAULT_REALTIME_MODEL` since the batch model name differs
+    /// Uses `DEFAULT_REALTIME_MODEL` since the one-shot model name differs
     /// from the realtime model name.
     fn realtime_model(&self) -> &str {
         DEFAULT_REALTIME_MODEL
