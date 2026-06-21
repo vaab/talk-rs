@@ -1,6 +1,6 @@
-//! Mistral API batch transcription backend.
+//! Mistral API one-shot transcription backend.
 //!
-//! This module provides a [`BatchTranscriber`] implementation that uses the
+//! This module provides a [`OneShotTranscriber`] implementation that uses the
 //! Mistral API to transcribe audio files.
 
 use crate::config::MistralConfig;
@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use super::transport::http::{parse_u64_field, proportional_timeout, ProgressBody};
 use super::transport::{self, Method, Request, RequestBody};
-use super::BatchTranscriber;
+use super::OneShotTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink};
 use tokio_util::sync::CancellationToken;
 
@@ -167,7 +167,7 @@ pub(crate) async fn validate_mistral_model(
 /// owns a `reqwest::Client` directly.  Retries, cancellation, and
 /// [`crate::error::PipelineFailure`] construction are owned by the
 /// transport.
-pub struct MistralBatchTranscriber {
+pub struct MistralOneShotTranscriber {
     /// Mistral API configuration (contains API key).
     config: MistralConfig,
     /// API endpoint URL (can be overridden for testing).
@@ -181,12 +181,12 @@ pub struct MistralBatchTranscriber {
     /// Cancellation token wired into the transport's request loop.
     /// Defaults to a fresh token (never fires); the picker /
     /// streaming orchestrator overrides via
-    /// [`BatchTranscriber::set_cancel_token`] so Stop buttons and
+    /// [`OneShotTranscriber::set_cancel_token`] so Stop buttons and
     /// SIGUSR1 from another process abort the in-flight request.
     cancel_token: CancellationToken,
 }
 
-impl MistralBatchTranscriber {
+impl MistralOneShotTranscriber {
     /// Create a new Mistral transcriber with the given configuration
     /// and the default
     /// [`RequestTimeoutPolicy::Proportional`] wall-clock policy.
@@ -414,7 +414,7 @@ impl MistralBatchTranscriber {
 }
 
 #[async_trait]
-impl BatchTranscriber for MistralBatchTranscriber {
+impl OneShotTranscriber for MistralOneShotTranscriber {
     fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
         self.sink = sink;
     }
@@ -449,7 +449,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 // so sending anything richer is pure waste.
                 super::normalize_file_for_upload(&path)?
             }
-            TranscriptionBody::Stream {
+            TranscriptionBody::Pipe {
                 mut chunks,
                 file_name,
             } => {
@@ -461,7 +461,7 @@ impl BatchTranscriber for MistralBatchTranscriber {
                 }
                 let audio_len = bytes.len() as u64;
                 log::info!(
-                    "streaming upload: collected {} bytes for Mistral batch request",
+                    "upload: collected {} bytes for Mistral one-shot request",
                     audio_len
                 );
                 log::warn!(
@@ -493,7 +493,7 @@ mod tests {
             model: "voxtral-mini-2507".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::new(config, false).expect("build client");
+        let transcriber = MistralOneShotTranscriber::new(config, false).expect("build client");
         assert_eq!(
             transcriber.endpoint,
             "https://api.mistral.ai/v1/audio/transcriptions"
@@ -508,7 +508,7 @@ mod tests {
             model: "voxtral-mini-2507".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::new(config, false).expect("build client");
+        let transcriber = MistralOneShotTranscriber::new(config, false).expect("build client");
         assert_eq!(
             transcriber.endpoint,
             "https://custom.example.com/v1/audio/transcriptions"
@@ -523,7 +523,7 @@ mod tests {
             model: "voxtral-mini-2507".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::new(config, false).expect("build client");
+        let transcriber = MistralOneShotTranscriber::new(config, false).expect("build client");
         assert_eq!(
             transcriber.endpoint,
             "https://custom.example.com/v1/audio/transcriptions"
@@ -558,7 +558,7 @@ mod tests {
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
@@ -596,7 +596,7 @@ mod tests {
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
@@ -613,7 +613,7 @@ mod tests {
 
         // Transcribe from the stream
         let result = transcriber
-            .fetch_transcription(TranscriptionBody::Stream {
+            .fetch_transcription(TranscriptionBody::Pipe {
                 chunks: rx,
                 file_name: "test.wav".to_string(),
             })
@@ -647,7 +647,7 @@ mod tests {
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
@@ -694,7 +694,7 @@ mod tests {
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
@@ -718,7 +718,7 @@ mod tests {
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::new(config, false).expect("build client");
+        let transcriber = MistralOneShotTranscriber::new(config, false).expect("build client");
 
         let result = transcriber
             .fetch_transcription(TranscriptionBody::File(std::path::PathBuf::from(
@@ -754,7 +754,7 @@ mod tests {
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
@@ -807,7 +807,7 @@ mod tests {
             model: "voxtral-mini-2602".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             true,
@@ -908,7 +908,7 @@ mod tests {
             model: "voxtral-mini-2602".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::with_endpoint(
+        let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
             format!("{}/v1/audio/transcriptions", mock_server.uri()),
             false,
@@ -927,7 +927,7 @@ mod tests {
 
     /// Spec for `with_policy(UserAttended)`:
     ///
-    /// When a Mistral batch request fails because the server accepts
+    /// When a Mistral one-shot request fails because the server accepts
     /// the connection but never replies, the error message must NOT
     /// be attributed to `request_wall_clock` (because the
     /// `UserAttended` policy intentionally omits the wall-clock
@@ -963,7 +963,7 @@ mod tests {
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
         };
-        let transcriber = MistralBatchTranscriber::with_policy(
+        let transcriber = MistralOneShotTranscriber::with_policy(
             config,
             false,
             crate::transcription::RequestTimeoutPolicy::UserAttended,

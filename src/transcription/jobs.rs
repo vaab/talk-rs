@@ -81,7 +81,7 @@ pub struct LockPayload {
     pub provider: String,
     /// Model identifier.
     pub model: String,
-    /// Streaming flag (realtime vs batch).
+    /// Streaming flag (realtime vs one-shot).
     pub realtime: bool,
 }
 

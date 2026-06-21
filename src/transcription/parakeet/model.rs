@@ -5,7 +5,7 @@
 //!
 //! Local-inference backends have a concept the remote-API providers
 //! don't: a multi-hundred-megabyte artifact that must be present on
-//! disk before the first `BatchTranscriber::validate()` succeeds.
+//! disk before the first `OneShotTranscriber::validate()` succeeds.
 //! Keeping the I/O-heavy lifecycle (download streaming, bzip2 +
 //! tar extraction, file-locking, atomic rename) isolated from the
 //! Phase-3 transcriber keeps the inference path thin and makes the

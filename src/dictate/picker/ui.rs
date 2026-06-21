@@ -76,8 +76,8 @@ impl PickerCandidate {
 pub(super) enum PickerMessage {
     /// A transcription result (success or error).
     Candidate(Box<PickerCandidate>),
-    /// All initial batch transcription tasks have completed.
-    /// The poll loop should mark any remaining batch spinners as
+    /// All initial one-shot transcription tasks have completed.
+    /// The poll loop should mark any remaining one-shot spinners as
     /// failed but keep running to receive retry results.
     InitialBatchDone,
     /// Incremental text update from a realtime transcriber.
@@ -87,7 +87,7 @@ pub(super) enum PickerMessage {
         model: String,
         accumulated_text: String,
     },
-    /// Live status update for an in-flight batch candidate.
+    /// Live status update for an in-flight one-shot candidate.
     ///
     /// Emitted by [`super::backend::PickerStatusSink`] while the
     /// HTTP request is in progress.  The picker UI renders
@@ -103,8 +103,8 @@ pub(super) enum PickerMessage {
     CandidateStatus {
         provider: Provider,
         model: String,
-        /// Whether this status is for the streaming (realtime) row
-        /// or the batch row.  Required for picker row disambiguation
+        /// Whether this status is for the realtime row
+        /// or the one-shot row.  Required for picker row disambiguation
         /// when both rows exist for the same (provider, model) pair
         /// — without this the status would race to whichever row
         /// `position()` finds first.
@@ -975,7 +975,7 @@ pub(super) async fn pick_with_streaming_gtk(
         // triple that should appear in the picker is gathered into a
         // single list, sorted once, then rendered in one pass.  Each
         // row falls into one of four kinds based on its current state
-        // (already cached, batch pending, realtime pending, or
+        // (already cached, one-shot pending, realtime pending, or
         // user-deferred) — but its *position* is determined solely by
         // (provider, model, streaming), so the visual order never
         // depends on which rows happen to have cached results.
@@ -990,7 +990,7 @@ pub(super) async fn pick_with_streaming_gtk(
             /// Cached result — render the transcript text directly.
             /// Fields: text, is_primary.
             Cached { text: &'a str, is_primary: bool },
-            /// Auto-firing batch model — render a spinner, result
+            /// Auto-firing one-shot model — render a spinner, result
             /// arrives via the poll loop.
             PendingBatch,
             /// Auto-firing realtime model — render an empty label,
@@ -1215,7 +1215,7 @@ pub(super) async fn pick_with_streaming_gtk(
                                 }
 
                                 // Swap the transcript cell to a spinner
-                                // (batch) or empty streaming label
+                                // (one-shot) or empty streaming label
                                 // (realtime).
                                 {
                                     let cells = cells_ref.borrow();
@@ -1466,7 +1466,7 @@ pub(super) async fn pick_with_streaming_gtk(
                             if !*is_error {
                                 // `has_result`: row has received a
                                 // candidate (text may be empty).  We
-                                // detect "pending batch row" by
+                                // detect "pending one-shot row" by
                                 // checking if the text is empty AND
                                 // the row is not streaming -- a
                                 // realtime row may legitimately have
@@ -1937,7 +1937,7 @@ pub(super) async fn pick_with_streaming_gtk(
                             // Match on (provider, model, streaming).
                             // Step 10 of the transport-consolidation
                             // plan wired the realtime path's sink so
-                            // both batch AND realtime rows receive
+                            // both one-shot AND realtime rows receive
                             // status updates; the `streaming` flag
                             // disambiguates them when both rows exist
                             // for the same (provider, model) pair.
@@ -2088,7 +2088,7 @@ pub(super) async fn pick_with_streaming_gtk(
     });
 
     // ── Parallel transcriptions ─────────────────────────────────
-    // Fire initial batch.
+    // Fire initial one-shot.
     let done_tx = msg_tx.clone();
     let retry_msg_tx = msg_tx.clone();
 
@@ -2152,7 +2152,7 @@ pub(super) async fn pick_with_streaming_gtk(
             }
             drop(tx);
             while (tasks.join_next().await).is_some() {}
-            // All initial batch tasks finished — notify GTK.
+            // All initial one-shot tasks finished — notify GTK.
             let _ = done_tx.send(PickerMessage::InitialBatchDone);
         }
     });

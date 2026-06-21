@@ -1,4 +1,4 @@
-//! Shared HTTP helpers for batch transcription backends.
+//! Shared HTTP helpers for one-shot transcription backends.
 //!
 //! Contains common constants, client construction, JSON parsing
 //! utilities, and model validation logic used by both the Mistral
@@ -93,7 +93,7 @@ pub(crate) fn proportional_timeout(audio_bytes: u64) -> Duration {
 /// Description of a single timeout that was attached to a reqwest
 /// request at the call site.
 ///
-/// A call site (e.g. `MistralBatchTranscriber::send_once`) typically
+/// A call site (e.g. `MistralOneShotTranscriber::send_once`) typically
 /// has *two* active timers when it issues a request: the client-wide
 /// [`CONNECT_TIMEOUT`] (covers TCP+TLS) and a per-request
 /// [`proportional_timeout`] applied via `RequestBuilder::timeout`

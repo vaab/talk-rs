@@ -5,7 +5,7 @@
 //!
 //! Two traits model the two modes of operation:
 //!
-//! - [`BatchTranscriber`]: file or byte-stream in, full text out.
+//! - [`OneShotTranscriber`]: file or byte-stream in, full text out.
 //! - [`RealtimeTranscriber`]: raw PCM stream in, incremental event stream out.
 
 use crate::config::{Config, Provider};
@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Audio format for batch uploads.
+/// Audio format for one-shot uploads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum UploadFormat {
     /// Uncompressed WAV (default).
@@ -24,13 +24,13 @@ pub enum UploadFormat {
     Ogg,
 }
 
-/// Body source for a batch transcription request.
+/// Body source for a one-shot transcription request.
 pub(crate) enum TranscriptionBody {
     /// Full audio file on disk. The transport reads it.
     File(PathBuf),
     /// Chunks arriving through a channel — used during
     /// record-while-upload streaming. The transport collects them.
-    Stream {
+    Pipe {
         chunks: tokio::sync::mpsc::Receiver<Vec<u8>>,
         file_name: String,
     },
@@ -114,7 +114,7 @@ fn encode_16k_mono_ogg(path: &std::path::Path) -> Result<Vec<u8>, TalkError> {
     Ok(out)
 }
 
-/// Per-request wall-clock-timeout policy for batch transcription.
+/// Per-request wall-clock-timeout policy for one-shot transcription.
 ///
 /// Two distinct call contexts demand opposite defaults:
 ///
@@ -125,7 +125,7 @@ fn encode_16k_mono_ogg(path: &std::path::Path) -> Result<Vec<u8>, TalkError> {
 ///   as it takes" — the user can dismiss the picker if a candidate
 ///   is taking forever.  These callers pick [`Self::UserAttended`].
 ///
-/// The policy is stored on each [`BatchTranscriber`] (chosen at
+/// The policy is stored on each [`OneShotTranscriber`] (chosen at
 /// construction via `with_policy`) and consulted by `send_once`
 /// when it issues the HTTP request.  In both cases the
 /// `connect_timeout` from `build_client()` and the kernel-level TCP
@@ -136,8 +136,8 @@ fn encode_16k_mono_ogg(path: &std::path::Path) -> Result<Vec<u8>, TalkError> {
 pub enum RequestTimeoutPolicy {
     /// Cap each attempt at `proportional_timeout(file_len)` so an
     /// unattended pipeline cannot hang forever.  This is the legacy
-    /// behaviour and remains the default of [`MistralBatchTranscriber::new`]
-    /// / [`OpenAIBatchTranscriber::new`].
+    /// behaviour and remains the default of [`MistralOneShotTranscriber::new`]
+    /// / [`OpenAIOneShotTranscriber::new`].
     #[default]
     Proportional,
     /// No per-request wall-clock cap; rely solely on
@@ -197,11 +197,11 @@ pub mod parakeet;
 pub mod realtime;
 pub mod transport;
 
-pub use mistral::MistralBatchTranscriber;
-pub use openai::OpenAIBatchTranscriber;
+pub use mistral::MistralOneShotTranscriber;
+pub use openai::OpenAIOneShotTranscriber;
 pub use openai_realtime::OpenAIRealtimeTranscriber;
 #[cfg(feature = "parakeet")]
-pub use parakeet::ParakeetBatchTranscriber;
+pub use parakeet::ParakeetOneShotTranscriber;
 pub use realtime::{MistralRealtimeTranscriber, TranscriptionEvent};
 
 /// Result type for transcription operations.
@@ -239,7 +239,7 @@ pub struct DiarizationSegment {
 
 /// A time-localized transcript segment without speaker attribution.
 ///
-/// Provider-agnostic: each batch/realtime backend maps its native
+/// Provider-agnostic: each one-shot/realtime backend maps its native
 /// segment representation into this shape.  Unlike `DiarizationSegment`,
 /// a `TranscriptSegment` does not carry a speaker identifier — it is
 /// just a start/end window around a piece of text, suitable for
@@ -428,15 +428,15 @@ pub struct MistralProviderMetadata {
     pub unknown_event_types: Vec<String>,
 }
 
-// ── Batch trait ──────────────────────────────────────────────────────
+// ── One-shot trait ──────────────────────────────────────────────────
 
-/// Batch transcription: file or byte-stream in, full text out.
+/// One-shot transcription: file or byte-stream in, full text out.
 ///
 /// Implementations should handle file I/O, API communication, and error
 /// handling.  All implementations must be `Send + Sync` for use in async
 /// contexts.
 #[async_trait]
-pub(crate) trait BatchTranscriber: Send + Sync {
+pub(crate) trait OneShotTranscriber: Send + Sync {
     /// Pre-flight check: verify API connectivity and model validity.
     ///
     /// Called before starting audio capture so the user gets immediate
@@ -476,7 +476,7 @@ pub(crate) trait BatchTranscriber: Send + Sync {
 pub(crate) trait RealtimeTranscriber: Send + Sync {
     /// Pre-flight check: verify API connectivity and model validity.
     ///
-    /// Same purpose as [`BatchTranscriber::validate`] — called before
+    /// Same purpose as [`OneShotTranscriber::validate`] — called before
     /// starting audio capture to give the user immediate feedback.
     #[allow(dead_code)]
     async fn validate(&self) -> Result<(), TalkError>;
@@ -494,7 +494,7 @@ pub(crate) trait RealtimeTranscriber: Send + Sync {
     /// Inject a cancellation token for the realtime session.
     ///
     /// When the token fires, the in-flight WebSocket upgrade or
-    /// active session aborts.  See [`BatchTranscriber::set_cancel_token`]
+    /// active session aborts.  See [`OneShotTranscriber::set_cancel_token`]
     /// for the wiring rationale.
     fn set_cancel_token(&mut self, _token: tokio_util::sync::CancellationToken) {}
 }
@@ -570,7 +570,7 @@ pub async fn enrich_model_error(
 
 // ── Factory ──────────────────────────────────────────────────────────
 
-/// Create a batch transcriber for the given provider.
+/// Create a one-shot transcriber for the given provider.
 ///
 /// When `model` is `Some`, it overrides the config default for that
 /// provider (the `--model` CLI flag).  When `diarize` is `true`, the
@@ -579,13 +579,13 @@ pub async fn enrich_model_error(
 /// consulted by its `send_once` implementation to decide whether to
 /// attach a per-request wall-clock timeout — see
 /// [`RequestTimeoutPolicy`] for variant semantics.
-pub(crate) fn create_batch_transcriber(
+pub(crate) fn create_oneshot_transcriber(
     config: &Config,
     provider: Provider,
     model: Option<&str>,
     diarize: bool,
     policy: RequestTimeoutPolicy,
-) -> Result<Box<dyn BatchTranscriber>, TalkError> {
+) -> Result<Box<dyn OneShotTranscriber>, TalkError> {
     match provider {
         Provider::Mistral => {
             let mut cfg = config.providers.mistral.clone().ok_or_else(|| {
@@ -601,7 +601,7 @@ pub(crate) fn create_batch_transcriber(
             if let Some(m) = model {
                 cfg.model = m.to_string();
             }
-            Ok(Box::new(MistralBatchTranscriber::with_policy(
+            Ok(Box::new(MistralOneShotTranscriber::with_policy(
                 cfg, diarize, policy,
             )?))
         }
@@ -619,7 +619,9 @@ pub(crate) fn create_batch_transcriber(
             if let Some(m) = model {
                 cfg.model = m.to_string();
             }
-            Ok(Box::new(OpenAIBatchTranscriber::with_policy(cfg, policy)?))
+            Ok(Box::new(OpenAIOneShotTranscriber::with_policy(
+                cfg, policy,
+            )?))
         }
         // Phase 3: local Parakeet backend.  Construction is cheap
         // (path resolution only); the heavy model load happens on
@@ -633,7 +635,7 @@ pub(crate) fn create_batch_transcriber(
             if let Some(m) = model {
                 cfg.model = Some(m.to_string());
             }
-            Ok(Box::new(ParakeetBatchTranscriber::with_policy(
+            Ok(Box::new(ParakeetOneShotTranscriber::with_policy(
                 cfg, policy,
             )?))
         }
@@ -654,7 +656,7 @@ pub(crate) fn create_batch_transcriber(
 /// 1. **Pick file** (``<stem>.pick.yml``) -- the authoritative
 ///    transcript, possibly user-edited.  Returned if present.
 /// 2. **Default-provider / default-model sidecar** -- the
-///    batch-mode cache for the default transcription model.
+///    one-shot-mode cache for the default transcription model.
 ///    Read synchronously, no API call.
 /// 3. **None** -- no transcript cached.
 ///
@@ -763,7 +765,7 @@ pub async fn produce_transcript(
 
 /// Transcribe an audio file.
 ///
-/// THE single transcription entry point for batch-from-file
+/// THE single transcription entry point for one-shot-from-file
 /// transcription (Layer 3).  Checks the sidecar cache first; on
 /// miss and when `allow_api` is true, acquires a per-model lock,
 /// calls the provider API, stores the sidecar, releases the lock.
@@ -832,7 +834,7 @@ pub async fn transcribe_audio(
 
     // Wrap API call in a closure so we can always release the lock.
     let api_result = async {
-        let mut transcriber = create_batch_transcriber(config, provider, model, diarize, policy)?;
+        let mut transcriber = create_oneshot_transcriber(config, provider, model, diarize, policy)?;
         transcriber.set_sink(sink.clone());
         if let Some(token) = cancel_token {
             transcriber.set_cancel_token(token);
@@ -941,9 +943,9 @@ pub(crate) fn create_realtime_transcriber(
             }
             Ok(Box::new(OpenAIRealtimeTranscriber::new(cfg)))
         }
-        // Parakeet is batch-only; reject realtime selection cleanly.
+        // Parakeet is one-shot-only; reject realtime selection cleanly.
         Provider::Parakeet => Err(TalkError::Config(
-            "parakeet provider has no realtime mode; use batch transcription (omit --realtime)"
+            "parakeet provider has no realtime mode; use one-shot transcription (omit --realtime)"
                 .to_string(),
         )),
     }
@@ -951,15 +953,15 @@ pub(crate) fn create_realtime_transcriber(
 
 // ── Mock ─────────────────────────────────────────────────────────────
 
-/// Mock batch transcriber for testing.
+/// Mock one-shot transcriber for testing.
 ///
 /// Returns a hardcoded transcription result without making any API calls.
-pub struct MockBatchTranscriber {
+pub struct MockOneShotTranscriber {
     /// The text to return when transcribe is called.
     pub response_text: String,
 }
 
-impl MockBatchTranscriber {
+impl MockOneShotTranscriber {
     /// Create a new mock transcriber with the given response text.
     pub fn new(response_text: impl Into<String>) -> Self {
         Self {
@@ -969,7 +971,7 @@ impl MockBatchTranscriber {
 }
 
 #[async_trait]
-impl BatchTranscriber for MockBatchTranscriber {
+impl OneShotTranscriber for MockOneShotTranscriber {
     async fn validate(&self) -> Result<(), TalkError> {
         Ok(())
     }
@@ -978,7 +980,7 @@ impl BatchTranscriber for MockBatchTranscriber {
         &self,
         body: TranscriptionBody,
     ) -> Result<TranscriptionResult, TalkError> {
-        if let TranscriptionBody::Stream { mut chunks, .. } = body {
+        if let TranscriptionBody::Pipe { mut chunks, .. } = body {
             while chunks.recv().await.is_some() {}
         }
 
@@ -1092,7 +1094,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_transcriber_returns_text() {
-        let mock = MockBatchTranscriber::new("Hello, world!");
+        let mock = MockOneShotTranscriber::new("Hello, world!");
         let result = mock
             .fetch_transcription(TranscriptionBody::File(PathBuf::from("/tmp/test.wav")))
             .await;
@@ -1103,7 +1105,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_transcriber_stream() {
-        let mock = MockBatchTranscriber::new("Streamed transcription");
+        let mock = MockOneShotTranscriber::new("Streamed transcription");
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
         // Send some fake audio data
@@ -1112,7 +1114,7 @@ mod tests {
         drop(tx); // Close the channel
 
         let result = mock
-            .fetch_transcription(TranscriptionBody::Stream {
+            .fetch_transcription(TranscriptionBody::Pipe {
                 chunks: rx,
                 file_name: "test.wav".to_string(),
             })
@@ -1124,7 +1126,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_transcriber_ignores_path() {
-        let mock = MockBatchTranscriber::new("Fixed response");
+        let mock = MockOneShotTranscriber::new("Fixed response");
         let result1 = mock
             .fetch_transcription(TranscriptionBody::File(PathBuf::from("/path/one.wav")))
             .await;
@@ -1485,13 +1487,13 @@ providers:
     }
 
     /// Factory wiring: with the `parakeet` feature enabled (the
-    /// default), `create_batch_transcriber(.., Provider::Parakeet, ..)`
+    /// default), `create_oneshot_transcriber(.., Provider::Parakeet, ..)`
     /// must return `Ok(boxed)` without touching the filesystem or the
     /// network.  The expensive model load is deferred to
     /// `validate` / `fetch_transcription`.
     #[cfg(feature = "parakeet")]
     #[test]
-    fn create_batch_transcriber_parakeet_constructs_without_io() {
+    fn create_oneshot_transcriber_parakeet_constructs_without_io() {
         use crate::config::{ParakeetConfig, ParakeetVariant, ProvidersConfig};
 
         let tmp = tempfile::TempDir::new().expect("tmp dir");
@@ -1516,7 +1518,7 @@ providers:
             recording: None,
         };
 
-        let t = create_batch_transcriber(
+        let t = create_oneshot_transcriber(
             &config,
             Provider::Parakeet,
             None,
@@ -1526,6 +1528,6 @@ providers:
         .expect("parakeet construction must succeed");
         // We only need to confirm the boxed value exists — the
         // concrete type stays private behind the trait.
-        let _: Box<dyn BatchTranscriber> = t;
+        let _: Box<dyn OneShotTranscriber> = t;
     }
 }

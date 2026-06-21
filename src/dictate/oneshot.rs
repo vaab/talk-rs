@@ -1,4 +1,4 @@
-//! Batch dictation mode.
+//! One-shot dictation mode.
 //!
 //! Encodes audio and streams it directly to a single transcription
 //! request.  Audio is independently recorded to a cache OGG via the
@@ -11,7 +11,7 @@ use crate::audio::indicator::SoundPlayer;
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::{AudioConfig, Config, Provider};
 use crate::error::TalkError;
-use crate::transcription::{self, BatchTranscriber, TranscriptionBody, TranscriptionResult};
+use crate::transcription::{self, OneShotTranscriber, TranscriptionBody, TranscriptionResult};
 use crate::x11::overlay::{IndicatorKind, OverlayHandle};
 use crate::x11::visualizer::VisualizerHandle;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ const MAX_LIVE_RETRIES: u32 = 3;
 fn spawn_encode_pipeline(
     buffer: &Arc<AudioBuffer>,
     audio_config: AudioConfig,
-    transcriber: Box<dyn BatchTranscriber>,
+    transcriber: Box<dyn OneShotTranscriber>,
 ) -> (
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), TalkError>>,
@@ -80,7 +80,7 @@ fn spawn_encode_pipeline(
     // Transcribe: stream_rx → API
     let transcribe_handle = tokio::spawn(async move {
         transcriber
-            .fetch_transcription(TranscriptionBody::Stream {
+            .fetch_transcription(TranscriptionBody::Pipe {
                 chunks: stream_rx,
                 file_name: "audio.ogg".to_string(),
             })
@@ -108,7 +108,7 @@ fn abort_pipeline(
 
 // ── Main entry point ────────────────────────────────────────────────
 
-/// Batch dictation mode.
+/// One-shot dictation mode.
 ///
 /// Records audio to a cache OGG via [`ogg_recording_task`] and
 /// independently streams encoded OGG to a transcription API.  If the
@@ -116,13 +116,13 @@ fn abort_pipeline(
 /// immediately from the beginning of the shared [`AudioBuffer`] so
 /// no audio is lost.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn dictate_streaming(
+pub(crate) async fn dictate_oneshot(
     capture: &mut dyn AudioCapture,
     from_file: bool,
     audio_config: AudioConfig,
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     cache_ogg_path: &std::path::Path,
-    transcriber: Box<dyn BatchTranscriber>,
+    transcriber: Box<dyn OneShotTranscriber>,
     shutdown: &CancellationToken,
     player: Option<&SoundPlayer>,
     boop_token: Option<&CancellationToken>,
@@ -155,7 +155,7 @@ pub(crate) async fn dictate_streaming(
     let rec_start = std::time::Instant::now();
     let t_stop: Option<std::time::Instant>;
     if from_file {
-        log::info!("transcribing audio file (batch)...");
+        log::info!("transcribing audio file (one-shot)...");
         tokio::select! {
             _ = shutdown.cancelled() => {
                 t_stop = Some(std::time::Instant::now());
@@ -250,7 +250,7 @@ pub(crate) async fn dictate_streaming(
                     if let Some(viz) = visualizer {
                         viz.push_message(&msg);
                     }
-                    match transcription::create_batch_transcriber(
+                    match transcription::create_oneshot_transcriber(
                         config,
                         provider,
                         model,
@@ -448,7 +448,7 @@ pub(crate) async fn dictate_streaming(
     encode_handle.abort();
 
     log::info!(
-        "dictate_streaming total elapsed: {:.2}s",
+        "dictate_oneshot total elapsed: {:.2}s",
         t0.elapsed().as_secs_f64()
     );
 

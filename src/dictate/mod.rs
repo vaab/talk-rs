@@ -4,9 +4,9 @@
 //! into the focused application via clipboard.
 
 mod models;
+mod oneshot;
 mod picker;
 mod realtime;
-mod streaming;
 mod text;
 mod toggle;
 
@@ -31,10 +31,10 @@ use crate::x11::overlay::{IndicatorKind, OverlayHandle};
 use crate::x11::render_util::RingBuffer;
 use crate::x11::visualizer::VisualizerHandle;
 use models::{resolve_model, resolve_provider};
+use oneshot::dictate_oneshot;
 use picker::{run_pick, PickParams};
 use realtime::dictate_realtime;
 use std::path::PathBuf;
-use streaming::dictate_streaming;
 use toggle::toggle_dispatch;
 use tokio_util::sync::CancellationToken;
 
@@ -309,7 +309,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // (PipeWire capture, sound playback) — so that a quick toggle-off
     // is never missed.  Without this, there is a ~1 s race window
     // between capture.start() and the ctrl_c().await inside
-    // dictate_streaming/dictate_realtime where SIGINT has no handler
+    // dictate_oneshot/dictate_realtime where SIGINT has no handler
     // and the daemon becomes an unkillable orphan.
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
@@ -329,7 +329,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     log::info!(
         "starting {} transcription{}",
-        if opts.realtime { "realtime" } else { "batch" },
+        if opts.realtime {
+            "realtime"
+        } else {
+            "one-shot"
+        },
         if from_file { " (from file)" } else { "" }
     );
 
@@ -348,7 +352,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     //    the previous run died.
     // 2. Switch any connected BT headset to its best HFP profile so
     //    the headset microphone is enabled.  The returned guard is
-    //    moved into dictate_streaming / dictate_realtime, where it is
+    //    moved into dictate_oneshot / dictate_realtime, where it is
     //    triggered explicitly the moment `capture.stop()` returns —
     //    so the user gets A2DP audio back IMMEDIATELY on toggle-off,
     //    not only after the transcription + paste pipeline finishes.
@@ -717,11 +721,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
         result
     } else {
-        // Batch mode (default): capture audio, encode, then transcribe.
+        // One-shot mode (default): capture audio, encode, then transcribe.
         // Dictate is an autonomous pipeline (no human watching),
         // so use `Proportional` so a hung server cannot wedge the
         // pipeline forever.
-        let mut transcriber = transcription::create_batch_transcriber(
+        let mut transcriber = transcription::create_oneshot_transcriber(
             &config,
             provider,
             opts.model.as_deref(),
@@ -730,7 +734,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         )?;
         transcriber.set_sink(sink.clone());
 
-        let (stream_result, t_stop_val) = dictate_streaming(
+        let (stream_result, t_stop_val) = dictate_oneshot(
             &mut *capture,
             from_file,
             encode_config.clone(),
@@ -828,14 +832,14 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     }
 
     // Stop boop loop (idempotent — may already be cancelled by
-    // dictate_streaming or dictate_realtime).
+    // dictate_oneshot or dictate_realtime).
     if let Some(token) = boop_token {
         log::debug!("stopping boop loop");
         token.cancel();
     }
 
     // For realtime mode, play stop sound and hide visualizer here
-    // (batch mode already did this inside dictate_streaming on SIGINT).
+    // (one-shot mode already did this inside dictate_oneshot on SIGINT).
     if opts.realtime {
         if let Some(ref p) = player {
             log::debug!("playing stop sound");
@@ -850,7 +854,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             o.hide();
         }
     }
-    // Batch mode: overlay is still showing "Transcribing" badge —
+    // One-shot mode: overlay is still showing "Transcribing" badge —
     // it will be hidden after paste (below).
 
     let text = crate::transcription::format_transcription_output(&result, opts.timestamp)
@@ -934,7 +938,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             std::process::id()
         );
         log::warn!("empty transcription — nothing to paste");
-        // Hide transcribing overlay and visualizer (batch mode keeps
+        // Hide transcribing overlay and visualizer (one-shot mode keeps
         // them visible until now).
         if !opts.realtime {
             if let Some(ref o) = overlay {
@@ -946,7 +950,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     log::info!("transcription: {}", text);
 
-    // Paste into focused application (batch mode only;
+    // Paste into focused application (one-shot mode only;
     // realtime mode pastes per-segment during recording)
     if !opts.realtime && !opts.no_paste {
         // Keep the overlay visible during paste so the phase layer
@@ -978,7 +982,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     }
 
-    // Print transcription to stdout (batch mode only;
+    // Print transcription to stdout (one-shot mode only;
     // realtime mode already prints segments as they arrive)
     if !opts.realtime {
         println!("{}", text);
@@ -1007,7 +1011,7 @@ mod tests {
         use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
         use crate::clipboard::MockClipboard;
         use crate::config::AudioConfig;
-        use crate::transcription::{BatchTranscriber, MockBatchTranscriber, TranscriptionBody};
+        use crate::transcription::{MockOneShotTranscriber, OneShotTranscriber, TranscriptionBody};
 
         let audio_config = AudioConfig::new();
 
@@ -1049,10 +1053,10 @@ mod tests {
         });
 
         // Spawn transcription with mock
-        let transcriber = MockBatchTranscriber::new("Hello world from dictation");
+        let transcriber = MockOneShotTranscriber::new("Hello world from dictation");
         let transcribe_task = tokio::spawn(async move {
             transcriber
-                .fetch_transcription(TranscriptionBody::Stream {
+                .fetch_transcription(TranscriptionBody::Pipe {
                     chunks: stream_rx,
                     file_name: "audio.ogg".to_string(),
                 })

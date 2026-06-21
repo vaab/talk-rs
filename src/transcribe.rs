@@ -218,7 +218,7 @@ mod tests {
     async fn test_transcribe_pipeline_with_mock_transcriber() {
         use crate::config::Provider;
         use crate::recording_cache;
-        use crate::transcription::{BatchTranscriber, MockBatchTranscriber, TranscriptionBody};
+        use crate::transcription::{MockOneShotTranscriber, OneShotTranscriber, TranscriptionBody};
         use std::fs;
         use tempfile::TempDir;
 
@@ -233,7 +233,7 @@ mod tests {
         let output_path = temp_dir.path().join("transcript.txt");
 
         // Create mock transcriber
-        let mock = MockBatchTranscriber::new("This is a test transcription");
+        let mock = MockOneShotTranscriber::new("This is a test transcription");
 
         // Transcribe using mock
         let transcription = mock

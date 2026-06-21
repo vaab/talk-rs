@@ -1,7 +1,7 @@
 //! Transport primitives for transcription API calls.
 //!
 //! This module contains the resilience and connectivity concerns
-//! shared by every provider, across both batch (HTTP POST) and
+//! shared by every provider, across both one-shot (HTTP POST) and
 //! realtime (WebSocket) protocols.
 //!
 //! # Architecture
@@ -10,7 +10,7 @@
 //! through this module.  The public surface is intentionally small:
 //!
 //! - [`http_request`] — the single entry point for HTTP requests
-//!   (batch transcription POST, model validation GET, model list
+//!   (one-shot transcription POST, model validation GET, model list
 //!   GET).  Handles retries (connection + data) internally; emits
 //!   [`ConnectionEvent`]s; supports cancellation via
 //!   [`tokio_util::sync::CancellationToken`].
@@ -33,7 +33,7 @@
 //!   validation, and model-error enrichment.  Functions here will
 //!   either move behind [`http_request`] or become private helpers
 //!   over the course of the transport consolidation.
-//! - [`retry`]: the legacy retry primitive used by batch HTTP calls
+//! - [`retry`]: the legacy retry primitive used by one-shot HTTP calls
 //!   and realtime WebSocket upgrade handshakes.  Being absorbed
 //!   into [`http_request`] / [`ws_upgrade`].
 //! - [`validate_cache`]: disk-backed memoization of `/v1/models`
