@@ -79,7 +79,7 @@ pub(super) enum PickerMessage {
     /// All initial one-shot transcription tasks have completed.
     /// The poll loop should mark any remaining one-shot spinners as
     /// failed but keep running to receive retry results.
-    InitialBatchDone,
+    InitialOneShotDone,
     /// Incremental text update from a realtime transcriber.
     /// Contains the full accumulated text so GTK just replaces the label.
     StreamUpdate {
@@ -798,7 +798,7 @@ pub(super) async fn pick_with_streaming_gtk(
         let transcript_labels: Rc<RefCell<Vec<Option<gtk4::Label>>>> =
             Rc::new(RefCell::new(Vec::new()));
         // Deferred row indices — rows awaiting user click, excluded
-        // from the InitialBatchDone "no response" sweep.
+        // from the InitialOneShotDone "no response" sweep.
         let deferred_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         // Per-row "has-transcription" flag — true once the row has
@@ -992,7 +992,7 @@ pub(super) async fn pick_with_streaming_gtk(
             Cached { text: &'a str, is_primary: bool },
             /// Auto-firing one-shot model — render a spinner, result
             /// arrives via the poll loop.
-            PendingBatch,
+            PendingOneShot,
             /// Auto-firing realtime model — render an empty label,
             /// text fills in incrementally.
             PendingRealtime,
@@ -1016,7 +1016,7 @@ pub(super) async fn pick_with_streaming_gtk(
             ));
         }
         for (p, m) in &pending_info {
-            all_rows.push((*p, m.clone(), false, RowKind::PendingBatch));
+            all_rows.push((*p, m.clone(), false, RowKind::PendingOneShot));
         }
         for (p, m) in &realtime_pending_info {
             all_rows.push((*p, m.clone(), true, RowKind::PendingRealtime));
@@ -1356,7 +1356,7 @@ pub(super) async fn pick_with_streaming_gtk(
                     cell.append(&label);
                     ((*text).to_string(), *is_primary, false, Some(label))
                 }
-                RowKind::PendingBatch => {
+                RowKind::PendingOneShot => {
                     let spinner = gtk4::Spinner::new();
                     spinner.start();
                     cell.append(&spinner);
@@ -1378,7 +1378,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let action_btn =
                 make_action_button(*provider, model.clone(), *streaming, is_primary, row_idx);
             match kind {
-                RowKind::PendingBatch | RowKind::PendingRealtime => {
+                RowKind::PendingOneShot | RowKind::PendingRealtime => {
                     action_btn.set_sensitive(true);
                     set_action_icon_stop(&action_btn);
                 }
@@ -1997,7 +1997,7 @@ pub(super) async fn pick_with_streaming_gtk(
                                 }
                             }
                         }
-                        Ok(PickerMessage::InitialBatchDone) => {
+                        Ok(PickerMessage::InitialOneShotDone) => {
                             // Mark rows that still show a spinner as
                             // failed — the API never responded.  Rows
                             // whose spinner was already replaced (by a
@@ -2153,7 +2153,7 @@ pub(super) async fn pick_with_streaming_gtk(
             drop(tx);
             while (tasks.join_next().await).is_some() {}
             // All initial one-shot tasks finished — notify GTK.
-            let _ = done_tx.send(PickerMessage::InitialBatchDone);
+            let _ = done_tx.send(PickerMessage::InitialOneShotDone);
         }
     });
 

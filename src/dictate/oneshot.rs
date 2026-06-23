@@ -255,7 +255,7 @@ pub(crate) async fn dictate_oneshot(
                         provider,
                         model,
                         diarize,
-                        // Reconnect after a streaming failure stays
+                        // Reconnect after a one-shot failure stays
                         // on the autonomous-pipeline `Proportional`
                         // policy — dictate has no human watching.
                         transcription::RequestTimeoutPolicy::Proportional,
@@ -331,7 +331,7 @@ pub(crate) async fn dictate_oneshot(
         }
         if let Some(t) = t_stop {
             log::warn!(
-                "[DBG] streaming: overlay→Transcribing, +{}ms since SIGINT",
+                "[DBG] one-shot: overlay→Transcribing, +{}ms since SIGINT",
                 t.elapsed().as_millis()
             );
         }
@@ -349,7 +349,7 @@ pub(crate) async fn dictate_oneshot(
     if let Some(t) = t_stop {
         log::info!("timing: stop +{}ms ogg_flushed", t.elapsed().as_millis());
         log::warn!(
-            "[DBG] streaming: cache_ogg finalized, +{}ms since SIGINT",
+            "[DBG] one-shot: cache_ogg finalized, +{}ms since SIGINT",
             t.elapsed().as_millis()
         );
     }
@@ -377,7 +377,7 @@ pub(crate) async fn dictate_oneshot(
     // take a while to process long recordings.
     let t0 = std::time::Instant::now();
     log::info!("waiting for transcription result");
-    log::warn!("[DBG] streaming: awaiting transcribe_handle (no timeout)");
+    log::warn!("[DBG] one-shot: awaiting transcribe_handle (no timeout)");
 
     // Heartbeat: log every 2s while transcribe_handle is pending so
     // we can distinguish a slow HTTP response from a deadlock or lost
@@ -393,7 +393,7 @@ pub(crate) async fn dictate_oneshot(
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
                     elapsed += 2;
                     log::warn!(
-                        "[DBG] streaming: still waiting for transcribe result ({}s elapsed, wall {:.1}s)",
+                        "[DBG] one-shot: still waiting for transcribe result ({}s elapsed, wall {:.1}s)",
                         elapsed,
                         hb_start.elapsed().as_secs_f64()
                     );
@@ -409,7 +409,7 @@ pub(crate) async fn dictate_oneshot(
                 t0.elapsed().as_secs_f64()
             );
             log::warn!(
-                "[DBG] streaming: transcribe_handle returned OK after {}ms",
+                "[DBG] one-shot: transcribe_handle returned OK after {}ms",
                 t0.elapsed().as_millis()
             );
             Ok(result)
@@ -421,14 +421,14 @@ pub(crate) async fn dictate_oneshot(
                 err
             );
             log::warn!(
-                "[DBG] streaming: transcribe_handle returned ERR after {}ms",
+                "[DBG] one-shot: transcribe_handle returned ERR after {}ms",
                 t0.elapsed().as_millis()
             );
             Err(err)
         }
         Err(err) => {
             log::warn!(
-                "[DBG] streaming: transcribe_handle PANICKED after {}ms: {}",
+                "[DBG] one-shot: transcribe_handle PANICKED after {}ms: {}",
                 t0.elapsed().as_millis(),
                 err
             );
