@@ -492,45 +492,163 @@ pub enum PasteShortcut {
     CtrlV,
 }
 
-/// Paste behaviour configuration.
+/// Flat (pre-tree) paste configuration schema.
+///
+/// Kept as the BACKWARD-COMPAT surface for `paste:` sections that
+/// predate the node-tree refactor.  New configs should prefer the
+/// tree form via [`PasteConfig::Tree`].
 #[derive(Debug, Clone, Deserialize)]
-pub struct PasteConfig {
+pub struct FlatPasteConfig {
     /// Maximum characters per clipboard paste chunk.
     ///
     /// Text longer than this is split on word boundaries into
-    /// consecutive Ctrl+Shift+V keystrokes.  Keeping chunks small
-    /// avoids terminal paste-summary behaviour that collapses large
-    /// pastes.  Set to `0` to disable chunking entirely (paste in one
-    /// shot).
+    /// consecutive Ctrl+Shift+V keystrokes.  Set to `0` to disable
+    /// chunking entirely (paste in one shot).
     #[serde(default = "default_paste_chunk_chars")]
     pub chunk_chars: usize,
 
     /// Keyboard shortcut to trigger paste in the target application.
-    ///
-    /// `ctrl_shift_v` (default) uses the primary selection clipboard.
-    /// `ctrl_v` uses the regular clipboard, useful for terminal
-    /// applications that don't support Shift+Insert / Ctrl+Shift+V.
     #[serde(default)]
     pub shortcut: PasteShortcut,
 
     /// Milliseconds the clipboard content must remain unchanged
     /// before the post-paste restore is allowed to overwrite it.
-    ///
-    /// Guards against a slow paste target re-fetching the clipboard
-    /// after we've already restored the user's saved content — which
-    /// would leak the restored value into the document and drop the
-    /// last chunk.  Default: 200.
     #[serde(default = "default_paste_restore_settle_ms")]
     pub restore_settle_ms: u64,
 
     /// Maximum milliseconds to wait between chunks for the paste
     /// target to fetch the offered clipboard content.
-    ///
-    /// On timeout a `WARN` is emitted (likely corruption — target
-    /// never actually pulled the chunk).  Also caps the total settle
-    /// loop before the final restore.  Default: 400.
     #[serde(default = "default_paste_chunk_fetch_timeout_ms")]
     pub chunk_fetch_timeout_ms: u64,
+}
+
+/// Paste behaviour configuration.
+///
+/// Two surface forms, both honoured at deserialise time:
+///
+/// * **Tree** (new): the YAML carries a `node:` key at the top level
+///   and is parsed as a [`crate::paste::PasteNodeConfig`].  Enables
+///   the composable paste-node abstraction.
+/// * **Flat** (legacy): the YAML carries the historical flat keys
+///   (`chunk_chars`, `shortcut`, `restore_settle_ms`,
+///   `chunk_fetch_timeout_ms`).  Behaves byte-for-byte identically
+///   to pre-refactor `talk-rs`.
+///
+/// Selection is via `#[serde(untagged)]`: tree parsing is tried
+/// first; if it fails (because no `node:` key is present) the flat
+/// parser runs.  See `tests::test_paste_config_*` for the contract.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PasteConfig {
+    /// New tree form.  Always carries a `node:` key.
+    Tree(crate::paste::PasteNodeConfig),
+    /// Legacy flat form.
+    Flat(FlatPasteConfig),
+}
+
+impl PasteConfig {
+    /// Materialise this configuration into a runtime paste-node tree.
+    ///
+    /// * Tree form ⇒ build the tree as-declared.
+    /// * Flat form with `chunk_chars > 0` ⇒
+    ///   `chunk(chunk_chars) → clipboard(shortcut, restore_settle_ms, chunk_fetch_timeout_ms)`.
+    /// * Flat form with `chunk_chars == 0` ⇒
+    ///   `clipboard(shortcut, restore_settle_ms, chunk_fetch_timeout_ms)` (chunk wrapper skipped).
+    ///
+    /// `no_chunk_paste` (the CLI flag) strips every `Chunk` node from
+    /// the resulting tree — identical effect to today's
+    /// "set chunk_chars to 0" path on the flat form, and a natural
+    /// extension to arbitrary trees.
+    pub fn build_root(&self, no_chunk_paste: bool) -> Box<dyn crate::paste::PasteNode> {
+        let tree = self.to_tree();
+        crate::paste::build_root_from_config(&tree, no_chunk_paste)
+    }
+
+    /// Resolve the settle/timeout timing knobs for this configuration.
+    pub fn timing(&self) -> crate::paste::PasteTiming {
+        crate::paste::timing_from_root(&self.to_tree())
+    }
+
+    /// Lower this configuration to its equivalent
+    /// [`crate::paste::PasteNodeConfig`] tree.  Flat form is mapped
+    /// according to [`PasteConfig::build_root`]'s contract.
+    pub fn to_tree(&self) -> crate::paste::PasteNodeConfig {
+        match self {
+            Self::Tree(t) => t.clone(),
+            Self::Flat(f) => flat_to_tree(f),
+        }
+    }
+}
+
+impl PasteConfig {
+    /// Backward-compat accessor: the configured chunk size.  For tree
+    /// configs we walk down to the first `Chunk` node; `0` if none.
+    pub fn chunk_chars(&self) -> usize {
+        fn find(cfg: &crate::paste::PasteNodeConfig) -> Option<usize> {
+            match cfg {
+                crate::paste::PasteNodeConfig::Chunk { chunk_chars, .. } => Some(*chunk_chars),
+                crate::paste::PasteNodeConfig::DetectDisplayServer { x11, .. } => find(x11),
+                crate::paste::PasteNodeConfig::MatchWmClass { default, .. } => find(default),
+                crate::paste::PasteNodeConfig::Clipboard { .. }
+                | crate::paste::PasteNodeConfig::XtestType {} => None,
+            }
+        }
+        match self {
+            Self::Flat(f) => f.chunk_chars,
+            Self::Tree(t) => find(t).unwrap_or(0),
+        }
+    }
+
+    /// Backward-compat accessor: the configured paste shortcut.  For
+    /// tree configs we walk down to the first `Clipboard` node;
+    /// defaults to [`PasteShortcut::default`] if none.
+    pub fn shortcut(&self) -> PasteShortcut {
+        fn find(cfg: &crate::paste::PasteNodeConfig) -> Option<PasteShortcut> {
+            match cfg {
+                crate::paste::PasteNodeConfig::Clipboard { shortcut, .. } => Some(*shortcut),
+                crate::paste::PasteNodeConfig::Chunk { child, .. } => find(child),
+                crate::paste::PasteNodeConfig::DetectDisplayServer { x11, .. } => find(x11),
+                crate::paste::PasteNodeConfig::MatchWmClass { default, .. } => find(default),
+                crate::paste::PasteNodeConfig::XtestType {} => None,
+            }
+        }
+        match self {
+            Self::Flat(f) => f.shortcut,
+            Self::Tree(t) => find(t).unwrap_or_default(),
+        }
+    }
+
+    /// Backward-compat accessor: settle window in ms.
+    pub fn restore_settle_ms(&self) -> u64 {
+        match self {
+            Self::Flat(f) => f.restore_settle_ms,
+            Self::Tree(_) => self.timing().restore_settle_ms,
+        }
+    }
+
+    /// Backward-compat accessor: per-chunk fetch timeout in ms.
+    pub fn chunk_fetch_timeout_ms(&self) -> u64 {
+        match self {
+            Self::Flat(f) => f.chunk_fetch_timeout_ms,
+            Self::Tree(_) => self.timing().chunk_fetch_timeout_ms,
+        }
+    }
+}
+
+fn flat_to_tree(f: &FlatPasteConfig) -> crate::paste::PasteNodeConfig {
+    let clipboard = crate::paste::PasteNodeConfig::Clipboard {
+        shortcut: f.shortcut,
+        restore_settle_ms: f.restore_settle_ms,
+        chunk_fetch_timeout_ms: f.chunk_fetch_timeout_ms,
+    };
+    if f.chunk_chars == 0 {
+        clipboard
+    } else {
+        crate::paste::PasteNodeConfig::Chunk {
+            chunk_chars: f.chunk_chars,
+            child: Box::new(clipboard),
+        }
+    }
 }
 
 fn default_paste_chunk_chars() -> usize {
@@ -1340,7 +1458,7 @@ paste: {}
 
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
-        assert_eq!(paste.chunk_chars, 150);
+        assert_eq!(paste.chunk_chars(), 150);
         Ok(())
     }
 
@@ -1359,7 +1477,7 @@ paste:
 
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
-        assert_eq!(paste.chunk_chars, 300);
+        assert_eq!(paste.chunk_chars(), 300);
         Ok(())
     }
 
@@ -1378,7 +1496,7 @@ paste:
 
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
-        assert_eq!(paste.chunk_chars, 0);
+        assert_eq!(paste.chunk_chars(), 0);
         Ok(())
     }
 
@@ -1396,7 +1514,7 @@ paste: {}
 
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
-        assert_eq!(paste.restore_settle_ms, 200);
+        assert_eq!(paste.restore_settle_ms(), 200);
         Ok(())
     }
 
@@ -1415,7 +1533,7 @@ paste:
 
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
-        assert_eq!(paste.restore_settle_ms, 500);
+        assert_eq!(paste.restore_settle_ms(), 500);
         Ok(())
     }
 
@@ -1433,7 +1551,7 @@ paste: {}
 
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
-        assert_eq!(paste.chunk_fetch_timeout_ms, 400);
+        assert_eq!(paste.chunk_fetch_timeout_ms(), 400);
         Ok(())
     }
 
@@ -1452,7 +1570,7 @@ paste:
 
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
-        assert_eq!(paste.chunk_fetch_timeout_ms, 800);
+        assert_eq!(paste.chunk_fetch_timeout_ms(), 800);
         Ok(())
     }
 

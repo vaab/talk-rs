@@ -460,3 +460,53 @@ pub fn x11_get_active_window() -> Option<u32> {
     }
     Some(wid)
 }
+
+/// Read the `WM_CLASS` property of `wid` and return its
+/// `(instance, class)` pair, or `None` if the property is missing or
+/// malformed.
+///
+/// `WM_CLASS` is a STRING property containing two NUL-terminated
+/// strings: the resource-name (instance) followed by the class.
+/// Per ICCCM § 4.1.2.5.  This is what `xprop -id <wid> WM_CLASS`
+/// prints and what the `match-wm-class` paste node uses for routing.
+pub fn x11_get_wm_class(wid: u32) -> Option<(String, String)> {
+    use x11rb::protocol::xproto::*;
+
+    let (conn, _screen_num) = x11rb::connect(None).ok()?;
+
+    // WM_CLASS is a pre-defined ICCCM atom — fetch via `intern_atom`
+    // (cheaper than hard-coding the atom id, robust across servers).
+    let atom_wm_class = conn
+        .intern_atom(false, b"WM_CLASS")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+
+    // Request up to 1 KiB; WM_CLASS pairs are always tiny.  Type
+    // STRING (Latin-1) is the ICCCM-mandated encoding; a few apps
+    // ship UTF8_STRING — we accept any 8-bit value the server hands
+    // back.
+    let prop = conn
+        .get_property(false, wid, atom_wm_class, AtomEnum::ANY, 0, 1024 / 4)
+        .ok()?
+        .reply()
+        .ok()?;
+
+    if prop.format != 8 {
+        return None;
+    }
+    let bytes = prop.value;
+    // Split on the FIRST NUL to separate instance from class; class
+    // is up to the second NUL (or end of buffer).
+    let mut parts = bytes.split(|&b| b == 0);
+    let instance = parts.next()?;
+    let class = parts.next()?;
+    if instance.is_empty() && class.is_empty() {
+        return None;
+    }
+    Some((
+        String::from_utf8_lossy(instance).into_owned(),
+        String::from_utf8_lossy(class).into_owned(),
+    ))
+}

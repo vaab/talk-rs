@@ -17,12 +17,13 @@ use crate::audio::monitor_capture::MonitorCapture;
 use crate::audio::pipewire_capture::PipeWireCapture;
 use crate::audio::resample;
 use crate::audio::{AudioCapture, CHUNK_DURATION_MS};
-use crate::clipboard::{Clipboard, X11Clipboard};
+
 use crate::config::{AudioConfig, Config, Provider};
 use crate::daemon;
 use crate::error::TalkError;
 use crate::paste::{
-    focus_window, get_active_window, paste_text_to_target, simulate_paste, PASTE_CHUNK_CHARS,
+    default_root, focus_window, get_active_window, paste_with_root, PasteNode,
+    RealtimeClipboardGuard,
 };
 use crate::recording_cache;
 use crate::telemetry::{BroadcastSink, TelemetrySink, TranscriptionEvent};
@@ -80,35 +81,21 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Load configuration
     let config = Config::load(None)?;
 
-    // Effective paste chunk size: --no-chunk-paste disables chunking (0),
-    // otherwise use config value or the built-in default (150).
-    let paste_chunk_chars = if opts.no_chunk_paste {
-        0
-    } else {
-        config
-            .paste
-            .as_ref()
-            .map(|p| p.chunk_chars)
-            .unwrap_or(PASTE_CHUNK_CHARS)
+    // Build the runtime paste-node tree from config (or fall back to
+    // the default `chunk(150) → clipboard(ctrl-shift-v, 200, 400)`
+    // tree when no `paste:` section is configured).  `--no-chunk-paste`
+    // strips chunk wrappers from whatever tree is configured.
+    let paste_root: std::sync::Arc<dyn PasteNode> = match config.paste.as_ref() {
+        Some(p) => std::sync::Arc::from(p.build_root(opts.no_chunk_paste)),
+        None => std::sync::Arc::from(default_root(opts.no_chunk_paste)),
     };
 
-    // Resolve paste shortcut from config (default: Ctrl+Shift+V).
-    let paste_shortcut = config
-        .paste
-        .as_ref()
-        .map(|p| p.shortcut)
-        .unwrap_or_default();
-
-    // Resolve paste timing from config (defaults: 200 / 400).  Threaded
-    // into `paste_text_to_target` and the realtime per-segment paste
-    // task so a slow target cannot race the next overwrite.
+    // Resolve paste timing from config (defaults: 200 / 400).  Drives
+    // the settle loop in `paste_with_root` and the realtime guard.
     let paste_timing = config
         .paste
         .as_ref()
-        .map(|p| crate::paste::PasteTiming {
-            restore_settle_ms: p.restore_settle_ms,
-            chunk_fetch_timeout_ms: p.chunk_fetch_timeout_ms,
-        })
+        .map(|p| p.timing())
         .unwrap_or_default();
 
     // Determine target window: use --target-window arg (from daemon mode)
@@ -167,8 +154,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                 provider: opts.provider,
                 model: opts.model,
                 target_window,
-                paste_chunk_chars,
-                paste_shortcut,
+                paste_root: paste_root.clone(),
                 paste_timing,
             },
         )
@@ -189,14 +175,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     "pick file present for {} — pasting without new transcription",
                     audio.display()
                 );
-                paste_text_to_target(
+                paste_with_root(
+                    paste_root.as_ref(),
                     target_window.as_ref(),
                     &text,
                     replace_char_count.unwrap_or(0),
-                    paste_chunk_chars,
                     None,
                     &crate::telemetry::NoOpSink,
-                    paste_shortcut,
                     paste_timing,
                 )
                 .await?;
@@ -624,16 +609,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // Each segment is pasted into the focused application as it
         // arrives, providing real-time feedback while dictating.
 
-        // Save clipboard and focus target window before recording starts
-        let rt_clipboard = X11Clipboard::new();
-        let saved_clipboard = rt_clipboard.get_text().await.ok();
-        log::trace!(
-            "paste(realtime): saved original clipboard = {}",
-            saved_clipboard
-                .as_deref()
-                .map(crate::paste::log_preview)
-                .unwrap_or_else(|| "<none>".to_string()),
-        );
+        // Save clipboard and focus target window before recording starts.
+        // Each segment is pasted whole (no chunking) — match legacy
+        // behaviour by routing through the configured paste tree with
+        // chunk wrappers stripped.
+        let rt_guard = RealtimeClipboardGuard::begin(paste_timing).await;
         if let Some(ref wid) = target_window {
             log::debug!("pre-focusing target window: {}", wid);
             if !focus_window(wid).await {
@@ -642,16 +622,28 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
+        // Build the realtime-flavoured root: strip chunk wrappers
+        // so each segment is pasted as a single clipboard call.
+        let rt_root: std::sync::Arc<dyn PasteNode> = match config.paste.as_ref() {
+            Some(p) => std::sync::Arc::from(p.build_root(true)),
+            None => std::sync::Arc::from(default_root(true)),
+        };
+
         // Create segment channel for per-segment pasting
         let (seg_tx, mut seg_rx) = tokio::sync::mpsc::channel::<String>(32);
 
         // Spawn paste consumer: each segment is pasted immediately
-        let rt_shortcut = paste_shortcut;
-        let rt_chunk_fetch_timeout_ms = paste_timing.chunk_fetch_timeout_ms;
+        // through the SAME node tree used by the one-shot path.
+        let rt_root_for_task = rt_root.clone();
         let paste_task = tokio::spawn(async move {
-            let paste_clip = X11Clipboard::new();
             let mut is_first = true;
             let mut seg_idx = 0usize;
+            // Per-segment guard reuses the rt_guard's clipboard via a
+            // fresh per-call PasteCtx; legacy parity requires that
+            // every segment uses the same X11Clipboard so the settle
+            // loop at end-of-stream observes a meaningful serve
+            // counter.  RealtimeClipboardGuard carries the shared
+            // clipboard and exposes paste_segment() for this purpose.
             while let Some(segment) = seg_rx.recv().await {
                 seg_idx += 1;
                 let paste_text = if is_first {
@@ -665,44 +657,18 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     seg_idx,
                     crate::paste::log_preview(&paste_text),
                 );
-                if let Err(e) = paste_clip.set_text(&paste_text).await {
-                    log::warn!("per-segment clipboard set failed: {}", e);
-                    continue;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                if let Err(e) = simulate_paste(rt_shortcut).await {
+                if let Err(e) = rt_guard
+                    .paste_segment(
+                        rt_root_for_task.as_ref(),
+                        &paste_text,
+                        &crate::telemetry::NoOpSink,
+                    )
+                    .await
+                {
                     log::warn!("per-segment paste failed: {}", e);
                 }
-                // Wait for the target to actually fetch our segment
-                // before the NEXT segment overwrites the clipboard.
-                // Fresh serve handle each set_text → baseline 0.
-                let served = paste_clip
-                    .wait_until_served(
-                        0,
-                        std::time::Duration::from_millis(rt_chunk_fetch_timeout_ms),
-                    )
-                    .await;
-                if served == 0 {
-                    log::trace!(
-                        "paste(realtime): segment {} pasted but served_count=0 \
-                         (target did NOT fetch our clipboard — check shortcut/focus)",
-                        seg_idx,
-                    );
-                    log::warn!(
-                        "paste(realtime): segment {} timed out after {} ms with \
-                         served_count=0 — target never fetched our clipboard, \
-                         likely paste corruption",
-                        seg_idx,
-                        rt_chunk_fetch_timeout_ms,
-                    );
-                } else {
-                    log::trace!(
-                        "paste(realtime): segment {} consumed (served_count={})",
-                        seg_idx,
-                        served,
-                    );
-                }
             }
+            rt_guard.finish().await;
         });
 
         let result = match dictate_realtime(
@@ -732,58 +698,10 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             }
         };
 
-        // Wait for all pending pastes to complete
+        // Wait for the paste task to drain every segment and run
+        // its end-of-stream settle + restore (inside `rt_guard.finish()`).
         if let Err(e) = paste_task.await {
             log::warn!("paste task error: {}", e);
-        }
-
-        // Restore original clipboard: wait until the last segment's
-        // served count has been STABLE for `restore_settle_ms`
-        // (capped at `chunk_fetch_timeout_ms` total) before
-        // overwriting — a slow target re-fetching after the restore
-        // would otherwise leak the saved value into the document.
-        {
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis(paste_timing.chunk_fetch_timeout_ms);
-            let settle = std::time::Duration::from_millis(paste_timing.restore_settle_ms);
-            let poll = std::time::Duration::from_millis(5);
-            let mut last = rt_clipboard.last_served_count();
-            let mut stable_since = std::time::Instant::now();
-            loop {
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    log::warn!(
-                        "paste(realtime): pre-restore settle timed out after {} ms \
-                         (served_count={}) — proceeding anyway",
-                        paste_timing.chunk_fetch_timeout_ms,
-                        last,
-                    );
-                    break;
-                }
-                if now.duration_since(stable_since) >= settle {
-                    log::trace!(
-                        "paste(realtime): pre-restore settled (served_count={}, \
-                         stable for {} ms)",
-                        last,
-                        paste_timing.restore_settle_ms,
-                    );
-                    break;
-                }
-                tokio::time::sleep(poll).await;
-                let current = rt_clipboard.last_served_count();
-                if current != last {
-                    last = current;
-                    stable_since = std::time::Instant::now();
-                }
-            }
-        }
-        if let Some(saved) = saved_clipboard {
-            log::debug!("restoring original clipboard");
-            log::trace!(
-                "paste(realtime): restoring original clipboard = {}",
-                crate::paste::log_preview(&saved),
-            );
-            let _ = rt_clipboard.set_text(&saved).await;
         }
 
         result
@@ -822,18 +740,18 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         .await;
         t_stop = t_stop_val;
 
-        // If the streaming transcription failed, fall back to a
+        // If the one-shot transcription failed, fall back to a
         // single call to `transcribe_audio` using the saved OGG
         // file.  Retry lives inside `transcribe_audio` (see
         // `transcription::transport::retry`) — no loop here.
         match stream_result {
             Ok(r) => r,
             Err(first_err) => {
-                log::warn!("streaming transcription failed: {}", first_err);
+                log::warn!("one-shot transcription failed: {}", first_err);
 
                 // Fall back to file-based transcription.  Retry is
                 // already handled by Layer 3.  Same `Proportional`
-                // policy as the streaming path above — autonomous
+                // policy as the one-shot path above — autonomous
                 // dictate must not hang.
                 let result = transcription::transcribe_audio(
                     &cache_path,
@@ -1029,14 +947,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         if let Some(t) = t_stop {
             log::info!("timing: stop +{}ms paste_start", t.elapsed().as_millis());
         }
-        paste_text_to_target(
+        paste_with_root(
+            paste_root.as_ref(),
             target_window.as_ref(),
             &text,
             0,
-            paste_chunk_chars,
             t_stop,
             &*sink,
-            paste_shortcut,
             paste_timing,
         )
         .await?;
@@ -1071,13 +988,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_dictate_pipeline_with_mocks() {
         use crate::audio::mock::MockAudioCapture;
         use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
-        use crate::clipboard::MockClipboard;
+        use crate::clipboard::{Clipboard, MockClipboard};
         use crate::config::AudioConfig;
         use crate::transcription::{MockOneShotTranscriber, OneShotTranscriber, TranscriptionBody};
 

@@ -7,9 +7,9 @@
 mod backend;
 mod ui;
 
-use crate::config::{Config, PasteShortcut, Provider};
+use crate::config::{Config, Provider};
 use crate::error::TalkError;
-use crate::paste::{paste_text_to_target, PasteTiming};
+use crate::paste::{paste_with_root, PasteNode, PasteTiming};
 use crate::recording_cache;
 use crate::transcription::{self, RealtimeTranscriber};
 use crate::x11::x11_centre_and_raise;
@@ -27,8 +27,10 @@ pub(crate) struct PickParams {
     pub provider: Option<Provider>,
     pub model: Option<String>,
     pub target_window: Option<String>,
-    pub paste_chunk_chars: usize,
-    pub paste_shortcut: PasteShortcut,
+    /// Pre-built paste-node tree shared with the dictate one-shot
+    /// path.  `Arc` rather than `Box` so the same root can be cloned
+    /// into both the one-shot and pick paths.
+    pub paste_root: std::sync::Arc<dyn PasteNode>,
     pub paste_timing: PasteTiming,
 }
 
@@ -267,7 +269,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
     );
 
     // Split default candidates into one-shot and realtime groups.
-    let batch_filtered: Vec<(Provider, String)> = default_filtered
+    let oneshot_filtered: Vec<(Provider, String)> = default_filtered
         .iter()
         .filter(|(_, _, s)| !s)
         .map(|(p, m, _)| (*p, m.clone()))
@@ -287,7 +289,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         }
     }
 
-    if batch_filtered.is_empty()
+    if oneshot_filtered.is_empty()
         && cached_entries.is_empty()
         && rt_transcribers.is_empty()
         && deferred.is_empty()
@@ -298,7 +300,7 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
     }
 
     let selected = pick_with_streaming_gtk(
-        batch_filtered,
+        oneshot_filtered,
         audio_path,
         cached_entries,
         config.clone(),
@@ -334,14 +336,13 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         0
     };
 
-    paste_text_to_target(
+    paste_with_root(
+        params.paste_root.as_ref(),
         params.target_window.as_ref(),
         &selection.text,
         delete_chars,
-        params.paste_chunk_chars,
         None,
         &crate::telemetry::NoOpSink,
-        params.paste_shortcut,
         params.paste_timing,
     )
     .await?;
