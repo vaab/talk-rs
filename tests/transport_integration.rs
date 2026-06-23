@@ -414,7 +414,7 @@ async fn stale_lock_detected_when_owner_pid_dead() {
     std::fs::File::create(&audio).unwrap();
 
     let stale_pid: u32 = u32::MAX - 1;
-    let lock_path = dir.path().join("rec_mistral_voxtral_batch-lock.yml");
+    let lock_path = dir.path().join("rec_mistral_voxtral_oneshot-lock.yml");
     let yaml = format!(
         "version: 1\nowner_pid: {}\nowner_started_at_unix_secs: 0\n\
          provider: mistral\nmodel: voxtral\nrealtime: false\n",

@@ -244,7 +244,10 @@ impl TranscriptionCache {
     pub fn get(audio_path: &Path, provider: Provider, model: &str) -> Option<TranscriptionResult> {
         let dir = audio_path.parent()?;
         let stem = audio_path.file_stem()?.to_str()?;
-        for mode in &["batch", "realtime"] {
+        // `oneshot` is the current mode token; `batch` is the legacy
+        // alias kept in the read list so pre-rename sidecars written
+        // before the batch->one-shot vocabulary change are still found.
+        for mode in &["oneshot", "batch", "realtime"] {
             let safe_model = model.replace(['/', ' '], "-");
             let filename = format!("{}_{}_{}_{}.yml", stem, provider, safe_model, mode);
             let path = dir.join(&filename);
@@ -501,9 +504,9 @@ pub fn generate_recording_path() -> Result<(PathBuf, String), TalkError> {
 /// Build the metadata YAML filename from components.
 ///
 /// Format: `{timestamp}_{provider}_{model}_{mode}.yml`
-/// where mode is "realtime" or "batch".
+/// where mode is "realtime" or "oneshot".
 fn metadata_filename(timestamp: &str, provider: Provider, model: &str, realtime: bool) -> String {
-    let mode = if realtime { "realtime" } else { "batch" };
+    let mode = if realtime { "realtime" } else { "oneshot" };
     // Sanitise model name: replace `/` and spaces with `-`
     let safe_model = model.replace(['/', ' '], "-");
     format!("{}_{}_{}_{}.yml", timestamp, provider, safe_model, mode)
@@ -513,7 +516,7 @@ fn metadata_filename(timestamp: &str, provider: Provider, model: &str, realtime:
 ///
 /// Format: `{stem}_{provider}_{model}_{mode}_lock.yml`.
 fn model_lock_filename(stem: &str, provider: Provider, model: &str, realtime: bool) -> String {
-    let mode = if realtime { "realtime" } else { "batch" };
+    let mode = if realtime { "realtime" } else { "oneshot" };
     let safe_model = model.replace(['/', ' '], "-");
     format!("{}_{}_{}_{}-lock.yml", stem, provider, safe_model, mode)
 }
@@ -1259,9 +1262,9 @@ mod tests {
     /// directly in a temp directory and testing rotation logic.
 
     #[test]
-    fn test_metadata_filename_batch() {
+    fn test_metadata_filename_oneshot() {
         let name = metadata_filename("2026-02-18T12-33-45", Provider::OpenAI, "whisper-1", false);
-        assert_eq!(name, "2026-02-18T12-33-45_openai_whisper-1_batch.yml");
+        assert_eq!(name, "2026-02-18T12-33-45_openai_whisper-1_oneshot.yml");
     }
 
     #[test]
@@ -1288,14 +1291,14 @@ mod tests {
         );
         assert_eq!(
             name,
-            "2026-02-18T12-33-45_mistral_voxtral-mini-latest_batch.yml"
+            "2026-02-18T12-33-45_mistral_voxtral-mini-latest_oneshot.yml"
         );
     }
 
     #[test]
     fn test_metadata_filename_sanitises_slashes() {
         let name = metadata_filename("2026-02-18T12-33-45", Provider::OpenAI, "org/model", false);
-        assert_eq!(name, "2026-02-18T12-33-45_openai_org-model_batch.yml");
+        assert_eq!(name, "2026-02-18T12-33-45_openai_org-model_oneshot.yml");
     }
 
     #[test]
