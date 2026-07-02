@@ -511,15 +511,27 @@ pub struct FlatPasteConfig {
     #[serde(default)]
     pub shortcut: PasteShortcut,
 
-    /// Milliseconds the clipboard content must remain unchanged
-    /// before the post-paste restore is allowed to overwrite it.
+    /// **Backward-compat only.**  Was the pre-restore "settle" window
+    /// in the legacy heuristic.  Replaced by the deterministic
+    /// per-chunk target-confirmation gate inside the clipboard node;
+    /// kept as an accepted-but-ignored field so existing YAML configs
+    /// do not need editing.
     #[serde(default = "default_paste_restore_settle_ms")]
     pub restore_settle_ms: u64,
 
-    /// Maximum milliseconds to wait between chunks for the paste
-    /// target to fetch the offered clipboard content.
+    /// Per-chunk ABORT deadline in milliseconds.  Default 500 (post
+    /// retry work; was 300 under Phase 2, 400 under the legacy
+    /// heuristic gate).  When the target does not fetch a chunk in
+    /// time the clipboard node RETRIES (see `target_fetch_retries`)
+    /// before failing loudly.
     #[serde(default = "default_paste_chunk_fetch_timeout_ms")]
     pub chunk_fetch_timeout_ms: u64,
+
+    /// Number of automatic per-chunk retries on the deterministic
+    /// target-confirmation path (default `2` = up to 3 attempts).
+    /// See [`crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES`].
+    #[serde(default = "default_paste_target_fetch_retries")]
+    pub target_fetch_retries: u32,
 }
 
 /// Paste behaviour configuration.
@@ -636,10 +648,16 @@ impl PasteConfig {
 }
 
 fn flat_to_tree(f: &FlatPasteConfig) -> crate::paste::PasteNodeConfig {
+    // Flat YAML has no `target_quiescence_ms` knob — it lives only
+    // on the node-tree surface.  Fall back to the runtime default so
+    // existing flat configs pick up the Phase-2 gate behaviour
+    // transparently.
     let clipboard = crate::paste::PasteNodeConfig::Clipboard {
         shortcut: f.shortcut,
         restore_settle_ms: f.restore_settle_ms,
         chunk_fetch_timeout_ms: f.chunk_fetch_timeout_ms,
+        target_quiescence_ms: crate::paste::PasteTiming::default().target_quiescence_ms,
+        target_fetch_retries: f.target_fetch_retries,
     };
     if f.chunk_chars == 0 {
         clipboard
@@ -660,7 +678,18 @@ fn default_paste_restore_settle_ms() -> u64 {
 }
 
 fn default_paste_chunk_fetch_timeout_ms() -> u64 {
-    400
+    // 500 ms ABORT deadline for the deterministic gate (was 300 under
+    // Phase 2, 400 under the legacy heuristic gate).  See
+    // `crate::paste::node::DEFAULT_CHUNK_FETCH_TIMEOUT_MS` for the
+    // rationale and the single source of truth.
+    crate::paste::node::DEFAULT_CHUNK_FETCH_TIMEOUT_MS
+}
+
+fn default_paste_target_fetch_retries() -> u32 {
+    // Up to 3 total attempts per chunk on the deterministic gate.
+    // See `crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES` for the
+    // single source of truth.
+    crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES
 }
 
 /// Expand a leading `~` (or `~/…`) in a path to the user's home
@@ -1551,7 +1580,145 @@ paste: {}
 
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
-        assert_eq!(paste.chunk_fetch_timeout_ms(), 400);
+        // Default widened to 500 (was 300 under Phase 2, 400 under the
+        // legacy heuristic) to cover a transient re-focus latency that
+        // the retry loop also guards against.  See
+        // `crate::paste::node::DEFAULT_CHUNK_FETCH_TIMEOUT_MS`.
+        assert_eq!(paste.chunk_fetch_timeout_ms(), 500);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_target_fetch_retries_default_flat() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        // An empty flat paste section must pick up the retry default.
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste: {}
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        match paste {
+            PasteConfig::Flat(f) => {
+                assert_eq!(f.target_fetch_retries, 2);
+                assert_eq!(f.chunk_fetch_timeout_ms, 500);
+            }
+            PasteConfig::Tree(_) => panic!("expected flat variant for empty paste section"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_target_fetch_retries_custom_flat() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste:
+  target_fetch_retries: 5
+  chunk_fetch_timeout_ms: 500
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        match paste {
+            PasteConfig::Flat(f) => {
+                assert_eq!(f.target_fetch_retries, 5);
+                assert_eq!(f.chunk_fetch_timeout_ms, 500);
+            }
+            PasteConfig::Tree(_) => panic!("expected flat variant"),
+        }
+        // flat → tree wiring threads the retry count through.
+        match paste.to_tree() {
+            crate::paste::PasteNodeConfig::Chunk { child, .. } => match *child {
+                crate::paste::PasteNodeConfig::Clipboard {
+                    target_fetch_retries,
+                    chunk_fetch_timeout_ms,
+                    ..
+                } => {
+                    assert_eq!(target_fetch_retries, 5);
+                    assert_eq!(chunk_fetch_timeout_ms, 500);
+                }
+                other => panic!("expected Clipboard child, got {:?}", other),
+            },
+            other => panic!("expected Chunk root, got {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_target_fetch_retries_tree() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        // Tree form: explicit knob parses; omitted knob picks default.
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste:
+  node: chunk
+  chunk_chars: 120
+  child:
+    node: clipboard
+    chunk_fetch_timeout_ms: 500
+    target_fetch_retries: 4
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        match paste.to_tree() {
+            crate::paste::PasteNodeConfig::Chunk { child, .. } => match *child {
+                crate::paste::PasteNodeConfig::Clipboard {
+                    target_fetch_retries,
+                    chunk_fetch_timeout_ms,
+                    ..
+                } => {
+                    assert_eq!(target_fetch_retries, 4);
+                    assert_eq!(chunk_fetch_timeout_ms, 500);
+                }
+                other => panic!("expected Clipboard child, got {:?}", other),
+            },
+            other => panic!("expected Chunk root, got {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_paste_target_fetch_retries_tree_default_when_absent(
+    ) -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers: {}
+paste:
+  node: clipboard
+"#;
+        let file = write_config(yaml)?;
+
+        let config = Config::load(Some(file.path()))?;
+        let paste = config.paste.as_ref().expect("paste section present");
+        match paste.to_tree() {
+            crate::paste::PasteNodeConfig::Clipboard {
+                target_fetch_retries,
+                chunk_fetch_timeout_ms,
+                ..
+            } => {
+                assert_eq!(target_fetch_retries, 2);
+                assert_eq!(chunk_fetch_timeout_ms, 500);
+            }
+            other => panic!("expected Clipboard root, got {:?}", other),
+        }
         Ok(())
     }
 

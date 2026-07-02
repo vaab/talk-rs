@@ -429,6 +429,32 @@ pub fn x11_send_key_repeat(keysym: u32, count: usize) -> bool {
     true
 }
 
+/// Resolve the X11 client-base of a window XID via a fresh server
+/// round-trip.
+///
+/// X11 packs every client's resources (windows, atoms, pixmaps, …)
+/// into a contiguous block: every XID minted by a given client
+/// shares the same high-bits prefix.  The prefix is exactly
+/// `xid & !resource_id_mask`, where `resource_id_mask` is reported
+/// in the connection setup.  Two windows from the SAME client
+/// (e.g. a toplevel and the focus-grabbing child widget it created)
+/// therefore yield the same client-base — the stable identity the
+/// deterministic paste gate uses to confirm "the target consumed
+/// this chunk".
+///
+/// Returns `None` when the X11 connection cannot be established.
+/// Does NOT validate that `wid` is a live window — masking is a pure
+/// bit operation, so a stale XID still yields its (now-defunct)
+/// client-base.  Callers should treat a `None` here as "blind paste"
+/// and fall back to the legacy gate, never as "abort".
+pub fn x11_client_base(wid: u32) -> Option<u32> {
+    use x11rb::connection::Connection;
+
+    let (conn, _screen_num) = x11rb::connect(None).ok()?;
+    let mask = conn.setup().resource_id_mask;
+    Some(crate::x11::clipboard::client_base(wid, mask))
+}
+
 /// Return the XID of the currently active (focused) window via
 /// `_NET_ACTIVE_WINDOW` on the root window, or `None` if the query
 /// fails.

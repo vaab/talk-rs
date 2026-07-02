@@ -97,32 +97,120 @@ indicators:
   # mono: false
 
 # Optional: Paste Behaviour
-# Configure how transcribed text is pasted into the target application
+# Configure how transcribed text is pasted into the target application.
+#
+# Omitting `paste:` entirely reproduces the default: chunk text at 150
+# characters, then paste each chunk via Ctrl+Shift+V (clipboard).
+#
+# Two schemas are accepted:
+#
+# ── SCHEMA 1: LEGACY FLAT (still fully supported) ────────────────────────────
+#
 # paste:
 #   # Maximum characters per clipboard paste chunk (default: 150).
 #   # Text longer than this is split on word boundaries into consecutive
-#   # Ctrl+Shift+V keystrokes.  Keeping chunks small avoids terminal
-#   # paste-summary behaviour.  Set to 0 to disable chunking (paste in
-#   # one shot).  Also overridden by --no-chunk-paste (which forces 0).
+#   # paste keystrokes.  Keeping chunks small avoids terminal paste-summary
+#   # collapse.  Set to 0 to disable chunking.  Also --no-chunk-paste.
 #   chunk_chars: 150
 #
-#   # Milliseconds the clipboard content must remain unchanged before
-#   # the post-paste restore is allowed to overwrite it (default: 200).
-#   # Guards against a slow paste target re-fetching the clipboard
-#   # AFTER we've restored the user's saved value — which would leak
-#   # the restored content into the document and drop the last chunk.
-#   # Increase if pasting into a slow application (e.g. Electron apps
-#   # under load) still shows the previous clipboard leaking through.
-#   restore_settle_ms: 200
+#   # Paste shortcut sent after loading the clipboard (default: ctrl_shift_v).
+#   # Use ctrl_v for terminals that don't support Ctrl+Shift+V.
+#   shortcut: ctrl_shift_v   # or: ctrl_v
 #
-#   # Maximum milliseconds to wait between chunks for the paste target
-#   # to actually fetch the offered clipboard content (default: 400).
-#   # On timeout a WARN is logged (likely corruption — target never
-#   # pulled the chunk).  Also caps the total settle loop before the
-#   # final restore.  Raise alongside restore_settle_ms for very slow
-#   # targets; the wait short-circuits as soon as the fetch lands so a
-#   # higher cap costs nothing in the common case.
-#   chunk_fetch_timeout_ms: 400
+#   # Milliseconds to wait for the TARGET WINDOW to actually fetch each
+#   # clipboard chunk before retrying or aborting (default: 500).
+#   # This is a per-attempt deadline: if the target doesn't fetch within
+#   # this window, talk-rs re-focuses the target window and re-sends the
+#   # paste keystroke (up to target_fetch_retries additional attempts).
+#   # After all retries are exhausted the paste aborts with a red overlay
+#   # and alert sound, and your original clipboard is restored.
+#   # Total effective wait before abort = chunk_fetch_timeout_ms × (1 + target_fetch_retries).
+#   # The wait short-circuits as soon as the fetch lands, so a higher
+#   # value costs nothing in the common case.
+#   chunk_fetch_timeout_ms: 500
+#
+#   # Number of automatic retries when the target app doesn't fetch a
+#   # chunk within chunk_fetch_timeout_ms (default: 2).  On each retry,
+#   # talk-rs re-focuses the target window and re-sends the paste
+#   # keystroke.  After all retries are exhausted the paste aborts with
+#   # a red overlay + alert sound, and your original clipboard is restored.
+#   target_fetch_retries: 2
+#
+#   # Quiet-window in ms used to learn how many times the target fetches
+#   # each chunk (default: 50).  After the first fetch, talk-rs waits
+#   # this long for additional fetches before declaring the count stable.
+#   # Subsequent chunks must reach the same count before advancing.
+#   target_quiescence_ms: 50
+#
+#   # DEPRECATED / no-op.  Accepted for backward compatibility but has
+#   # no effect.  The old settle-loop heuristic was replaced by
+#   # target-confirmation (see chunk_fetch_timeout_ms above).
+#   # restore_settle_ms: 200
+#
+# ── SCHEMA 2: NEW TREE (composable node tree) ────────────────────────────────
+#
+# The tree schema lets you route paste behaviour per display server and
+# per target application.  Each node has a `node:` key that selects its
+# type.  Nodes are composable: most accept a `child:` (or `children:`)
+# that is itself a node.
+#
+# Available node types:
+#   detect-display-server  -- routes by $WAYLAND_DISPLAY (x11 / wayland branch)
+#   match-wm-class         -- first-match routing on "<instance>.<class>" glob
+#   chunk                  -- splits text into word-boundary chunks, delegates each
+#   clipboard              -- sets clipboard + sends paste shortcut, waits for target fetch
+#   xtest-type             -- types text via XTest synthetic keystrokes (no clipboard;
+#                             ASCII/Latin-1 only; non-Latin-1 chars skipped with a warning)
+#
+# Full example (uncomment and adjust to taste):
+#
+# paste:
+#   node: detect-display-server
+#   x11:
+#     node: match-wm-class
+#     patterns:
+#       # Terminals: type directly via XTest (no clipboard needed)
+#       - match: "*.Alacritty"
+#         child:
+#           node: xtest-type
+#       # Terminals using Ctrl+Shift+V (most VTE-based terminals)
+#       - match: "*.gnome-terminal-server"
+#         child:
+#           node: clipboard
+#           shortcut: ctrl_shift_v
+#           chunk_fetch_timeout_ms: 500
+#           target_fetch_retries: 2
+#           target_quiescence_ms: 50
+#       # Emacs: uses Ctrl+Y (yank); no chunking needed
+#       - match: "emacs.*"
+#         child:
+#           node: clipboard
+#           shortcut: ctrl_v
+#           chunk_fetch_timeout_ms: 500
+#           target_fetch_retries: 2
+#           target_quiescence_ms: 50
+#       # Firefox and most GUI apps: chunk then paste via Ctrl+Shift+V
+#       - match: "*.firefox"
+#         child:
+#           node: chunk
+#           chunk_chars: 150
+#           child:
+#             node: clipboard
+#             shortcut: ctrl_shift_v
+#             chunk_fetch_timeout_ms: 500
+#             target_fetch_retries: 2
+#             target_quiescence_ms: 50
+#     # Default for any window not matched above
+#     default:
+#       node: chunk
+#       chunk_chars: 150
+#       child:
+#         node: clipboard
+#         shortcut: ctrl_shift_v
+#         chunk_fetch_timeout_ms: 500
+#         target_fetch_retries: 2
+#         target_quiescence_ms: 50
+#   # wayland: currently errors ("Wayland paste not supported"); X11 only for now.
 
 # Optional: Runtime Audio Settings
 # audio:

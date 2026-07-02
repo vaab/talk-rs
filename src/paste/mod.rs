@@ -62,34 +62,36 @@ const FOCUS_MAX_RETRIES: u32 = 5;
 /// Initial delay between focus retry attempts (doubles each retry).
 const FOCUS_INITIAL_DELAY_MS: u64 = 50;
 
-/// Poll interval (ms) used by the pre-restore settle loop in
-/// [`paste_text_to_target`].  Five milliseconds matches
-/// [`crate::clipboard::X11Clipboard::wait_until_served`] and keeps
-/// the wait responsive without saturating the async runtime.
-const SETTLE_POLL_INTERVAL_MS: u64 = 5;
-
 /// Timing knobs for the paste pipeline.
 ///
-/// Threaded into [`paste_text_to_target`] so the per-chunk fetch
-/// timeout and the pre-restore settle window can be tuned via
-/// `paste.chunk_fetch_timeout_ms` / `paste.restore_settle_ms` in
-/// the config without growing the call-site signature unboundedly.
+/// Threaded through [`paste_with_root`] for callers that want to
+/// override the per-chunk gate deadline / quiescence window without
+/// growing the call-site signature unboundedly.
 ///
-/// `Default` matches the config defaults (200 / 400) so call sites
-/// without a loaded config — and tests — can fall back transparently.
+/// `restore_settle_ms` is RETAINED on this struct (and in the YAML
+/// schema) for backward compatibility but is no longer used at
+/// runtime: the pre-restore "settle" heuristic has been replaced by
+/// the deterministic per-chunk target-confirmation gate inside the
+/// clipboard node, which removes the race between the last chunk's
+/// fetch and the clipboard restore by construction.
+///
+/// `Default` matches the config defaults (200 / 300 / 50).
 #[derive(Debug, Clone, Copy)]
 pub struct PasteTiming {
-    /// See `paste.restore_settle_ms`.
+    /// **Backward-compat only.**  See struct doc.
     pub restore_settle_ms: u64,
     /// See `paste.chunk_fetch_timeout_ms`.
     pub chunk_fetch_timeout_ms: u64,
+    /// See `paste.target_quiescence_ms`.
+    pub target_quiescence_ms: u64,
 }
 
 impl Default for PasteTiming {
     fn default() -> Self {
         Self {
             restore_settle_ms: 200,
-            chunk_fetch_timeout_ms: 400,
+            chunk_fetch_timeout_ms: node::DEFAULT_CHUNK_FETCH_TIMEOUT_MS,
+            target_quiescence_ms: node::DEFAULT_TARGET_QUIESCENCE_MS,
         }
     }
 }
@@ -191,9 +193,14 @@ pub fn split_into_char_chunks(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
-/// Materialise the default paste tree: `chunk(150) → clipboard(ctrl-shift-v,
-/// 200, 400)` — the exact tree that reproduces legacy behaviour when no
-/// `paste:` section is present in the YAML config.
+/// Materialise the default paste tree:
+/// `chunk(150) → clipboard(ctrl-shift-v, 200, 300, 50)` — the exact
+/// tree that reproduces post-Phase-2 paste behaviour when no
+/// `paste:` section is present in the YAML config.  (Pre-Phase-2 the
+/// last knob — `chunk_fetch_timeout_ms` — was 400; lowered to 300 by
+/// the per-chunk target-confirmation gate; `200` is the legacy
+/// `restore_settle_ms` retained for backward-compat but unused at
+/// runtime; `50` is the new `target_quiescence_ms` knob.)
 ///
 /// When `no_chunk_paste` is `true`, the `chunk` wrapper is dropped and
 /// the tree collapses to a single `clipboard` leaf — matching the
@@ -205,6 +212,8 @@ pub fn default_root(no_chunk_paste: bool) -> Box<dyn PasteNode> {
             shortcut: PasteShortcut::CtrlShiftV,
             restore_settle_ms: PasteTiming::default().restore_settle_ms,
             chunk_fetch_timeout_ms: PasteTiming::default().chunk_fetch_timeout_ms,
+            target_quiescence_ms: PasteTiming::default().target_quiescence_ms,
+            target_fetch_retries: node::DEFAULT_TARGET_FETCH_RETRIES,
         }),
     };
     if no_chunk_paste {
@@ -233,14 +242,20 @@ pub fn timing_from_root(cfg: &PasteNodeConfig) -> PasteTiming {
 }
 
 /// Paste `text` through the supplied root node, wrapping with
-/// save-clipboard / settle / restore-clipboard.  Direct successor of
-/// the legacy `paste_text_to_target`.
+/// save-clipboard / restore-clipboard.  Direct successor of the
+/// legacy `paste_text_to_target`.
 ///
-/// Behaviour is identical to today's pipeline for the default tree:
-/// focus → optional backspace → save clipboard → root.paste(text) →
-/// settle → restore.  The `timing` argument is used ONLY for the
-/// settle loop here; per-clipboard-call timing knobs live on each
-/// `Clipboard` node inside the tree.
+/// Behaviour for the default tree:
+/// focus → optional backspace → resolve target client-base → save
+/// clipboard → root.paste(text) → restore.  No "settle" stability
+/// window is needed at the wrapper level: the
+/// [`crate::paste::nodes::clipboard::ClipboardNode`] gate confirms
+/// the target consumed the LAST chunk before returning, so we can
+/// restore the original clipboard immediately afterwards.
+///
+/// `timing` is retained for API compatibility — the per-clipboard
+/// gate uses the knobs declared on its own [`PasteNodeConfig::Clipboard`]
+/// instance inside the tree, not these struct fields.
 #[allow(clippy::too_many_arguments)]
 pub async fn paste_with_root(
     root: &dyn PasteNode,
@@ -250,9 +265,16 @@ pub async fn paste_with_root(
     t_stop: Option<std::time::Instant>,
     sink: &dyn crate::telemetry::TelemetrySink,
     timing: PasteTiming,
+    alert: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<(), TalkError> {
     let clipboard = X11Clipboard::new();
     let total_chars = text.len() as u64;
+
+    // Wrapper-level timing knobs are no longer consumed here (the
+    // per-chunk gate carries its own).  Kept on the API surface so
+    // callers can keep passing their resolved PasteTiming without
+    // touching every call site.
+    let _ = timing;
 
     log::trace!(
         "paste: BEGIN delete_before={} target_window={:?} text={}",
@@ -290,6 +312,14 @@ pub async fn paste_with_root(
         log::info!("timing: stop +{}ms first_paste", t.elapsed().as_millis());
     }
 
+    // Resolve the target X11 client-base ONCE for this paste
+    // operation.  See `node::PasteCtx::target_client_base` docs for
+    // the contract.  Parse / mask failures fall back to None
+    // (blind-paste fallback gate in ClipboardNode) — never hard-fail
+    // here, the contract is "best-effort resolution, deterministic
+    // path when possible".
+    let target_client_base = resolve_target_client_base(target_window).await;
+
     let target_window_str: Option<&str> = target_window.map(|s| s.as_str());
     let ctx = PasteCtx {
         target_window: target_window_str,
@@ -297,14 +327,16 @@ pub async fn paste_with_root(
         t_stop,
         sink,
         clipboard: &clipboard,
+        target_client_base,
+        expected_target_fetches: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        alert,
     };
 
-    root.paste(text, &ctx).await?;
+    let paste_result = root.paste(text, &ctx).await;
 
-    // Settle before restoring: same race-protection as the legacy
-    // pipeline — see `settle_before_restore` docs.
-    settle_before_restore(&clipboard, timing).await;
-
+    // Restore the original clipboard regardless of whether paste
+    // succeeded: a half-finished paste should not leave clipboard
+    // contents from the failed operation in the user's clipboard.
     if let Some(saved) = saved_clipboard {
         log::trace!(
             "paste: restoring original clipboard = {}",
@@ -313,32 +345,92 @@ pub async fn paste_with_root(
         let _ = clipboard.set_text(&saved).await;
     }
 
+    paste_result?;
+
     log::trace!("paste: END (total_chars={})", total_chars);
     Ok(())
+}
+
+/// Resolve the X11 client-base of the optional target window XID
+/// string.
+///
+/// Returns `None` when `target_window` is absent, when the string
+/// fails to parse as a base-10 `u32`, or when the X11 connection
+/// used to read `resource_id_mask` cannot be established.  All
+/// three failure modes are silently mapped to "fall back to the
+/// legacy gate" — none of them should abort the paste, since blind
+/// pastes have always worked and this is meant to be a
+/// best-effort upgrade.
+async fn resolve_target_client_base(target_window: Option<&String>) -> Option<u32> {
+    let wid = match target_window.and_then(|s| s.parse::<u32>().ok()) {
+        Some(w) => w,
+        None => {
+            if target_window.is_some() {
+                log::debug!(
+                    "paste: target_window {:?} could not be parsed as u32 \
+                     — falling back to legacy served_count gate",
+                    target_window,
+                );
+            }
+            return None;
+        }
+    };
+    let base = tokio::task::spawn_blocking(move || crate::x11::x11_client_base(wid))
+        .await
+        .ok()
+        .flatten();
+    match base {
+        Some(b) => {
+            log::debug!(
+                "paste: resolved target X11 client-base {:#x} for window {} \
+                 (deterministic gate enabled)",
+                b,
+                wid,
+            );
+            Some(b)
+        }
+        None => {
+            log::debug!(
+                "paste: failed to resolve X11 client-base for window {} \
+                 — falling back to legacy served_count gate",
+                wid,
+            );
+            None
+        }
+    }
 }
 
 /// Per-segment paste guard for the realtime path.
 ///
 /// Today the realtime per-segment loop in `dictate/mod.rs` saved the
-/// clipboard before the first segment, pasted each segment via an
-/// open-coded sequence (set_text → simulate_paste → wait_until_served),
-/// then settled + restored at the end.  This guard re-implements
-/// EXACTLY that sequence by routing each segment through the SAME
-/// root node tree used by the one-shot path — the `chunk` wrapper is
-/// stripped (segments are pasted whole; legacy parity) and the
-/// shared `X11Clipboard` outlives the loop so `settle_before_restore`
-/// observes the right serve counter on `finish`.
+/// clipboard before the first segment, pasted each segment via the
+/// configured paste tree (chunk wrappers stripped — each segment
+/// pastes whole), then restored at the end.  The legacy
+/// "settle-before-restore" stability window has been REMOVED here:
+/// the per-chunk target-confirmation gate inside the clipboard node
+/// already waits for the actual target to consume each segment, so
+/// no further stability window is needed at finish time.
+///
+/// The realtime path normally has no specific target window (the
+/// segment is pasted into whatever currently has focus), so the
+/// clipboard gate falls back to the legacy `served_count > 0`
+/// behaviour with a warning — backward compatible.
 pub struct RealtimeClipboardGuard {
     clipboard: X11Clipboard,
     saved: Option<String>,
-    timing: PasteTiming,
 }
 
 impl RealtimeClipboardGuard {
     /// Save the current clipboard.  Does not pre-focus the target
     /// window — call sites do that separately to preserve today's
     /// ordering.
+    ///
+    /// `timing` is accepted for backward API compat but no longer
+    /// drives any behaviour at the guard level: the per-chunk gate
+    /// inside each clipboard-node call owns the timing knobs that
+    /// matter.
     pub async fn begin(timing: PasteTiming) -> Self {
+        let _ = timing;
         let clipboard = X11Clipboard::new();
         let saved = clipboard.get_text().await.ok();
         log::trace!(
@@ -348,11 +440,7 @@ impl RealtimeClipboardGuard {
                 .map(log_preview)
                 .unwrap_or_else(|| "<none>".to_string()),
         );
-        Self {
-            clipboard,
-            saved,
-            timing,
-        }
+        Self { clipboard, saved }
     }
 
     /// Paste one segment through `root`.  Each call is independent —
@@ -370,13 +458,26 @@ impl RealtimeClipboardGuard {
             t_stop: None,
             sink,
             clipboard: &self.clipboard,
+            // Realtime path: no specific target window → fall back
+            // to the legacy `served_count > 0` gate inside the
+            // clipboard node.  Each segment carries its OWN learn
+            // state (the AtomicU32 starts at 0 every call), so even
+            // when a target_window IS plumbed in later we'd cleanly
+            // learn per-segment.
+            target_client_base: None,
+            expected_target_fetches: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            // Realtime path has no target window and no sound player
+            // plumbed in — nothing to signal audibly here.
+            alert: None,
         };
         root.paste(segment, &ctx).await
     }
 
-    /// Settle + restore.  Idempotent; safe to call multiple times.
+    /// Restore the original clipboard.  Idempotent.  No
+    /// settle-stability window: the per-chunk gate inside each
+    /// `paste_segment` call already confirmed the target consumed
+    /// the last segment before returning.
     pub async fn finish(self) {
-        settle_before_restore(&self.clipboard, self.timing).await;
         if let Some(saved) = self.saved {
             log::debug!("restoring original clipboard");
             log::trace!(
@@ -384,53 +485,6 @@ impl RealtimeClipboardGuard {
                 log_preview(&saved),
             );
             let _ = self.clipboard.set_text(&saved).await;
-        }
-    }
-}
-
-/// Block until the last-chunk served count has been STABLE for
-/// `timing.restore_settle_ms`, capped at `timing.chunk_fetch_timeout_ms`
-/// total wall-clock.
-///
-/// "Stable" means: the count observed at time `t` equals the count
-/// observed at `t + restore_settle_ms`.  Polls every
-/// [`SETTLE_POLL_INTERVAL_MS`].  This is the critical guard against
-/// the user's restored clipboard leaking into a slow paste target
-/// AFTER the last chunk — the symptom we set out to fix.
-async fn settle_before_restore(clipboard: &X11Clipboard, timing: PasteTiming) {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(timing.chunk_fetch_timeout_ms);
-    let settle = std::time::Duration::from_millis(timing.restore_settle_ms);
-    let poll = std::time::Duration::from_millis(SETTLE_POLL_INTERVAL_MS);
-
-    let mut last = clipboard.last_served_count();
-    let mut stable_since = std::time::Instant::now();
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            log::warn!(
-                "paste: pre-restore settle timed out after {} ms (served_count={}, \
-                 last change still within {} ms window) — proceeding anyway, \
-                 slow paste target may still re-fetch and corrupt the paste",
-                timing.chunk_fetch_timeout_ms,
-                last,
-                timing.restore_settle_ms,
-            );
-            return;
-        }
-        if now.duration_since(stable_since) >= settle {
-            log::trace!(
-                "paste: pre-restore settled (served_count={}, stable for {} ms)",
-                last,
-                timing.restore_settle_ms,
-            );
-            return;
-        }
-        tokio::time::sleep(poll).await;
-        let current = clipboard.last_served_count();
-        if current != last {
-            last = current;
-            stable_since = std::time::Instant::now();
         }
     }
 }
@@ -695,7 +749,7 @@ paste:
         }
 
         // Building the root tree from flat must collapse to
-        // chunk(80) → clipboard(ctrl_v, 250, 600).
+        // chunk(80) → clipboard(ctrl_v, 250, 600, <default-quiescence>).
         let tree = p.to_tree();
         match tree {
             PasteNodeConfig::Chunk { chunk_chars, child } => {
@@ -705,10 +759,19 @@ paste:
                         shortcut,
                         restore_settle_ms,
                         chunk_fetch_timeout_ms,
+                        target_quiescence_ms,
+                        target_fetch_retries,
                     } => {
                         assert_eq!(shortcut, PasteShortcut::CtrlV);
                         assert_eq!(restore_settle_ms, 250);
                         assert_eq!(chunk_fetch_timeout_ms, 600);
+                        // Flat YAML has no target_quiescence_ms knob
+                        // (added by Phase 2 at the node-tree level only);
+                        // flat → tree adapter falls back to the default.
+                        assert_eq!(target_quiescence_ms, 50);
+                        // Flat YAML also omits target_fetch_retries here;
+                        // flat → tree adapter falls back to the default.
+                        assert_eq!(target_fetch_retries, 2);
                     }
                     other => panic!("expected Clipboard child, got {:?}", other),
                 }
@@ -745,6 +808,7 @@ paste:
     shortcut: ctrl_shift_v
     restore_settle_ms: 150
     chunk_fetch_timeout_ms: 350
+    target_quiescence_ms: 60
 "#;
         let p = parse_paste(yaml).expect("paste section");
         match p {
@@ -756,10 +820,15 @@ paste:
                             shortcut,
                             restore_settle_ms,
                             chunk_fetch_timeout_ms,
+                            target_quiescence_ms,
+                            target_fetch_retries,
                         } => {
                             assert_eq!(shortcut, PasteShortcut::CtrlShiftV);
                             assert_eq!(restore_settle_ms, 150);
                             assert_eq!(chunk_fetch_timeout_ms, 350);
+                            assert_eq!(target_quiescence_ms, 60);
+                            // Omitted in this fixture → default.
+                            assert_eq!(target_fetch_retries, 2);
                         }
                         other => panic!("expected Clipboard child, got {:?}", other),
                     }
@@ -814,18 +883,23 @@ providers: {}
         let cfg: Config = serde_yaml::from_str(yaml).expect("parses");
         assert!(cfg.paste.is_none());
 
-        // Default tree: chunk(150) → clipboard(ctrl_shift_v, 200, 400).
+        // Default tree: chunk(150) → clipboard(ctrl_shift_v, 200,
+        // 500, 50).  Note 500 vs the pre-retry 300 — see the
+        // `DEFAULT_CHUNK_FETCH_TIMEOUT_MS` constant doc.
         let default = PasteNodeConfig::Chunk {
             chunk_chars: super::PASTE_CHUNK_CHARS,
             child: Box::new(PasteNodeConfig::Clipboard {
                 shortcut: PasteShortcut::CtrlShiftV,
                 restore_settle_ms: super::PasteTiming::default().restore_settle_ms,
                 chunk_fetch_timeout_ms: super::PasteTiming::default().chunk_fetch_timeout_ms,
+                target_quiescence_ms: super::PasteTiming::default().target_quiescence_ms,
+                target_fetch_retries: super::node::DEFAULT_TARGET_FETCH_RETRIES,
             }),
         };
         let timing = super::node::timing_from_tree(&default);
         assert_eq!(timing.restore_settle_ms, 200);
-        assert_eq!(timing.chunk_fetch_timeout_ms, 400);
+        assert_eq!(timing.chunk_fetch_timeout_ms, 500);
+        assert_eq!(timing.target_quiescence_ms, 50);
     }
 
     #[test]
@@ -858,6 +932,8 @@ providers: {}
                             shortcut: PasteShortcut::CtrlV,
                             restore_settle_ms: 200,
                             chunk_fetch_timeout_ms: 400,
+                            target_quiescence_ms: 50,
+                            target_fetch_retries: 2,
                         }),
                     }),
                 }],
@@ -865,6 +941,8 @@ providers: {}
                     shortcut: PasteShortcut::CtrlShiftV,
                     restore_settle_ms: 200,
                     chunk_fetch_timeout_ms: 400,
+                    target_quiescence_ms: 50,
+                    target_fetch_retries: 2,
                 }),
             }),
         };
@@ -942,6 +1020,9 @@ providers: {}
             t_stop: None,
             sink: &progress_sink,
             clipboard: &clipboard,
+            target_client_base: None,
+            expected_target_fetches: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            alert: None,
         };
 
         chunk.paste(text, &ctx).await.expect("paste");
@@ -978,6 +1059,9 @@ providers: {}
             t_stop: None,
             sink: &NoOpSink,
             clipboard: &clipboard,
+            target_client_base: None,
+            expected_target_fetches: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            alert: None,
         };
 
         chunk.paste(text, &ctx).await.expect("paste");

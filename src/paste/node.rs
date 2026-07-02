@@ -32,18 +32,58 @@ pub(crate) const DEFAULT_CHUNK_CHARS: usize = 150;
 pub(crate) const DEFAULT_RESTORE_SETTLE_MS: u64 = 200;
 
 /// Default per-chunk fetch timeout in milliseconds.
-pub(crate) const DEFAULT_CHUNK_FETCH_TIMEOUT_MS: u64 = 400;
+///
+/// This is the ABORT deadline for the deterministic target-confirmation
+/// gate, not a silent-advance one: when a target client-base is known
+/// and it has not fetched the expected count within this window, the
+/// clipboard node RETRIES (re-focus + re-send keystroke + re-wait; see
+/// [`DEFAULT_TARGET_FETCH_RETRIES`]) and only fails loudly once retries
+/// are exhausted.  Widened from 300 → 500 ms after a real session
+/// showed a transient focus failure (Ctrl+Shift+V sent before the
+/// keyboard focus was effective) causing one abort out of thirteen
+/// pastes: the extra 200 ms plus the retry loop cover the worst-case
+/// re-focus latency observed in the wild.
+pub(crate) const DEFAULT_CHUNK_FETCH_TIMEOUT_MS: u64 = 500;
+
+/// Default number of automatic per-chunk retries when the target
+/// client-base does not fetch a chunk within
+/// [`DEFAULT_CHUNK_FETCH_TIMEOUT_MS`].
+///
+/// `2` retries means up to THREE total attempts per chunk: the initial
+/// attempt plus two re-tries.  Each retry re-serves the chunk
+/// (`set_text`), re-focuses the target window, re-sends the paste
+/// keystroke and re-waits on the gate — the retry directly addresses
+/// the observed root cause (focus not yet effective when the keystroke
+/// was sent).  Only the deterministic target-confirmation path retries;
+/// the blind-paste fallback gate is unchanged.
+pub(crate) const DEFAULT_TARGET_FETCH_RETRIES: u32 = 2;
+
+/// Default per-chunk target-quiescence window in milliseconds.
+///
+/// Once the target client-base has fetched the expected number of
+/// times for the current chunk, the gate waits this long for any
+/// extra fetches (extra clipboard pull from the same client, or a
+/// trailing fetch by a clipboard manager) before advancing to the
+/// next chunk.  50 ms is large enough to absorb the empirically
+/// observed second fetch from real apps and small enough to keep
+/// total paste latency unchanged at typical 4-7 chunk pastes.
+pub(crate) const DEFAULT_TARGET_QUIESCENCE_MS: u64 = 50;
 
 /// Runtime context threaded into every [`PasteNode::paste`] call.
 ///
 /// `target_window`, `delete_chars_before_paste`, `t_stop`, and `sink`
 /// are the canonical spec fields.  `clipboard` is an internal routing
 /// field: the [`crate::paste::paste_with_root`] wrapper owns the
-/// [`X11Clipboard`] handle (so save / settle / restore can read its
-/// serve counter), and the [`ClipboardNode`] reuses the SAME instance
-/// — without this shared handle the settle loop would observe a
+/// [`X11Clipboard`] handle (so save / restore can reach its serve
+/// counter), and the [`ClipboardNode`] reuses the SAME instance
+/// — without this shared handle the per-chunk gate would observe a
 /// fresh-zero counter on a different X11Clipboard and the existing
 /// race-protection would be lost.
+///
+/// `target_client_base` and `expected_target_fetches` carry the
+/// per-paste-operation state for the deterministic per-chunk gate
+/// implemented in [`crate::paste::nodes::clipboard::ClipboardNode`].
+/// See the field docs for the contract.
 pub struct PasteCtx<'a> {
     /// XID of the target window as a base-10 string, or `None` when
     /// pasting blind (no specific window to refocus).
@@ -62,6 +102,44 @@ pub struct PasteCtx<'a> {
     pub sink: &'a dyn TelemetrySink,
     /// Shared clipboard handle (see struct docs).
     pub(crate) clipboard: &'a X11Clipboard,
+    /// X11 client-base of the target window (= `xid & !resource_id_mask`),
+    /// resolved once at paste-operation start in
+    /// [`crate::paste::paste_with_root`].
+    ///
+    /// `Some(base)` enables the DETERMINISTIC per-chunk gate: the
+    /// clipboard node waits until the target client-base has
+    /// fetched the expected number of times before advancing.
+    /// `None` (blind paste, missing target_window, or X11 connection
+    /// failure during resolution) falls back to the legacy
+    /// `served_count > 0` gate with a warning.
+    pub(crate) target_client_base: Option<u32>,
+    /// Per-paste-operation state shared across chunk invocations of
+    /// [`crate::paste::nodes::clipboard::ClipboardNode`].
+    ///
+    /// Chunk 1 LEARNS the target's fetch count (typically 1 or 2 —
+    /// modern toolkits fetch UTF8_STRING twice for a single paste,
+    /// once for size probing and once for the real read).  Once
+    /// learned, subsequent chunks CONFIRM the same count is reached
+    /// before advancing.
+    ///
+    /// Encoding: `0` = not yet learned (initial state); `N>0` =
+    /// chunk 1 observed exactly `N` target fetches.  Interior
+    /// mutability across `&` ctx via `Arc<AtomicU32>` so chunk-node
+    /// invocations share state without taking a `&mut` on the ctx.
+    pub(crate) expected_target_fetches: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Optional alert hook, invoked ONCE on a FINAL paste abort
+    /// (target-confirmation retries exhausted) to give the user an
+    /// audible signal that nothing was pasted.  Reuses the same
+    /// [`crate::audio::indicator::AlertPlayer`] triple-pulse tone as
+    /// the dead-audio "NO SOUND" feature.
+    ///
+    /// `None` on paste paths that have no sound player (picker /
+    /// cached-transcript flows using [`crate::telemetry::NoOpSink`]);
+    /// populated from the one-shot dictate path where the
+    /// [`crate::audio::indicator::SoundPlayer`] lives.  Wrapped in an
+    /// `Arc<dyn Fn()>` so the ctx stays `Send`-safe and cheap to
+    /// construct without leaking `AlertPlayer` into the paste API.
+    pub(crate) alert: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A node in the paste tree.
@@ -118,14 +196,45 @@ pub enum PasteNodeConfig {
         child: Box<PasteNodeConfig>,
     },
     /// Deliver via the clipboard: set_text + simulate keystroke +
-    /// wait_until_served.  Matches the legacy `paste_one` step.
+    /// per-chunk target-confirmation gate.  Replaces the legacy
+    /// `paste_one` step with a deterministic chunk advancement (no
+    /// more dropped or duplicated chunks; see the field docs).
     Clipboard {
         #[serde(default)]
         shortcut: PasteShortcut,
+        /// **Backward-compat only.**  Was the pre-restore "settle"
+        /// window in the legacy heuristic.  Replaced by the
+        /// per-chunk target-confirmation gate (which removes the
+        /// need for a stability window at the end of the operation);
+        /// kept as an accepted-but-ignored config field so existing
+        /// YAML configs do not need editing.
         #[serde(default = "default_restore_settle_ms")]
         restore_settle_ms: u64,
+        /// Per-chunk ABORT deadline in milliseconds.  When a target
+        /// client-base is resolved, the paste fails loudly after
+        /// this many milliseconds without the target reaching the
+        /// expected fetch count.  When no target client-base could
+        /// be resolved (blind paste), governs the fallback
+        /// `served_count > 0` timeout (with a warning, not an
+        /// abort, to preserve backward compatibility).
         #[serde(default = "default_chunk_fetch_timeout_ms")]
         chunk_fetch_timeout_ms: u64,
+        /// Per-chunk target-quiescence window in milliseconds.  Once
+        /// the target client-base has reached its fetch count for
+        /// the current chunk, the gate waits this long for any
+        /// trailing fetches (extra read from the same client, or a
+        /// late clipboard manager) before advancing.
+        #[serde(default = "default_target_quiescence_ms")]
+        target_quiescence_ms: u64,
+        /// Number of automatic per-chunk retries on the deterministic
+        /// target-confirmation path.  When the target client-base does
+        /// not fetch a chunk within `chunk_fetch_timeout_ms`, the node
+        /// re-serves the chunk, re-focuses the target window, re-sends
+        /// the paste keystroke and re-waits, up to this many extra
+        /// times before aborting.  Default `2` (= up to 3 attempts).
+        /// Has no effect on the blind-paste fallback gate.
+        #[serde(default = "default_target_fetch_retries")]
+        target_fetch_retries: u32,
     },
     /// Deliver via XTest keystroke synthesis (no clipboard
     /// involvement).  Phase 1 ships ASCII/Latin-1 only; non-ASCII
@@ -143,6 +252,14 @@ fn default_restore_settle_ms() -> u64 {
 
 fn default_chunk_fetch_timeout_ms() -> u64 {
     DEFAULT_CHUNK_FETCH_TIMEOUT_MS
+}
+
+fn default_target_quiescence_ms() -> u64 {
+    DEFAULT_TARGET_QUIESCENCE_MS
+}
+
+fn default_target_fetch_retries() -> u32 {
+    DEFAULT_TARGET_FETCH_RETRIES
 }
 
 impl PasteNodeConfig {
@@ -171,10 +288,14 @@ impl PasteNodeConfig {
                 shortcut,
                 restore_settle_ms,
                 chunk_fetch_timeout_ms,
+                target_quiescence_ms,
+                target_fetch_retries,
             } => Box::new(ClipboardNode {
                 shortcut: *shortcut,
                 restore_settle_ms: *restore_settle_ms,
                 chunk_fetch_timeout_ms: *chunk_fetch_timeout_ms,
+                target_quiescence_ms: *target_quiescence_ms,
+                target_fetch_retries: *target_fetch_retries,
             }),
             Self::XtestType {} => Box::new(XtestTypeNode {}),
         }
@@ -206,25 +327,28 @@ impl PasteNodeConfig {
     }
 }
 
-/// Resolve the path-prefix relevant settle timing from the root
-/// configuration.  Used by the legacy wrapper to drive
-/// `settle_before_restore` after the tree completes its work.
+/// Resolve the relevant paste timing from the root configuration.
+/// Used by the wrapper to drive the per-chunk target-confirmation
+/// abort deadline and the final clipboard restore once the tree has
+/// completed its work.
 ///
 /// We walk the tree to find the FIRST `Clipboard` node and use its
 /// timing.  This is a faithful reflection of today's behaviour where
 /// there is exactly one clipboard sink and its timing knobs govern
 /// the whole pipeline.  When no clipboard node exists (pure XTest
-/// tree) the defaults are used — settle becomes a no-op in practice
+/// tree) the defaults are used — timing is irrelevant in practice
 /// because no clipboard is being served.
 pub(crate) fn timing_from_tree(cfg: &PasteNodeConfig) -> super::PasteTiming {
     match cfg {
         PasteNodeConfig::Clipboard {
             restore_settle_ms,
             chunk_fetch_timeout_ms,
+            target_quiescence_ms,
             ..
         } => super::PasteTiming {
             restore_settle_ms: *restore_settle_ms,
             chunk_fetch_timeout_ms: *chunk_fetch_timeout_ms,
+            target_quiescence_ms: *target_quiescence_ms,
         },
         PasteNodeConfig::Chunk { child, .. } => timing_from_tree(child),
         PasteNodeConfig::DetectDisplayServer { x11, .. } => timing_from_tree(x11),
