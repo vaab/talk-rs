@@ -4,6 +4,7 @@
 //! using native X11 via `x11rb` (no external tools required).
 
 use crate::error::TalkError;
+#[cfg(feature = "ui")]
 use crate::x11::clipboard::{x11_clipboard_get, x11_clipboard_set, ClipboardServeHandle};
 use async_trait::async_trait;
 
@@ -26,10 +27,12 @@ pub trait Clipboard: Send + Sync {
 /// background thread that serves `SelectionRequest` events so the
 /// paste target can retrieve the data.  The thread is automatically
 /// replaced on the next `set_text` and cleaned up on drop.
+#[cfg(feature = "ui")]
 pub struct X11Clipboard {
     serve_handle: std::sync::Mutex<Option<ClipboardServeHandle>>,
 }
 
+#[cfg(feature = "ui")]
 impl Default for X11Clipboard {
     fn default() -> Self {
         Self {
@@ -38,6 +41,7 @@ impl Default for X11Clipboard {
     }
 }
 
+#[cfg(feature = "ui")]
 impl X11Clipboard {
     pub fn new() -> Self {
         Self::default()
@@ -162,8 +166,10 @@ impl X11Clipboard {
 /// async runtime: a single `SelectionRequest` round-trip is typically
 /// served within a few milliseconds, so most waits resolve on the
 /// first or second poll.
+#[cfg(feature = "ui")]
 const SERVED_POLL_INTERVAL_MS: u64 = 5;
 
+#[cfg(feature = "ui")]
 #[async_trait]
 impl Clipboard for X11Clipboard {
     async fn get_text(&self) -> Result<String, TalkError> {

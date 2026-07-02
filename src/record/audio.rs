@@ -9,7 +9,7 @@ pub(super) const OPUS_SAMPLE_RATE: u32 = 48_000;
 ///
 /// Assumes 16-bit mono 16 kHz PCM with a 44-byte header:
 /// `(file_size - 44) / (16000 * 2)` = seconds.
-#[cfg(test)]
+#[cfg(all(test, feature = "ui"))]
 pub(super) fn wav_duration_secs(path: &std::path::Path) -> Option<f64> {
     let size = std::fs::metadata(path).ok()?.len();
     if size <= 44 {
@@ -25,6 +25,7 @@ pub(super) fn wav_duration_secs(path: &std::path::Path) -> Option<f64> {
 /// OGG page header (`OggS`), reading the absolute granule position
 /// from it.  This is O(1) regardless of file size — only the last
 /// ~64 KB are read, instead of iterating every packet sequentially.
+#[cfg(feature = "ui")]
 pub(super) fn ogg_duration_secs(path: &std::path::Path) -> Option<f64> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -141,6 +142,7 @@ pub(super) fn read_wav_as_f32(
 /// The function is tolerant of unknown / extended-size boxes and
 /// returns `None` rather than erroring when the structure is
 /// unexpected (matching `ogg_duration_secs`' contract).
+#[cfg(feature = "ui")]
 pub(super) fn m4a_duration_secs(path: &std::path::Path) -> Option<f64> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
@@ -480,6 +482,7 @@ pub(super) fn resample_linear(
 }
 
 /// Return the `.wf` cache path for a given audio file.
+#[cfg(feature = "ui")]
 fn waterfall_cache_path(audio_path: &std::path::Path) -> std::path::PathBuf {
     audio_path.with_extension("wf")
 }
@@ -491,6 +494,7 @@ fn waterfall_cache_path(audio_path: &std::path::Path) -> std::path::PathBuf {
 ///   u32  num_rows
 ///   f32  peak
 ///   f32 × (num_columns × num_rows)  column-major data
+#[cfg(feature = "ui")]
 fn write_waterfall_cache(
     audio_path: &std::path::Path,
     columns: &[Vec<f32>],
@@ -524,6 +528,7 @@ fn write_waterfall_cache(
 /// newer than the audio file.
 ///
 /// Returns `None` if the cache is missing, stale, or corrupt.
+#[cfg(feature = "ui")]
 fn read_waterfall_cache(audio_path: &std::path::Path) -> Option<(Vec<Vec<f32>>, f32)> {
     let cache = waterfall_cache_path(audio_path);
     let cache_meta = std::fs::metadata(&cache).ok()?;
@@ -567,6 +572,7 @@ fn read_waterfall_cache(audio_path: &std::path::Path) -> Option<(Vec<Vec<f32>>, 
 /// Load waterfall columns for an audio file, using the `.wf` binary
 /// cache when available.  On cache miss the columns are computed from
 /// the audio and persisted for next time.
+#[cfg(feature = "ui")]
 pub(crate) fn load_waterfall(
     audio_path: &std::path::Path,
 ) -> Result<(Vec<Vec<f32>>, f32), TalkError> {
@@ -639,6 +645,7 @@ mod tests {
     /// at half speed / an octave low).
     const FIXTURE_M4A_STEREO: &str = "sine_440_0.5s_stereo.m4a";
 
+    #[cfg(feature = "ui")]
     #[test]
     fn m4a_duration_secs_matches_fixture() {
         let path = fixture(FIXTURE_M4A);
@@ -657,6 +664,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ui")]
     #[test]
     fn m4a_duration_secs_missing_file_returns_none() {
         let path = fixture("does-not-exist.m4a");

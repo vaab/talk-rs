@@ -1,7 +1,7 @@
 //! Audio tee: splits a PCM stream so the overlay visualizer reads
 //! from the same PipeWire capture as the recording pipeline.
 
-use crate::x11::render_util::RingBuffer;
+use crate::audio::ring_buffer::RingBuffer;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

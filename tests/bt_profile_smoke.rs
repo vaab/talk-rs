@@ -16,6 +16,10 @@
 //! casual `--ignored` run on a machine where the user is currently
 //! listening to music — the round-trip briefly takes the headset out
 //! of A2DP and would interrupt playback.
+//!
+//! Requires the `capture` feature (the `bt_profile` module lives
+//! behind it — libpulse-binding is a capture-gated dependency).
+#![cfg(feature = "capture")]
 
 use talk_rs::audio::bt_profile;
 

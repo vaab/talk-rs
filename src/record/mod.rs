@@ -4,19 +4,32 @@
 //! Supports graceful shutdown via SIGINT (Ctrl+C).
 
 pub(crate) mod audio;
+#[cfg(feature = "ui")]
 mod entries;
+#[cfg(feature = "ui")]
 pub(crate) mod player;
+#[cfg(feature = "ui")]
 pub(crate) mod ui;
 
+#[cfg(feature = "capture")]
 use crate::audio::bt_profile;
+#[cfg(feature = "capture")]
 use crate::audio::monitor_capture::MonitorCapture;
+#[cfg(feature = "capture")]
 use crate::audio::pipewire_capture::PipeWireCapture;
+#[cfg(feature = "capture")]
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
+#[cfg(feature = "capture")]
 use crate::config::{AudioConfig, Config};
+#[cfg(feature = "capture")]
 use crate::error::TalkError;
+#[cfg(feature = "capture")]
 use chrono::Local;
+#[cfg(feature = "capture")]
 use std::io::SeekFrom;
+#[cfg(feature = "capture")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "capture")]
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 /// Generate a default timestamped filename for a recording.
@@ -26,6 +39,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 /// replaced by dashes so the filename is safe on every filesystem.  The
 /// format matches the ``memo`` tool so recordings from both tools can
 /// coexist in the same directory.
+#[cfg(feature = "capture")]
 fn default_filename() -> String {
     let now = Local::now();
     now.format("%Y-%m-%dT%H-%M-%S%z.ogg").to_string()
@@ -44,6 +58,7 @@ fn default_filename() -> String {
 /// This is a pure computation: it does not create the directory.  The
 /// caller is responsible for calling [`std::fs::create_dir_all`] on the
 /// parent before opening the file.
+#[cfg(feature = "capture")]
 fn resolve_output_path(args: &[String], output_dir: &Path) -> Result<PathBuf, TalkError> {
     match args.len() {
         0 => {
@@ -63,11 +78,13 @@ fn resolve_output_path(args: &[String], output_dir: &Path) -> Result<PathBuf, Ta
 ///
 /// Returns the output file path. If not provided, generates a
 /// timestamp-based filename inside the configured `output_dir`.
+#[cfg(feature = "capture")]
 pub fn parse_args(args: &[String]) -> Result<PathBuf, TalkError> {
     let config = Config::load(None)?;
     resolve_output_path(args, &config.output_dir)
 }
 
+#[cfg(feature = "capture")]
 fn create_writer(path: &Path, config: AudioConfig) -> Result<Box<dyn AudioWriter>, TalkError> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("wav") => Ok(Box::new(WavWriter::new(config))),
@@ -90,6 +107,7 @@ fn create_writer(path: &Path, config: AudioConfig) -> Result<Box<dyn AudioWriter
 /// 4. Spawn async task to read from capture channel, encode, and write to file
 /// 5. Wait for SIGINT (Ctrl+C) to gracefully shutdown
 /// 6. Flush encoder and close file
+#[cfg(feature = "capture")]
 pub async fn record(
     args: Vec<String>,
     monitor: bool,
@@ -273,7 +291,7 @@ pub async fn record(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "capture"))]
 mod tests {
     use super::*;
     use chrono::Datelike;
