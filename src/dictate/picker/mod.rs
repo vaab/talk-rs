@@ -344,6 +344,8 @@ pub(crate) async fn run_pick(config: Config, params: PickParams) -> Result<(), T
         None,
         &crate::telemetry::NoOpSink,
         params.paste_timing,
+        // Picker paste path has no sound player wired.
+        None,
     )
     .await?;
     let _ =

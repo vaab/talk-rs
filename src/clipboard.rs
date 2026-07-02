@@ -88,6 +88,72 @@ impl X11Clipboard {
             tokio::time::sleep(poll).await;
         }
     }
+
+    /// Number of `UTF8_STRING` fetches answered for the given target
+    /// client-base on the CURRENT serve handle.  Returns `0` when no
+    /// handle is held (i.e. no clipboard content is currently
+    /// served), or when the target client-base has not yet fetched.
+    ///
+    /// This is the per-target counterpart of [`last_served_count`]
+    /// (the legacy total).  The deterministic paste gate uses it to
+    /// confirm "the actual target consumed this chunk" rather than
+    /// the unreliable "anyone fetched at least once" signal that
+    /// counted clipboard managers and dropped real chunks.
+    pub fn target_fetch_count(&self, target_client_base: u32) -> u32 {
+        self.serve_handle
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|h| h.fetches_by_client(target_client_base))
+            })
+            .unwrap_or(0)
+    }
+
+    /// X11 `resource_id_mask` snapshotted from the current serve
+    /// handle's connection, or `None` when no handle is held.  The
+    /// mask is server-wide (any connection returns the same value),
+    /// so callers who only need to derive a client-base typically
+    /// reach for [`crate::x11::x11_client_base`] instead — this
+    /// accessor is for the rare case of needing the mask the serve
+    /// thread is actively using.
+    pub fn resource_id_mask(&self) -> Option<u32> {
+        self.serve_handle
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|h| h.resource_id_mask()))
+    }
+
+    /// Block until the target client-base has fetched at least
+    /// `expected` times for the currently-served content, or until
+    /// `timeout` elapses.  Returns the final per-target count.
+    ///
+    /// On timeout returns the last-observed count (possibly below
+    /// `expected`); the caller decides whether to abort the paste
+    /// loudly or fall back.  The deterministic paste gate calls this
+    /// once per chunk: chunk 1 with `expected=1` (to wait for the
+    /// initial fetch before measuring quiescence), subsequent chunks
+    /// with the learned target-fetch count.
+    pub async fn wait_until_target_fetched(
+        &self,
+        target_client_base: u32,
+        expected: u32,
+        timeout: std::time::Duration,
+    ) -> u32 {
+        let deadline = std::time::Instant::now() + timeout;
+        let poll = std::time::Duration::from_millis(SERVED_POLL_INTERVAL_MS);
+        loop {
+            let count = self.target_fetch_count(target_client_base);
+            if count >= expected {
+                return count;
+            }
+            if std::time::Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
 }
 
 /// Poll interval (ms) used by [`X11Clipboard::wait_until_served`].

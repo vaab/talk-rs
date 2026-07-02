@@ -183,6 +183,8 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                     None,
                     &crate::telemetry::NoOpSink,
                     paste_timing,
+                    // Cached-transcript path has no sound player wired.
+                    None,
                 )
                 .await?;
                 let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
@@ -947,6 +949,16 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         if let Some(t) = t_stop {
             log::info!("timing: stop +{}ms paste_start", t.elapsed().as_millis());
         }
+        // Wire the alert tone into the paste path so a FINAL paste
+        // abort (target-confirmation retries exhausted) plays the same
+        // triple-pulse used by the dead-audio "NO SOUND" feature,
+        // alongside the red overlay driven by the `Failed` telemetry
+        // event.  `None` when sound is disabled / unavailable.
+        let paste_alert: Option<std::sync::Arc<dyn Fn() + Send + Sync>> =
+            player.as_ref().map(|p| {
+                let ap = p.alert_player();
+                std::sync::Arc::new(move || ap.play()) as std::sync::Arc<dyn Fn() + Send + Sync>
+            });
         paste_with_root(
             paste_root.as_ref(),
             target_window.as_ref(),
@@ -955,6 +967,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             t_stop,
             &*sink,
             paste_timing,
+            paste_alert,
         )
         .await?;
         let _ = recording_cache::write_last_paste_state(target_window.as_deref(), &text);
