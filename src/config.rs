@@ -553,6 +553,12 @@ pub struct FlatPasteConfig {
 #[serde(untagged)]
 pub enum PasteConfig {
     /// New tree form.  Always carries a `node:` key.
+    ///
+    /// Gated behind the `ui` feature: the composable paste-node tree
+    /// is materialised into X11-backed runtime nodes, which live in
+    /// the `ui`-gated `paste` module.  A `--no-default-features`
+    /// (headless) build still parses the legacy `Flat` form.
+    #[cfg(feature = "ui")]
     Tree(crate::paste::PasteNodeConfig),
     /// Legacy flat form.
     Flat(FlatPasteConfig),
@@ -571,12 +577,14 @@ impl PasteConfig {
     /// the resulting tree — identical effect to today's
     /// "set chunk_chars to 0" path on the flat form, and a natural
     /// extension to arbitrary trees.
+    #[cfg(feature = "ui")]
     pub fn build_root(&self, no_chunk_paste: bool) -> Box<dyn crate::paste::PasteNode> {
         let tree = self.to_tree();
         crate::paste::build_root_from_config(&tree, no_chunk_paste)
     }
 
     /// Resolve the settle/timeout timing knobs for this configuration.
+    #[cfg(feature = "ui")]
     pub fn timing(&self) -> crate::paste::PasteTiming {
         crate::paste::timing_from_root(&self.to_tree())
     }
@@ -584,6 +592,7 @@ impl PasteConfig {
     /// Lower this configuration to its equivalent
     /// [`crate::paste::PasteNodeConfig`] tree.  Flat form is mapped
     /// according to [`PasteConfig::build_root`]'s contract.
+    #[cfg(feature = "ui")]
     pub fn to_tree(&self) -> crate::paste::PasteNodeConfig {
         match self {
             Self::Tree(t) => t.clone(),
@@ -596,6 +605,7 @@ impl PasteConfig {
     /// Backward-compat accessor: the configured chunk size.  For tree
     /// configs we walk down to the first `Chunk` node; `0` if none.
     pub fn chunk_chars(&self) -> usize {
+        #[cfg(feature = "ui")]
         fn find(cfg: &crate::paste::PasteNodeConfig) -> Option<usize> {
             match cfg {
                 crate::paste::PasteNodeConfig::Chunk { chunk_chars, .. } => Some(*chunk_chars),
@@ -607,6 +617,7 @@ impl PasteConfig {
         }
         match self {
             Self::Flat(f) => f.chunk_chars,
+            #[cfg(feature = "ui")]
             Self::Tree(t) => find(t).unwrap_or(0),
         }
     }
@@ -615,6 +626,7 @@ impl PasteConfig {
     /// tree configs we walk down to the first `Clipboard` node;
     /// defaults to [`PasteShortcut::default`] if none.
     pub fn shortcut(&self) -> PasteShortcut {
+        #[cfg(feature = "ui")]
         fn find(cfg: &crate::paste::PasteNodeConfig) -> Option<PasteShortcut> {
             match cfg {
                 crate::paste::PasteNodeConfig::Clipboard { shortcut, .. } => Some(*shortcut),
@@ -626,6 +638,7 @@ impl PasteConfig {
         }
         match self {
             Self::Flat(f) => f.shortcut,
+            #[cfg(feature = "ui")]
             Self::Tree(t) => find(t).unwrap_or_default(),
         }
     }
@@ -634,6 +647,7 @@ impl PasteConfig {
     pub fn restore_settle_ms(&self) -> u64 {
         match self {
             Self::Flat(f) => f.restore_settle_ms,
+            #[cfg(feature = "ui")]
             Self::Tree(_) => self.timing().restore_settle_ms,
         }
     }
@@ -642,11 +656,13 @@ impl PasteConfig {
     pub fn chunk_fetch_timeout_ms(&self) -> u64 {
         match self {
             Self::Flat(f) => f.chunk_fetch_timeout_ms,
+            #[cfg(feature = "ui")]
             Self::Tree(_) => self.timing().chunk_fetch_timeout_ms,
         }
     }
 }
 
+#[cfg(feature = "ui")]
 fn flat_to_tree(f: &FlatPasteConfig) -> crate::paste::PasteNodeConfig {
     // Flat YAML has no `target_quiescence_ms` knob — it lives only
     // on the node-tree surface.  Fall back to the runtime default so
@@ -679,17 +695,19 @@ fn default_paste_restore_settle_ms() -> u64 {
 
 fn default_paste_chunk_fetch_timeout_ms() -> u64 {
     // 500 ms ABORT deadline for the deterministic gate (was 300 under
-    // Phase 2, 400 under the legacy heuristic gate).  See
-    // `crate::paste::node::DEFAULT_CHUNK_FETCH_TIMEOUT_MS` for the
-    // rationale and the single source of truth.
-    crate::paste::node::DEFAULT_CHUNK_FETCH_TIMEOUT_MS
+    // Phase 2, 400 under the legacy heuristic gate).  Kept in sync with
+    // `crate::paste::node::DEFAULT_CHUNK_FETCH_TIMEOUT_MS` (the runtime
+    // source of truth); inlined here so core config parsing does not
+    // depend on the `ui`-gated `paste` module.
+    500
 }
 
 fn default_paste_target_fetch_retries() -> u32 {
     // Up to 3 total attempts per chunk on the deterministic gate.
-    // See `crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES` for the
-    // single source of truth.
-    crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES
+    // Kept in sync with `crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES`
+    // (the runtime source of truth); inlined here so core config parsing
+    // does not depend on the `ui`-gated `paste` module.
+    2
 }
 
 /// Expand a leading `~` (or `~/…`) in a path to the user's home
@@ -1608,6 +1626,7 @@ paste: {}
                 assert_eq!(f.target_fetch_retries, 2);
                 assert_eq!(f.chunk_fetch_timeout_ms, 500);
             }
+            #[cfg(feature = "ui")]
             PasteConfig::Tree(_) => panic!("expected flat variant for empty paste section"),
         }
         Ok(())
@@ -1634,9 +1653,12 @@ paste:
                 assert_eq!(f.target_fetch_retries, 5);
                 assert_eq!(f.chunk_fetch_timeout_ms, 500);
             }
+            #[cfg(feature = "ui")]
             PasteConfig::Tree(_) => panic!("expected flat variant"),
         }
-        // flat → tree wiring threads the retry count through.
+        // flat → tree wiring threads the retry count through.  The
+        // `to_tree` lowering targets the `ui`-gated paste-node types.
+        #[cfg(feature = "ui")]
         match paste.to_tree() {
             crate::paste::PasteNodeConfig::Chunk { child, .. } => match *child {
                 crate::paste::PasteNodeConfig::Clipboard {
@@ -1654,6 +1676,7 @@ paste:
         Ok(())
     }
 
+    #[cfg(feature = "ui")]
     #[test]
     fn test_config_paste_target_fetch_retries_tree() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
@@ -1692,6 +1715,7 @@ paste:
         Ok(())
     }
 
+    #[cfg(feature = "ui")]
     #[test]
     fn test_config_paste_target_fetch_retries_tree_default_when_absent(
     ) -> Result<(), Box<dyn Error>> {

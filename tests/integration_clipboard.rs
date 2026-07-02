@@ -4,7 +4,10 @@
 //! Run ignored tests sequentially to avoid clipboard race conditions:
 //! `cargo test --test integration_clipboard -- --ignored --test-threads=1`
 
-use talk_rs::clipboard::{Clipboard, MockClipboard, X11Clipboard};
+use talk_rs::clipboard::{Clipboard, MockClipboard};
+// `X11Clipboard` lives behind the `ui` feature (native X11 clipboard).
+#[cfg(feature = "ui")]
+use talk_rs::clipboard::X11Clipboard;
 
 /// Verify that xclip binary is available on the system.
 #[tokio::test]
@@ -23,6 +26,8 @@ async fn test_xclip_binary_exists() {
 
 /// Test X11Clipboard set and get roundtrip with real xclip.
 /// Requires X11 display and xclip installed.
+/// Requires the `ui` feature (native X11 clipboard).
+#[cfg(feature = "ui")]
 #[tokio::test]
 #[ignore]
 async fn test_x11_clipboard_roundtrip() {
@@ -44,6 +49,8 @@ async fn test_x11_clipboard_roundtrip() {
 
 /// Test X11Clipboard save and restore pattern with real xclip.
 /// Requires X11 display and xclip installed.
+/// Requires the `ui` feature (native X11 clipboard).
+#[cfg(feature = "ui")]
 #[tokio::test]
 #[ignore]
 async fn test_x11_clipboard_save_restore() {

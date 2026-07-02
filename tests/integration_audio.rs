@@ -3,6 +3,9 @@
 //! Non-ignored tests verify basic device enumeration via cpal.
 //! Ignored tests require actual audio hardware and should be run with:
 //!   cargo test -- --ignored
+//!
+//! Requires the `capture` feature (cpal capture backend).
+#![cfg(feature = "capture")]
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use talk_rs::audio::cpal_capture::CpalCapture;

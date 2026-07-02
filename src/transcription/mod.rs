@@ -30,6 +30,14 @@ pub(crate) enum TranscriptionBody {
     File(PathBuf),
     /// Chunks arriving through a channel — used during
     /// record-while-upload streaming. The transport collects them.
+    //
+    // The `Pipe` variant is only *constructed* by the live
+    // record-while-upload path (`dictate`), which requires `capture`.
+    // In a build without `capture` the variant is only ever pattern-
+    // matched (e.g. by the parakeet backend), never constructed — but
+    // it remains part of the transcription-transport contract, hence
+    // the scoped allow.
+    #[cfg_attr(not(feature = "capture"), allow(dead_code))]
     Pipe {
         chunks: tokio::sync::mpsc::Receiver<Vec<u8>>,
         file_name: String,
@@ -472,6 +480,13 @@ pub(crate) trait OneShotTranscriber: Send + Sync {
 // ── Realtime trait ───────────────────────────────────────────────────
 
 /// Realtime transcription: raw PCM stream in, incremental events out.
+//
+// The trait is driven exclusively by the live dictation path, which
+// requires both `capture` and `ui`.  In a headless build the trait
+// methods are never invoked (the concrete realtime transcribers still
+// expose inherent `transcribe_realtime` methods for library
+// consumers), so the dead-code allow is scoped to that configuration.
+#[cfg_attr(not(all(feature = "capture", feature = "ui")), allow(dead_code))]
 #[async_trait]
 pub(crate) trait RealtimeTranscriber: Send + Sync {
     /// Pre-flight check: verify API connectivity and model validity.
@@ -908,6 +923,13 @@ fn resolve_effective_model(config: &Config, provider: Provider, model: Option<&s
 ///
 /// When `model` is `Some`, it overrides the config default for that
 /// provider's realtime model (the `--model` CLI flag).
+//
+// Only the live dictation path (`dictate` / picker) constructs a
+// realtime transcriber; that path requires both `capture` and `ui`.
+// In a headless build it is never called, but the factory + the
+// `RealtimeTranscriber` trait remain part of the exposed realtime
+// API surface, so the allow is scoped to the headless configuration.
+#[cfg_attr(not(all(feature = "capture", feature = "ui")), allow(dead_code))]
 pub(crate) fn create_realtime_transcriber(
     config: &Config,
     provider: Provider,

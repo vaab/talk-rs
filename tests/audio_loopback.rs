@@ -9,6 +9,9 @@
 //! - `pactl` available on PATH
 //!
 //! Run with: `cargo test --test audio_loopback -- --ignored --test-threads=1`
+//!
+//! Requires the `capture` feature (cpal + the audio indicator).
+#![cfg(feature = "capture")]
 
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};

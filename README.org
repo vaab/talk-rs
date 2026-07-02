@@ -374,6 +374,25 @@ cargo test                    # test
 cargo build                   # build
 #+end_src
 
+*** Cargo feature flags
+
+The default build enables everything (full dictation CLI).  Library
+consumers can opt out of the desktop stack with
+~default-features = false~:
+
+| Feature    | Default | Pulls in                                                 | Provides                                                                                                             |
+|------------+---------+----------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------|
+| (core)     | always  | reqwest, tokio-tungstenite, opus, rubato, symphonia, ... | Transcription providers (Mistral/OpenAI batch + realtime WS), resampler, Opus/OGG encode, file decode, config, cache |
+| ~parakeet~ | yes     | sherpa-onnx (static C++), tar, bzip2                     | Local ASR backend (Parakeet TDT, CPU)                                                                                |
+| ~capture~  | yes     | pipewire, cpal, libpulse-binding                         | Live mic/monitor capture, BT headset HFP switch, indicator tones                                                     |
+| ~ui~       | yes     | gtk4, x11rb, png, fontdue, dark-light, ...               | X11 overlay, visualizers, clipboard/paste, picker, recordings browser                                                |
+
+Example headless consumer (cloud transcription only):
+
+#+begin_src toml
+talk-rs = { path = "../talk-rs", default-features = false }
+#+end_src
+
 ** License
 
 MIT -- see [[file:LICENSE][LICENSE]].

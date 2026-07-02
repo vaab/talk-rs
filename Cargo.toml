@@ -21,6 +21,15 @@ exclude = [
 name = "talk_rs"
 path = "src/lib.rs"
 
+# The CLI binary drives the full dictation workflow (capture +
+# transcribe + paste) and the GTK/X11 UIs, so it requires both the
+# `capture` and `ui` features.  These are on by default; a
+# `--no-default-features` build produces the library only.
+[[bin]]
+name = "talk-rs"
+path = "src/main.rs"
+required-features = ["capture", "ui"]
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
@@ -30,9 +39,9 @@ log = "0.4"
 fern = "0.6"
 colored = "2"
 thiserror = "1"
-cpal = "0.15"
-pipewire = { version = "0.9", features = ["v0_3_43"] }
-libpulse-binding = "2.30"
+cpal = { version = "0.15", optional = true }
+pipewire = { version = "0.9", features = ["v0_3_43"], optional = true }
+libpulse-binding = { version = "2.30", optional = true }
 rubato = "1.0"
 audioadapter-buffers = "2.0"
 opus = "0.3"
@@ -51,13 +60,13 @@ base64 = "0.22"
 url = "2"
 serde_json = "1"
 nix = { version = "0.28", features = ["signal", "process", "fs"] }
-x11rb = { version = "0.13", features = ["shape", "xfixes", "randr", "xtest"] }
-png = "0.17"
-fontdue = "0.9"
-gtk4 = { version = "0.8", features = ["v4_10"] }
-gdk4-x11 = "0.8"
-dark-light = "2.0"
-dissimilar = "1"
+x11rb = { version = "0.13", features = ["shape", "xfixes", "randr", "xtest"], optional = true }
+png = { version = "0.17", optional = true }
+fontdue = { version = "0.9", optional = true }
+gtk4 = { version = "0.8", features = ["v4_10"], optional = true }
+gdk4-x11 = { version = "0.8", optional = true }
+dark-light = { version = "2.0", optional = true }
+dissimilar = { version = "1", optional = true }
 fs2 = "0.4.3"
 # Local ASR backend (Parakeet TDT via ONNX Runtime, CPU).  Phase 0
 # verified that a bare `sherpa-onnx = "1.13"` already static-links the
@@ -71,12 +80,40 @@ tar = { version = "0.4", optional = true }
 bzip2 = { version = "0.4", optional = true }
 
 [features]
-# `parakeet` is ON by default: prebuilt binaries ship the local
-# backend working out-of-the-box.  Build with
-# `--no-default-features` to drop the static sherpa-onnx C++ lib
-# (smaller binary, cloud providers only).
-default = ["parakeet"]
+# The default build enables every feature, so a plain `cargo build`
+# is behaviorally identical to the pre-feature-flag crate: the full
+# Linux dictation CLI (local ASR + audio capture + GTK/X11 desktop
+# UI).  Consumers who only want the transcription providers +
+# resampler + encoders (e.g. a headless server) depend on the crate
+# with `default-features = false` to drop every heavy desktop
+# dependency (GTK4, X11, PipeWire, PulseAudio, cpal, ...).
+default = ["parakeet", "capture", "ui"]
+
+# `parakeet`: local ASR backend (Parakeet TDT via ONNX Runtime, CPU).
+# Pulls the prebuilt static sherpa-onnx C++ lib plus the model-download
+# path's `tar` / `bzip2`.  Build without it (`--no-default-features`)
+# for a smaller binary that uses cloud providers only.
 parakeet = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
+
+# `capture`: live audio capture from system devices.  Gates the
+# PipeWire / cpal capture backends, the PulseAudio Bluetooth-profile
+# auto-switch, and the audio indicator (start/stop tones).  Required
+# by the `record` and `dictate` commands.
+capture = ["dep:cpal", "dep:pipewire", "dep:libpulse-binding"]
+
+# `ui`: the GTK4 / X11 desktop surface — overlay badge, visualizers,
+# clipboard + paste pipeline, multi-candidate picker, and the
+# recordings browser.  Gates all rendering (fontdue / png), theme
+# detection (dark-light), and the text-diff highlighting (dissimilar).
+ui = [
+    "dep:gtk4",
+    "dep:gdk4-x11",
+    "dep:x11rb",
+    "dep:png",
+    "dep:fontdue",
+    "dep:dark-light",
+    "dep:dissimilar",
+]
 
 [dev-dependencies]
 assert_cmd = "2"

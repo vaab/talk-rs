@@ -3,15 +3,21 @@
 use crate::error::TalkError;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "capture")]
 pub mod bt_profile;
+#[cfg(feature = "capture")]
 pub mod cpal_capture;
 pub mod encoder;
 pub mod file_source;
+#[cfg(feature = "capture")]
 pub mod indicator;
 pub mod mock;
+#[cfg(feature = "capture")]
 pub mod monitor_capture;
+#[cfg(feature = "capture")]
 pub mod pipewire_capture;
 pub mod resample;
+pub mod ring_buffer;
 pub mod tee;
 pub mod writer;
 

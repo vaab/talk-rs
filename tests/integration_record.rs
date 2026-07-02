@@ -169,6 +169,9 @@ fn test_record_default_filename_format() {
 /// to prevent it from running in CI environments.
 ///
 /// Run with: `cargo test -- --ignored test_record_creates_output_file`
+///
+/// Requires the `capture` feature (real cpal capture backend).
+#[cfg(feature = "capture")]
 #[tokio::test]
 #[ignore]
 async fn test_record_creates_output_file() {
