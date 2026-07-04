@@ -95,17 +95,28 @@ default = ["parakeet", "capture", "ui"]
 # for a smaller binary that uses cloud providers only.
 parakeet = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
 
+# `playback`: local audio playback through the default output device
+# via cpal.  Gates the reusable `AudioPlayer` used by the `speak`
+# command and the recordings-browser player.  Kept separate from
+# `capture` so a headless `speak -o out.wav` build (which never plays
+# audio) can drop cpal entirely.
+playback = ["dep:cpal"]
+
 # `capture`: live audio capture from system devices.  Gates the
 # PipeWire / cpal capture backends, the PulseAudio Bluetooth-profile
 # auto-switch, and the audio indicator (start/stop tones).  Required
-# by the `record` and `dictate` commands.
-capture = ["dep:cpal", "dep:pipewire", "dep:libpulse-binding"]
+# by the `record` and `dictate` commands.  Pulls `playback` because
+# the capture path shares cpal.
+capture = ["playback", "dep:pipewire", "dep:libpulse-binding"]
 
 # `ui`: the GTK4 / X11 desktop surface — overlay badge, visualizers,
 # clipboard + paste pipeline, multi-candidate picker, and the
 # recordings browser.  Gates all rendering (fontdue / png), theme
 # detection (dark-light), and the text-diff highlighting (dissimilar).
+# Pulls `playback` because the recordings browser's audio player uses
+# cpal via the shared `AudioPlayer`.
 ui = [
+    "playback",
     "dep:gtk4",
     "dep:gdk4-x11",
     "dep:x11rb",

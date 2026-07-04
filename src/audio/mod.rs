@@ -16,12 +16,16 @@ pub mod mock;
 pub mod monitor_capture;
 #[cfg(feature = "capture")]
 pub mod pipewire_capture;
+#[cfg(feature = "playback")]
+pub mod player;
 pub mod resample;
 pub mod ring_buffer;
 pub mod tee;
 pub mod writer;
 
 pub use encoder::{AudioEncoder, MockEncoder, OpusEncoder};
+#[cfg(feature = "playback")]
+pub use player::AudioPlayer;
 pub use writer::{AudioWriter, OggOpusWriter, WavWriter};
 
 pub(crate) const CHUNK_DURATION_MS: u64 = 20;
