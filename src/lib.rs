@@ -9,6 +9,8 @@ pub mod dictate;
 pub mod error;
 #[cfg(feature = "ui")]
 pub mod gtk_theme;
+#[cfg(any(feature = "parakeet", feature = "kokoro"))]
+pub mod model_fetch;
 #[cfg(feature = "ui")]
 pub mod paste;
 pub mod record;
