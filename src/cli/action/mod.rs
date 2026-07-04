@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub use crate::dictate::{dictate, DictateOpts};
 pub use crate::record::record;
 pub use crate::record::ui::record_ui;
+pub use crate::speak::{speak, SpeakOpts};
 pub use crate::transcribe::transcribe;
 
 pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std::error::Error>> {
@@ -34,6 +35,28 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
                 args.push(output_file);
             }
             transcribe(args, provider, model, diarize, timestamp).await?;
+        }
+        Commands::Speak {
+            text,
+            file,
+            provider,
+            voice,
+            lang,
+            speed,
+            output,
+            force,
+        } => {
+            speak(SpeakOpts {
+                text,
+                file: file.map(PathBuf::from),
+                provider,
+                voice,
+                lang,
+                speed,
+                output: output.map(PathBuf::from),
+                force,
+            })
+            .await?;
         }
         Commands::Dictate {
             save,

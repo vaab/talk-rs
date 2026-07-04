@@ -1,4 +1,4 @@
-use crate::config::Provider;
+use crate::config::{Provider, SynthesisProvider};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -55,6 +55,40 @@ pub enum Commands {
         /// Include timestamps in the output (HH:MM:SS prefix)
         #[arg(long)]
         timestamp: bool,
+    },
+    /// Synthesize speech from text and play it (or save to a WAV file)
+    Speak {
+        /// Text to speak.  When omitted, text is read from `--file` or,
+        /// failing that, from stdin (when stdin is not a TTY).
+        #[arg(value_name = "TEXT")]
+        text: Option<String>,
+        /// Read the text to speak from this file instead of the
+        /// positional argument
+        #[arg(short = 'f', long, value_name = "PATH")]
+        file: Option<String>,
+        /// Synthesis provider (kokoro or mistral)
+        #[arg(long, value_parser = clap::value_parser!(SynthesisProvider))]
+        provider: Option<SynthesisProvider>,
+        /// Voice: a Kokoro voice name (e.g. af_heart, ff_siwis) or a
+        /// Mistral preset voice id
+        #[arg(long, value_name = "NAME_OR_ID")]
+        voice: Option<String>,
+        /// Phonemization language for Kokoro (e.g. en, fr).  Ignored by
+        /// the Mistral provider (voice implies language)
+        #[arg(long, value_name = "LANG")]
+        lang: Option<String>,
+        /// Speech rate multiplier (Kokoro only; 1.0 = normal)
+        #[arg(long, value_name = "FACTOR")]
+        speed: Option<f32>,
+        /// Save synthesized audio to this WAV file instead of playing
+        /// it through the speakers
+        #[arg(short = 'o', long, value_name = "PATH")]
+        output: Option<String>,
+        /// Bypass the voice/language mismatch guard: synthesize even
+        /// when an explicitly-chosen voice's language differs from the
+        /// resolved (auto-detected / --lang / config) language
+        #[arg(long)]
+        force: bool,
     },
     /// Record, transcribe, and paste text into the focused application
     Dictate {

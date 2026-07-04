@@ -51,6 +51,18 @@ providers:
     # Optimized for English; experimental for other languages.
     # context_bias: "Kalysto,talk-rs,Voxtral,cpal,tokio"
 
+    # Text-to-speech (used by the `speak` command with --provider mistral).
+    # The API key above is SHARED between speech-to-text and text-to-speech;
+    # there is no separate voxtral section.
+    #
+    # Model for the /v1/audio/speech endpoint (optional, defaults to
+    # "voxtral-mini-tts-latest").
+    # tts_model: voxtral-mini-tts-latest
+    #
+    # Default preset voice id (a Mistral voice UUID) used when --voice is not
+    # given.  List available voices with GET /v1/audio/voices?voice_type=preset.
+    # tts_voice: "5a271406-039d-46fe-835b-fbbb00eaf08d"   # Marie (fr_FR)
+
   # OpenAI API Configuration (optional)
   # openai:
   #   api_key: <PLACEHOLDER>
@@ -71,10 +83,36 @@ providers:
   #   num_threads: 2         # decode threads (default 2)
   #   # model: parakeet-tdt-0.6b-v3-int8   # logical name surfaced in cache keys / metadata
 
+  # Kokoro local TTS backend (on-device, offline, CPU). No API key.
+  # Multi-language text-to-speech used by the `speak` command with
+  # --provider kokoro.  The model (~350 MB) auto-downloads on first use
+  # into ~/.local/share/talk-rs/models/kokoro-multi-lang-v1_0/ and is
+  # cached forever after (fully offline thereafter).
+  # Requires the `kokoro` build feature (enabled by default; drop via
+  # `cargo build --release --no-default-features`).
+  #
+  # Language handling is config-driven and agnostic: the requested
+  # language (--lang / lang below) selects the phonemizer.  The stock
+  # model ships one baked language (en-us); other languages are derived
+  # on demand by patching the model's ONNX voice metadata, cached as
+  # model-<lang>.onnx next to the stock model.
+  # kokoro:
+  #   # model_dir: ~/.local/share/talk-rs/models/kokoro-multi-lang-v1_0   # override cache location
+  #   voice: af_heart        # default voice name (af_heart, am_michael, ff_siwis, …)
+  #   num_threads: 4         # inference threads (default 4)
+  #   lang: en               # default phonemization language (en, fr, …)
+
 # Optional: Default provider when --provider is not specified.
 # Valid values: mistral, openai, parakeet.
 # transcription:
 #   default_provider: mistral
+
+# Optional: Default text-to-speech provider for the `speak` command,
+# used when --provider is not specified.  Valid values: kokoro, mistral.
+# When omitted, `speak` prefers the local Kokoro backend if a
+# providers.kokoro section exists, else falls back to Mistral.
+# speak:
+#   default_provider: kokoro
 
 # Optional: Visual and Audio Indicators
 # Configure feedback mechanisms during recording

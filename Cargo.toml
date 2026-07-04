@@ -59,6 +59,11 @@ tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 base64 = "0.22"
 url = "2"
 serde_json = "1"
+# Automatic language detection for the `speak` command (whichlang:
+# quickwit-oss, MIT, zero runtime deps).  Non-optional and tiny — it
+# powers `lang: auto` on BOTH synthesis providers, so it must be
+# present even in a `--no-default-features` (Mistral-only) build.
+whichlang = "0.1"
 nix = { version = "0.28", features = ["signal", "process", "fs"] }
 x11rb = { version = "0.13", features = ["shape", "xfixes", "randr", "xtest"], optional = true }
 png = { version = "0.17", optional = true }
@@ -87,13 +92,21 @@ bzip2 = { version = "0.4", optional = true }
 # resampler + encoders (e.g. a headless server) depend on the crate
 # with `default-features = false` to drop every heavy desktop
 # dependency (GTK4, X11, PipeWire, PulseAudio, cpal, ...).
-default = ["parakeet", "capture", "ui"]
+default = ["parakeet", "kokoro", "playback", "capture", "ui"]
 
 # `parakeet`: local ASR backend (Parakeet TDT via ONNX Runtime, CPU).
 # Pulls the prebuilt static sherpa-onnx C++ lib plus the model-download
 # path's `tar` / `bzip2`.  Build without it (`--no-default-features`)
 # for a smaller binary that uses cloud providers only.
 parakeet = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
+
+# `kokoro`: local TTS backend (Kokoro multi-lang via sherpa-onnx, CPU).
+# Architectural mirror of `parakeet` on the synthesis side: pulls the
+# same prebuilt static sherpa-onnx C++ lib (its TTS API is compiled in)
+# plus the model-download path's `tar` / `bzip2`.  Build without it
+# (`--no-default-features`) for a smaller binary that speaks via the
+# remote Mistral Voxtral TTS provider only.
+kokoro = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
 
 # `playback`: local audio playback through the default output device
 # via cpal.  Gates the reusable `AudioPlayer` used by the `speak`
@@ -132,3 +145,4 @@ predicates = "3"
 insta = "1"
 tempfile = "3"
 wiremock = "0.6"
+indoc = "2"

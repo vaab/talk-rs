@@ -109,6 +109,9 @@ async fn test_transcribe_audio_cache_only_on_missing_entry() {
         url: None,
         model: "voxtral-mini-latest".to_string(),
         context_bias: None,
+        tts_model: "voxtral-mini-tts-latest".to_string(),
+        tts_voice: None,
+        tts_voices: None,
     };
     let temp_dir = TempDir::new().expect("create temp dir");
     let audio_path = temp_dir.path().join("missing.wav");
@@ -118,9 +121,11 @@ async fn test_transcribe_audio_cache_only_on_missing_entry() {
             mistral: Some(config),
             openai: None,
             parakeet: None,
+            kokoro: None,
         },
         indicators: None,
         transcription: None,
+        speak: None,
         paste: None,
         audio: None,
         recording: None,
@@ -200,9 +205,11 @@ async fn test_mistral_transcriber_real_api() {
             mistral: Some(mistral_config),
             openai: None,
             parakeet: None,
+            kokoro: None,
         },
         indicators: None,
         transcription: None,
+        speak: None,
         paste: None,
         audio: None,
         recording: None,

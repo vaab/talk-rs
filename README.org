@@ -28,6 +28,11 @@ happening.
 - *Multiple providers* -- Mistral (Voxtral) and OpenAI (Whisper /
   GPT-4o) for batch transcription; Mistral and OpenAI realtime
   streaming via WebSocket.
+- *Text-to-speech* -- the ~speak~ command synthesizes text and plays
+  it (or saves a WAV).  Two providers mirror the transcription side:
+  ~kokoro~ (local, offline, multi-language via sherpa-onnx) and
+  ~mistral~ (remote Voxtral TTS).  Language handling is config-driven
+  and agnostic.
 - *Speaker diarization* -- identify who is speaking (~--diarize~);
   output is tagged with speaker labels.  Currently supported with
   Mistral V2 models in batch mode.
@@ -192,10 +197,17 @@ providers:
 | ~providers.mistral.url~            | ~https://api.mistral.ai~  | Mistral API base URL               |
 | ~providers.mistral.model~          | ~voxtral-mini-2507~       | Mistral transcription model        |
 | ~providers.mistral.context_bias~   | /none/                    | Comma-separated words for accuracy |
+| ~providers.mistral.tts_model~      | ~voxtral-mini-tts-latest~ | Voxtral TTS model for ~speak --provider mistral~ (shares the STT api_key) |
+| ~providers.mistral.tts_voice~      | /none/                    | Default Mistral preset voice id for ~speak~ (else pass ~--voice~) |
 | ~providers.openai.url~             | ~https://api.openai.com~  | OpenAI API base URL                |
 | ~providers.openai.model~           | ~whisper-1~               | OpenAI batch model                 |
 | ~providers.openai.realtime_model~  | ~gpt-4o-mini-transcribe~  | OpenAI realtime model              |
-| ~transcription.default_provider~   | ~mistral~                 | Default provider when unspecified  |
+| ~providers.kokoro.model_dir~       | /XDG data dir/            | Kokoro TTS model cache dir (auto-downloaded on first ~speak~) |
+| ~providers.kokoro.voice~           | /per-language default/    | Default Kokoro voice name (~af_heart~, ~ff_siwis~, …)          |
+| ~providers.kokoro.num_threads~     | ~4~                       | Kokoro inference threads           |
+| ~providers.kokoro.lang~            | ~en~ (model-baked)        | Default Kokoro phonemization language |
+| ~transcription.default_provider~   | ~mistral~                 | Default transcription provider when unspecified |
+| ~speak.default_provider~           | /kokoro-if-configured/    | Default ~speak~ provider (~kokoro~ or ~mistral~) |
 | ~indicators.boop_interval_ms~      | ~5000~                    | Periodic boop interval in ms (~0~ disables boops; also ~--no-boop~) |
 | ~indicators.visual_overlay~        | ~true~                    | Show X11 overlay badge             |
 | ~indicators.viz~                   | /none/                    | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ (also ~--viz~; env ~TALK_RS_INDICATORS_VIZ~) |
@@ -312,6 +324,50 @@ Options:
 | ~--model~    | Override model for this invocation            |
 | ~--diarize~  | Enable speaker diarization (tag by speaker)  |
 
+*** Speak (text-to-speech)
+
+The architectural mirror of ~transcribe~: text in, speech out.
+Synthesize text and play it through the speakers, or save it to a
+WAV file.  Two providers -- ~kokoro~ (local, offline, on-device via
+sherpa-onnx) and ~mistral~ (remote Voxtral TTS).
+
+#+begin_src sh
+talk-rs speak "hello world"                        # synthesize + play
+talk-rs speak --provider mistral --voice <id> "hi" # remote Voxtral TTS
+talk-rs speak -o out.wav "save me to a file"       # write WAV, don't play
+echo "from a pipe" | talk-rs speak                 # read text from stdin
+talk-rs speak -f message.txt                       # read text from a file
+talk-rs speak --lang fr --voice ff_siwis "Bonjour" # French (Kokoro)
+#+end_src
+
+Text is resolved in priority order: the positional argument, then
+~--file~, then stdin (when stdin is not a TTY).
+
+The default provider is resolved as ~--provider~ >
+~speak.default_provider~ (config) > the local ~kokoro~ backend when a
+~providers.kokoro~ section exists, else ~mistral~.  On first use the
+Kokoro model (~350 MB) is downloaded after an interactive consent
+prompt (or a non-interactive proceed-with-log, exactly like the
+Parakeet ASR model) into
+~~/.local/share/talk-rs/models/kokoro-multi-lang-v1_0/~.
+
+Options:
+
+| Flag                | Effect                                                                 |
+|---------------------+------------------------------------------------------------------------|
+| ~--provider~        | Choose ~kokoro~ (local) or ~mistral~ (remote Voxtral)                   |
+| ~--voice~           | Kokoro voice name (~af_heart~, ~am_michael~, ~ff_siwis~, …) or a Mistral preset voice id |
+| ~--lang~            | Phonemization language for Kokoro (~en~, ~fr~, …); ignored by Mistral   |
+| ~--speed~           | Speech rate multiplier for Kokoro (~1.0~ = normal)                     |
+| ~-f~, ~--file~      | Read the text to speak from a file                                     |
+| ~-o~, ~--output~    | Save synthesized audio to a WAV file instead of playing it             |
+
+Language handling is config-driven and agnostic: the requested
+language selects the phonemizer.  The stock Kokoro model ships one
+baked language; other languages are derived on demand by patching the
+model's ONNX ~voice~ metadata, cached as ~model-<lang>.onnx~ next to
+the stock model.
+
 *** Supported input audio formats
 
 Commands that read audio from disk -- ~transcribe~,
@@ -382,10 +438,12 @@ consumers can opt out of the desktop stack with
 
 | Feature    | Default | Pulls in                                                 | Provides                                                                                                             |
 |------------+---------+----------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------|
-| (core)     | always  | reqwest, tokio-tungstenite, opus, rubato, symphonia, ... | Transcription providers (Mistral/OpenAI batch + realtime WS), resampler, Opus/OGG encode, file decode, config, cache |
+| (core)     | always  | reqwest, tokio-tungstenite, opus, rubato, symphonia, ... | Transcription providers (Mistral/OpenAI batch + realtime WS), Mistral Voxtral TTS, resampler, Opus/OGG encode, file decode, config, cache |
 | ~parakeet~ | yes     | sherpa-onnx (static C++), tar, bzip2                     | Local ASR backend (Parakeet TDT, CPU)                                                                                |
-| ~capture~  | yes     | pipewire, cpal, libpulse-binding                         | Live mic/monitor capture, BT headset HFP switch, indicator tones                                                     |
-| ~ui~       | yes     | gtk4, x11rb, png, fontdue, dark-light, ...               | X11 overlay, visualizers, clipboard/paste, picker, recordings browser                                                |
+| ~kokoro~   | yes     | sherpa-onnx (static C++), tar, bzip2                     | Local TTS backend (Kokoro multi-lang, CPU) for ~speak~                                                               |
+| ~playback~ | yes     | cpal                                                     | Local audio playback (the ~speak~ command's speakers output; shared player)                                          |
+| ~capture~  | yes     | pipewire, cpal (via ~playback~), libpulse-binding        | Live mic/monitor capture, BT headset HFP switch, indicator tones                                                     |
+| ~ui~       | yes     | gtk4, x11rb, png, fontdue, dark-light, ... (+ ~playback~) | X11 overlay, visualizers, clipboard/paste, picker, recordings browser                                                |
 
 Example headless consumer (cloud transcription only):
 

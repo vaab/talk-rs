@@ -623,6 +623,9 @@ mod tests {
             url: Some("https://custom.example.com".to_string()),
             model: "voxtral-mini-2507".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralRealtimeTranscriber::new(config);
         assert_eq!(transcriber.endpoint, "wss://custom.example.com");
@@ -635,6 +638,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-2507".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralRealtimeTranscriber::new(config);
         assert_eq!(transcriber.endpoint, "wss://api.mistral.ai");

@@ -15,6 +15,8 @@ pub mod model_fetch;
 pub mod paste;
 pub mod record;
 pub mod recording_cache;
+pub mod speak;
+pub mod synthesis;
 pub mod telemetry;
 pub mod transcribe;
 pub mod transcription;

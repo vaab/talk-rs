@@ -31,6 +31,11 @@ pub struct Config {
     /// Optional transcription defaults (provider selection, etc.).
     pub transcription: Option<TranscriptionConfig>,
 
+    /// Optional speech-synthesis defaults for the `speak` command
+    /// (default provider selection).
+    #[serde(default)]
+    pub speak: Option<SpeakConfig>,
+
     /// Optional paste behaviour settings.
     #[serde(default)]
     pub paste: Option<PasteConfig>,
@@ -175,6 +180,49 @@ impl std::str::FromStr for Provider {
     }
 }
 
+/// Speech-synthesis (text-to-speech) provider identifier.
+///
+/// The synthesis-side mirror of [`Provider`].  Like `Provider`, its
+/// variants are ALWAYS present regardless of build features so a YAML
+/// config naming `provider: kokoro` always parses — the feature gate
+/// only affects whether the concrete backend can be *constructed*
+/// (see [`crate::synthesis::create_oneshot_synthesizer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SynthesisProvider {
+    /// Local Kokoro multi-lang TTS (ONNX via sherpa-onnx, CPU).  The
+    /// synthesis-side sibling of [`Provider::Parakeet`]: on-device,
+    /// keyed by model files on disk rather than an API key.
+    Kokoro,
+    /// Remote Mistral / Voxtral TTS (`POST /v1/audio/speech`).  Shares
+    /// the [`MistralConfig`] API key with the transcription surface.
+    Mistral,
+}
+
+impl std::fmt::Display for SynthesisProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SynthesisProvider::Kokoro => write!(f, "kokoro"),
+            SynthesisProvider::Mistral => write!(f, "mistral"),
+        }
+    }
+}
+
+impl std::str::FromStr for SynthesisProvider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "kokoro" => Ok(SynthesisProvider::Kokoro),
+            "mistral" => Ok(SynthesisProvider::Mistral),
+            other => Err(format!(
+                "unknown synthesis provider '{}' (expected 'kokoro' or 'mistral')",
+                other
+            )),
+        }
+    }
+}
+
 /// Transcription providers configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvidersConfig {
@@ -191,6 +239,12 @@ pub struct ProvidersConfig {
     /// as an empty `parakeet: {}` block).
     #[serde(default)]
     pub parakeet: Option<ParakeetConfig>,
+
+    /// Local Kokoro TTS configuration (optional — only required when
+    /// using the Kokoro synthesis provider; defaults are usable when
+    /// present as an empty `kokoro: {}` block).
+    #[serde(default)]
+    pub kokoro: Option<KokoroConfig>,
 }
 
 /// Mistral API configuration.
@@ -218,10 +272,46 @@ pub struct MistralConfig {
     /// or domain-specific vocabulary.
     #[serde(default)]
     pub context_bias: Option<String>,
+
+    /// Model name for text-to-speech synthesis via the Voxtral TTS
+    /// endpoint (`POST /v1/audio/speech`).  Defaults to
+    /// `voxtral-mini-tts-latest`.
+    ///
+    /// Deliberately co-located with the transcription fields rather
+    /// than in a separate section: the Mistral API key is shared
+    /// between speech-to-text and text-to-speech, so a single
+    /// `providers.mistral` block keys both surfaces.
+    #[serde(default = "default_mistral_tts_model")]
+    pub tts_model: String,
+
+    /// Default *pinned* TTS voice id (a Mistral preset voice UUID) used
+    /// by the `speak` command when `--voice` is not supplied.  A pin
+    /// takes precedence over the per-language [`Self::tts_voices`] map,
+    /// so a pinned voice whose language conflicts with the resolved
+    /// language trips the mismatch guard (see
+    /// [`crate::synthesis::resolve::guard_voice_lang`]).  When unset the
+    /// per-language map (then a built-in default table) is consulted;
+    /// the available voices can be listed via `GET /v1/audio/voices`.
+    #[serde(default)]
+    pub tts_voice: Option<String>,
+
+    /// Per-language TTS voices (ISO 639-1 code → preset voice UUID).
+    ///
+    /// Consulted after `--voice` and [`Self::tts_voice`] but before the
+    /// built-in default table: the entry matching the resolved language
+    /// is chosen automatically, so it can never trip the mismatch guard
+    /// (an auto-selected voice matches the language by construction).
+    /// Example: `{ en: "<paul-uuid>", fr: "<marie-uuid>" }`.
+    #[serde(default)]
+    pub tts_voices: Option<std::collections::HashMap<String, String>>,
 }
 
 fn default_mistral_model() -> String {
     "voxtral-mini-2507".to_string()
+}
+
+fn default_mistral_tts_model() -> String {
+    "voxtral-mini-tts-latest".to_string()
 }
 
 /// OpenAI API configuration.
@@ -382,6 +472,75 @@ impl ParakeetConfig {
     }
 }
 
+/// Local Kokoro TTS backend configuration.
+///
+/// The synthesis-side sibling of [`ParakeetConfig`]: like Parakeet,
+/// Kokoro runs on-device and is keyed by **model files on disk**
+/// rather than an API key.  Every field is optional; the
+/// default-constructed value resolves its model directory to the XDG
+/// data dir under `models/kokoro-multi-lang-v1_0`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct KokoroConfig {
+    /// Reserved for future multi-variant support (mirrors
+    /// [`ParakeetConfig::variant`]).  Kokoro currently ships a single
+    /// `kokoro-multi-lang-v1_0` tarball, so this is accepted-but-unused
+    /// today; kept so a future quantized variant does not need a
+    /// config-schema change.
+    #[serde(default)]
+    pub variant: Option<String>,
+
+    /// Directory holding the model files (`model.onnx`, `voices.bin`,
+    /// `tokens.txt`, `espeak-ng-data/`, `dict/`, lexicons).  Defaults
+    /// to the XDG data dir:
+    /// `~/.local/share/talk-rs/models/kokoro-multi-lang-v1_0`.
+    #[serde(default)]
+    pub model_dir: Option<PathBuf>,
+
+    /// Default voice name (e.g. `af_heart`, `am_michael`, `ff_siwis`)
+    /// used when `--voice` is not supplied.  When unset the backend
+    /// picks a per-language default (`af_heart` for English,
+    /// `ff_siwis` for French).
+    #[serde(default)]
+    pub voice: Option<String>,
+
+    /// Inference threads.  Default: 4.
+    #[serde(default)]
+    pub num_threads: Option<usize>,
+
+    /// Default phonemization language (`en` or `fr`) used when
+    /// `--lang` is not supplied.  Defaults to `en`.
+    #[serde(default)]
+    pub lang: Option<String>,
+}
+
+impl KokoroConfig {
+    /// Resolved on-disk model directory.
+    ///
+    /// Pure path computation — does NOT touch the filesystem.  Returns
+    /// the user-supplied `model_dir` verbatim when present, else
+    /// constructs the XDG default
+    /// `<data_dir>/models/kokoro-multi-lang-v1_0`.  Mirrors
+    /// [`ParakeetConfig::resolved_model_dir`].
+    pub fn resolved_model_dir(&self) -> Result<PathBuf, TalkError> {
+        if let Some(ref dir) = self.model_dir {
+            return Ok(dir.clone());
+        }
+        let data_dir = ProjectDirs::from("org", "kalysto", "talk-rs")
+            .map(|dirs| dirs.data_dir().to_path_buf())
+            .ok_or_else(|| {
+                TalkError::Config(
+                    "Could not determine data directory for kokoro model_dir".to_string(),
+                )
+            })?;
+        Ok(data_dir.join("models").join("kokoro-multi-lang-v1_0"))
+    }
+
+    /// Resolved inference thread count (defaults to 4).
+    pub fn resolved_num_threads(&self) -> usize {
+        self.num_threads.unwrap_or(4)
+    }
+}
+
 /// Transcription defaults.
 #[derive(Debug, Deserialize, Clone)]
 pub struct TranscriptionConfig {
@@ -392,6 +551,17 @@ pub struct TranscriptionConfig {
 
 fn default_provider() -> Provider {
     Provider::Mistral
+}
+
+/// Speech-synthesis defaults for the `speak` command.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SpeakConfig {
+    /// Default synthesis provider when `--provider` is not specified.
+    ///
+    /// When unset the `speak` command falls back to Kokoro if a
+    /// `providers.kokoro` section exists, else Mistral.
+    #[serde(default)]
+    pub default_provider: Option<SynthesisProvider>,
 }
 
 /// Audio configuration.
@@ -783,6 +953,13 @@ impl Config {
     /// - TALK_RS_PROVIDERS_PARAKEET_MODEL_DIR
     /// - TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS
     /// - TALK_RS_PROVIDERS_PARAKEET_MODEL
+    /// - TALK_RS_PROVIDERS_MISTRAL_TTS_MODEL
+    /// - TALK_RS_PROVIDERS_MISTRAL_TTS_VOICE
+    /// - TALK_RS_PROVIDERS_KOKORO_VARIANT
+    /// - TALK_RS_PROVIDERS_KOKORO_MODEL_DIR
+    /// - TALK_RS_PROVIDERS_KOKORO_VOICE
+    /// - TALK_RS_PROVIDERS_KOKORO_NUM_THREADS
+    /// - TALK_RS_PROVIDERS_KOKORO_LANG
     pub fn load(path: Option<&Path>) -> Result<Self, TalkError> {
         let config_path = match path {
             Some(path) => path.to_path_buf(),
@@ -874,6 +1051,12 @@ impl Config {
             if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")? {
                 mistral.context_bias = Some(value);
             }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_TTS_MODEL")? {
+                mistral.tts_model = value;
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_TTS_VOICE")? {
+                mistral.tts_voice = Some(value);
+            }
         } else {
             // Allow creating the Mistral section purely from env vars.
             if let Some(api_key) = env_var_string("TALK_RS_PROVIDERS_MISTRAL_API_KEY")? {
@@ -883,6 +1066,13 @@ impl Config {
                     model: env_var_string("TALK_RS_PROVIDERS_MISTRAL_MODEL")?
                         .unwrap_or_else(default_mistral_model),
                     context_bias: env_var_string("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?,
+                    tts_model: env_var_string("TALK_RS_PROVIDERS_MISTRAL_TTS_MODEL")?
+                        .unwrap_or_else(default_mistral_tts_model),
+                    tts_voice: env_var_string("TALK_RS_PROVIDERS_MISTRAL_TTS_VOICE")?,
+                    // The per-language `tts_voices` map is config-file
+                    // only (a map has no single-string env form); a pure
+                    // env-created section starts without it.
+                    tts_voices: None,
                 });
             }
         }
@@ -972,6 +1162,56 @@ impl Config {
                     model_dir: model_dir_env.map(PathBuf::from),
                     num_threads,
                     model: model_env,
+                });
+            }
+        }
+
+        // Kokoro env var overrides (only when the section exists).
+        if let Some(ref mut kokoro) = config.providers.kokoro {
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_KOKORO_VARIANT")? {
+                kokoro.variant = Some(value);
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_KOKORO_MODEL_DIR")? {
+                kokoro.model_dir = Some(PathBuf::from(value));
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_KOKORO_VOICE")? {
+                kokoro.voice = Some(value);
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_KOKORO_NUM_THREADS")? {
+                let parsed = parse_u32_env("TALK_RS_PROVIDERS_KOKORO_NUM_THREADS", &value)?;
+                kokoro.num_threads = Some(parsed as usize);
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_KOKORO_LANG")? {
+                kokoro.lang = Some(value);
+            }
+        } else {
+            // Allow creating the Kokoro section purely from env vars —
+            // any one knob materialises it, mirroring the Parakeet
+            // "create purely from env" branch.
+            let variant_env = env_var_string("TALK_RS_PROVIDERS_KOKORO_VARIANT")?;
+            let model_dir_env = env_var_string("TALK_RS_PROVIDERS_KOKORO_MODEL_DIR")?;
+            let voice_env = env_var_string("TALK_RS_PROVIDERS_KOKORO_VOICE")?;
+            let num_threads_env = env_var_string("TALK_RS_PROVIDERS_KOKORO_NUM_THREADS")?;
+            let lang_env = env_var_string("TALK_RS_PROVIDERS_KOKORO_LANG")?;
+            if variant_env.is_some()
+                || model_dir_env.is_some()
+                || voice_env.is_some()
+                || num_threads_env.is_some()
+                || lang_env.is_some()
+            {
+                let num_threads = match num_threads_env {
+                    Some(v) => {
+                        let parsed = parse_u32_env("TALK_RS_PROVIDERS_KOKORO_NUM_THREADS", &v)?;
+                        Some(parsed as usize)
+                    }
+                    None => None,
+                };
+                config.providers.kokoro = Some(KokoroConfig {
+                    variant: variant_env,
+                    model_dir: model_dir_env.map(PathBuf::from),
+                    voice: voice_env,
+                    num_threads,
+                    lang: lang_env,
                 });
             }
         }
@@ -1114,6 +1354,8 @@ mod tests {
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_URL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_CONTEXT_BIAS")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_TTS_MODEL")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_TTS_VOICE")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_API_KEY")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_URL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_MODEL")?,
@@ -1122,6 +1364,11 @@ mod tests {
             EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_MODEL_DIR")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_MODEL")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_KOKORO_VARIANT")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_KOKORO_MODEL_DIR")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_KOKORO_VOICE")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_KOKORO_NUM_THREADS")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_KOKORO_LANG")?,
         ])
     }
 
@@ -2308,5 +2555,238 @@ providers: {}
         assert_eq!(o.api_key, "sk-env-key");
         assert_eq!(o.url.as_deref(), Some("https://env-openai.example.com"));
         Ok(())
+    }
+
+    // ── Synthesis / TTS config ──────────────────────────────────────
+
+    #[test]
+    fn test_config_mistral_tts_defaults() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+        let config = Config::load(Some(file.path()))?;
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        // TTS model defaults; TTS voice stays unset.
+        assert_eq!(m.tts_model, "voxtral-mini-tts-latest");
+        assert!(m.tts_voice.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_mistral_tts_fields_parse() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+    tts_model: voxtral-mini-tts-2026
+    tts_voice: 5a271406-039d-46fe-835b-fbbb00eaf08d
+"#;
+        let file = write_config(yaml)?;
+        let config = Config::load(Some(file.path()))?;
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        assert_eq!(m.tts_model, "voxtral-mini-tts-2026");
+        assert_eq!(
+            m.tts_voice.as_deref(),
+            Some("5a271406-039d-46fe-835b-fbbb00eaf08d")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_mistral_tts_voices_map_parses() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+    tts_voices:
+      fr: 5a271406-039d-46fe-835b-fbbb00eaf08d
+      en: c69964a6-ab8b-4f8a-9465-ec0925096ec8
+"#;
+        let file = write_config(yaml)?;
+        let config = Config::load(Some(file.path()))?;
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        // Pin unset; the per-language map is present.
+        assert!(m.tts_voice.is_none());
+        let map = m.tts_voices.as_ref().expect("tts_voices present");
+        assert_eq!(
+            map.get("fr").map(String::as_str),
+            Some("5a271406-039d-46fe-835b-fbbb00eaf08d")
+        );
+        assert_eq!(
+            map.get("en").map(String::as_str),
+            Some("c69964a6-ab8b-4f8a-9465-ec0925096ec8")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_kokoro_lang_auto_parses() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+  kokoro:
+    lang: auto
+"#;
+        let file = write_config(yaml)?;
+        let config = Config::load(Some(file.path()))?;
+        let k = config.providers.kokoro.as_ref().expect("kokoro present");
+        // `auto` is stored verbatim; the speak-command resolution layer
+        // interprets it as "auto-detect from text".
+        assert_eq!(k.lang.as_deref(), Some("auto"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_mistral_tts_env_override() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _m = EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_TTS_MODEL", "env-tts-model")?;
+        let _v = EnvGuard::set("TALK_RS_PROVIDERS_MISTRAL_TTS_VOICE", "env-voice-id")?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+        let config = Config::load(Some(file.path()))?;
+        let m = config.providers.mistral.as_ref().expect("mistral present");
+        assert_eq!(m.tts_model, "env-tts-model");
+        assert_eq!(m.tts_voice.as_deref(), Some("env-voice-id"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_kokoro_section_parses() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+  kokoro:
+    voice: am_michael
+    num_threads: 8
+    lang: fr
+"#;
+        let file = write_config(yaml)?;
+        let config = Config::load(Some(file.path()))?;
+        let k = config.providers.kokoro.as_ref().expect("kokoro present");
+        assert_eq!(k.voice.as_deref(), Some("am_michael"));
+        assert_eq!(k.resolved_num_threads(), 8);
+        assert_eq!(k.lang.as_deref(), Some("fr"));
+        // Model dir defaults to the XDG data dir with the tarball name.
+        let dir = k.resolved_model_dir()?;
+        assert!(
+            dir.ends_with("models/kokoro-multi-lang-v1_0"),
+            "unexpected default model dir: {}",
+            dir.display()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_kokoro_defaults() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+  kokoro: {}
+"#;
+        let file = write_config(yaml)?;
+        let config = Config::load(Some(file.path()))?;
+        let k = config.providers.kokoro.as_ref().expect("kokoro present");
+        // Threads default to 4 when unset.
+        assert_eq!(k.resolved_num_threads(), 4);
+        assert!(k.voice.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_kokoro_env_creates_section() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _v = EnvGuard::set("TALK_RS_PROVIDERS_KOKORO_VOICE", "af_heart")?;
+        let _t = EnvGuard::set("TALK_RS_PROVIDERS_KOKORO_NUM_THREADS", "2")?;
+
+        // No kokoro section in YAML — created purely from env vars.
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+"#;
+        let file = write_config(yaml)?;
+        let config = Config::load(Some(file.path()))?;
+        let k = config.providers.kokoro.as_ref().expect("kokoro from env");
+        assert_eq!(k.voice.as_deref(), Some("af_heart"));
+        assert_eq!(k.resolved_num_threads(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_speak_default_provider_parses() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = r#"
+output_dir: /tmp/test-output
+providers:
+  mistral:
+    api_key: test-api-key
+speak:
+  default_provider: kokoro
+"#;
+        let file = write_config(yaml)?;
+        let config = Config::load(Some(file.path()))?;
+        let speak = config.speak.as_ref().expect("speak section present");
+        assert_eq!(speak.default_provider, Some(SynthesisProvider::Kokoro));
+        Ok(())
+    }
+
+    #[test]
+    fn test_synthesis_provider_from_str_and_display() {
+        assert_eq!(
+            "kokoro"
+                .parse::<SynthesisProvider>()
+                .unwrap_or(SynthesisProvider::Mistral),
+            SynthesisProvider::Kokoro
+        );
+        assert_eq!(
+            "MISTRAL"
+                .parse::<SynthesisProvider>()
+                .unwrap_or(SynthesisProvider::Kokoro),
+            SynthesisProvider::Mistral
+        );
+        assert!("bogus".parse::<SynthesisProvider>().is_err());
+        assert_eq!(SynthesisProvider::Kokoro.to_string(), "kokoro");
+        assert_eq!(SynthesisProvider::Mistral.to_string(), "mistral");
     }
 }
