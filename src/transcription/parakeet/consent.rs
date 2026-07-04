@@ -21,7 +21,6 @@
 //! both call [`model::download_model`] directly after consent, reusing
 //! [`resolve`] for the presence decision.
 
-use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use crate::config::{Config, ParakeetVariant};
@@ -73,48 +72,25 @@ pub fn resolve(config: &Config) -> Result<ModelStatus, TalkError> {
 ///   policy). This keeps scripts/cron working without a hung prompt.
 ///
 /// A no-op (returns `Ok`) when the model is already present.
+///
+/// Delegates the interactive `[y/N]` prompt / non-interactive
+/// proceed-with-log mechanics to the shared
+/// [`crate::model_fetch::ensure_with_cli_consent`], passing the
+/// parakeet INT8 [`ModelSpec`](crate::model_fetch::ModelSpec).  This
+/// is behaviour-preserving: the prompt copy is templated from the
+/// spec's `display_name` / `approx_size`, and the download still runs
+/// through [`model::download_model`]'s atomic + concurrency path.
 pub async fn ensure_with_cli_consent(config: &Config) -> Result<(), TalkError> {
     let status = resolve(config)?;
     if status.present {
         return Ok(());
     }
 
-    let dir = &status.model_dir;
-
-    if std::io::stdin().is_terminal() {
-        // Interactive: ask before downloading ~640 MB.
-        eprint!(
-            "The Parakeet speech model (~640 MB) is not installed at {}.\n\
-             Download it now? [y/N] ",
-            dir.display()
-        );
-        // Flush so the prompt shows before we block on stdin.
-        let _ = std::io::stderr().flush();
-
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .map_err(TalkError::Io)?;
-        let answer = answer.trim().to_ascii_lowercase();
-        if answer != "y" && answer != "yes" {
-            return Err(TalkError::Config(format!(
-                "Parakeet model download declined; nothing was downloaded. \
-                 Install it later by re-running and accepting the prompt, \
-                 or place the files manually in {}.",
-                dir.display()
-            )));
-        }
-        eprintln!("Downloading Parakeet model to {} …", dir.display());
-    } else {
-        // Non-interactive: selecting Parakeet is the consent. Make the
-        // download loud on stderr so it is never a silent surprise.
-        eprintln!(
-            "Parakeet model not found at {}; downloading (~640 MB) — \
-             selecting the parakeet provider implies consent. Set a \
-             different provider to avoid this.",
-            dir.display()
-        );
+    // FP32 has no prebuilt tarball; surface the clear error rather than
+    // prompting to download something that cannot be fetched.
+    if status.variant == ParakeetVariant::Fp32 {
+        return model::download_model(&status.model_dir, status.variant).await;
     }
 
-    model::download_model(dir, status.variant).await
+    crate::model_fetch::ensure_with_cli_consent(&status.model_dir, &model::INT8_SPEC).await
 }
