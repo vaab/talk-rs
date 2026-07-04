@@ -492,6 +492,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-2507".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::new(config, false).expect("build client");
         assert_eq!(
@@ -507,6 +510,9 @@ mod tests {
             url: Some("https://custom.example.com".to_string()),
             model: "voxtral-mini-2507".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::new(config, false).expect("build client");
         assert_eq!(
@@ -522,6 +528,9 @@ mod tests {
             url: Some("https://custom.example.com/".to_string()),
             model: "voxtral-mini-2507".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::new(config, false).expect("build client");
         assert_eq!(
@@ -557,6 +566,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
@@ -595,6 +607,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
@@ -646,6 +661,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
@@ -693,6 +711,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
@@ -717,6 +738,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::new(config, false).expect("build client");
 
@@ -753,6 +777,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
@@ -806,6 +833,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-2602".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
@@ -907,6 +937,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-2602".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::with_endpoint(
             config,
@@ -962,6 +995,9 @@ mod tests {
             url: None,
             model: "voxtral-mini-latest".to_string(),
             context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
         };
         let transcriber = MistralOneShotTranscriber::with_policy(
             config,

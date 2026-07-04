@@ -1976,6 +1976,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "indoc"
+version = "2.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "insta"
 version = "1.46.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3625,6 +3634,7 @@ dependencies = [
  "futures",
  "gdk4-x11",
  "gtk4",
+ "indoc",
  "insta",
  "libpulse-binding",
  "log",
@@ -3649,6 +3659,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "url",
+ "whichlang",
  "wiremock",
  "x11rb",
 ]
@@ -4356,6 +4367,12 @@ checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
 ]
+
+[[package]]
+name = "whichlang"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b9aa3ad29c3d08283ac6b769e3ec15ad1ddb88af7d2e9bc402c574973b937e7"
 
 [[package]]
 name = "winapi"
