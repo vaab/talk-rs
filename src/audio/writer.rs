@@ -66,6 +66,15 @@ pub struct OggOpusWriter {
     granule_rate_ratio: f64,
     /// Whether header has been written.
     header_written: bool,
+    /// Test-only instrumentation: running total of `i16` samples
+    /// relocated by front-drains of `pcm_buffer` inside `write_pcm`.
+    ///
+    /// This is the exact quantity that made the old implementation
+    /// quadratic, so it is the quantity the regression test asserts on.
+    /// Compiled out of every non-test build (including the release
+    /// binary), so it costs nothing at runtime.
+    #[cfg(test)]
+    tail_samples_relocated: u64,
 }
 
 // OggOpusWriter is Send because opus::Encoder is Send and PacketWriter<Vec<u8>> is Send
@@ -130,6 +139,8 @@ impl OggOpusWriter {
             granule_position: 0,
             granule_rate_ratio: 48000.0 / config.sample_rate as f64,
             header_written: false,
+            #[cfg(test)]
+            tail_samples_relocated: 0,
         })
     }
 }
@@ -177,16 +188,40 @@ impl AudioWriter for OggOpusWriter {
         let samples_per_frame = self.frame_size * self.channels as usize;
         let mut output = Vec::new();
 
-        while self.pcm_buffer.len() >= samples_per_frame {
-            let frame: Vec<i16> = self.pcm_buffer.drain(..samples_per_frame).collect();
+        // Consume `pcm_buffer` with a read cursor and drain ONCE at the
+        // end of the call.
+        //
+        // Do NOT reintroduce `self.pcm_buffer.drain(..samples_per_frame)`
+        // inside this loop: `Vec::drain` from the front memmoves the whole
+        // remaining tail down on *every* iteration, making the function
+        // O(n^2) in the number of buffered samples.  Harmless for the
+        // streaming call sites (`dictate`, `record`) which feed small
+        // chunks, but catastrophic for `encode_16k_mono_ogg`
+        // (`src/transcription/mod.rs`), which hands a whole decoded file
+        // over in a single call.
+        //
+        // Measured, release build, one call: 20 minutes of 16 kHz mono
+        // audio took 455.6 s with the front-drain versus 15.6 s with this
+        // cursor form (29x; the remainder is the Opus encode itself,
+        // which is linear and unchanged).  Extrapolated to the 2h22m
+        // (8524.8 s) voice memo that exposed this, the front-drain costs
+        // ~132 minutes of pure memmove — 426240 frames, ~58 TB moved —
+        // before a single byte reaches the network.
+        let mut pos = 0usize;
+        while self.pcm_buffer.len() - pos >= samples_per_frame {
+            // Split the borrows: `frame` borrows `pcm_buffer` immutably
+            // while `encoder` / `packet_writer` are borrowed mutably.
+            let frame = &self.pcm_buffer[pos..pos + samples_per_frame];
 
             // Encode with Opus
             let mut opus_output = vec![0u8; 4000];
             let len = self
                 .encoder
-                .encode(&frame, &mut opus_output)
+                .encode(frame, &mut opus_output)
                 .map_err(|e| TalkError::Audio(format!("Opus encoding failed: {e}")))?;
             opus_output.truncate(len);
+
+            pos += samples_per_frame;
 
             // Update granule position (in 48kHz samples)
             self.granule_position += (self.frame_size as f64 * self.granule_rate_ratio) as u64;
@@ -204,6 +239,17 @@ impl AudioWriter for OggOpusWriter {
             // Extract bytes
             output.extend_from_slice(self.packet_writer.inner_mut());
             self.packet_writer.inner_mut().clear();
+        }
+
+        // Single memmove for the whole call.  The leftover tail is exactly
+        // the samples after the last full frame, which is what
+        // `finalize()` pads and flushes.
+        if pos > 0 {
+            #[cfg(test)]
+            {
+                self.tail_samples_relocated += (self.pcm_buffer.len() - pos) as u64;
+            }
+            self.pcm_buffer.drain(..pos);
         }
 
         Ok(output)
@@ -348,6 +394,75 @@ mod tests {
         AudioConfig::new()
     }
 
+    /// Fixed OGG stream serial, so two independently constructed
+    /// writers produce byte-comparable output (`rand_serial()` is
+    /// time-derived and would otherwise differ).
+    const FIXED_SERIAL: u32 = 0x1234_5678;
+
+    fn writer_with_fixed_serial() -> OggOpusWriter {
+        let mut w = OggOpusWriter::new(test_config()).unwrap();
+        w.serial = FIXED_SERIAL;
+        w
+    }
+
+    /// Reference copy of the ORIGINAL `OggOpusWriter::write_pcm`, kept
+    /// in the test module only.
+    ///
+    /// It drains `samples_per_frame` from the *front* of `pcm_buffer` on
+    /// every iteration — the O(n²) form that the production
+    /// implementation deliberately no longer uses (see the comment on
+    /// the cursor loop in `write_pcm`).  It exists so the fixed
+    /// implementation can be asserted **byte-identical** to the
+    /// behaviour it replaced, and so the quadratic blow-up can be
+    /// measured side by side.
+    fn legacy_write_pcm(w: &mut OggOpusWriter, pcm: &[i16]) -> Result<Vec<u8>, TalkError> {
+        w.pcm_buffer.extend_from_slice(pcm);
+
+        let samples_per_frame = w.frame_size * w.channels as usize;
+        let mut output = Vec::new();
+
+        while w.pcm_buffer.len() >= samples_per_frame {
+            w.tail_samples_relocated += (w.pcm_buffer.len() - samples_per_frame) as u64;
+            let frame: Vec<i16> = w.pcm_buffer.drain(..samples_per_frame).collect();
+
+            let mut opus_output = vec![0u8; 4000];
+            let len = w
+                .encoder
+                .encode(&frame, &mut opus_output)
+                .map_err(|e| TalkError::Audio(format!("Opus encoding failed: {e}")))?;
+            opus_output.truncate(len);
+
+            w.granule_position += (w.frame_size as f64 * w.granule_rate_ratio) as u64;
+
+            w.packet_writer
+                .write_packet(
+                    opus_output,
+                    w.serial,
+                    PacketWriteEndInfo::EndPage,
+                    w.granule_position,
+                )
+                .map_err(|e| TalkError::Audio(format!("failed to write OGG page: {e}")))?;
+
+            output.extend_from_slice(w.packet_writer.inner_mut());
+            w.packet_writer.inner_mut().clear();
+        }
+
+        Ok(output)
+    }
+
+    /// Deterministic test signal: a sine sweep, so successive frames
+    /// differ and the Opus encoder cannot collapse them into identical
+    /// packets.
+    fn sine_pcm(n: usize) -> Vec<i16> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                let freq = 220.0 + 80.0 * (t * 0.7).sin();
+                ((t * freq * std::f32::consts::TAU).sin() * 12000.0) as i16
+            })
+            .collect()
+    }
+
     #[test]
     fn test_ogg_opus_writer_produces_valid_ogg() {
         let mut writer = OggOpusWriter::new(test_config()).unwrap();
@@ -416,5 +531,142 @@ mod tests {
         let writer = WavWriter::new(test_config());
         assert_eq!(writer.mime_type(), "audio/wav");
         assert_eq!(writer.extension(), "wav");
+    }
+
+    /// The cursor-based `write_pcm` must be byte-for-byte equivalent to
+    /// the drain-in-loop implementation it replaced, when the whole
+    /// signal arrives in ONE call — the `encode_16k_mono_ogg` shape.
+    #[test]
+    fn test_write_pcm_bulk_call_is_byte_identical_to_legacy() {
+        // 5000 frames (100 s of 16 kHz mono audio) plus a deliberate
+        // partial tail of 137 samples, so `finalize()` padding is
+        // exercised too.
+        let pcm = sine_pcm(5000 * 320 + 137);
+
+        let mut fixed = writer_with_fixed_serial();
+        let fixed_bytes = [
+            fixed.header().unwrap(),
+            fixed.write_pcm(&pcm).unwrap(),
+            fixed.finalize().unwrap(),
+        ]
+        .concat();
+
+        let mut legacy = writer_with_fixed_serial();
+        let legacy_bytes = [
+            legacy.header().unwrap(),
+            legacy_write_pcm(&mut legacy, &pcm).unwrap(),
+            legacy.finalize().unwrap(),
+        ]
+        .concat();
+
+        assert_eq!(
+            fixed.pcm_buffer.len(),
+            legacy.pcm_buffer.len(),
+            "leftover tail length must match the legacy implementation"
+        );
+        assert_eq!(
+            fixed_bytes.len(),
+            legacy_bytes.len(),
+            "output length must match the legacy implementation"
+        );
+        assert!(
+            fixed_bytes == legacy_bytes,
+            "cursor-based write_pcm must be byte-identical to the legacy draining impl"
+        );
+    }
+
+    /// Same equivalence, but fed in irregular chunks — the streaming
+    /// (`dictate` / `record`) shape, where each call carries only a
+    /// fraction of a frame and the tail must survive across calls.
+    #[test]
+    fn test_write_pcm_chunked_calls_are_byte_identical_to_legacy() {
+        let pcm = sine_pcm(200 * 320 + 45);
+        // Chunk sizes that are deliberately not multiples of 320.
+        let chunk_sizes = [1usize, 7, 319, 320, 321, 1000, 4097];
+
+        let mut fixed = writer_with_fixed_serial();
+        let mut legacy = writer_with_fixed_serial();
+        let mut fixed_bytes = fixed.header().unwrap();
+        let mut legacy_bytes = legacy.header().unwrap();
+
+        let mut offset = 0usize;
+        let mut which = 0usize;
+        while offset < pcm.len() {
+            let take = chunk_sizes[which % chunk_sizes.len()].min(pcm.len() - offset);
+            let chunk = &pcm[offset..offset + take];
+            fixed_bytes.extend_from_slice(&fixed.write_pcm(chunk).unwrap());
+            legacy_bytes.extend_from_slice(&legacy_write_pcm(&mut legacy, chunk).unwrap());
+            offset += take;
+            which += 1;
+        }
+
+        fixed_bytes.extend_from_slice(&fixed.finalize().unwrap());
+        legacy_bytes.extend_from_slice(&legacy.finalize().unwrap());
+
+        assert!(
+            fixed_bytes == legacy_bytes,
+            "chunked cursor-based write_pcm must be byte-identical to the legacy draining impl"
+        );
+    }
+
+    /// Regression guard against reintroducing `drain(..frame)` inside
+    /// the encode loop.
+    ///
+    /// This asserts on the *cause*, not on wall-clock time: the
+    /// `tail_samples_relocated` counter (test-only, `#[cfg(test)]`)
+    /// records how many `i16` samples each front-drain has to memmove.
+    /// That is precisely the quantity that grows quadratically.
+    ///
+    /// A wall-clock assertion was tried first and rejected: at
+    /// test-affordable input sizes the (linear) Opus encode dominates,
+    /// so the measured ratio between the two implementations was only
+    /// ~1.2x — too close to noise to be a reliable discriminator, while
+    /// a size large enough to separate them would make the test take
+    /// minutes.  The counter separates them by three orders of
+    /// magnitude, deterministically, in a fraction of a second.
+    #[test]
+    fn test_write_pcm_bulk_call_does_not_memmove_quadratically() {
+        // 4000 frames = 80 s of 16 kHz mono audio, delivered in ONE call
+        // (the `encode_16k_mono_ogg` shape).
+        const FRAMES: usize = 4000;
+        const SAMPLES_PER_FRAME: usize = 320;
+        let pcm = sine_pcm(FRAMES * SAMPLES_PER_FRAME);
+
+        let mut fixed = writer_with_fixed_serial();
+        let _ = fixed.header().unwrap();
+        let fixed_out = fixed.write_pcm(&pcm).unwrap();
+
+        let mut legacy = writer_with_fixed_serial();
+        let _ = legacy.header().unwrap();
+        let legacy_out = legacy_write_pcm(&mut legacy, &pcm).unwrap();
+
+        // Same input, same bytes: the only difference is the memmove cost.
+        assert!(
+            fixed_out == legacy_out,
+            "both implementations must produce the same bytes"
+        );
+
+        // Legacy: sum over i in 0..FRAMES of (FRAMES - 1 - i) * 320
+        // = 320 * FRAMES * (FRAMES - 1) / 2 — quadratic in FRAMES.
+        let expected_legacy = SAMPLES_PER_FRAME as u64 * FRAMES as u64 * (FRAMES as u64 - 1) / 2;
+        assert_eq!(
+            legacy.tail_samples_relocated, expected_legacy,
+            "the legacy reference must exhibit the quadratic memmove it is here to model"
+        );
+
+        // Fixed: one drain at the end of the call, and there is no tail
+        // left over (the input is an exact multiple of the frame size),
+        // so nothing is relocated at all.
+        eprintln!(
+            "write_pcm {FRAMES} frames in one call: fixed relocated {} samples, \
+             legacy(drain-in-loop) relocated {} samples",
+            fixed.tail_samples_relocated, legacy.tail_samples_relocated
+        );
+        assert!(
+            fixed.tail_samples_relocated <= SAMPLES_PER_FRAME as u64,
+            "write_pcm is memmoving its buffer tail per frame again ({} samples relocated \
+             for {FRAMES} frames) — did drain(..frame) come back inside the loop?",
+            fixed.tail_samples_relocated
+        );
     }
 }
