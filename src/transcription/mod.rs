@@ -1554,4 +1554,69 @@ providers:
         // concrete type stays private behind the trait.
         let _: Box<dyn OneShotTranscriber> = t;
     }
+
+    /// End-to-end guard on the pre-upload normalization step for a
+    /// *long* recording.
+    ///
+    /// `encode_16k_mono_ogg` is the one call site that hands a whole
+    /// decoded file to `OggOpusWriter::write_pcm` in a single call, so
+    /// it is where the historical quadratic front-drain in `write_pcm`
+    /// actually hurt: a 2h22m memo spent ~132 minutes memmoving its PCM
+    /// buffer before contacting the API at all (see the comment on the
+    /// cursor loop in `src/audio/writer.rs`).
+    ///
+    /// This test writes a real 20-minute OGG/Opus file to a temp dir,
+    /// then normalizes it through the production path and asserts the
+    /// whole step stays well under a minute.  The threshold is
+    /// deliberately loose — the point is to catch a return to
+    /// minutes-per-recording, not to benchmark the encoder.  The
+    /// deterministic guard on the underlying cause lives in
+    /// `audio::writer::tests::test_write_pcm_bulk_call_does_not_memmove_quadratically`.
+    #[test]
+    fn encode_16k_mono_ogg_normalizes_a_long_recording_quickly() {
+        use crate::audio::{AudioWriter, OggOpusWriter};
+
+        const SECONDS: usize = 20 * 60;
+        const RATE: usize = 16_000;
+
+        let dir = tempfile::TempDir::new().expect("tmp dir");
+        let path = dir.path().join("talkrs-perf-check.ogg");
+
+        // Build the fixture with the project's own writer rather than an
+        // external tool, so the test has no runtime dependency on ffmpeg.
+        let pcm: Vec<i16> = (0..SECONDS * RATE)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                ((t * 440.0 * std::f32::consts::TAU).sin() * 12000.0) as i16
+            })
+            .collect();
+        let mut writer =
+            OggOpusWriter::new(crate::config::AudioConfig::new()).expect("writer construction");
+        let mut fixture = writer.header().expect("header");
+        fixture.extend_from_slice(&writer.write_pcm(&pcm).expect("encode fixture"));
+        fixture.extend_from_slice(&writer.finalize().expect("finalize fixture"));
+        std::fs::write(&path, &fixture).expect("write fixture");
+
+        let started = std::time::Instant::now();
+        let out = encode_16k_mono_ogg(&path).expect("normalization must succeed");
+        let elapsed = started.elapsed();
+
+        assert!(!out.is_empty(), "normalization produced no bytes");
+        assert_eq!(
+            &out[0..4],
+            b"OggS",
+            "normalized output must be an OGG stream"
+        );
+        eprintln!(
+            "encode_16k_mono_ogg: {SECONDS}s recording ({} bytes in, {} bytes out) in {:?}",
+            fixture.len(),
+            out.len(),
+            elapsed
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "normalizing a {SECONDS}s recording took {elapsed:?}; the pre-upload step has \
+             regressed to the quadratic-buffer regime"
+        );
+    }
 }
