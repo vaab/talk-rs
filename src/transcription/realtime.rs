@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -50,6 +50,23 @@ pub enum TranscriptionEvent {
         start: Option<f64>,
         end: Option<f64>,
     },
+    /// Conversation item ordering metadata.
+    ItemCreated {
+        item_id: String,
+        previous_item_id: Option<String>,
+    },
+    /// Provisional text for one conversation item content part.
+    ItemTextDelta {
+        item_id: String,
+        content_index: u64,
+        text: String,
+    },
+    /// Authoritative text for one conversation item content part.
+    ItemTextCompleted {
+        item_id: String,
+        content_index: u64,
+        transcript: String,
+    },
     /// Detected language.
     Language { language: String },
     /// Realtime session metadata.
@@ -70,6 +87,247 @@ pub enum TranscriptionEvent {
         event_type: Option<String>,
         raw: String,
     },
+}
+
+#[derive(Debug, Default)]
+struct ItemText {
+    provisional: String,
+    completed: Option<String>,
+    emitted: bool,
+}
+
+#[derive(Debug)]
+struct ItemOrder {
+    previous_item_id: Option<String>,
+    first_seen: usize,
+    order_known: bool,
+}
+
+/// Reconciled transcript state for item-aware realtime providers.
+///
+/// Text is keyed by `(item_id, content_index)`. Deltas append only to
+/// their provisional item content, while completion replaces that
+/// content. Conversation links determine item order; first-seen order
+/// is the deterministic fallback for absent or incomplete links.
+#[derive(Debug, Default)]
+pub(crate) struct OrderedItemTranscript {
+    text: BTreeMap<(String, u64), ItemText>,
+    order: BTreeMap<String, ItemOrder>,
+    next_first_seen: usize,
+}
+
+impl OrderedItemTranscript {
+    pub(crate) fn item_created(&mut self, item_id: &str, previous_item_id: Option<&str>) {
+        self.ensure_item(item_id);
+        if let Some(order) = self.order.get_mut(item_id) {
+            order.order_known = true;
+            if let Some(previous_item_id) = previous_item_id {
+                order.previous_item_id = Some(previous_item_id.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn append_delta(&mut self, item_id: &str, content_index: u64, text: &str) {
+        self.ensure_item(item_id);
+        self.text
+            .entry((item_id.to_string(), content_index))
+            .or_default()
+            .provisional
+            .push_str(text);
+    }
+
+    pub(crate) fn complete(&mut self, item_id: &str, content_index: u64, transcript: &str) {
+        self.ensure_item(item_id);
+        self.text
+            .entry((item_id.to_string(), content_index))
+            .or_default()
+            .completed = Some(transcript.to_string());
+    }
+
+    pub(crate) fn snapshot(&self) -> String {
+        self.render(false).join(" ")
+    }
+
+    /// Drain authoritative content that is safe to emit in conversation order.
+    ///
+    /// Items without explicit order metadata remain buffered. A successor also
+    /// remains buffered until its known predecessor has fully emitted.
+    pub(crate) fn drain_completed_prefix(&mut self) -> Vec<String> {
+        let mut drained = Vec::new();
+        for item_id in self.ordered_item_ids() {
+            let Some(order) = self.order.get(&item_id) else {
+                break;
+            };
+            if !order.order_known {
+                break;
+            }
+            if let Some(previous_item_id) = order.previous_item_id.as_deref() {
+                if !self.item_is_resolved(previous_item_id) {
+                    break;
+                }
+            }
+
+            let keys = self.item_keys(&item_id);
+            if keys.is_empty() {
+                break;
+            }
+            let mut expected_index = 0;
+            for key in keys {
+                if key.1 != expected_index {
+                    return drained;
+                }
+                let Some(item_text) = self.text.get_mut(&key) else {
+                    return drained;
+                };
+                if item_text.emitted {
+                    expected_index += 1;
+                    continue;
+                }
+                let Some(completed) = item_text.completed.as_deref() else {
+                    return drained;
+                };
+                if !completed.is_empty() {
+                    drained.push(completed.to_string());
+                }
+                item_text.emitted = true;
+                expected_index += 1;
+            }
+        }
+        drained
+    }
+
+    /// Drain all remaining terminal text exactly once.
+    ///
+    /// Authoritative content wins when present; otherwise provisional text is
+    /// retained as the terminal fallback.
+    pub(crate) fn drain_terminal(&mut self) -> Vec<String> {
+        let mut drained = self.drain_completed_prefix();
+        for item_id in self.ordered_item_ids() {
+            for key in self.item_keys(&item_id) {
+                let Some(item_text) = self.text.get_mut(&key) else {
+                    continue;
+                };
+                if item_text.emitted {
+                    continue;
+                }
+                let text = item_text
+                    .completed
+                    .as_deref()
+                    .unwrap_or(item_text.provisional.as_str());
+                if !text.is_empty() {
+                    drained.push(text.to_string());
+                }
+                item_text.emitted = true;
+            }
+        }
+        drained
+    }
+
+    pub(crate) fn reset_generation(&mut self) {
+        self.text.clear();
+        self.order.clear();
+        self.next_first_seen = 0;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn ensure_item(&mut self, item_id: &str) {
+        if self.order.contains_key(item_id) {
+            return;
+        }
+        self.order.insert(
+            item_id.to_string(),
+            ItemOrder {
+                previous_item_id: None,
+                first_seen: self.next_first_seen,
+                order_known: false,
+            },
+        );
+        self.next_first_seen += 1;
+    }
+
+    fn render(&self, completed_only: bool) -> Vec<String> {
+        self.ordered_item_ids()
+            .into_iter()
+            .filter_map(|item_id| {
+                let parts = self
+                    .text
+                    .iter()
+                    .filter(|((id, _), _)| id == &item_id)
+                    .filter_map(|(_, item_text)| {
+                        if completed_only {
+                            item_text.completed.as_deref()
+                        } else {
+                            item_text
+                                .completed
+                                .as_deref()
+                                .or(Some(item_text.provisional.as_str()))
+                        }
+                    })
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (!parts.is_empty()).then_some(parts)
+            })
+            .collect()
+    }
+
+    fn item_keys(&self, item_id: &str) -> Vec<(String, u64)> {
+        self.text
+            .keys()
+            .filter(|(id, _)| id == item_id)
+            .cloned()
+            .collect()
+    }
+
+    fn item_is_resolved(&self, item_id: &str) -> bool {
+        let keys = self.item_keys(item_id);
+        !keys.is_empty()
+            && keys
+                .iter()
+                .enumerate()
+                .all(|(index, key)| key.1 == index as u64 && self.text[key].emitted)
+    }
+
+    fn ordered_item_ids(&self) -> Vec<String> {
+        let mut first_seen = self.order.keys().cloned().collect::<Vec<_>>();
+        first_seen.sort_by_key(|item_id| self.order[item_id].first_seen);
+
+        let mut visiting = BTreeSet::new();
+        let mut emitted = BTreeSet::new();
+        let mut ordered = Vec::new();
+        for item_id in first_seen {
+            self.visit_item(&item_id, &mut visiting, &mut emitted, &mut ordered);
+        }
+        ordered
+    }
+
+    fn visit_item(
+        &self,
+        item_id: &str,
+        visiting: &mut BTreeSet<String>,
+        emitted: &mut BTreeSet<String>,
+        ordered: &mut Vec<String>,
+    ) {
+        if emitted.contains(item_id) || !visiting.insert(item_id.to_string()) {
+            return;
+        }
+        if let Some(previous_item_id) = self
+            .order
+            .get(item_id)
+            .and_then(|item| item.previous_item_id.as_deref())
+        {
+            if self.order.contains_key(previous_item_id) {
+                self.visit_item(previous_item_id, visiting, emitted, ordered);
+            }
+        }
+        visiting.remove(item_id);
+        if emitted.insert(item_id.to_string()) {
+            ordered.push(item_id.to_string());
+        }
+    }
 }
 
 /// Parse a JSON text frame into a `TranscriptionEvent`.
@@ -703,6 +961,131 @@ mod tests {
             }
             other => panic!("Expected SegmentDelta, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn ordered_items_replace_provisional_with_completed() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.item_created("item-1", None);
+        transcript.append_delta("item-1", 0, "Hello");
+        transcript.append_delta("item-1", 0, " world");
+        assert_eq!(transcript.snapshot(), "Hello world");
+
+        transcript.complete("item-1", 0, "Hello, corrected world.");
+
+        assert_eq!(transcript.snapshot(), "Hello, corrected world.");
+        assert_eq!(transcript.snapshot(), "Hello, corrected world.");
+    }
+
+    #[test]
+    fn ordered_items_render_conversation_order_when_completed_in_reverse() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.item_created("item-1", None);
+        transcript.item_created("item-2", Some("item-1"));
+
+        transcript.complete("item-2", 0, "second");
+        assert!(transcript.drain_completed_prefix().is_empty());
+        transcript.complete("item-1", 0, "first");
+
+        assert_eq!(transcript.snapshot(), "first second");
+        assert_eq!(
+            transcript.drain_completed_prefix(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn ordered_items_late_order_metadata_unblocks_completed_prefix() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.complete("item-2", 0, "second");
+        assert!(transcript.drain_completed_prefix().is_empty());
+
+        transcript.item_created("item-1", None);
+        transcript.complete("item-1", 0, "first");
+        transcript.item_created("item-2", Some("item-1"));
+
+        assert_eq!(
+            transcript.drain_completed_prefix(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn ordered_items_drain_multiple_content_indexes_in_order() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.item_created("item-1", None);
+        transcript.append_delta("item-1", 0, "zero provisional");
+        transcript.append_delta("item-1", 1, "one provisional");
+        transcript.complete("item-1", 1, "one");
+        assert!(transcript.drain_completed_prefix().is_empty());
+
+        transcript.complete("item-1", 0, "zero");
+
+        assert_eq!(
+            transcript.drain_completed_prefix(),
+            vec!["zero".to_string(), "one".to_string()]
+        );
+    }
+
+    #[test]
+    fn ordered_items_terminal_drain_preserves_provisional_once() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.item_created("item-1", None);
+        transcript.append_delta("item-1", 0, "provisional terminal text");
+
+        assert_eq!(
+            transcript.drain_terminal(),
+            vec!["provisional terminal text".to_string()]
+        );
+        assert!(transcript.drain_terminal().is_empty());
+    }
+
+    #[test]
+    fn ordered_items_empty_completion_replaces_provisional_without_emission() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.item_created("item-1", None);
+        transcript.append_delta("item-1", 0, "discard me");
+        transcript.complete("item-1", 0, "");
+
+        assert!(transcript.drain_completed_prefix().is_empty());
+        assert!(transcript.drain_terminal().is_empty());
+        assert_eq!(transcript.snapshot(), "");
+    }
+
+    #[test]
+    fn ordered_items_accept_completion_without_delta() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.complete("item-1", 0, "authoritative only");
+
+        assert_eq!(transcript.snapshot(), "authoritative only");
+        assert_eq!(transcript.snapshot(), "authoritative only");
+    }
+
+    #[test]
+    fn ordered_items_fall_back_to_first_seen_order_without_links() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.complete("item-b", 0, "first seen");
+        transcript.complete("item-a", 0, "second seen");
+
+        assert_eq!(transcript.snapshot(), "first seen second seen");
+    }
+
+    #[test]
+    fn ordered_items_generation_reset_clears_active_item_ids() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.item_created("old-item", None);
+        transcript.complete("old-item", 0, "old");
+        assert_eq!(transcript.drain_completed_prefix(), vec!["old".to_string()]);
+
+        transcript.reset_generation();
+        transcript.item_created("fresh-item", None);
+        transcript.complete("fresh-item", 0, "fresh");
+
+        assert_eq!(transcript.snapshot(), "fresh");
+        assert_eq!(
+            transcript.drain_completed_prefix(),
+            vec!["fresh".to_string()]
+        );
     }
 
     #[test]

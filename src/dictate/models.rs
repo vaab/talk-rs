@@ -38,14 +38,14 @@ pub(super) fn resolve_model(
                     .openai
                     .as_ref()
                     .map(|c| c.realtime_model.clone())
-                    .unwrap_or_else(|| "gpt-realtime-whisper".to_string())
+                    .unwrap_or_else(|| "gpt-live-transcribe".to_string())
             } else {
                 config
                     .providers
                     .openai
                     .as_ref()
                     .map(|c| c.model.clone())
-                    .unwrap_or_else(|| "whisper-1".to_string())
+                    .unwrap_or_else(|| "gpt-transcribe".to_string())
             }
         }
         // Parakeet has only a one-shot model; the `realtime` flag is
@@ -58,10 +58,6 @@ pub(super) fn resolve_model(
             .unwrap_or_else(|| "parakeet-tdt-0.6b-v3-int8".to_string()),
     }
 }
-
-/// Known OpenAI models for the `/v1/audio/transcriptions` endpoint.
-const OPENAI_TRANSCRIPTION_MODELS: &[&str] =
-    &["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"];
 
 /// Known Mistral models for the `/v1/audio/transcriptions` endpoint.
 ///
@@ -80,19 +76,11 @@ const MISTRAL_REALTIME_MODELS: &[&str] = &["voxtral-mini-transcribe-realtime-260
 
 /// Known OpenAI models that support realtime (WebSocket) transcription.
 ///
-/// After the 2026-02-27 Realtime API GA cutover, the historical
-/// list ``["gpt-4o-mini-transcribe", "gpt-4o-transcribe"]`` is
-/// no longer accepted by the GA endpoint — those names return
-/// ``invalid_model`` from the realtime transcription path.  The
-/// GA model for streaming transcription is
-/// ``"gpt-realtime-whisper"``.
-const OPENAI_REALTIME_MODELS: &[&str] = &["gpt-realtime-whisper"];
-
 /// Push all known realtime transcription models for `provider` into
 /// `out`.  The third element of each tuple is `true` (streaming).
 fn add_known_realtime_models(out: &mut Vec<(Provider, String, bool)>, provider: Provider) {
     let models = match provider {
-        Provider::OpenAI => OPENAI_REALTIME_MODELS,
+        Provider::OpenAI => crate::transcription::openai::OPENAI_REALTIME_MODELS,
         Provider::Mistral => MISTRAL_REALTIME_MODELS,
         // Parakeet has no realtime mode.
         Provider::Parakeet => &[],
@@ -112,7 +100,10 @@ pub(super) fn build_retry_candidates(
     // If the user explicitly specified a model, include it even if it
     // is not in the known list (e.g. a dated snapshot or new model).
     if let (Some(provider), Some(model)) = (cli_provider, cli_model) {
-        out.push((provider, model.to_string(), false));
+        let streaming = provider == Provider::OpenAI
+            && crate::transcription::openai::known_model_mode(model)
+                == Some(crate::transcription::openai::OpenAITranscriptionMode::Realtime);
+        out.push((provider, model.to_string(), streaming));
     }
 
     match cli_provider {
@@ -171,7 +162,7 @@ pub(super) fn build_retry_candidates(
 /// as `(provider, model, streaming=false)` triples.
 fn add_known_models_with_streaming(out: &mut Vec<(Provider, String, bool)>, provider: Provider) {
     let models = match provider {
-        Provider::OpenAI => OPENAI_TRANSCRIPTION_MODELS,
+        Provider::OpenAI => crate::transcription::openai::OPENAI_BATCH_MODELS,
         Provider::Mistral => MISTRAL_TRANSCRIPTION_MODELS,
         Provider::Parakeet => PARAKEET_TRANSCRIPTION_MODELS,
     };
@@ -262,5 +253,51 @@ mod tests {
             "explicit --provider parakeet must yield Parakeet candidates; got: {:?}",
             candidates
         );
+    }
+
+    #[test]
+    fn openai_defaults_and_known_catalogs_are_consistent() {
+        let config = config_with_parakeet(None);
+        assert_eq!(
+            resolve_model(None, &config, Provider::OpenAI, false),
+            "gpt-transcribe"
+        );
+        assert_eq!(
+            resolve_model(None, &config, Provider::OpenAI, true),
+            "gpt-live-transcribe"
+        );
+
+        let candidates = build_retry_candidates(&config, Some(Provider::OpenAI), None);
+        for model in [
+            "gpt-transcribe",
+            "whisper-1",
+            "gpt-4o-transcribe",
+            "gpt-4o-mini-transcribe",
+        ] {
+            assert!(candidates.contains(&(Provider::OpenAI, model.to_string(), false)));
+        }
+        for model in ["gpt-live-transcribe", "gpt-realtime-whisper"] {
+            assert!(candidates.contains(&(Provider::OpenAI, model.to_string(), true)));
+        }
+    }
+
+    #[test]
+    fn explicit_openai_realtime_model_is_only_classified_realtime() {
+        let config = config_with_parakeet(None);
+        for model in crate::transcription::openai::OPENAI_REALTIME_MODELS {
+            let candidates = build_retry_candidates(&config, Some(Provider::OpenAI), Some(model));
+            assert!(candidates.contains(&(Provider::OpenAI, (*model).to_string(), true)));
+            assert!(!candidates.contains(&(Provider::OpenAI, (*model).to_string(), false)));
+        }
+    }
+
+    #[test]
+    fn explicit_openai_batch_model_is_only_classified_batch() {
+        let config = config_with_parakeet(None);
+        for model in crate::transcription::openai::OPENAI_BATCH_MODELS {
+            let candidates = build_retry_candidates(&config, Some(Provider::OpenAI), Some(model));
+            assert!(candidates.contains(&(Provider::OpenAI, (*model).to_string(), false)));
+            assert!(!candidates.contains(&(Provider::OpenAI, (*model).to_string(), true)));
+        }
     }
 }

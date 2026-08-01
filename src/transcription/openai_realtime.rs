@@ -2,7 +2,7 @@
 //!
 //! Connects to the OpenAI Realtime API over WebSocket in
 //! transcription-only mode (`?intent=transcription`), configures
-//! the session via `transcription_session.update`, streams PCM
+//! the session via `session.update`, streams PCM
 //! audio resampled from 16 kHz to 24 kHz, and receives
 //! incremental transcription events.
 
@@ -141,26 +141,51 @@ pub fn parse_openai_event(json_str: &str) -> TranscriptionEvent {
         }
 
         Some("conversation.item.input_audio_transcription.delta") => {
-            let text = value
-                .get("delta")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            TranscriptionEvent::TextDelta { text }
+            match (openai_item_key(&value), string_field(&value, "delta")) {
+                (Some((item_id, content_index)), Some(text)) => TranscriptionEvent::ItemTextDelta {
+                    item_id,
+                    content_index,
+                    text,
+                },
+                _ => unknown_openai_event(event_type, json_str),
+            }
         }
 
         Some("conversation.item.input_audio_transcription.completed") => {
-            let text = value
-                .get("transcript")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            TranscriptionEvent::SegmentDelta {
-                text,
-                start: None,
-                end: None,
+            match (openai_item_key(&value), string_field(&value, "transcript")) {
+                (Some((item_id, content_index)), Some(transcript)) => {
+                    TranscriptionEvent::ItemTextCompleted {
+                        item_id,
+                        content_index,
+                        transcript,
+                    }
+                }
+                _ => unknown_openai_event(event_type, json_str),
             }
         }
+
+        Some("conversation.item.created") => {
+            let item_id = value
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(|id| id.as_str())
+                .or_else(|| value.get("item_id").and_then(|id| id.as_str()));
+            match item_id {
+                Some(item_id) => TranscriptionEvent::ItemCreated {
+                    item_id: item_id.to_string(),
+                    previous_item_id: optional_string_field(&value, "previous_item_id"),
+                },
+                None => unknown_openai_event(event_type, json_str),
+            }
+        }
+
+        Some("input_audio_buffer.committed") => match string_field(&value, "item_id") {
+            Some(item_id) => TranscriptionEvent::ItemCreated {
+                item_id,
+                previous_item_id: optional_string_field(&value, "previous_item_id"),
+            },
+            None => unknown_openai_event(event_type, json_str),
+        },
 
         Some("error") => {
             let message = value
@@ -175,18 +200,35 @@ pub fn parse_openai_event(json_str: &str) -> TranscriptionEvent {
         Some("rate_limits.updated") => TranscriptionEvent::RateLimitsUpdated { raw: value },
 
         // VAD events — logged by caller, no user-visible event.
-        Some("input_audio_buffer.speech_started")
-        | Some("input_audio_buffer.speech_stopped")
-        | Some("input_audio_buffer.committed")
-        | Some("conversation.item.created") => TranscriptionEvent::Unknown {
-            event_type: event_type.map(|s| s.to_string()),
-            raw: json_str.to_string(),
-        },
+        Some("input_audio_buffer.speech_started") | Some("input_audio_buffer.speech_stopped") => {
+            unknown_openai_event(event_type, json_str)
+        }
 
-        _ => TranscriptionEvent::Unknown {
-            event_type: event_type.map(|s| s.to_string()),
-            raw: json_str.to_string(),
-        },
+        _ => unknown_openai_event(event_type, json_str),
+    }
+}
+
+fn openai_item_key(value: &serde_json::Value) -> Option<(String, u64)> {
+    let item_id = value.get("item_id")?.as_str()?.to_string();
+    let content_index = value.get("content_index")?.as_u64()?;
+    Some((item_id, content_index))
+}
+
+fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    value.get(field)?.as_str().map(ToString::to_string)
+}
+
+fn optional_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+fn unknown_openai_event(event_type: Option<&str>, raw: &str) -> TranscriptionEvent {
+    TranscriptionEvent::Unknown {
+        event_type: event_type.map(ToString::to_string),
+        raw: raw.to_string(),
     }
 }
 
@@ -214,7 +256,7 @@ fn extract_ws_upgrade_headers(
 ///
 /// Uses `?intent=transcription` to create a transcription-only
 /// session.  The transcription model is set separately in
-/// `transcription_session.update`.
+/// `session.update`.
 pub fn build_ws_url(endpoint: &str) -> String {
     format!("{}{}?{}", endpoint, REALTIME_PATH, REALTIME_INTENT)
 }
@@ -234,13 +276,70 @@ fn http_to_ws(url: &str) -> String {
     }
 }
 
+fn build_session_update(
+    config: &OpenAIConfig,
+    model: &str,
+) -> Result<serde_json::Value, TalkError> {
+    let capability = super::openai::validate_openai_hints(
+        super::openai::OpenAITranscriptionMode::Realtime,
+        model,
+        config.prompt.as_deref(),
+        config.keywords.as_deref(),
+        config.languages.as_deref(),
+        config.realtime_delay,
+    )?;
+
+    let mut transcription = serde_json::Map::new();
+    transcription.insert("model".to_string(), serde_json::json!(model));
+    if let Some(prompt) = &config.prompt {
+        transcription.insert("prompt".to_string(), serde_json::json!(prompt));
+    }
+    match capability {
+        super::openai::OpenAIModelCapability::GptLiveTranscribe => {
+            if let Some(keywords) = &config.keywords {
+                transcription.insert("keywords".to_string(), serde_json::json!(keywords));
+            }
+            if let Some(languages) = &config.languages {
+                transcription.insert("languages".to_string(), serde_json::json!(languages));
+            }
+            if let Some(delay) = config.realtime_delay {
+                transcription.insert("delay".to_string(), serde_json::json!(delay.to_string()));
+            }
+        }
+        super::openai::OpenAIModelCapability::LegacyRealtime => {
+            if let Some(language) = config.languages.as_ref().and_then(|values| values.first()) {
+                transcription.insert("language".to_string(), serde_json::json!(language));
+            }
+        }
+        super::openai::OpenAIModelCapability::GptTranscribe
+        | super::openai::OpenAIModelCapability::LegacyBatch => {
+            return Err(TalkError::Config(format!(
+                "OpenAI model '{model}' cannot be encoded for realtime transcription"
+            )));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "type": "session.update",
+        "session": {
+            "type": "transcription",
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "transcription": transcription
+                }
+            }
+        }
+    }))
+}
+
 // ── Transcriber ─────────────────────────────────────────────────────
 
 /// Realtime transcriber that connects via WebSocket to the OpenAI
 /// Realtime API in transcription-only mode.
 pub struct OpenAIRealtimeTranscriber {
     config: OpenAIConfig,
-    /// Transcription model (e.g. `gpt-4o-mini-transcribe`).
+    /// Realtime transcription model (e.g. `gpt-live-transcribe`).
     model: String,
     endpoint: String,
     /// Telemetry sink for WS upgrade lifecycle events.
@@ -298,8 +397,8 @@ impl OpenAIRealtimeTranscriber {
         }
     }
 
-    /// Open a throwaway WebSocket connection, send
-    /// `transcription_session.update` with our model config, and
+    /// Open a throwaway WebSocket connection, send `session.update`
+    /// with our model config, and
     /// wait for the API's answer.
     ///
     /// Uses [`super::transport::ws_upgrade`] for the handshake so
@@ -307,6 +406,7 @@ impl OpenAIRealtimeTranscriber {
     /// transport machinery.
     #[allow(dead_code)]
     async fn validate_realtime_session(&self) -> Result<(), TalkError> {
+        let session_update = build_session_update(&self.config, &self.model)?;
         let ws_url = build_ws_url(&self.endpoint);
 
         log::debug!("validation: connecting to {}", ws_url);
@@ -363,20 +463,6 @@ impl OpenAIRealtimeTranscriber {
         // namespace — the same ``session.update`` event handles
         // both speech-to-speech and transcription, discriminated
         // by the inner ``session.type`` field.
-        let session_update = serde_json::json!({
-            "type": "session.update",
-            "session": {
-                "type": "transcription",
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 24000},
-                        "transcription": {
-                            "model": self.model,
-                        }
-                    }
-                }
-            }
-        });
         sink.send(Message::Text(session_update.to_string()))
             .await
             .map_err(|e| TalkError::Config(format!("Failed to send session.update: {}", e)))?;
@@ -433,6 +519,7 @@ impl OpenAIRealtimeTranscriber {
         &self,
         audio_rx: mpsc::Receiver<Vec<i16>>,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TalkError> {
+        let session_update = build_session_update(&self.config, &self.model)?;
         let ws_url = build_ws_url(&self.endpoint);
 
         log::debug!("connecting to OpenAI Realtime WebSocket: {}", ws_url);
@@ -497,20 +584,6 @@ impl OpenAIRealtimeTranscriber {
         // Send session.update in the GA shape — see the mirror
         // call in `validate_realtime_session` for the rationale
         // (flat beta format was deprecated 2026-02-27).
-        let session_update = serde_json::json!({
-            "type": "session.update",
-            "session": {
-                "type": "transcription",
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": 24000},
-                        "transcription": {
-                            "model": self.model,
-                        }
-                    }
-                }
-            }
-        });
         log::debug!("sending session.update (GA) with model={}", self.model);
         ws_sink
             .send(Message::Text(session_update.to_string()))
@@ -578,6 +651,14 @@ impl OpenAIRealtimeTranscriber {
 #[async_trait]
 impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
     async fn validate(&self) -> Result<(), TalkError> {
+        super::openai::validate_openai_hints(
+            super::openai::OpenAITranscriptionMode::Realtime,
+            &self.model,
+            self.config.prompt.as_deref(),
+            self.config.keywords.as_deref(),
+            self.config.languages.as_deref(),
+            self.config.realtime_delay,
+        )?;
         // Step 1: REST check — validates API key + model existence,
         // and lists available transcription models on failure.
         let api_base = self
@@ -596,7 +677,7 @@ impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
         .await?;
 
         // Step 2: WebSocket check — connect, send
-        // transcription_session.update with our model config, and wait
+        // session.update with our model config, and wait
         // for the API's answer.  This catches errors like "model X is
         // not supported in realtime mode" that the REST models endpoint
         // cannot detect.
@@ -846,6 +927,19 @@ async fn receiver_loop<S>(
 mod tests {
     use super::*;
 
+    fn openai_config(model: &str) -> OpenAIConfig {
+        OpenAIConfig {
+            api_key: "key".to_string(),
+            url: None,
+            model: "gpt-transcribe".to_string(),
+            realtime_model: model.to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
+        }
+    }
+
     #[test]
     fn test_http_to_ws_https() {
         assert_eq!(http_to_ws("https://api.openai.com"), "wss://api.openai.com");
@@ -862,7 +956,11 @@ mod tests {
             api_key: "key".to_string(),
             url: Some("https://custom.example.com".to_string()),
             model: "whisper-1".to_string(),
-            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            realtime_model: "gpt-live-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIRealtimeTranscriber::new(config);
         assert_eq!(transcriber.endpoint, "wss://custom.example.com");
@@ -874,7 +972,11 @@ mod tests {
             api_key: "key".to_string(),
             url: None,
             model: "whisper-1".to_string(),
-            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            realtime_model: "gpt-live-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIRealtimeTranscriber::new(config);
         assert_eq!(transcriber.endpoint, "wss://api.openai.com");
@@ -886,10 +988,14 @@ mod tests {
             api_key: "key".to_string(),
             url: Some("https://custom.example.com".to_string()),
             model: "whisper-1".to_string(),
-            realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            realtime_model: "gpt-live-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber =
-            OpenAIRealtimeTranscriber::with_model(config, "gpt-4o-transcribe".to_string());
+            OpenAIRealtimeTranscriber::with_model(config, "gpt-realtime-whisper".to_string());
         assert_eq!(transcriber.endpoint, "wss://custom.example.com");
     }
 
@@ -961,24 +1067,68 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_openai_event_transcription_delta() {
-        let json =
-            r#"{"type": "conversation.item.input_audio_transcription.delta", "delta": "hello "}"#;
+    fn openai_delta_preserves_item_key_and_text() {
+        let json = r#"{"type":"conversation.item.input_audio_transcription.delta","item_id":"item-7","content_index":2,"delta":"hello "}"#;
         match parse_openai_event(json) {
-            TranscriptionEvent::TextDelta { text } => assert_eq!(text, "hello "),
-            other => panic!("expected TextDelta, got {:?}", other),
+            TranscriptionEvent::ItemTextDelta {
+                item_id,
+                content_index,
+                text,
+            } => {
+                assert_eq!(item_id, "item-7");
+                assert_eq!(content_index, 2);
+                assert_eq!(text, "hello ");
+            }
+            other => panic!("expected ItemTextDelta, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_parse_openai_event_transcription_completed() {
-        let json = r#"{"type": "conversation.item.input_audio_transcription.completed", "transcript": "hello world"}"#;
+    fn openai_completed_preserves_item_key_and_authoritative_transcript() {
+        let json = r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-7","content_index":2,"transcript":"hello, corrected world."}"#;
         match parse_openai_event(json) {
-            TranscriptionEvent::SegmentDelta { text, .. } => {
-                assert_eq!(text, "hello world");
+            TranscriptionEvent::ItemTextCompleted {
+                item_id,
+                content_index,
+                transcript,
+            } => {
+                assert_eq!(item_id, "item-7");
+                assert_eq!(content_index, 2);
+                assert_eq!(transcript, "hello, corrected world.");
             }
-            other => panic!("expected SegmentDelta, got {:?}", other),
+            other => panic!("expected ItemTextCompleted, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn openai_order_events_preserve_item_links() {
+        let created = r#"{"type":"conversation.item.created","previous_item_id":"item-1","item":{"id":"item-2"}}"#;
+        let committed = r#"{"type":"input_audio_buffer.committed","item_id":"item-3","previous_item_id":"item-2"}"#;
+
+        for (json, expected_item, expected_previous) in [
+            (created, "item-2", Some("item-1")),
+            (committed, "item-3", Some("item-2")),
+        ] {
+            match parse_openai_event(json) {
+                TranscriptionEvent::ItemCreated {
+                    item_id,
+                    previous_item_id,
+                } => {
+                    assert_eq!(item_id, expected_item);
+                    assert_eq!(previous_item_id.as_deref(), expected_previous);
+                }
+                other => panic!("expected ItemCreated, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn openai_malformed_item_event_remains_nonfatal() {
+        let json = r#"{"type":"conversation.item.input_audio_transcription.delta","content_index":0,"delta":"hello"}"#;
+        assert!(matches!(
+            parse_openai_event(json),
+            TranscriptionEvent::Unknown { .. }
+        ));
     }
 
     #[test]
@@ -1033,5 +1183,172 @@ mod tests {
         let b64 = pcm_bytes_to_base64(&bytes);
         let decoded = BASE64_STANDARD.decode(&b64).expect("valid base64");
         assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn gpt_live_session_update_nests_exact_migration_fields() {
+        let mut config = openai_config("gpt-live-transcribe");
+        config.prompt = Some("Keep names exact.".to_string());
+        config.keywords = Some(vec!["Kalysto".to_string(), "talk-rs".to_string()]);
+        config.languages = Some(vec!["fr".to_string(), "en".to_string()]);
+        config.realtime_delay = Some(crate::config::OpenAIRealtimeDelay::High);
+
+        let actual = build_session_update(&config, "gpt-live-transcribe").expect("valid update");
+        assert_eq!(
+            actual,
+            serde_json::json!({
+                "type": "session.update",
+                "session": {
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "transcription": {
+                                "model": "gpt-live-transcribe",
+                                "prompt": "Keep names exact.",
+                                "keywords": ["Kalysto", "talk-rs"],
+                                "languages": ["fr", "en"],
+                                "delay": "high"
+                            }
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn gpt_live_session_update_omits_unconfigured_hints() {
+        let config = openai_config("gpt-live-transcribe");
+        let actual = build_session_update(&config, "gpt-live-transcribe").expect("valid update");
+        assert_eq!(
+            actual,
+            serde_json::json!({
+                "type": "session.update",
+                "session": {
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "transcription": {"model": "gpt-live-transcribe"}
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_realtime_maps_one_language_and_rejects_incompatible_hints() {
+        let mut config = openai_config("gpt-realtime-whisper");
+        config.prompt = Some("Keep names exact.".to_string());
+        config.languages = Some(vec!["fr".to_string()]);
+        let actual =
+            build_session_update(&config, "gpt-realtime-whisper").expect("valid legacy update");
+        assert_eq!(
+            actual["session"]["audio"]["input"]["transcription"],
+            serde_json::json!({
+                "model": "gpt-realtime-whisper",
+                "prompt": "Keep names exact.",
+                "language": "fr"
+            })
+        );
+
+        config.keywords = Some(vec!["Kalysto".to_string()]);
+        let error =
+            build_session_update(&config, "gpt-realtime-whisper").expect_err("keywords rejected");
+        assert_eq!(error.to_string(), "Configuration error: OpenAI model 'gpt-realtime-whisper' does not support field 'keywords'");
+
+        config.keywords = None;
+        config.languages = Some(vec!["fr".to_string(), "en".to_string()]);
+        let error =
+            build_session_update(&config, "gpt-realtime-whisper").expect_err("languages rejected");
+        assert_eq!(error.to_string(), "Configuration error: OpenAI model 'gpt-realtime-whisper' does not support multiple values for field 'languages'");
+    }
+
+    #[tokio::test]
+    async fn legacy_realtime_rejects_hints_before_websocket_upgrade() {
+        for (keywords, languages, expected) in [
+            (
+                Some(vec!["Kalysto".to_string()]),
+                None,
+                "Configuration error: OpenAI model 'gpt-realtime-whisper' does not support field 'keywords'",
+            ),
+            (
+                None,
+                Some(vec!["fr".to_string(), "en".to_string()]),
+                "Configuration error: OpenAI model 'gpt-realtime-whisper' does not support multiple values for field 'languages'",
+            ),
+        ] {
+            let mut config = openai_config("gpt-realtime-whisper");
+            config.keywords = keywords;
+            config.languages = languages;
+            let transcriber =
+                OpenAIRealtimeTranscriber::with_endpoint(config, "ws://127.0.0.1:1".to_string());
+            let (_audio_tx, audio_rx) = mpsc::channel(1);
+
+            let error = transcriber
+                .transcribe_realtime(audio_rx)
+                .await
+                .expect_err("invalid hints must fail before connecting");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_validate_rejects_hints_before_rest_preflight() {
+        for (keywords, languages, expected) in [
+            (
+                Some(vec!["Kalysto".to_string()]),
+                None,
+                "Configuration error: OpenAI model 'gpt-realtime-whisper' does not support field 'keywords'",
+            ),
+            (
+                None,
+                Some(vec!["fr".to_string(), "en".to_string()]),
+                "Configuration error: OpenAI model 'gpt-realtime-whisper' does not support multiple values for field 'languages'",
+            ),
+        ] {
+            let mut config = openai_config("gpt-realtime-whisper");
+            config.keywords = keywords;
+            config.languages = languages;
+            let transcriber =
+                OpenAIRealtimeTranscriber::with_endpoint(config, "ws://127.0.0.1:1".to_string());
+
+            let error = RealtimeTranscriber::validate(&transcriber)
+                .await
+                .expect_err("hints rejected before REST preflight");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_validate_rejects_known_batch_model_before_rest_preflight() {
+        for model in crate::transcription::openai::OPENAI_BATCH_MODELS {
+            let config = openai_config(model);
+            let transcriber =
+                OpenAIRealtimeTranscriber::with_endpoint(config, "ws://127.0.0.1:1".to_string());
+
+            let error = RealtimeTranscriber::validate(&transcriber)
+                .await
+                .expect_err("batch model rejected before REST preflight");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Configuration error: OpenAI model '{model}' is batch-only and cannot be used for realtime transcription"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn realtime_session_builder_rejects_known_batch_model() {
+        let config = openai_config("gpt-transcribe");
+        let error = build_session_update(&config, "gpt-transcribe")
+            .expect_err("batch model rejected by realtime builder");
+        assert_eq!(
+            error.to_string(),
+            "Configuration error: OpenAI model 'gpt-transcribe' is batch-only and cannot be used for realtime transcription"
+        );
     }
 }

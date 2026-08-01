@@ -210,6 +210,7 @@ pub use openai::OpenAIOneShotTranscriber;
 pub use openai_realtime::OpenAIRealtimeTranscriber;
 #[cfg(feature = "parakeet")]
 pub use parakeet::ParakeetOneShotTranscriber;
+pub(crate) use realtime::OrderedItemTranscript;
 pub use realtime::{MistralRealtimeTranscriber, TranscriptionEvent};
 
 /// Result type for transcription operations.
@@ -621,7 +622,7 @@ pub(crate) fn create_oneshot_transcriber(
             )?))
         }
         Provider::OpenAI => {
-            let mut cfg = config.providers.openai.clone().ok_or_else(|| {
+            let cfg = config.providers.openai.as_ref().ok_or_else(|| {
                 TalkError::Config(
                     "OpenAI provider selected but providers.openai is not configured".to_string(),
                 )
@@ -631,9 +632,7 @@ pub(crate) fn create_oneshot_transcriber(
                     "providers.openai.api_key is required".to_string(),
                 ));
             }
-            if let Some(m) = model {
-                cfg.model = m.to_string();
-            }
+            let cfg = override_openai_batch_model(cfg, model);
             Ok(Box::new(OpenAIOneShotTranscriber::with_policy(
                 cfg, policy,
             )?))
@@ -661,6 +660,17 @@ pub(crate) fn create_oneshot_transcriber(
                 .to_string(),
         )),
     }
+}
+
+fn override_openai_batch_model(
+    config: &crate::config::OpenAIConfig,
+    model: Option<&str>,
+) -> crate::config::OpenAIConfig {
+    let mut config = config.clone();
+    if let Some(model) = model {
+        config.model = model.to_string();
+    }
+    config
 }
 
 /// Read the transcript for a recording from the cache, falling
@@ -909,7 +919,7 @@ fn resolve_effective_model(config: &Config, provider: Provider, model: Option<&s
             .openai
             .as_ref()
             .map(|c| c.model.clone())
-            .unwrap_or_else(|| "whisper-1".to_string()),
+            .unwrap_or_else(|| "gpt-transcribe".to_string()),
         Provider::Parakeet => config
             .providers
             .parakeet
@@ -1423,6 +1433,30 @@ mod tests {
         assert!(result.segments.is_none());
         assert!(result.diarization.is_none());
         assert_eq!(result.text, "");
+    }
+
+    #[test]
+    fn openai_batch_override_clones_config_and_replaces_only_model() {
+        let original = crate::config::OpenAIConfig {
+            api_key: "key".to_string(),
+            url: Some("https://example.test".to_string()),
+            model: "gpt-transcribe".to_string(),
+            realtime_model: "gpt-live-transcribe".to_string(),
+            prompt: Some("prompt".to_string()),
+            keywords: Some(vec!["keyword".to_string()]),
+            languages: Some(vec!["fr".to_string()]),
+            realtime_delay: Some(crate::config::OpenAIRealtimeDelay::Low),
+        };
+
+        let overridden = override_openai_batch_model(&original, Some("whisper-1"));
+        assert_eq!(overridden.model, "whisper-1");
+        assert_eq!(overridden.api_key, original.api_key);
+        assert_eq!(overridden.url, original.url);
+        assert_eq!(overridden.realtime_model, original.realtime_model);
+        assert_eq!(overridden.prompt, original.prompt);
+        assert_eq!(overridden.keywords, original.keywords);
+        assert_eq!(overridden.languages, original.languages);
+        assert_eq!(overridden.realtime_delay, original.realtime_delay);
     }
 
     fn minimal_config() -> Config {

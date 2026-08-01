@@ -200,8 +200,12 @@ providers:
 | ~providers.mistral.tts_model~      | ~voxtral-mini-tts-latest~ | Voxtral TTS model for ~speak --provider mistral~ (shares the STT api_key) |
 | ~providers.mistral.tts_voice~      | /none/                    | Default Mistral preset voice id for ~speak~ (else pass ~--voice~) |
 | ~providers.openai.url~             | ~https://api.openai.com~  | OpenAI API base URL                |
-| ~providers.openai.model~           | ~whisper-1~               | OpenAI batch model                 |
-| ~providers.openai.realtime_model~  | ~gpt-4o-mini-transcribe~  | OpenAI realtime model              |
+| ~providers.openai.model~           | ~gpt-transcribe~          | OpenAI batch model                 |
+| ~providers.openai.realtime_model~  | ~gpt-live-transcribe~     | OpenAI realtime model              |
+| ~providers.openai.prompt~          | /none/                    | Prompt for spelling, punctuation, and context hints |
+| ~providers.openai.keywords~        | /none/                    | Expected vocabulary list for the new models |
+| ~providers.openai.languages~       | /none/                    | Ordered expected-language list     |
+| ~providers.openai.realtime_delay~  | /none/                    | Realtime delay: ~minimal~, ~low~, ~medium~, ~high~, or ~xhigh~ |
 | ~providers.kokoro.model_dir~       | /XDG data dir/            | Kokoro TTS model cache dir (auto-downloaded on first ~speak~) |
 | ~providers.kokoro.voice~           | /per-language default/    | Default Kokoro voice name (~af_heart~, ~ff_siwis~, …)          |
 | ~providers.kokoro.num_threads~     | ~4~                       | Kokoro inference threads           |
@@ -224,6 +228,37 @@ transcription: audio sent to the providers is always downsampled to
 16 kHz mono internally (both Voxtral and Whisper operate at 16 kHz),
 so these knobs do not affect transcription accuracy or upload size.
 
+*** OpenAI model migration
+
+The OpenAI batch default is exactly ~gpt-transcribe~, and the realtime
+default is exactly ~gpt-live-transcribe~.  Existing configuration files
+remain valid: ~prompt~, ~keywords~, ~languages~, and ~realtime_delay~ are
+optional, and omitting them sends no hint fields.
+
+- ~gpt-transcribe~ sends ~prompt~, repeated ~keywords[]~, repeated
+  ~languages[]~, and ~response_format=json~ to the batch endpoint.
+- ~gpt-live-transcribe~ nests ~model~, ~prompt~, ~keywords~,
+  ~languages~, and ~delay~ under
+  ~session.audio.input.transcription~ in the realtime ~session.update~.
+- ~whisper-1~ remains available for segment/word timestamps, subtitles,
+  and translation workflows.  It retains ~response_format=verbose_json~,
+  accepts ~prompt~ and one unambiguous singular ~language~, and does not
+  accept ~keywords~ or multiple languages.
+- ~gpt-4o-transcribe~ and ~gpt-4o-mini-transcribe~ remain available as
+  legacy batch choices.  ~gpt-realtime-whisper~ remains available as a
+  legacy realtime choice, using singular ~language~ for one expected
+  language and rejecting ~keywords~, multiple languages, and
+  ~realtime_delay~.
+
+Configured hints that the selected model cannot represent fail locally
+before HTTP or WebSocket traffic; talk-rs never silently drops them.
+There is no structured previous-turn configuration field in the official
+schema.  Earlier-turn context is service-managed where supported.
+
+Direct-OpenAI prices checked 2026-07-31: ~gpt-transcribe~ costs
+$0.0045/min ($0.27/hr), while ~whisper-1~ costs $0.006/min ($0.36/hr).
+The new batch default is 25% lower, a $0.09 per hour savings.
+
 *** Environment overrides
 
 Every config value can be overridden via environment variables:
@@ -231,7 +266,17 @@ Every config value can be overridden via environment variables:
 #+begin_src sh
 export TALK_RS_PROVIDERS_MISTRAL_API_KEY="sk-..."
 export TALK_RS_PROVIDERS_OPENAI_API_KEY="sk-..."
+export TALK_RS_PROVIDERS_OPENAI_PROMPT="Preserve punctuation and casing."
+export TALK_RS_PROVIDERS_OPENAI_KEYWORDS="Kalysto, talk-rs"
+export TALK_RS_PROVIDERS_OPENAI_LANGUAGES="fr, en"
+export TALK_RS_PROVIDERS_OPENAI_REALTIME_DELAY="low"
 #+end_src
+
+~TALK_RS_PROVIDERS_OPENAI_KEYWORDS~ and
+~TALK_RS_PROVIDERS_OPENAI_LANGUAGES~ are comma-separated lists.  talk-rs
+trims whitespace and ignores empty entries deterministically; environment
+values override YAML in both existing and environment-created OpenAI
+sections.
 
 See ~config.example.yaml~ for the full list.
 
