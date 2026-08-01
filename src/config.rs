@@ -314,6 +314,47 @@ fn default_mistral_tts_model() -> String {
     "voxtral-mini-tts-latest".to_string()
 }
 
+/// Realtime transcription delay requested from OpenAI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAIRealtimeDelay {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl std::fmt::Display for OpenAIRealtimeDelay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        };
+        write!(f, "{value}")
+    }
+}
+
+impl std::str::FromStr for OpenAIRealtimeDelay {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            _ => Err(format!(
+                "invalid OpenAI realtime delay '{value}' (expected minimal, low, medium, high, or xhigh)"
+            )),
+        }
+    }
+}
+
 /// OpenAI API configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct OpenAIConfig {
@@ -328,27 +369,42 @@ pub struct OpenAIConfig {
     #[serde(default)]
     pub url: Option<String>,
 
-    /// Model name for one-shot transcription (defaults to "whisper-1").
+    /// Model name for one-shot transcription (defaults to "gpt-transcribe").
     #[serde(default = "default_openai_model")]
     pub model: String,
 
     /// Model name for realtime transcription (defaults to
-    /// ``"gpt-realtime-whisper"``).  The historical default,
-    /// ``"gpt-4o-mini-transcribe"``, was rejected by the GA
-    /// endpoint after the 2026-02-27 Realtime API GA cutover:
-    /// the server replies ``invalid_model``.  ``gpt-realtime-
-    /// whisper`` is the official transcription model for the GA
-    /// API.
+    /// `"gpt-live-transcribe"`).
     #[serde(default = "default_openai_realtime_model")]
     pub realtime_model: String,
+
+    /// Optional transcription prompt. Supported by the new models and
+    /// retained for compatible legacy models.
+    #[serde(default)]
+    pub prompt: Option<String>,
+
+    /// Optional expected vocabulary. Values are sent as repeated
+    /// `keywords[]` fields by `gpt-transcribe` and as a JSON array by
+    /// `gpt-live-transcribe`.
+    #[serde(default)]
+    pub keywords: Option<Vec<String>>,
+
+    /// Optional expected languages. The new models accept multiple
+    /// values; legacy models accept at most one unambiguous language.
+    #[serde(default)]
+    pub languages: Option<Vec<String>>,
+
+    /// Optional delay profile for `gpt-live-transcribe` realtime sessions.
+    #[serde(default)]
+    pub realtime_delay: Option<OpenAIRealtimeDelay>,
 }
 
 fn default_openai_model() -> String {
-    "whisper-1".to_string()
+    "gpt-transcribe".to_string()
 }
 
 fn default_openai_realtime_model() -> String {
-    "gpt-realtime-whisper".to_string()
+    "gpt-live-transcribe".to_string()
 }
 
 /// Parakeet quantization variant.
@@ -949,6 +1005,10 @@ impl Config {
     /// - TALK_RS_PROVIDERS_OPENAI_URL
     /// - TALK_RS_PROVIDERS_OPENAI_MODEL
     /// - TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL
+    /// - TALK_RS_PROVIDERS_OPENAI_PROMPT
+    /// - TALK_RS_PROVIDERS_OPENAI_KEYWORDS (comma-separated; whitespace and empty entries ignored)
+    /// - TALK_RS_PROVIDERS_OPENAI_LANGUAGES (comma-separated; whitespace and empty entries ignored)
+    /// - TALK_RS_PROVIDERS_OPENAI_REALTIME_DELAY
     /// - TALK_RS_PROVIDERS_PARAKEET_VARIANT
     /// - TALK_RS_PROVIDERS_PARAKEET_MODEL_DIR
     /// - TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS
@@ -1091,6 +1151,18 @@ impl Config {
             if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")? {
                 openai.realtime_model = value;
             }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_PROMPT")? {
+                openai.prompt = Some(value);
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_KEYWORDS")? {
+                openai.keywords = parse_string_list_env(&value);
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_LANGUAGES")? {
+                openai.languages = parse_string_list_env(&value);
+            }
+            if let Some(value) = env_var_string("TALK_RS_PROVIDERS_OPENAI_REALTIME_DELAY")? {
+                openai.realtime_delay = Some(value.parse().map_err(TalkError::Config)?);
+            }
         } else {
             // Allow creating the OpenAI section purely from env vars.
             if let Some(api_key) = env_var_string("TALK_RS_PROVIDERS_OPENAI_API_KEY")? {
@@ -1101,6 +1173,14 @@ impl Config {
                         .unwrap_or_else(default_openai_model),
                     realtime_model: env_var_string("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?
                         .unwrap_or_else(default_openai_realtime_model),
+                    prompt: env_var_string("TALK_RS_PROVIDERS_OPENAI_PROMPT")?,
+                    keywords: env_var_string("TALK_RS_PROVIDERS_OPENAI_KEYWORDS")?
+                        .and_then(|value| parse_string_list_env(&value)),
+                    languages: env_var_string("TALK_RS_PROVIDERS_OPENAI_LANGUAGES")?
+                        .and_then(|value| parse_string_list_env(&value)),
+                    realtime_delay: env_var_string("TALK_RS_PROVIDERS_OPENAI_REALTIME_DELAY")?
+                        .map(|value| value.parse().map_err(TalkError::Config))
+                        .transpose()?,
                 });
             }
         }
@@ -1249,6 +1329,20 @@ fn parse_bool_env(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_string_list_env(value: &str) -> Option<Vec<String>> {
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
 /// Parse an unsigned-integer env var value, producing a clear config
 /// error (naming the variable) on failure.
 fn parse_u32_env(key: &str, value: &str) -> Result<u32, TalkError> {
@@ -1290,6 +1384,7 @@ fn validate_config(config: &Config) -> Result<(), TalkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
     use std::error::Error;
     use std::ffi::OsString;
     use std::io::Write;
@@ -1360,6 +1455,10 @@ mod tests {
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_URL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_MODEL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_REALTIME_MODEL")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_PROMPT")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_KEYWORDS")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_LANGUAGES")?,
+            EnvGuard::clear("TALK_RS_PROVIDERS_OPENAI_REALTIME_DELAY")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_VARIANT")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_MODEL_DIR")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_PARAKEET_NUM_THREADS")?,
@@ -1658,6 +1757,183 @@ providers:
     }
 
     #[test]
+    fn openai_omitted_migration_fields_preserve_defaults() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers:
+              openai:
+                api_key: sk-test-key
+        "})?;
+
+        let config = Config::load(Some(file.path()))?;
+        let openai = config.providers.openai.as_ref().ok_or("openai missing")?;
+        assert_eq!(openai.model, "gpt-transcribe");
+        assert_eq!(openai.realtime_model, "gpt-live-transcribe");
+        assert!(openai.prompt.is_none());
+        assert!(openai.keywords.is_none());
+        assert!(openai.languages.is_none());
+        assert!(openai.realtime_delay.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn openai_yaml_parses_migration_hints() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers:
+              openai:
+                api_key: sk-test-key
+                prompt: Preserve punctuation and casing.
+                keywords: [Kalysto, talk-rs]
+                languages: [fr, en]
+                realtime_delay: high
+        "})?;
+
+        let config = Config::load(Some(file.path()))?;
+        let openai = config.providers.openai.as_ref().ok_or("openai missing")?;
+        assert_eq!(
+            openai.prompt.as_deref(),
+            Some("Preserve punctuation and casing.")
+        );
+        assert_eq!(
+            openai.keywords.as_deref(),
+            Some(&["Kalysto".into(), "talk-rs".into()][..])
+        );
+        assert_eq!(
+            openai.languages.as_deref(),
+            Some(&["fr".into(), "en".into()][..])
+        );
+        assert_eq!(openai.realtime_delay, Some(OpenAIRealtimeDelay::High));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_env_hints_override_yaml_with_trimmed_nonempty_lists() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _prompt = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_PROMPT", "env prompt")?;
+        let _keywords = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_KEYWORDS", " Kalysto, ,talk-rs,")?;
+        let _languages = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_LANGUAGES", " fr, en ,, ")?;
+        let _delay = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_REALTIME_DELAY", "xhigh")?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers:
+              openai:
+                api_key: sk-test-key
+                prompt: yaml prompt
+                keywords: [yaml]
+                languages: [de]
+                realtime_delay: low
+        "})?;
+
+        let config = Config::load(Some(file.path()))?;
+        let openai = config.providers.openai.as_ref().ok_or("openai missing")?;
+        assert_eq!(openai.prompt.as_deref(), Some("env prompt"));
+        assert_eq!(
+            openai.keywords.as_deref(),
+            Some(&["Kalysto".into(), "talk-rs".into()][..])
+        );
+        assert_eq!(
+            openai.languages.as_deref(),
+            Some(&["fr".into(), "en".into()][..])
+        );
+        assert_eq!(openai.realtime_delay, Some(OpenAIRealtimeDelay::Xhigh));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_env_created_section_carries_migration_hints() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _key = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_API_KEY", "sk-env")?;
+        let _prompt = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_PROMPT", "env prompt")?;
+        let _keywords = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_KEYWORDS", "one,two")?;
+        let _languages = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_LANGUAGES", "fr,en")?;
+        let _delay = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_REALTIME_DELAY", "minimal")?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers: {}
+        "})?;
+
+        let config = Config::load(Some(file.path()))?;
+        let openai = config.providers.openai.as_ref().ok_or("openai missing")?;
+        assert_eq!(openai.prompt.as_deref(), Some("env prompt"));
+        assert_eq!(
+            openai.keywords.as_deref(),
+            Some(&["one".into(), "two".into()][..])
+        );
+        assert_eq!(
+            openai.languages.as_deref(),
+            Some(&["fr".into(), "en".into()][..])
+        );
+        assert_eq!(openai.realtime_delay, Some(OpenAIRealtimeDelay::Minimal));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_empty_env_lists_clear_existing_yaml_hints() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _keywords = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_KEYWORDS", " , , ")?;
+        let _languages = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_LANGUAGES", ",,")?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers:
+              openai:
+                api_key: sk-test-key
+                keywords: [yaml]
+                languages: [de]
+        "})?;
+
+        let config = Config::load(Some(file.path()))?;
+        let openai = config.providers.openai.as_ref().ok_or("openai missing")?;
+        assert!(openai.keywords.is_none());
+        assert!(openai.languages.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn openai_empty_env_lists_are_none_in_env_created_section() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _key = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_API_KEY", "sk-env")?;
+        let _keywords = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_KEYWORDS", " , ")?;
+        let _languages = EnvGuard::set("TALK_RS_PROVIDERS_OPENAI_LANGUAGES", ",,")?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers: {}
+        "})?;
+
+        let config = Config::load(Some(file.path()))?;
+        let openai = config.providers.openai.as_ref().ok_or("openai missing")?;
+        assert!(openai.keywords.is_none());
+        assert!(openai.languages.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn openai_explicit_yaml_empty_languages_remains_configured() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers:
+              openai:
+                api_key: sk-test-key
+                languages: []
+        "})?;
+
+        let config = Config::load(Some(file.path()))?;
+        let openai = config.providers.openai.as_ref().ok_or("openai missing")?;
+        assert_eq!(openai.languages.as_deref(), Some(&[][..]));
+        Ok(())
+    }
+
+    #[test]
     fn test_config_openai_env_override() -> Result<(), Box<dyn Error>> {
         let _lock = env_lock()?;
         let _guards = clear_all_provider_env_vars()?;
@@ -1673,7 +1949,8 @@ providers: {}
         let config = Config::load(Some(file.path()))?;
         let o = config.providers.openai.as_ref().expect("openai from env");
         assert_eq!(o.api_key, "sk-env-key");
-        assert_eq!(o.model, "whisper-1"); // default
+        assert_eq!(o.model, "gpt-transcribe");
+        assert_eq!(o.realtime_model, "gpt-live-transcribe");
         Ok(())
     }
 

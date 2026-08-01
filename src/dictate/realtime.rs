@@ -16,10 +16,11 @@ use crate::config::{AudioConfig, Config, Provider};
 use crate::error::TalkError;
 use crate::transcription::{
     self, MistralProviderMetadata, OpenAIProviderMetadata, OpenAIRealtimeMetadata,
-    ProviderSpecificMetadata, TranscriptSegment, TranscriptionEvent, TranscriptionMetadata,
-    TranscriptionResult,
+    OrderedItemTranscript, ProviderSpecificMetadata, TranscriptSegment, TranscriptionEvent,
+    TranscriptionMetadata, TranscriptionResult,
 };
 use crate::x11::visualizer::VisualizerHandle;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -192,6 +193,162 @@ pub(super) async fn buffer_feeder(
     // fwd_tx dropped here → signals end-of-audio downstream.
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NormalTranscriptUpdate {
+    live_text: String,
+    segments_to_send: Vec<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FinishedNormalTranscript {
+    text: String,
+    segments_to_send: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct NormalTranscriptAccumulator {
+    generic_segments: Vec<String>,
+    current_line: String,
+    item_text: OrderedItemTranscript,
+    item_segments: Vec<String>,
+    replay_prefix: VecDeque<String>,
+}
+
+impl NormalTranscriptAccumulator {
+    fn apply(&mut self, event: TranscriptionEvent) -> NormalTranscriptUpdate {
+        let segments_to_send = match event {
+            TranscriptionEvent::TextDelta { text } => {
+                self.current_line.push_str(&text);
+                let previous_len = self.generic_segments.len();
+                flush_sentences(&mut self.current_line, &mut self.generic_segments);
+                self.generic_segments[previous_len..].to_vec()
+            }
+            TranscriptionEvent::SegmentDelta { text, .. } => {
+                let segment = text.trim().to_string();
+                self.current_line.clear();
+                if segment.is_empty() {
+                    Vec::new()
+                } else {
+                    self.generic_segments.push(segment.clone());
+                    vec![segment]
+                }
+            }
+            TranscriptionEvent::ItemCreated {
+                item_id,
+                previous_item_id,
+            } => {
+                self.item_text
+                    .item_created(&item_id, previous_item_id.as_deref());
+                let drained = self.item_text.drain_completed_prefix();
+                self.accept_item_drain(drained)
+            }
+            TranscriptionEvent::ItemTextDelta {
+                item_id,
+                content_index,
+                text,
+            } => {
+                self.item_text.append_delta(&item_id, content_index, &text);
+                Vec::new()
+            }
+            TranscriptionEvent::ItemTextCompleted {
+                item_id,
+                content_index,
+                transcript,
+            } => {
+                self.item_text
+                    .complete(&item_id, content_index, &transcript);
+                let drained = self.item_text.drain_completed_prefix();
+                self.accept_item_drain(drained)
+            }
+            _ => Vec::new(),
+        };
+
+        NormalTranscriptUpdate {
+            live_text: self.live_text(),
+            segments_to_send,
+        }
+    }
+
+    fn finish(&mut self) -> FinishedNormalTranscript {
+        if !self.item_text.is_empty() || !self.item_segments.is_empty() {
+            let drained = self.item_text.drain_terminal();
+            let segments_to_send = self.accept_item_drain(drained);
+            return FinishedNormalTranscript {
+                text: self.item_segments.join(" "),
+                segments_to_send,
+            };
+        }
+
+        let trailing = self.current_line.trim().to_string();
+        let segments_to_send = if trailing.is_empty() {
+            Vec::new()
+        } else {
+            self.generic_segments.push(trailing.clone());
+            vec![trailing]
+        };
+        self.current_line.clear();
+        FinishedNormalTranscript {
+            text: self.generic_segments.join(" "),
+            segments_to_send,
+        }
+    }
+
+    fn live_text(&self) -> String {
+        if !self.item_text.is_empty() {
+            return self.item_text.snapshot();
+        }
+        if !self.item_segments.is_empty() {
+            return self.item_segments.join(" ");
+        }
+        let mut live = self.generic_segments.join(" ");
+        if !live.is_empty() && !self.current_line.is_empty() {
+            live.push(' ');
+        }
+        live.push_str(&self.current_line);
+        live
+    }
+
+    fn text(&self) -> String {
+        if self.item_segments.is_empty() {
+            self.generic_segments.join(" ")
+        } else {
+            self.item_segments.join(" ")
+        }
+    }
+
+    fn segment_count(&self) -> usize {
+        if self.item_segments.is_empty() {
+            self.generic_segments.len()
+        } else {
+            self.item_segments.len()
+        }
+    }
+
+    fn reset_item_generation_for_replay(&mut self) {
+        self.item_text.reset_generation();
+        self.replay_prefix = self.item_segments.clone().into();
+    }
+
+    fn accept_item_drain(&mut self, drained: Vec<String>) -> Vec<String> {
+        let mut segments_to_send = Vec::new();
+        for segment in drained {
+            if self.replay_prefix.front() == Some(&segment) {
+                self.replay_prefix.pop_front();
+                continue;
+            }
+            if !self.replay_prefix.is_empty() {
+                // The replay diverged from text already emitted downstream.
+                // This layer cannot rewrite that output, so stop prefix
+                // suppression and retain both observations explicitly.
+                self.replay_prefix.clear();
+            }
+            self.item_segments.push(segment.clone());
+            segments_to_send.push(segment);
+        }
+        segments_to_send
+    }
+}
+
 /// Realtime dictation mode via WebSocket.
 ///
 /// Streams raw PCM audio to the transcription API and receives
@@ -259,11 +416,8 @@ pub(crate) async fn dictate_realtime(
         capture_stop_clone.store(true, std::sync::atomic::Ordering::Release);
     });
 
-    // Completed sentences/phrases emitted so far.
-    let mut segments: Vec<String> = Vec::new();
+    let mut transcript = NormalTranscriptAccumulator::default();
     let mut timed_segments: Vec<TranscriptSegment> = Vec::new();
-    // Buffer for the current in-progress phrase (live TextDelta).
-    let mut current_line = String::new();
     let mut detected_language: Option<String> = None;
     let mut unknown_event_types: Vec<String> = Vec::new();
     let mut event_counts: std::collections::BTreeMap<String, u64> =
@@ -312,27 +466,14 @@ pub(crate) async fn dictate_realtime(
                 match event {
                     Some(TranscriptionEvent::TextDelta { text }) => {
                         bump("text_delta", &mut event_counts);
-                        current_line.push_str(&text);
-                        eprint!("\r{}", current_line);
-
-                        // Push live text to the overlay.
+                        let update = transcript.apply(TranscriptionEvent::TextDelta { text });
+                        eprint!("\r{}", update.live_text);
                         if let Some(viz) = visualizer {
-                            let mut live = segments.join(" ");
-                            if !live.is_empty() && !current_line.is_empty() {
-                                live.push(' ');
-                            }
-                            live.push_str(&current_line);
-                            viz.set_text(&live);
+                            viz.set_text(&update.live_text);
                         }
-
-                        // Flush completed sentences from the buffer.
-                        // Split on sentence-ending punctuation followed by
-                        // whitespace or end-of-string.
-                        let prev_count = segments.len();
-                        flush_sentences(&mut current_line, &mut segments);
                         if let Some(ref tx) = segment_tx {
-                            for seg in &segments[prev_count..] {
-                                let _ = tx.send(seg.clone()).await;
+                            for segment in update.segments_to_send {
+                                let _ = tx.send(segment).await;
                             }
                         }
                     }
@@ -350,33 +491,57 @@ pub(crate) async fn dictate_realtime(
                                     text: segment_text.clone(),
                                 });
                             }
-                            println!("{}", segment_text);
-                            if let Some(ref tx) = segment_tx {
-                                let _ = tx.send(segment_text.clone()).await;
-                            }
-                            segments.push(segment_text);
                         }
-                        let blank = " ".repeat(current_line.len());
-                        eprint!("\r{}\r", blank);
-                        current_line.clear();
-
-                        // Update overlay with completed segments.
+                        let update = transcript.apply(TranscriptionEvent::SegmentDelta {
+                            text,
+                            start,
+                            end,
+                        });
+                        for segment in update.segments_to_send {
+                            println!("{}", segment);
+                            if let Some(ref tx) = segment_tx {
+                                let _ = tx.send(segment).await;
+                            }
+                        }
                         if let Some(viz) = visualizer {
-                            viz.set_text(&segments.join(" "));
+                            viz.set_text(&update.live_text);
+                        }
+                    }
+                    Some(event @ TranscriptionEvent::ItemCreated { .. }) => {
+                        bump("item_created", &mut event_counts);
+                        let update = transcript.apply(event);
+                        for segment in update.segments_to_send {
+                            println!("{}", segment);
+                            if let Some(ref tx) = segment_tx {
+                                let _ = tx.send(segment).await;
+                            }
+                        }
+                    }
+                    Some(event @ TranscriptionEvent::ItemTextDelta { .. }) => {
+                        bump("item_text_delta", &mut event_counts);
+                        let update = transcript.apply(event);
+                        eprint!("\r{}", update.live_text);
+                        if let Some(viz) = visualizer {
+                            viz.set_text(&update.live_text);
+                        }
+                    }
+                    Some(event @ TranscriptionEvent::ItemTextCompleted { .. }) => {
+                        bump("item_text_completed", &mut event_counts);
+                        api_segment_count += 1;
+                        let update = transcript.apply(event);
+                        eprint!("\r{}", update.live_text);
+                        if let Some(viz) = visualizer {
+                            viz.set_text(&update.live_text);
+                        }
+                        for segment in update.segments_to_send {
+                            println!("{}", segment);
+                            if let Some(ref tx) = segment_tx {
+                                let _ = tx.send(segment).await;
+                            }
                         }
                     }
                     Some(TranscriptionEvent::Done) => {
                         bump("done", &mut event_counts);
-                        // Flush any trailing text that didn't end with punctuation
-                        let trailing = current_line.trim().to_string();
-                        if !trailing.is_empty() {
-                            println!("{}", trailing);
-                            if let Some(ref tx) = segment_tx {
-                                let _ = tx.send(trailing.clone()).await;
-                            }
-                            segments.push(trailing);
-                        }
-                        eprintln!();
                         break;
                     }
                     Some(TranscriptionEvent::Error { message }) => {
@@ -406,6 +571,7 @@ pub(crate) async fn dictate_realtime(
                                 match new_transcriber.transcribe_realtime(new_fwd_rx).await {
                                     Ok(new_rx) => {
                                         log::info!("realtime transcription reconnected");
+                                        transcript.reset_item_generation_for_replay();
                                         event_rx = new_rx;
                                         continue;
                                     }
@@ -494,6 +660,7 @@ pub(crate) async fn dictate_realtime(
                                 match new_transcriber.transcribe_realtime(new_fwd_rx).await {
                                     Ok(new_rx) => {
                                         log::info!("realtime transcription reconnected");
+                                        transcript.reset_item_generation_for_replay();
                                         event_rx = new_rx;
                                         continue;
                                     }
@@ -514,16 +681,6 @@ pub(crate) async fn dictate_realtime(
                                 }
                             }
                         }
-                        // Reconnect failed — flush trailing text and exit.
-                        let trailing = current_line.trim().to_string();
-                        if !trailing.is_empty() {
-                            println!("{}", trailing);
-                            if let Some(ref tx) = segment_tx {
-                                let _ = tx.send(trailing.clone()).await;
-                            }
-                            segments.push(trailing);
-                        }
-                        eprintln!();
                         break;
                     }
                 }
@@ -533,6 +690,17 @@ pub(crate) async fn dictate_realtime(
             }
         }
     }
+
+    // Every terminal exit, including reconnect failure, drains exactly the
+    // remaining authoritative/provisional text once.
+    let finished = transcript.finish();
+    for segment in finished.segments_to_send {
+        println!("{}", segment);
+        if let Some(ref tx) = segment_tx {
+            let _ = tx.send(segment).await;
+        }
+    }
+    eprintln!();
 
     ctrlc_task.abort();
     feeder_handle.abort();
@@ -572,7 +740,7 @@ pub(crate) async fn dictate_realtime(
     };
 
     Ok(TranscriptionResult {
-        text: segments.join(" "),
+        text: transcript.text(),
         metadata: TranscriptionMetadata {
             request_latency_ms: None,
             session_elapsed_ms: Some(started.elapsed().as_millis() as u64),
@@ -585,7 +753,7 @@ pub(crate) async fn dictate_realtime(
             segment_count: Some(if api_segment_count > 0 {
                 api_segment_count
             } else {
-                segments.len()
+                transcript.segment_count()
             }),
             word_count: None,
             token_usage: None,
@@ -608,6 +776,181 @@ pub(crate) async fn dictate_realtime(
 mod tests {
     use super::*;
     use crate::config::AudioConfig;
+
+    #[test]
+    fn normal_openai_completion_emits_incrementally_and_finish_does_not_resend() {
+        let mut transcript = NormalTranscriptAccumulator::default();
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "item-1".to_string(),
+            previous_item_id: None,
+        });
+        let delta = transcript.apply(TranscriptionEvent::ItemTextDelta {
+            item_id: "item-1".to_string(),
+            content_index: 0,
+            text: "Hello world.".to_string(),
+        });
+        assert_eq!(delta.live_text, "Hello world.");
+        assert!(delta.segments_to_send.is_empty());
+
+        let completed = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "item-1".to_string(),
+            content_index: 0,
+            transcript: "Hello, corrected world.".to_string(),
+        });
+        assert_eq!(completed.live_text, "Hello, corrected world.");
+        assert_eq!(
+            completed.segments_to_send,
+            vec!["Hello, corrected world.".to_string()]
+        );
+
+        let finished = transcript.finish();
+        assert_eq!(finished.text, "Hello, corrected world.");
+        assert!(finished.segments_to_send.is_empty());
+    }
+
+    #[test]
+    fn normal_openai_reverse_completion_emits_in_conversation_order() {
+        let mut transcript = NormalTranscriptAccumulator::default();
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "item-1".to_string(),
+            previous_item_id: None,
+        });
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "item-2".to_string(),
+            previous_item_id: Some("item-1".to_string()),
+        });
+
+        let second = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "item-2".to_string(),
+            content_index: 0,
+            transcript: "second".to_string(),
+        });
+        assert!(second.segments_to_send.is_empty());
+        let first = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "item-1".to_string(),
+            content_index: 0,
+            transcript: "first".to_string(),
+        });
+
+        assert_eq!(
+            first.segments_to_send,
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert_eq!(transcript.finish().text, "first second");
+    }
+
+    #[test]
+    fn normal_openai_late_item_created_event_unblocks_incremental_emission() {
+        let mut transcript = NormalTranscriptAccumulator::default();
+        let second = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "item-2".to_string(),
+            content_index: 0,
+            transcript: "second".to_string(),
+        });
+        assert!(second.segments_to_send.is_empty());
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "item-1".to_string(),
+            previous_item_id: None,
+        });
+        let first = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "item-1".to_string(),
+            content_index: 0,
+            transcript: "first".to_string(),
+        });
+        assert!(first.segments_to_send.is_empty());
+
+        let ordered = transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "item-2".to_string(),
+            previous_item_id: Some("item-1".to_string()),
+        });
+
+        assert_eq!(
+            ordered.segments_to_send,
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn normal_openai_finish_preserves_provisional_terminal_text() {
+        let mut transcript = NormalTranscriptAccumulator::default();
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "item-1".to_string(),
+            previous_item_id: None,
+        });
+        transcript.apply(TranscriptionEvent::ItemTextDelta {
+            item_id: "item-1".to_string(),
+            content_index: 0,
+            text: "provisional terminal text".to_string(),
+        });
+
+        let finished = transcript.finish();
+
+        assert_eq!(finished.text, "provisional terminal text");
+        assert_eq!(
+            finished.segments_to_send,
+            vec!["provisional terminal text".to_string()]
+        );
+    }
+
+    #[test]
+    fn normal_openai_replay_reset_deduplicates_emitted_prefix() {
+        let mut transcript = NormalTranscriptAccumulator::default();
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "old-item".to_string(),
+            previous_item_id: None,
+        });
+        let old = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "old-item".to_string(),
+            content_index: 0,
+            transcript: "old text".to_string(),
+        });
+        assert_eq!(old.segments_to_send, vec!["old text".to_string()]);
+
+        transcript.reset_item_generation_for_replay();
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "fresh-1".to_string(),
+            previous_item_id: None,
+        });
+        let replayed = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "fresh-1".to_string(),
+            content_index: 0,
+            transcript: "old text".to_string(),
+        });
+        assert!(replayed.segments_to_send.is_empty());
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "fresh-2".to_string(),
+            previous_item_id: Some("fresh-1".to_string()),
+        });
+        let suffix = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "fresh-2".to_string(),
+            content_index: 0,
+            transcript: "new text".to_string(),
+        });
+
+        assert_eq!(suffix.segments_to_send, vec!["new text".to_string()]);
+        let finished = transcript.finish();
+        assert_eq!(finished.text, "old text new text");
+        assert!(finished.segments_to_send.is_empty());
+    }
+
+    #[test]
+    fn normal_generic_segments_remain_additive() {
+        let mut transcript = NormalTranscriptAccumulator::default();
+        let first = transcript.apply(TranscriptionEvent::SegmentDelta {
+            text: "first".to_string(),
+            start: None,
+            end: None,
+        });
+        let second = transcript.apply(TranscriptionEvent::SegmentDelta {
+            text: "second".to_string(),
+            start: None,
+            end: None,
+        });
+
+        assert_eq!(first.segments_to_send, vec!["first".to_string()]);
+        assert_eq!(second.segments_to_send, vec!["second".to_string()]);
+        assert_eq!(transcript.finish().text, "first second");
+    }
 
     // ── AudioBuffer tests ───────────────────────────────────────────
 

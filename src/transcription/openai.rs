@@ -3,7 +3,7 @@
 //! This module provides a [`OneShotTranscriber`] implementation that uses the
 //! OpenAI API to transcribe audio files (Whisper, GPT-4o-transcribe, etc.).
 
-use crate::config::OpenAIConfig;
+use crate::config::{OpenAIConfig, OpenAIRealtimeDelay};
 use crate::error::TalkError;
 use crate::transcription::{
     parse_transcript_segments, OpenAIProviderMetadata, ProviderSpecificMetadata,
@@ -36,6 +36,9 @@ struct OpenAIResponse {
     /// Detected language code.
     #[serde(default)]
     language: Option<String>,
+    /// Detected languages returned by gpt-transcribe.
+    #[serde(default)]
+    languages: Option<Vec<OpenAIResponseLanguage>>,
     /// Input audio duration in seconds.
     #[serde(default)]
     duration: Option<f64>,
@@ -48,6 +51,145 @@ struct OpenAIResponse {
     /// Usage payload (shape varies by model endpoint).
     #[serde(default)]
     usage: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponseLanguage {
+    code: String,
+}
+
+impl OpenAIResponse {
+    fn detected_language(&self) -> Option<String> {
+        self.languages
+            .as_ref()
+            .and_then(|languages| languages.first())
+            .map(|language| language.code.clone())
+            .or_else(|| self.language.clone())
+    }
+}
+
+pub(crate) const OPENAI_BATCH_MODELS: &[&str] = &[
+    "gpt-transcribe",
+    "gpt-4o-mini-transcribe",
+    "gpt-4o-transcribe",
+    "whisper-1",
+];
+pub(crate) const OPENAI_REALTIME_MODELS: &[&str] = &["gpt-live-transcribe", "gpt-realtime-whisper"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAITranscriptionMode {
+    Batch,
+    Realtime,
+}
+
+impl OpenAITranscriptionMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Realtime => "realtime",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAIModelCapability {
+    GptTranscribe,
+    LegacyBatch,
+    GptLiveTranscribe,
+    LegacyRealtime,
+}
+
+pub(crate) fn known_model_mode(model: &str) -> Option<OpenAITranscriptionMode> {
+    if OPENAI_BATCH_MODELS.contains(&model) {
+        Some(OpenAITranscriptionMode::Batch)
+    } else if OPENAI_REALTIME_MODELS.contains(&model) {
+        Some(OpenAITranscriptionMode::Realtime)
+    } else {
+        None
+    }
+}
+
+fn model_capability(
+    model: &str,
+    mode: OpenAITranscriptionMode,
+) -> Result<OpenAIModelCapability, TalkError> {
+    if let Some(known_mode) = known_model_mode(model) {
+        if known_mode != mode {
+            return Err(TalkError::Config(format!(
+                "OpenAI model '{model}' is {}-only and cannot be used for {} transcription",
+                known_mode.label(),
+                mode.label()
+            )));
+        }
+    }
+
+    Ok(match mode {
+        OpenAITranscriptionMode::Batch if model == "gpt-transcribe" => {
+            OpenAIModelCapability::GptTranscribe
+        }
+        OpenAITranscriptionMode::Batch => OpenAIModelCapability::LegacyBatch,
+        OpenAITranscriptionMode::Realtime if model == "gpt-live-transcribe" => {
+            OpenAIModelCapability::GptLiveTranscribe
+        }
+        OpenAITranscriptionMode::Realtime => OpenAIModelCapability::LegacyRealtime,
+    })
+}
+
+pub(crate) fn validate_openai_hints(
+    mode: OpenAITranscriptionMode,
+    model: &str,
+    _prompt: Option<&str>,
+    keywords: Option<&[String]>,
+    languages: Option<&[String]>,
+    realtime_delay: Option<OpenAIRealtimeDelay>,
+) -> Result<OpenAIModelCapability, TalkError> {
+    let capability = model_capability(model, mode)?;
+
+    if let Some(keywords) = keywords {
+        if keywords.is_empty() {
+            return Err(TalkError::Config(
+                "OpenAI field 'keywords' must not be empty when configured".to_string(),
+            ));
+        }
+        for keyword in keywords {
+            if keyword.contains(['<', '>', '\r', '\n']) {
+                return Err(TalkError::Config(format!(
+                    "OpenAI field 'keywords' contains invalid value '{keyword}': '<', '>', CR, and LF are not allowed"
+                )));
+            }
+        }
+    }
+    if let Some(languages) = languages {
+        if languages.is_empty() || languages.iter().any(|language| language.trim().is_empty()) {
+            return Err(TalkError::Config(
+                "OpenAI field 'languages' must contain non-empty values".to_string(),
+            ));
+        }
+    }
+
+    match capability {
+        OpenAIModelCapability::GptTranscribe | OpenAIModelCapability::GptLiveTranscribe => {
+            Ok(capability)
+        }
+        OpenAIModelCapability::LegacyBatch | OpenAIModelCapability::LegacyRealtime => {
+            if keywords.is_some() {
+                return Err(TalkError::Config(format!(
+                    "OpenAI model '{model}' does not support field 'keywords'"
+                )));
+            }
+            if languages.is_some_and(|values| values.len() > 1) {
+                return Err(TalkError::Config(format!(
+                    "OpenAI model '{model}' does not support multiple values for field 'languages'"
+                )));
+            }
+            if realtime_delay.is_some() {
+                return Err(TalkError::Config(format!(
+                    "OpenAI model '{model}' does not support field 'realtime_delay'"
+                )));
+            }
+            Ok(capability)
+        }
+    }
 }
 
 fn parse_openai_token_usage(usage: &serde_json::Value) -> Option<TokenUsage> {
@@ -230,16 +372,28 @@ impl OpenAIOneShotTranscriber {
         let file_len = audio_bytes.len() as u64;
         let started = Instant::now();
 
-        let response_format = if self.config.model.starts_with("whisper") {
-            "verbose_json"
-        } else {
-            "json"
+        let capability = validate_openai_hints(
+            OpenAITranscriptionMode::Batch,
+            &self.config.model,
+            self.config.prompt.as_deref(),
+            self.config.keywords.as_deref(),
+            self.config.languages.as_deref(),
+            None,
+        )?;
+        let response_format = match capability {
+            OpenAIModelCapability::LegacyBatch if self.config.model == "whisper-1" => {
+                "verbose_json"
+            }
+            _ => "json",
         };
 
         let audio_arc = std::sync::Arc::new(audio_bytes);
         let model = self.config.model.clone();
         let file_name_owned = file_name.to_string();
         let response_format_owned = response_format.to_string();
+        let prompt = self.config.prompt.clone();
+        let keywords = self.config.keywords.clone();
+        let languages = self.config.languages.clone();
         let sink_for_factory = self.sink.clone();
 
         let body_factory: Box<dyn Fn() -> reqwest::multipart::Form + Send + Sync> = {
@@ -250,7 +404,7 @@ impl OpenAIOneShotTranscriber {
                     ProgressBody::new(audio_bytes_for_attempt, sink_for_factory.clone());
                 let body_len = progress_body.len();
 
-                reqwest::multipart::Form::new()
+                let mut form = reqwest::multipart::Form::new()
                     .text("model", model.clone())
                     .text("response_format", response_format_owned.clone())
                     .part(
@@ -260,7 +414,33 @@ impl OpenAIOneShotTranscriber {
                             body_len,
                         )
                         .file_name(file_name_owned.clone()),
-                    )
+                    );
+                if let Some(prompt) = &prompt {
+                    form = form.text("prompt", prompt.clone());
+                }
+                match capability {
+                    OpenAIModelCapability::GptTranscribe => {
+                        if let Some(keywords) = &keywords {
+                            for keyword in keywords {
+                                form = form.text("keywords[]", keyword.clone());
+                            }
+                        }
+                        if let Some(languages) = &languages {
+                            for language in languages {
+                                form = form.text("languages[]", language.clone());
+                            }
+                        }
+                    }
+                    OpenAIModelCapability::LegacyBatch => {
+                        if let Some(language) = languages.as_ref().and_then(|values| values.first())
+                        {
+                            form = form.text("language", language.clone());
+                        }
+                    }
+                    OpenAIModelCapability::GptLiveTranscribe
+                    | OpenAIModelCapability::LegacyRealtime => {}
+                }
+                form
             })
         };
 
@@ -338,6 +518,7 @@ impl OpenAIOneShotTranscriber {
             .and_then(|(_, v)| v.parse::<u64>().ok());
         let rate_limit_headers = extract_rate_limit_headers(&response.headers);
 
+        let detected_language = openai_response.detected_language();
         let text = openai_response.text;
         Ok(TranscriptionResult {
             text,
@@ -346,7 +527,7 @@ impl OpenAIOneShotTranscriber {
                 session_elapsed_ms: None,
                 request_id,
                 provider_processing_ms,
-                detected_language: openai_response.language,
+                detected_language,
                 audio_seconds,
                 segment_count,
                 word_count,
@@ -376,6 +557,14 @@ impl OneShotTranscriber for OpenAIOneShotTranscriber {
     }
 
     async fn validate(&self) -> Result<(), TalkError> {
+        validate_openai_hints(
+            OpenAITranscriptionMode::Batch,
+            &self.config.model,
+            self.config.prompt.as_deref(),
+            self.config.keywords.as_deref(),
+            self.config.languages.as_deref(),
+            None,
+        )?;
         // Derive the API base URL from the transcription endpoint.
         // Production: "https://api.openai.com/v1/audio/transcriptions" → "https://api.openai.com"
         // Test:       "http://127.0.0.1:PORT/v1/audio/transcriptions" → "http://127.0.0.1:PORT"
@@ -423,10 +612,73 @@ impl OneShotTranscriber for OpenAIOneShotTranscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::Write;
     use tempfile::NamedTempFile;
     use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Match, Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
+
+    fn openai_config(model: &str) -> OpenAIConfig {
+        OpenAIConfig {
+            api_key: "sk-test-key".to_string(),
+            url: None,
+            model: model.to_string(),
+            realtime_model: "gpt-live-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
+        }
+    }
+
+    #[derive(Clone)]
+    struct MultipartFields(BTreeMap<String, Vec<String>>);
+
+    impl Match for MultipartFields {
+        fn matches(&self, request: &WiremockRequest) -> bool {
+            parse_multipart_text_fields(request)
+                .map(|actual| actual == self.0)
+                .unwrap_or(false)
+        }
+    }
+
+    fn parse_multipart_text_fields(
+        request: &WiremockRequest,
+    ) -> Result<BTreeMap<String, Vec<String>>, String> {
+        let content_type = request
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "missing content-type".to_string())?;
+        let boundary = content_type
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("boundary="))
+            .ok_or_else(|| "missing multipart boundary".to_string())?;
+        let body = String::from_utf8_lossy(&request.body);
+        let mut fields = BTreeMap::<String, Vec<String>>::new();
+        for part in body.split(&format!("--{boundary}")) {
+            let Some((headers, value)) = part.split_once("\r\n\r\n") else {
+                continue;
+            };
+            if headers.contains("filename=") {
+                continue;
+            }
+            let Some(name_start) = headers.find("name=\"").map(|index| index + 6) else {
+                continue;
+            };
+            let Some(name_end) = headers[name_start..]
+                .find('"')
+                .map(|index| name_start + index)
+            else {
+                continue;
+            };
+            fields
+                .entry(headers[name_start..name_end].to_string())
+                .or_default()
+                .push(value.trim_end_matches("\r\n").to_string());
+        }
+        Ok(fields)
+    }
 
     #[test]
     fn test_new_uses_default_endpoint_when_url_is_none() {
@@ -435,6 +687,10 @@ mod tests {
             url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIOneShotTranscriber::new(config).expect("build client");
         assert_eq!(
@@ -450,6 +706,10 @@ mod tests {
             url: Some("https://custom.example.com".to_string()),
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIOneShotTranscriber::new(config).expect("build client");
         assert_eq!(
@@ -465,6 +725,10 @@ mod tests {
             url: Some("https://custom.example.com/".to_string()),
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIOneShotTranscriber::new(config).expect("build client");
         assert_eq!(
@@ -495,6 +759,10 @@ mod tests {
             url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
@@ -528,6 +796,10 @@ mod tests {
             url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
@@ -587,6 +859,10 @@ mod tests {
             url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
@@ -629,6 +905,10 @@ mod tests {
             url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
@@ -651,6 +931,10 @@ mod tests {
             url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIOneShotTranscriber::new(config).expect("build client");
 
@@ -728,6 +1012,10 @@ mod tests {
             url: None,
             model: "whisper-1".to_string(),
             realtime_model: "gpt-4o-mini-transcribe".to_string(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
         };
         let transcriber = OpenAIOneShotTranscriber::with_endpoint(
             config,
@@ -741,5 +1029,353 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("parse"));
+    }
+
+    #[tokio::test]
+    async fn gpt_transcribe_multipart_sends_exact_migration_fields() -> Result<(), TalkError> {
+        let mock_server = MockServer::start().await;
+        let expected = BTreeMap::from([
+            (
+                "keywords[]".to_string(),
+                vec!["Kalysto".to_string(), "talk-rs".to_string()],
+            ),
+            (
+                "languages[]".to_string(),
+                vec!["fr".to_string(), "en".to_string()],
+            ),
+            ("model".to_string(), vec!["gpt-transcribe".to_string()]),
+            ("prompt".to_string(), vec!["Keep names exact.".to_string()]),
+            ("response_format".to_string(), vec!["json".to_string()]),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(MultipartFields(expected))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "ok"})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let mut config = openai_config("gpt-transcribe");
+        config.prompt = Some("Keep names exact.".to_string());
+        config.keywords = Some(vec!["Kalysto".to_string(), "talk-rs".to_string()]);
+        config.languages = Some(vec!["fr".to_string(), "en".to_string()]);
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
+            config,
+            format!("{}/v1/audio/transcriptions", mock_server.uri()),
+        )?;
+
+        transcriber
+            .send_request(b"audio".to_vec(), "sample.ogg")
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gpt_transcribe_multipart_omits_unconfigured_hints() -> Result<(), TalkError> {
+        let mock_server = MockServer::start().await;
+        let expected = BTreeMap::from([
+            ("model".to_string(), vec!["gpt-transcribe".to_string()]),
+            ("response_format".to_string(), vec!["json".to_string()]),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(MultipartFields(expected))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "ok"})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
+            openai_config("gpt-transcribe"),
+            format!("{}/v1/audio/transcriptions", mock_server.uri()),
+        )?;
+
+        transcriber
+            .send_request(b"audio".to_vec(), "sample.ogg")
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whisper_multipart_maps_prompt_and_one_language() -> Result<(), TalkError> {
+        let mock_server = MockServer::start().await;
+        let expected = BTreeMap::from([
+            ("language".to_string(), vec!["fr".to_string()]),
+            ("model".to_string(), vec!["whisper-1".to_string()]),
+            ("prompt".to_string(), vec!["Keep names exact.".to_string()]),
+            (
+                "response_format".to_string(),
+                vec!["verbose_json".to_string()],
+            ),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(MultipartFields(expected))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "ok"})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let mut config = openai_config("whisper-1");
+        config.prompt = Some("Keep names exact.".to_string());
+        config.languages = Some(vec!["fr".to_string()]);
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
+            config,
+            format!("{}/v1/audio/transcriptions", mock_server.uri()),
+        )?;
+
+        transcriber
+            .send_request(b"audio".to_vec(), "sample.ogg")
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_batch_rejects_incompatible_hints_before_http() -> Result<(), TalkError> {
+        for (field, configure, expected) in [
+            (
+                "keywords",
+                0_u8,
+                "OpenAI model 'whisper-1' does not support field 'keywords'",
+            ),
+            (
+                "languages",
+                1_u8,
+                "OpenAI model 'whisper-1' does not support multiple values for field 'languages'",
+            ),
+        ] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/transcriptions"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&mock_server)
+                .await;
+            let mut config = openai_config("whisper-1");
+            if configure == 0 {
+                config.keywords = Some(vec!["Kalysto".to_string()]);
+            } else {
+                config.languages = Some(vec!["fr".to_string(), "en".to_string()]);
+            }
+            let transcriber = OpenAIOneShotTranscriber::with_endpoint(
+                config,
+                format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            )?;
+            let error = transcriber
+                .send_request(b"audio".to_vec(), "sample.ogg")
+                .await
+                .expect_err(field);
+            assert_eq!(
+                error.to_string(),
+                format!("Configuration error: {expected}")
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_validate_rejects_legacy_hints_before_model_preflight() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "whisper-1"}]
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        for (keywords, languages, expected) in [
+            (
+                Some(vec!["Kalysto".to_string()]),
+                None,
+                "Configuration error: OpenAI model 'whisper-1' does not support field 'keywords'",
+            ),
+            (
+                None,
+                Some(vec!["fr".to_string(), "en".to_string()]),
+                "Configuration error: OpenAI model 'whisper-1' does not support multiple values for field 'languages'",
+            ),
+        ] {
+            let mut config = openai_config("whisper-1");
+            config.keywords = keywords;
+            config.languages = languages;
+            let transcriber = OpenAIOneShotTranscriber::with_endpoint(
+                config,
+                format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            )
+            .expect("transcriber");
+
+            let error = transcriber
+                .validate()
+                .await
+                .expect_err("legacy hints rejected locally");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_validate_rejects_known_realtime_model_before_model_preflight() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "gpt-live-transcribe"}]
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        for model in OPENAI_REALTIME_MODELS {
+            let transcriber = OpenAIOneShotTranscriber::with_endpoint(
+                openai_config(model),
+                format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            )
+            .expect("transcriber");
+
+            let error = transcriber
+                .validate()
+                .await
+                .expect_err("realtime model rejected in batch mode");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Configuration error: OpenAI model '{model}' is realtime-only and cannot be used for batch transcription"
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_request_builder_rejects_realtime_model_before_http() -> Result<(), TalkError> {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
+            openai_config("gpt-live-transcribe"),
+            format!("{}/v1/audio/transcriptions", mock_server.uri()),
+        )?;
+
+        let error = transcriber
+            .send_request(b"audio".to_vec(), "sample.ogg")
+            .await
+            .expect_err("realtime model rejected by batch builder");
+        assert_eq!(
+            error.to_string(),
+            "Configuration error: OpenAI model 'gpt-live-transcribe' is realtime-only and cannot be used for batch transcription"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_models_remain_available_with_mode_local_legacy_capabilities() {
+        let language = ["fr".to_string()];
+        assert_eq!(
+            validate_openai_hints(
+                OpenAITranscriptionMode::Batch,
+                "custom-batch-model",
+                Some("prompt"),
+                None,
+                Some(&language),
+                None,
+            )
+            .expect("unknown batch model remains available"),
+            OpenAIModelCapability::LegacyBatch
+        );
+        assert_eq!(
+            validate_openai_hints(
+                OpenAITranscriptionMode::Realtime,
+                "custom-realtime-model",
+                Some("prompt"),
+                None,
+                Some(&language),
+                None,
+            )
+            .expect("unknown realtime model remains available"),
+            OpenAIModelCapability::LegacyRealtime
+        );
+
+        let keywords = ["Kalysto".to_string()];
+        let error = validate_openai_hints(
+            OpenAITranscriptionMode::Realtime,
+            "custom-realtime-model",
+            None,
+            Some(&keywords),
+            None,
+            None,
+        )
+        .expect_err("unknown model hints must not be dropped");
+        assert_eq!(
+            error.to_string(),
+            "Configuration error: OpenAI model 'custom-realtime-model' does not support field 'keywords'"
+        );
+    }
+
+    #[test]
+    fn keyword_validation_rejects_markup_and_line_breaks() {
+        for keyword in ["bad<term", "bad>term", "bad\rterm", "bad\nterm"] {
+            let error = validate_openai_hints(
+                OpenAITranscriptionMode::Batch,
+                "gpt-transcribe",
+                None,
+                Some(&[keyword.to_string()]),
+                None,
+                None,
+            )
+            .expect_err("invalid keyword");
+            assert_eq!(
+                error.to_string(),
+                format!("Configuration error: OpenAI field 'keywords' contains invalid value '{keyword}': '<', '>', CR, and LF are not allowed")
+            );
+        }
+    }
+
+    #[test]
+    fn language_validation_rejects_empty_configured_values() {
+        for languages in [Vec::new(), vec![" ".to_string()]] {
+            let error = validate_openai_hints(
+                OpenAITranscriptionMode::Batch,
+                "gpt-transcribe",
+                None,
+                None,
+                Some(&languages),
+                None,
+            )
+            .expect_err("empty language rejected");
+            assert_eq!(
+                error.to_string(),
+                "Configuration error: OpenAI field 'languages' must contain non-empty values"
+            );
+        }
+    }
+
+    #[test]
+    fn response_languages_populate_detected_language_with_legacy_fallback() {
+        let new: OpenAIResponse = serde_json::from_value(serde_json::json!({
+            "text": "bonjour",
+            "languages": [{"code": "fr"}]
+        }))
+        .expect("new response");
+        assert_eq!(new.detected_language(), Some("fr".to_string()));
+
+        let legacy: OpenAIResponse = serde_json::from_value(serde_json::json!({
+            "text": "bonjour",
+            "language": "fr"
+        }))
+        .expect("legacy response");
+        assert_eq!(legacy.detected_language(), Some("fr".to_string()));
+
+        let empty: OpenAIResponse = serde_json::from_value(serde_json::json!({
+            "text": "bonjour",
+            "language": "fr",
+            "languages": []
+        }))
+        .expect("empty languages response");
+        assert_eq!(empty.detected_language(), Some("fr".to_string()));
     }
 }

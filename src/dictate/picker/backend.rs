@@ -8,7 +8,8 @@ use super::ui::{PickerCandidate, PickerMessage};
 use crate::config::{Config, Provider};
 use crate::telemetry::{TelemetrySink, TranscriptionEvent as PipelineEvent};
 use crate::transcription::{
-    RealtimeTranscriber, TranscriptSegment, TranscriptionEvent, TranscriptionMetadata,
+    OrderedItemTranscript, RealtimeTranscriber, TranscriptSegment, TranscriptionEvent,
+    TranscriptionMetadata,
 };
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -147,6 +148,75 @@ impl TelemetrySink for PickerStatusSink {
 /// 16 kHz).
 const REALTIME_FEED_CHUNK: usize = 480;
 
+#[derive(Default)]
+struct PickerTranscriptAccumulator {
+    generic_text: String,
+    item_text: OrderedItemTranscript,
+    timed_segments: Vec<TranscriptSegment>,
+}
+
+impl PickerTranscriptAccumulator {
+    fn apply(&mut self, event: &TranscriptionEvent) -> Option<String> {
+        match event {
+            TranscriptionEvent::TextDelta { text } => {
+                self.generic_text.push_str(text);
+                Some(self.final_text())
+            }
+            TranscriptionEvent::SegmentDelta { text, start, end } => {
+                if text.is_empty() {
+                    return None;
+                }
+                let trimmed = text.trim().to_string();
+                if let (Some(start), Some(end)) = (start, end) {
+                    self.timed_segments.push(TranscriptSegment {
+                        start: *start,
+                        end: *end,
+                        text: trimmed.clone(),
+                    });
+                }
+                if !self.generic_text.is_empty() {
+                    self.generic_text.push(' ');
+                }
+                self.generic_text.push_str(&trimmed);
+                Some(self.final_text())
+            }
+            TranscriptionEvent::ItemCreated {
+                item_id,
+                previous_item_id,
+            } => {
+                self.item_text
+                    .item_created(item_id, previous_item_id.as_deref());
+                None
+            }
+            TranscriptionEvent::ItemTextDelta {
+                item_id,
+                content_index,
+                text,
+            } => {
+                self.item_text.append_delta(item_id, *content_index, text);
+                Some(self.final_text())
+            }
+            TranscriptionEvent::ItemTextCompleted {
+                item_id,
+                content_index,
+                transcript,
+            } => {
+                self.item_text.complete(item_id, *content_index, transcript);
+                Some(self.final_text())
+            }
+            _ => None,
+        }
+    }
+
+    fn final_text(&self) -> String {
+        if self.item_text.is_empty() {
+            self.generic_text.trim().to_string()
+        } else {
+            self.item_text.snapshot().trim().to_string()
+        }
+    }
+}
+
 /// Run a realtime transcription session: connect the transcriber,
 /// feed PCM samples from `samples`, and forward transcription events
 /// to the GTK channel via `tx`.
@@ -215,51 +285,34 @@ pub(super) async fn run_realtime_transcription(
 
     // Listen for events and forward to GTK.
     let mut event_rx = event_rx;
-    let mut accumulated = String::new();
-    let mut timed_segments: Vec<TranscriptSegment> = Vec::new();
+    let mut transcript = PickerTranscriptAccumulator::default();
     loop {
         match event_rx.recv().await {
-            Some(TranscriptionEvent::TextDelta { text }) => {
-                accumulated.push_str(&text);
-                let _ = tx.send(PickerMessage::StreamUpdate {
-                    provider,
-                    model: model.clone(),
-                    accumulated_text: accumulated.clone(),
-                });
-            }
-            Some(TranscriptionEvent::SegmentDelta { text, start, end }) => {
-                if !text.is_empty() {
-                    let trimmed = text.trim().to_string();
-                    if let (Some(start), Some(end)) = (start, end) {
-                        timed_segments.push(TranscriptSegment {
-                            start,
-                            end,
-                            text: trimmed.clone(),
-                        });
-                    }
-                    if !accumulated.is_empty() {
-                        accumulated.push(' ');
-                    }
-                    accumulated.push_str(&trimmed);
+            Some(event @ TranscriptionEvent::TextDelta { .. })
+            | Some(event @ TranscriptionEvent::SegmentDelta { .. })
+            | Some(event @ TranscriptionEvent::ItemCreated { .. })
+            | Some(event @ TranscriptionEvent::ItemTextDelta { .. })
+            | Some(event @ TranscriptionEvent::ItemTextCompleted { .. }) => {
+                if let Some(accumulated_text) = transcript.apply(&event) {
                     let _ = tx.send(PickerMessage::StreamUpdate {
                         provider,
                         model: model.clone(),
-                        accumulated_text: accumulated.clone(),
+                        accumulated_text,
                     });
                 }
             }
             Some(TranscriptionEvent::Done) => {
-                let final_text = accumulated.trim().to_string();
+                let final_text = transcript.final_text();
                 let _ = tx.send(PickerMessage::Candidate(Box::new(
                     PickerCandidate::success(
                         provider,
                         model,
                         final_text,
                         true,
-                        if timed_segments.is_empty() {
+                        if transcript.timed_segments.is_empty() {
                             None
                         } else {
-                            Some(timed_segments)
+                            Some(transcript.timed_segments)
                         },
                         TranscriptionMetadata::default(),
                     ),
@@ -274,17 +327,17 @@ pub(super) async fn run_realtime_transcription(
             }
             None => {
                 // Channel closed without Done — use what we have.
-                let final_text = accumulated.trim().to_string();
+                let final_text = transcript.final_text();
                 let _ = tx.send(PickerMessage::Candidate(Box::new(
                     PickerCandidate::success(
                         provider,
                         model,
                         final_text,
                         true,
-                        if timed_segments.is_empty() {
+                        if transcript.timed_segments.is_empty() {
                             None
                         } else {
-                            Some(timed_segments)
+                            Some(transcript.timed_segments)
                         },
                         TranscriptionMetadata::default(),
                     ),
@@ -410,6 +463,56 @@ pub(super) fn spawn_transcription(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn picker_reconciles_item_snapshots_and_final_text() {
+        let mut transcript = PickerTranscriptAccumulator::default();
+        assert_eq!(
+            transcript.apply(&TranscriptionEvent::ItemCreated {
+                item_id: "item-1".to_string(),
+                previous_item_id: None,
+            }),
+            None
+        );
+        assert_eq!(
+            transcript.apply(&TranscriptionEvent::ItemTextDelta {
+                item_id: "item-1".to_string(),
+                content_index: 0,
+                text: "Hello world".to_string(),
+            }),
+            Some("Hello world".to_string())
+        );
+        assert_eq!(
+            transcript.apply(&TranscriptionEvent::ItemTextCompleted {
+                item_id: "item-1".to_string(),
+                content_index: 0,
+                transcript: "Hello, corrected world.".to_string(),
+            }),
+            Some("Hello, corrected world.".to_string())
+        );
+
+        assert_eq!(transcript.final_text(), "Hello, corrected world.");
+    }
+
+    #[test]
+    fn picker_generic_segments_remain_additive() {
+        let mut transcript = PickerTranscriptAccumulator::default();
+        transcript.apply(&TranscriptionEvent::TextDelta {
+            text: "prefix".to_string(),
+        });
+        transcript.apply(&TranscriptionEvent::SegmentDelta {
+            text: "first".to_string(),
+            start: None,
+            end: None,
+        });
+        transcript.apply(&TranscriptionEvent::SegmentDelta {
+            text: "second".to_string(),
+            start: None,
+            end: None,
+        });
+
+        assert_eq!(transcript.final_text(), "prefix first second");
+    }
 
     /// Drain every queued message and return the
     /// `(provider, model, status_text)` tuples in arrival order.
