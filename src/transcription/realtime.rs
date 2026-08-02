@@ -110,14 +110,15 @@ struct ItemOrder {
 /// content. Conversation links determine item order; first-seen order
 /// is the deterministic fallback for absent or incomplete links.
 #[derive(Debug, Default)]
-pub(crate) struct OrderedItemTranscript {
+pub struct OrderedItemTranscript {
     text: BTreeMap<(String, u64), ItemText>,
     order: BTreeMap<String, ItemOrder>,
     next_first_seen: usize,
 }
 
 impl OrderedItemTranscript {
-    pub(crate) fn item_created(&mut self, item_id: &str, previous_item_id: Option<&str>) {
+    /// Record an item's conversation-order metadata.
+    pub fn item_created(&mut self, item_id: &str, previous_item_id: Option<&str>) {
         self.ensure_item(item_id);
         if let Some(order) = self.order.get_mut(item_id) {
             order.order_known = true;
@@ -127,7 +128,8 @@ impl OrderedItemTranscript {
         }
     }
 
-    pub(crate) fn append_delta(&mut self, item_id: &str, content_index: u64, text: &str) {
+    /// Append provisional text for one item content part.
+    pub fn append_delta(&mut self, item_id: &str, content_index: u64, text: &str) {
         self.ensure_item(item_id);
         self.text
             .entry((item_id.to_string(), content_index))
@@ -136,7 +138,8 @@ impl OrderedItemTranscript {
             .push_str(text);
     }
 
-    pub(crate) fn complete(&mut self, item_id: &str, content_index: u64, transcript: &str) {
+    /// Replace one item content part with its authoritative transcript.
+    pub fn complete(&mut self, item_id: &str, content_index: u64, transcript: &str) {
         self.ensure_item(item_id);
         self.text
             .entry((item_id.to_string(), content_index))
@@ -144,7 +147,8 @@ impl OrderedItemTranscript {
             .completed = Some(transcript.to_string());
     }
 
-    pub(crate) fn snapshot(&self) -> String {
+    /// Render the current transcript in conversation order.
+    pub fn snapshot(&self) -> String {
         self.render(false).join(" ")
     }
 
@@ -152,7 +156,7 @@ impl OrderedItemTranscript {
     ///
     /// Items without explicit order metadata remain buffered. A successor also
     /// remains buffered until its known predecessor has fully emitted.
-    pub(crate) fn drain_completed_prefix(&mut self) -> Vec<String> {
+    pub fn drain_completed_prefix(&mut self) -> Vec<String> {
         let mut drained = Vec::new();
         for item_id in self.ordered_item_ids() {
             let Some(order) = self.order.get(&item_id) else {
@@ -200,7 +204,7 @@ impl OrderedItemTranscript {
     ///
     /// Authoritative content wins when present; otherwise provisional text is
     /// retained as the terminal fallback.
-    pub(crate) fn drain_terminal(&mut self) -> Vec<String> {
+    pub fn drain_terminal(&mut self) -> Vec<String> {
         let mut drained = self.drain_completed_prefix();
         for item_id in self.ordered_item_ids() {
             for key in self.item_keys(&item_id) {

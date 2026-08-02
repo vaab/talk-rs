@@ -210,8 +210,7 @@ pub use openai::OpenAIOneShotTranscriber;
 pub use openai_realtime::OpenAIRealtimeTranscriber;
 #[cfg(feature = "parakeet")]
 pub use parakeet::ParakeetOneShotTranscriber;
-pub(crate) use realtime::OrderedItemTranscript;
-pub use realtime::{MistralRealtimeTranscriber, TranscriptionEvent};
+pub use realtime::{MistralRealtimeTranscriber, OrderedItemTranscript, TranscriptionEvent};
 
 /// Result type for transcription operations.
 #[derive(Debug, Clone, Default)]
