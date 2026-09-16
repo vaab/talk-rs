@@ -34,9 +34,13 @@ struct CachedModels {
     fetched_at: Instant,
 }
 
-static MODELS_CACHE: OnceLock<Mutex<HashMap<String, CachedModels>>> = OnceLock::new();
+type CacheKey = (String, String);
 
-fn cache() -> &'static Mutex<HashMap<String, CachedModels>> {
+/// Model lists are cached per (API endpoint, credential) because
+/// different credentials may have different model entitlements.
+static MODELS_CACHE: OnceLock<Mutex<HashMap<CacheKey, CachedModels>>> = OnceLock::new();
+
+fn cache() -> &'static Mutex<HashMap<CacheKey, CachedModels>> {
     MODELS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -47,7 +51,9 @@ fn cache() -> &'static Mutex<HashMap<String, CachedModels>> {
 /// Calls `GET {api_base}/v1/models` via the consolidated
 /// [`super::transport::http_request`] (which owns the retry loop),
 /// filters results with the caller-supplied `filter` predicate, and
-/// caches the result in-process with a TTL.
+/// caches the result in-process with a TTL per (API endpoint,
+/// credential), since credentials may have different model
+/// entitlements.
 ///
 /// On transport failure, returns the stale cache if one exists,
 /// otherwise propagates the structured failure.
@@ -56,7 +62,7 @@ pub(crate) async fn fetch_transcription_models(
     api_base: &str,
     filter: fn(&str) -> bool,
 ) -> Result<Vec<String>, TalkError> {
-    let cache_key = api_base.to_string();
+    let cache_key = (api_base.to_string(), api_key.to_string());
 
     // Fast path: fresh cache hit.
     if let Ok(guard) = cache().lock() {
@@ -130,7 +136,7 @@ pub(crate) async fn fetch_transcription_models(
 
 /// Return a stale cached entry if one exists, otherwise propagate
 /// the supplied error.
-fn fallback_to_stale_cache(cache_key: &str, err: TalkError) -> Result<Vec<String>, TalkError> {
+fn fallback_to_stale_cache(cache_key: &CacheKey, err: TalkError) -> Result<Vec<String>, TalkError> {
     if let Ok(guard) = cache().lock() {
         if let Some(cached) = guard.get(cache_key) {
             log::warn!("model-list fetch failed ({}); using stale cache", err);
