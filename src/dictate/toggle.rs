@@ -3,11 +3,10 @@
 //! Extracted from `dictate.rs` — handles the `--toggle` flag logic:
 //! spawn a new daemon process or stop a running one.
 
-use crate::daemon::{self, DaemonStatus};
+use crate::daemon::{self, ToggleOutcome};
 use crate::dictate::DictateOpts;
 use crate::error::TalkError;
 use crate::paste::get_active_window;
-use std::os::unix::process::CommandExt as _;
 
 /// Build the CLI argument list for the daemon process.
 ///
@@ -128,99 +127,22 @@ fn build_daemon_args(opts: &DictateOpts, target_window: Option<String>) -> Vec<S
 
 /// Toggle dispatch: start a new daemon or stop a running one.
 pub async fn toggle_dispatch(opts: &DictateOpts) -> Result<(), TalkError> {
-    let pid_file = daemon::pid_path()?;
-    let _lock = daemon::acquire_lock()?;
-
-    let status = daemon::check_status(&pid_file)?;
-    daemon::trace(&format!(
-        "[DBG] toggle_dispatch: check_status = {:?}",
-        status
-    ));
-    match status {
-        DaemonStatus::NotRunning => {
-            toggle_spawn(&pid_file, opts).await?;
-        }
-        DaemonStatus::Running { pid } => {
-            toggle_stop(pid, &pid_file)?;
-        }
+    let slot = daemon::dictate_slot()?;
+    let outcome = daemon::toggle_current_executable(&slot, || async {
+        let target_window = get_active_window().await;
+        Ok(build_daemon_args(opts, target_window))
+    })
+    .await?;
+    match outcome {
+        ToggleOutcome::Started { pid, log_path } => log::info!(
+            "dictation started (PID {}, logs: {})",
+            pid,
+            log_path.display()
+        ),
+        ToggleOutcome::Signalled { pid } => slot.trace(&format!(
+            "[DBG] dictate toggle sent SIGINT to daemon PID {pid}"
+        )),
     }
-
-    Ok(())
-}
-
-/// Spawn the daemon process and write the PID file.
-async fn toggle_spawn(pid_file: &std::path::Path, opts: &DictateOpts) -> Result<(), TalkError> {
-    // Capture active window before spawning daemon
-    let target_window = get_active_window().await;
-
-    // Find our own executable
-    let exe = std::env::current_exe()
-        .map_err(|e| TalkError::Config(format!("failed to determine current executable: {}", e)))?;
-
-    // Build daemon arguments
-    let args = build_daemon_args(opts, target_window);
-
-    let mut cmd = std::process::Command::new(&exe);
-    for arg in args {
-        cmd.arg(arg);
-    }
-
-    // Redirect stdout/stderr to log file
-    let log_file_path = daemon::log_path()?;
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file_path)
-        .map_err(|e| {
-            TalkError::Config(format!(
-                "failed to open log file {}: {}",
-                log_file_path.display(),
-                e
-            ))
-        })?;
-    let log_stderr = log_file
-        .try_clone()
-        .map_err(|e| TalkError::Config(format!("failed to clone log file handle: {}", e)))?;
-
-    cmd.stdout(std::process::Stdio::from(log_file));
-    cmd.stderr(std::process::Stdio::from(log_stderr));
-    cmd.stdin(std::process::Stdio::null());
-
-    // Create new process group (equivalent to setsid for signal isolation)
-    cmd.process_group(0);
-
-    // Spawn daemon — recording starts immediately.
-    let child = cmd
-        .spawn()
-        .map_err(|e| TalkError::Config(format!("failed to spawn daemon process: {}", e)))?;
-
-    let child_pid = child.id();
-    daemon::write_pid_file(pid_file, child_pid)?;
-
-    log::info!(
-        "dictation started (PID {}, logs: {})",
-        child_pid,
-        log_file_path.display()
-    );
-
-    Ok(())
-}
-
-/// Signal a running daemon to stop and remove the PID file.
-///
-/// Returns immediately — the daemon finishes its transcription and
-/// paste in the background, so a new toggle-on can proceed without
-/// waiting.
-fn toggle_stop(pid: u32, pid_file: &std::path::Path) -> Result<(), TalkError> {
-    daemon::trace(&format!(
-        "[DBG] toggle_stop: sending SIGINT to daemon PID {}",
-        pid
-    ));
-    daemon::signal_daemon(pid, pid_file)?;
-    daemon::trace(&format!(
-        "[DBG] toggle_stop: signal_daemon returned OK for PID {}",
-        pid
-    ));
     Ok(())
 }
 
@@ -374,5 +296,79 @@ mod tests {
         assert!(!args.contains(&"--diarize".to_string()));
         assert!(!args.contains(&"--realtime".to_string()));
         assert!(!args.contains(&"--no-sounds".to_string()));
+    }
+
+    #[test]
+    fn test_build_daemon_args_exact_vector() {
+        let mut opts = test_opts();
+        opts.verbose = 2;
+        opts.provider = Some(crate::config::Provider::OpenAI);
+        opts.model = Some("gpt-test".to_string());
+        opts.diarize = true;
+        opts.timestamp = true;
+        opts.realtime = true;
+        opts.no_sounds = true;
+        opts.no_boop = true;
+        opts.no_chunk_paste = true;
+        opts.no_paste = true;
+        opts.monitor = true;
+        opts.no_overlay = true;
+        opts.no_auto_pause = true;
+        opts.viz = Some(crate::config::VizMode::Waterfall);
+        opts.mono = true;
+        opts.upload_format = crate::transcription::UploadFormat::Ogg;
+        opts.no_bt_auto_switch = true;
+        opts.save = Some(PathBuf::from("/tmp/save.ogg"));
+        opts.output_yaml = Some(PathBuf::from("/tmp/output.yaml"));
+        opts.input_audio_file = Some(PathBuf::from("/tmp/input.ogg"));
+        opts.retry_last = true;
+        opts.pick = true;
+        opts.replace_last_paste = true;
+        opts.toggle = true;
+        opts.daemon = true;
+
+        let args = build_daemon_args(&opts, Some("0x1234".to_string()));
+
+        assert_eq!(
+            args,
+            vec![
+                "-vv",
+                "dictate",
+                "--daemon",
+                "--provider",
+                "openai",
+                "--model",
+                "gpt-test",
+                "--diarize",
+                "--timestamp",
+                "--realtime",
+                "--no-sounds",
+                "--no-boop",
+                "--no-chunk-paste",
+                "--no-paste",
+                "--monitor",
+                "--no-overlay",
+                "--no-auto-pause",
+                "--viz",
+                "waterfall",
+                "--mono",
+                "--upload-format",
+                "ogg",
+                "--no-bt-auto-switch",
+                "--save",
+                "/tmp/save.ogg",
+                "--output-yaml",
+                "/tmp/output.yaml",
+                "--input-audio-file",
+                "/tmp/input.ogg",
+                "--retry-last",
+                "--pick",
+                "--replace-last-paste",
+                "--target-window",
+                "0x1234",
+            ]
+        );
+        assert_eq!(args.iter().filter(|arg| *arg == "--daemon").count(), 1);
+        assert!(!args.iter().any(|arg| arg == "--toggle"));
     }
 }

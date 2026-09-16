@@ -76,6 +76,12 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         return toggle_dispatch(&opts).await;
     }
 
+    let _daemon_owner = if opts.daemon {
+        Some(daemon::dictate_slot()?.owner_guard())
+    } else {
+        None
+    };
+
     let save_path = opts.save;
 
     // Load configuration
@@ -796,14 +802,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         if let Some(ref o) = overlay {
                             o.hide();
                         }
-                        // Clean up PID so a new daemon can start
-                        // while the visualizer drains its messages.
-                        if opts.daemon {
-                            if let Ok(pid_file) = daemon::pid_path() {
-                                let _ =
-                                    daemon::remove_pid_file_if_owner(std::process::id(), &pid_file);
-                            }
-                        }
                         return Ok(());
                     }
                 }
@@ -984,16 +982,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // realtime mode already prints segments as they arrive)
     if !opts.realtime {
         println!("{}", text);
-    }
-
-    // If running as daemon, clean up PID file on normal exit — but only
-    // if we still own it.  Between our SIGINT and this cleanup a new daemon
-    // may have spawned and written its own PID, so blindly removing the
-    // file would orphan it.
-    if opts.daemon {
-        if let Ok(pid_file) = daemon::pid_path() {
-            let _ = daemon::remove_pid_file_if_owner(std::process::id(), &pid_file);
-        }
     }
 
     Ok(())

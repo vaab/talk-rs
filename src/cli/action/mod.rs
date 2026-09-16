@@ -2,8 +2,8 @@ use crate::cli::def::Commands;
 use std::path::PathBuf;
 
 pub use crate::dictate::{dictate, DictateOpts};
-pub use crate::record::record;
 pub use crate::record::ui::record_ui;
+pub use crate::record::{record, record_daemon, RecordOpts};
 pub use crate::speak::{speak, SpeakOpts};
 pub use crate::transcribe::transcribe;
 
@@ -13,13 +13,32 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             file,
             monitor,
             ui,
+            toggle,
             no_bt_auto_switch,
+            daemon,
         } => {
             if ui {
                 record_ui().await?;
+            } else if toggle {
+                crate::record::toggle::toggle_dispatch(&crate::record::toggle::RecordToggleOpts {
+                    file: file.map(PathBuf::from),
+                    monitor,
+                    no_bt_auto_switch,
+                    verbose,
+                })
+                .await?;
             } else {
                 let args = file.map(|f| vec![f]).unwrap_or_default();
-                record(args, monitor, no_bt_auto_switch).await?;
+                let opts = RecordOpts {
+                    args,
+                    monitor,
+                    no_bt_auto_switch,
+                };
+                if daemon {
+                    record_daemon(opts).await?;
+                } else {
+                    record(opts).await?;
+                }
             }
         }
         Commands::Transcribe {

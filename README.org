@@ -340,15 +340,30 @@ Capture audio to an OGG/Opus file:
 #+begin_src sh
 talk-rs record                       # auto-named <output_dir>/YYYY/MM/YYYY-MM-DDTHH-MM-SS±ZZZZ.ogg
 talk-rs record meeting-notes.ogg     # custom filename
+talk-rs record --toggle              # first call starts, second call stops
+talk-rs record --toggle meeting.ogg  # toggle with an explicit output path
 #+end_src
+
+Toggle mode starts a background recorder on the first call.  The second
+call sends SIGINT; the recorder stops capture, finalizes and syncs the
+audio file, then exits.  Its PID remains published during finalization,
+so repeated stop calls cannot start a second writer for the same toggle
+slot.  Toggle mode conflicts with ~--ui~.
 
 Options:
 
 | Flag                  | Effect                                           |
 |-----------------------+--------------------------------------------------|
+| ~--toggle~            | Toggle background recording on the first/second call |
 | ~--monitor~           | Mix system audio (monitor) with microphone input |
 | ~--ui~                | Open GTK4 recordings browser (play, delete, open folder) |
 | ~--no-bt-auto-switch~ | Disable Bluetooth headset HFP auto-switch (overrides ~audio.bt_auto_switch~) |
+
+Toggle state is stored under ~$XDG_CACHE_HOME/talk-rs/~ (normally
+~~/.cache/talk-rs/~).  Dictation keeps its existing ~daemon.pid~,
+~daemon.lock~, and ~daemon.log~ files.  Standalone recording uses the
+separate ~record.pid~, ~record.lock~, and ~record.log~ files, so the two
+commands cannot stop or overwrite each other's toggle state.
 
 *** Transcribe
 

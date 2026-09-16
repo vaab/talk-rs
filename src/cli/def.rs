@@ -29,11 +29,17 @@ pub enum Commands {
         /// Open GTK recordings browser to manage cached recordings
         #[arg(long)]
         ui: bool,
+        /// Toggle background recording: first call starts, second call stops
+        #[arg(long, conflicts_with = "ui")]
+        toggle: bool,
         /// Disable auto-switching of a Bluetooth headset to HFP for
         /// the duration of the recording (overrides config
         /// `audio.bt_auto_switch`)
         #[arg(long)]
         no_bt_auto_switch: bool,
+        /// Run as recording daemon (internal, used by --toggle)
+        #[arg(long, hide = true)]
+        daemon: bool,
     },
     /// Transcribe an audio file to text
     Transcribe {
@@ -170,4 +176,58 @@ pub enum Commands {
         #[arg(long, hide = true)]
         target_window: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_toggle_parses_public_options_and_hidden_child_mode() {
+        let cli = Cli::try_parse_from([
+            "talk-rs",
+            "-vv",
+            "record",
+            "--toggle",
+            "--monitor",
+            "--no-bt-auto-switch",
+            "meeting.ogg",
+        ])
+        .expect("record toggle arguments should parse");
+
+        assert_eq!(cli.verbose, 2);
+        match cli.command {
+            Commands::Record {
+                file,
+                monitor,
+                ui,
+                no_bt_auto_switch,
+                toggle,
+                daemon,
+            } => {
+                assert_eq!(file.as_deref(), Some("meeting.ogg"));
+                assert!(monitor);
+                assert!(!ui);
+                assert!(no_bt_auto_switch);
+                assert!(toggle);
+                assert!(!daemon);
+            }
+            other => panic!("expected record command, got {other:?}"),
+        }
+
+        let child = Cli::try_parse_from(["talk-rs", "record", "--daemon"])
+            .expect("hidden record child mode should parse");
+        match child.command {
+            Commands::Record { daemon, .. } => assert!(daemon),
+            other => panic!("expected record command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_toggle_conflicts_with_ui() {
+        let error = Cli::try_parse_from(["talk-rs", "record", "--toggle", "--ui"])
+            .expect_err("record toggle and UI must conflict");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 }

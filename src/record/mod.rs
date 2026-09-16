@@ -8,6 +8,8 @@ pub(crate) mod audio;
 mod entries;
 #[cfg(feature = "ui")]
 pub(crate) mod player;
+#[cfg(all(feature = "capture", feature = "ui"))]
+pub(crate) mod toggle;
 #[cfg(feature = "ui")]
 pub(crate) mod ui;
 
@@ -108,13 +110,23 @@ fn create_writer(path: &Path, config: AudioConfig) -> Result<Box<dyn AudioWriter
 /// 5. Wait for SIGINT (Ctrl+C) to gracefully shutdown
 /// 6. Flush encoder and close file
 #[cfg(feature = "capture")]
-pub async fn record(
-    args: Vec<String>,
-    monitor: bool,
-    no_bt_auto_switch: bool,
-) -> Result<(), TalkError> {
+pub struct RecordOpts {
+    pub args: Vec<String>,
+    pub monitor: bool,
+    pub no_bt_auto_switch: bool,
+}
+
+#[cfg(feature = "capture")]
+pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
+    // Register SIGINT before configuration, Bluetooth, capture, writer, or
+    // file resources so a quick toggle-off cannot be lost during startup.
+    // Foreground Ctrl-C uses this same signal stream.
+    let mut interrupt =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|error| TalkError::Audio(format!("Failed to listen for Ctrl+C: {error}")))?;
+
     // Parse arguments
-    let output_path = parse_args(&args)?;
+    let output_path = parse_args(&opts.args)?;
 
     // Bluetooth headset profile auto-switching.  Resolution order:
     // CLI flag `--no-bt-auto-switch` wins; otherwise config
@@ -124,13 +136,13 @@ pub async fn record(
     // returned guard restores the original profile on Drop (normal
     // return, panic, SIGINT).  Failures are logged but non-fatal.
     let config_for_bt = Config::load(None).ok();
-    let bt_auto_switch_enabled = !no_bt_auto_switch
+    let bt_auto_switch_enabled = !opts.no_bt_auto_switch
         && config_for_bt
             .as_ref()
             .and_then(|c| c.audio.as_ref())
             .map(|a| a.bt_auto_switch_enabled())
             .unwrap_or(true);
-    let _bt_guard = if !bt_auto_switch_enabled {
+    let mut bt_guard = if !bt_auto_switch_enabled {
         log::debug!("bt_profile: auto-switching disabled by config/flag");
         bt_profile::HeadsetGuard::new(None)
     } else {
@@ -169,7 +181,7 @@ pub async fn record(
     // device (duplicating a mono source to stereo when asked), which
     // makes a 48 kHz stereo request robust even on mono-only mics —
     // unlike the strict exact-match CpalCapture used previously.
-    let mut capture: Box<dyn AudioCapture> = if monitor {
+    let mut capture: Box<dyn AudioCapture> = if opts.monitor {
         log::info!("recording with mic+monitor (PipeWire)");
         Box::new(MonitorCapture::new(audio_config.clone()))
     } else {
@@ -270,15 +282,18 @@ pub async fn record(
         Ok::<(), TalkError>(())
     });
 
-    // Wait for SIGINT (Ctrl+C)
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|err| TalkError::Audio(format!("Failed to listen for Ctrl+C: {}", err)))?;
+    // Wait for SIGINT (Ctrl+C or toggle-off).
+    if interrupt.recv().await.is_none() {
+        return Err(TalkError::Audio(
+            "SIGINT listener closed before recording stopped".to_string(),
+        ));
+    }
 
     println!("Stopping recording...");
 
     // Stop capture (closes channel)
     capture.stop()?;
+    bt_guard.restore_now_async();
 
     // Wait for encode task to complete
     match encode_task.await {
@@ -289,6 +304,13 @@ pub async fn record(
         Ok(Err(err)) => Err(err),
         Err(err) => Err(TalkError::Audio(format!("Encode task panicked: {}", err))),
     }
+}
+
+#[cfg(feature = "capture")]
+pub async fn record_daemon(opts: RecordOpts) -> Result<(), TalkError> {
+    let slot = crate::daemon::record_slot()?;
+    let _owner = slot.owner_guard();
+    record(opts).await
 }
 
 #[cfg(all(test, feature = "capture"))]
