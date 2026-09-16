@@ -361,6 +361,7 @@ pub async fn http_request(
             attempt: retry_num,
             max: DATA_BACKOFF_SECS.len() as u32,
             reason,
+            delay: wait,
             t: Instant::now(),
         });
 
@@ -428,6 +429,7 @@ async fn run_connection_phase(
                 attempt: idx as u32,
                 max: max_connection_attempts.saturating_sub(1),
                 reason,
+                delay: Duration::ZERO,
                 t: Instant::now(),
             });
         }
@@ -897,6 +899,7 @@ pub async fn ws_upgrade(
                 attempt: idx as u32,
                 max: max_connection_attempts.saturating_sub(1),
                 reason,
+                delay: Duration::ZERO,
                 t: Instant::now(),
             });
         }

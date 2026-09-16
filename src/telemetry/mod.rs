@@ -145,14 +145,22 @@ pub enum TranscriptionEvent {
     /// - [`RetryKind::Connection`] — TCP / TLS / DNS retry with
     ///   growing budget `[2, 5, 8, 11, 15]` seconds.  Picker UI
     ///   should render as `connect retry N/M…`.
-    /// - [`RetryKind::Data`] — server returned a transient 5xx
-    ///   after the connection was established.  Picker UI should
-    ///   render as `server retry N/M…`.
+    /// - [`RetryKind::Data`] — server returned a retryable status
+    ///   (5xx or 429) after the connection was established.  Picker
+    ///   UI should render as `server retry N/M in Ss…`.
+    ///
+    /// `delay` is how long the transport will wait before the next
+    /// attempt fires, measured from `t`.  Connection retries fire
+    /// immediately (`Duration::ZERO`); data retries follow the
+    /// backoff schedule or the server's `Retry-After`.  UI consumers
+    /// use `t + delay` to render a countdown so a multi-minute
+    /// backoff never looks like a hang.
     RetryScheduled {
         kind: RetryKind,
         attempt: u32,
         max: u32,
         reason: String,
+        delay: std::time::Duration,
         t: Instant,
     },
 
@@ -435,6 +443,7 @@ mod tests {
                 attempt: 1,
                 max: 5,
                 reason: "timeout".to_string(),
+                delay: std::time::Duration::ZERO,
                 t: Instant::now(),
             },
             TranscriptionEvent::PasteStarted { t: Instant::now() },

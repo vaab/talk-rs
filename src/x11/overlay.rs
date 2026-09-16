@@ -701,6 +701,14 @@ enum Phase {
     WaitingResponse,
     /// `ResponseHeaders` received, body arriving / JSON parsing.
     Receiving,
+    /// `RetryScheduled { kind: Data }` received — the provider
+    /// answered "busy" (5xx / 429) and the transport is sleeping
+    /// out a backoff before the next attempt.  Amber like
+    /// [`Self::WaitingResponse`] ("the server's turn"), but the
+    /// stripe is drawn as a draining bar (see
+    /// [`render_backoff_bar`]) so a two-minute wait reads as
+    /// timed, not hung.  Leaves on the next `RequestStarted`.
+    WaitingRetry,
     /// `RequestCompleted { success: true }` received.
     Done,
     /// `RequestCompleted { success: false }` received.
@@ -711,6 +719,19 @@ enum Phase {
 /// validation in progress" green so [`Phase::color`] cannot drift
 /// between the two variants by accident.
 const PHASE_GREEN: [u8; 4] = [110, 255, 60, 255]; // RGB(60,255,110)
+
+/// Amber shared by the two "waiting on the provider" phases so the
+/// hue keeps one meaning: [`Phase::WaitingResponse`] (request sent,
+/// answer pending) and [`Phase::WaitingRetry`] (provider said busy,
+/// backoff running).  RGB(255,180,50) → BGRA.
+const PHASE_AMBER: [u8; 4] = [50, 180, 255, 255];
+
+/// Opacity of the [`Phase::WaitingRetry`] history stripe.  The
+/// per-column trail records "the provider was busy for this long"
+/// dimly, while the live countdown band ([`render_backoff_bar`]) is
+/// drawn at full opacity on top — the contrast between the two is
+/// what makes the drain readable.
+const BACKOFF_TRAIL_OPACITY: f32 = 0.35;
 
 /// Opacity used by [`Phase::Validating`] for both its phase-line
 /// stripe and the retry counter overlay.  At 0.5 the validation
@@ -733,7 +754,8 @@ impl Phase {
             // bright blue  RGB(60,170,255)
             Self::Uploading => Some(([255, 170, 60, 255], 1.0)),
             // amber  RGB(255,180,50)
-            Self::WaitingResponse => Some(([50, 180, 255, 255], 1.0)),
+            Self::WaitingResponse => Some((PHASE_AMBER, 1.0)),
+            Self::WaitingRetry => Some((PHASE_AMBER, BACKOFF_TRAIL_OPACITY)),
             // teal  RGB(60,200,180)
             Self::Receiving => Some(([180, 200, 60, 255], 1.0)),
             // green  RGB(60,255,110)
@@ -773,14 +795,16 @@ impl Phase {
             TranscriptionEvent::ResponseHeaders { .. } => Self::Receiving,
             TranscriptionEvent::RequestCompleted { success: true, .. } => Self::Done,
             TranscriptionEvent::RequestCompleted { success: false, .. } => Self::Error,
-            // A retry inside the transcription path drops back to
-            // `Connecting` (a new attempt is about to fire).  A
-            // retry inside the validate path (where `self` is
+            // A retry inside the validate path (where `self` is
             // `Validating`) stays in `Validating` so the stripe
-            // remains dimmed.
-            TranscriptionEvent::RetryScheduled { .. } => match self {
-                Self::Validating => Self::Validating,
-                _ => Self::Connecting,
+            // remains dimmed.  Otherwise a connection retry drops
+            // back to `Connecting` (a new attempt fires at once),
+            // while a data retry — provider busy, backoff running —
+            // enters `WaitingRetry` until the next `RequestStarted`.
+            TranscriptionEvent::RetryScheduled { kind, .. } => match (self, kind) {
+                (Self::Validating, _) => Self::Validating,
+                (_, crate::telemetry::RetryKind::Data) => Self::WaitingRetry,
+                (_, crate::telemetry::RetryKind::Connection) => Self::Connecting,
             },
             TranscriptionEvent::PasteStarted { .. } => Self::Done, // green during paste
             TranscriptionEvent::Done { .. } | TranscriptionEvent::PasteCompleted { .. } => {
@@ -850,6 +874,64 @@ fn render_phase_line(
             }
         }
     }
+}
+
+/// Fraction of a backoff wait still remaining at `now`, linear in
+/// elapsed time: `1.0` when the wait starts, `0.0` once `delay` has
+/// elapsed, clamped to `[0, 1]` (never negative when the render loop
+/// outlives the wait by a frame or two).  A zero `delay` — the
+/// connection-retry case — has nothing to drain and yields `0.0`.
+fn backoff_remaining_fraction(
+    now: std::time::Instant,
+    started: std::time::Instant,
+    delay: std::time::Duration,
+) -> f32 {
+    if delay.is_zero() {
+        return 0.0;
+    }
+    let elapsed = now.saturating_duration_since(started).as_secs_f32();
+    (1.0 - elapsed / delay.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+/// Render the backoff countdown as a solid amber band over the
+/// phase-line row: `fraction * w` pixels wide, anchored at the left
+/// edge of the spec area and `PHASE_LINE_HEIGHT` tall, so it drains
+/// right-to-left as the wait elapses.
+///
+/// Drawn AFTER [`render_phase_line`], on top of it: the scrolling
+/// per-column history underneath still records amber for every
+/// column pushed during the wait (so the timeline shows how long the
+/// provider stayed busy), while the band on top gives the live
+/// "how much longer" reading.
+fn render_backoff_bar(pb: &mut PixelBuffer, x0: usize, y0: usize, w: usize, fraction: f32) {
+    let filled = (w as f32 * fraction.clamp(0.0, 1.0)).round() as usize;
+    if filled == 0 {
+        return;
+    }
+    pb.fill_rect(x0, y0, filled.min(w), PHASE_LINE_HEIGHT, PHASE_AMBER);
+}
+
+/// Centre badge text shown while a server backoff runs.  Names the
+/// cause ("busy" — it is the provider, not the user's setup) and the
+/// progress through the server-retry budget.
+fn backoff_badge_label(attempt: u32, max: u32) -> String {
+    format!("BUSY · RETRY {}/{}", attempt, max)
+}
+
+/// Render the backoff badge text in amber, centred in the SPEC area
+/// (same path as `TRANSCRIBING` / `LISTENING`).  `retry` is the
+/// `(attempt, max)` pair from the last `RetryScheduled`.
+fn render_backoff_text(
+    pb: &mut PixelBuffer,
+    font: &fontdue::Font,
+    retry: (u32, u32),
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) {
+    let label = backoff_badge_label(retry.0, retry.1);
+    render_badge_text(pb, font, &label, PHASE_AMBER, x0, y0, w, h);
 }
 
 /// Pixel budget for each individual throughput track.  Each of the
@@ -1750,6 +1832,12 @@ fn overlay_thread(
     // doesn't leave a stale digit on screen for the next cycle).
     let mut current_retry: Option<(u32, u32)> = None;
 
+    // Server-backoff countdown: `(started, delay)` from the last
+    // `RetryScheduled { kind: Data }`.  Drives the draining amber
+    // bar and the `BUSY · RETRY N/M` badge while `current_phase`
+    // is `WaitingRetry`; cleared whenever `current_retry` is.
+    let mut current_backoff: Option<(std::time::Instant, std::time::Duration)> = None;
+
     // True when the recording has ended and the HTTP transcription is
     // in flight.  The render loop keeps running: empty columns are
     // pushed so the waterfall continues to scroll, and the phase
@@ -1878,6 +1966,7 @@ fn overlay_thread(
                     columns_pushed_total = 0;
                     current_phase = Phase::Idle;
                     current_retry = None;
+                    current_backoff = None;
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
                     spectrum_peak = PEAK_FLOOR;
@@ -1976,6 +2065,7 @@ fn overlay_thread(
                     columns_pushed_total = 0;
                     current_phase = Phase::Idle;
                     current_retry = None;
+                    current_backoff = None;
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
                     spectrum_peak = PEAK_FLOOR;
@@ -2036,6 +2126,7 @@ fn overlay_thread(
                     columns_pushed_total = 0;
                     current_phase = Phase::Idle;
                     current_retry = None;
+                    current_backoff = None;
                     rms_peak = PEAK_FLOOR;
                     spec_peak = PEAK_FLOOR;
                     spectrum_peak = PEAK_FLOOR;
@@ -2128,17 +2219,26 @@ fn overlay_thread(
                                 // we don't show a stale digit during
                                 // the transcription's first attempt.
                                 current_retry = None;
+                                current_backoff = None;
                             }
                             TranscriptionEvent::PreflightStarted { .. } => {
                                 // Fresh preflight cycle — clear any
                                 // retry counter that lingered from a
                                 // previous attempt's terminal state.
                                 current_retry = None;
+                                current_backoff = None;
                             }
-                            TranscriptionEvent::RetryScheduled { attempt, max, .. } => {
+                            TranscriptionEvent::RetryScheduled {
+                                kind,
+                                attempt,
+                                max,
+                                delay,
+                                t,
+                                ..
+                            } => {
                                 // Surface the retry attempt to the
                                 // overlay.  `RetryScheduled` is
-                                // emitted both by `with_retry`
+                                // emitted both by the transport
                                 // (transcription request) and by the
                                 // validate-cache miss path; the
                                 // counter is rendered in both cases
@@ -2146,6 +2246,15 @@ fn overlay_thread(
                                 // opacity during transcription —
                                 // controlled by the current phase).
                                 current_retry = Some((*attempt, *max));
+                                // A data retry carries a backoff
+                                // delay; start the countdown from
+                                // the event's own timestamp so a
+                                // lagged broadcast doesn't stretch
+                                // the bar.
+                                current_backoff = match kind {
+                                    crate::telemetry::RetryKind::Data => Some((*t, *delay)),
+                                    crate::telemetry::RetryKind::Connection => None,
+                                };
                             }
                             TranscriptionEvent::PasteStarted { .. } => {
                                 current_paste_chars = 0;
@@ -2558,6 +2667,15 @@ fn overlay_thread(
                 COLUMNS_PER_GRID_MARK,
             );
             render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            // Server-backoff countdown over the phase line: a solid
+            // amber band draining right-to-left across the wait.
+            if current_phase == Phase::WaitingRetry {
+                if let Some((started, delay)) = current_backoff {
+                    let fraction =
+                        backoff_remaining_fraction(std::time::Instant::now(), started, delay);
+                    render_backoff_bar(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, fraction);
+                }
+            }
             render_throughput_tracks(
                 &mut pb,
                 SPEC_LEFT,
@@ -2580,6 +2698,21 @@ fn overlay_thread(
             if let Some(ref f) = badge_font {
                 if is_downloading {
                     render_downloading_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+                } else if let (Phase::WaitingRetry, Some((attempt, max))) =
+                    (current_phase, current_retry)
+                {
+                    // Provider backoff: the centre text carries the
+                    // cause and the N/M count, so the small corner
+                    // digit is redundant here and stays hidden.
+                    render_backoff_text(
+                        &mut pb,
+                        f,
+                        (attempt, max),
+                        SPEC_LEFT,
+                        SPEC_TOP,
+                        SPEC_W,
+                        SPEC_H,
+                    );
                 } else {
                     render_transcribing_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
                     // Retry-attempt indicator (1, 2, 3, …) drawn
@@ -2677,6 +2810,15 @@ fn overlay_thread(
                 COLUMNS_PER_GRID_MARK,
             );
             render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            // Server-backoff countdown over the phase line: a solid
+            // amber band draining right-to-left across the wait.
+            if current_phase == Phase::WaitingRetry {
+                if let Some((started, delay)) = current_backoff {
+                    let fraction =
+                        backoff_remaining_fraction(std::time::Instant::now(), started, delay);
+                    render_backoff_bar(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, fraction);
+                }
+            }
             render_throughput_tracks(
                 &mut pb,
                 SPEC_LEFT,
@@ -2757,6 +2899,15 @@ fn overlay_thread(
                 COLUMNS_PER_GRID_MARK,
             );
             render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            // Server-backoff countdown over the phase line: a solid
+            // amber band draining right-to-left across the wait.
+            if current_phase == Phase::WaitingRetry {
+                if let Some((started, delay)) = current_backoff {
+                    let fraction =
+                        backoff_remaining_fraction(std::time::Instant::now(), started, delay);
+                    render_backoff_bar(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, fraction);
+                }
+            }
             render_throughput_tracks(
                 &mut pb,
                 SPEC_LEFT,
@@ -3581,6 +3732,7 @@ mod tests {
             attempt: 2,
             max: 5,
             reason: "timeout".into(),
+            delay: std::time::Duration::ZERO,
             t: Instant::now(),
         });
         assert_eq!(after, Phase::Validating);
@@ -3597,6 +3749,7 @@ mod tests {
             attempt: 2,
             max: 5,
             reason: "timeout".into(),
+            delay: std::time::Duration::ZERO,
             t: Instant::now(),
         });
         assert_eq!(after, Phase::Connecting);
@@ -3655,6 +3808,167 @@ mod tests {
                 opacity
             );
         }
+    }
+
+    // ── Provider-overload backoff (server retry) ───────────────
+
+    use std::time::{Duration, Instant};
+
+    /// Read back one BGRA pixel (test-only; production code never
+    /// needs random access reads).
+    fn pixel(pb: &PixelBuffer, x: usize, y: usize) -> [u8; 4] {
+        let off = (y * pb.width + x) * 4;
+        [
+            pb.data[off],
+            pb.data[off + 1],
+            pb.data[off + 2],
+            pb.data[off + 3],
+        ]
+    }
+
+    fn data_retry(delay_secs: u64) -> TranscriptionEvent {
+        TranscriptionEvent::RetryScheduled {
+            kind: crate::telemetry::RetryKind::Data,
+            attempt: 3,
+            max: 6,
+            reason: "503 high load".into(),
+            delay: Duration::from_secs(delay_secs),
+            t: Instant::now(),
+        }
+    }
+
+    /// Spec: a data-phase (server busy) retry enters
+    /// `WaitingRetry` from any transcription phase, while a
+    /// connection retry keeps the historical `Connecting` fallback.
+    #[test]
+    fn phase_advance_data_retry_enters_waiting_retry() {
+        for from in [
+            Phase::Connecting,
+            Phase::Uploading,
+            Phase::WaitingResponse,
+            Phase::Receiving,
+        ] {
+            assert_eq!(
+                from.advance(&data_retry(30)),
+                Phase::WaitingRetry,
+                "from {:?}",
+                from
+            );
+        }
+        let conn = TranscriptionEvent::RetryScheduled {
+            kind: crate::telemetry::RetryKind::Connection,
+            attempt: 2,
+            max: 6,
+            reason: "timeout".into(),
+            delay: Duration::ZERO,
+            t: Instant::now(),
+        };
+        assert_eq!(Phase::Receiving.advance(&conn), Phase::Connecting);
+    }
+
+    /// Spec: a data retry during validation stays dimmed-validating
+    /// (same rule as connection retries) — the preflight stripe is
+    /// not the place to advertise provider backoff.
+    #[test]
+    fn phase_advance_data_retry_during_validating_stays_validating() {
+        assert_eq!(
+            Phase::Validating.advance(&data_retry(30)),
+            Phase::Validating
+        );
+    }
+
+    /// Spec: the next attempt's `RequestStarted` leaves
+    /// `WaitingRetry` for `Connecting`, so the amber stripe ends
+    /// exactly when the wait ends.
+    #[test]
+    fn phase_advance_waiting_retry_returns_to_connecting_on_request_started() {
+        let after = Phase::WaitingRetry.advance(&TranscriptionEvent::RequestStarted {
+            endpoint: "https://x".into(),
+            t: Instant::now(),
+        });
+        assert_eq!(after, Phase::Connecting);
+    }
+
+    /// Spec: `WaitingRetry` is amber — the same hue family as
+    /// `WaitingResponse` ("the server's turn"), distinct from every
+    /// blue (our turn), red (failed) and green (done) phase — but at
+    /// `BACKOFF_TRAIL_OPACITY`, so the full-opacity countdown band
+    /// drawn on top by [`render_backoff_bar`] stays visibly distinct
+    /// from the dim "time already spent waiting" trail underneath.
+    #[test]
+    fn phase_color_waiting_retry_is_dim_amber() {
+        let (color, opacity) = Phase::WaitingRetry.color().expect("has colour");
+        assert_eq!(color, PHASE_AMBER);
+        assert!((opacity - BACKOFF_TRAIL_OPACITY).abs() < f32::EPSILON);
+        assert!(opacity < 1.0 && opacity > 0.0);
+        for other in [
+            Phase::Connecting,
+            Phase::Uploading,
+            Phase::Receiving,
+            Phase::Done,
+            Phase::Error,
+        ] {
+            let (c, _) = other.color().expect("has colour");
+            assert_ne!(
+                c, PHASE_AMBER,
+                "{:?} must not share the backoff amber",
+                other
+            );
+        }
+    }
+
+    /// Spec: the drained fraction of the backoff bar is linear in
+    /// elapsed time — 1.0 when the wait starts, 0.5 halfway, 0.0
+    /// once the delay has elapsed, and never negative afterwards.
+    #[test]
+    fn backoff_remaining_fraction_drains_linearly_and_clamps() {
+        let started = Instant::now();
+        let delay = Duration::from_secs(40);
+        let at = |secs: u64| {
+            backoff_remaining_fraction(started + Duration::from_secs(secs), started, delay)
+        };
+        assert!((at(0) - 1.0).abs() < 1e-6);
+        assert!((at(20) - 0.5).abs() < 1e-6);
+        assert!((at(40) - 0.0).abs() < 1e-6);
+        assert!((at(90) - 0.0).abs() < 1e-6, "must clamp after the delay");
+    }
+
+    /// Spec: a zero delay (connection retry) has nothing to drain —
+    /// the fraction is 0.0 immediately so no bar is drawn.
+    #[test]
+    fn backoff_remaining_fraction_zero_delay_is_empty() {
+        let started = Instant::now();
+        assert!((backoff_remaining_fraction(started, started, Duration::ZERO) - 0.0).abs() < 1e-6);
+    }
+
+    /// Spec: the backoff bar is drawn right-to-left as a solid amber
+    /// band `fraction * w` pixels wide, anchored at the left edge of
+    /// the spec area, `PHASE_LINE_HEIGHT` tall.  At fraction 0.5 on
+    /// a 100 px area, columns 0..50 are amber and 50..100 untouched.
+    #[test]
+    fn render_backoff_bar_fills_left_portion_proportionally() {
+        let mut pb = PixelBuffer::new(120, 20);
+        render_backoff_bar(&mut pb, 10, 5, 100, 0.5);
+        assert_eq!(pixel(&pb, 10, 5), PHASE_AMBER, "left edge amber");
+        assert_eq!(pixel(&pb, 59, 6), PHASE_AMBER, "last filled column amber");
+        assert_eq!(
+            pixel(&pb, 60, 5),
+            [0, 0, 0, 0],
+            "first drained column untouched"
+        );
+        assert_eq!(pixel(&pb, 109, 5), [0, 0, 0, 0], "right edge untouched");
+        assert_eq!(
+            pixel(&pb, 10, 5 + PHASE_LINE_HEIGHT),
+            [0, 0, 0, 0],
+            "below the band untouched"
+        );
+    }
+
+    /// Spec: the centre badge text during a server backoff names
+    /// the cause and the progress: `BUSY · RETRY 3/6`.
+    #[test]
+    fn backoff_badge_label_names_cause_and_progress() {
+        assert_eq!(backoff_badge_label(3, 6), "BUSY · RETRY 3/6");
     }
 
     /// Spec: `Phase::opacity` is a thin accessor for the opacity

@@ -34,7 +34,7 @@ use std::sync::Mutex;
 /// | `ConnectionEstablished`                | `uploading…`              |
 /// | `UploadComplete`                       | `waiting for server…`     |
 /// | `ResponseHeaders { status: 2xx }`      | `transcribing…`           |
-/// | `RetryScheduled { attempt, max }`      | `retry attempt/max…`      |
+/// | `RetryScheduled { attempt, max, delay }` | `connect retry N/M…` / `server retry N/M in Ss…` |
 /// | `RequestCompleted { success: false }`  | (silent — final candidate |
 /// |                                        |  message takes over)      |
 ///
@@ -121,13 +121,27 @@ impl TelemetrySink for PickerStatusSink {
                 self.push("transcribing…".to_string())
             }
             PipelineEvent::RetryScheduled {
-                kind, attempt, max, ..
+                kind,
+                attempt,
+                max,
+                delay,
+                ..
             } => {
                 let label = match kind {
                     crate::telemetry::RetryKind::Connection => "connect retry",
                     crate::telemetry::RetryKind::Data => "server retry",
                 };
-                self.push(format!("{} {}/{}…", label, attempt, max))
+                if delay.is_zero() {
+                    self.push(format!("{} {}/{}…", label, attempt, max))
+                } else {
+                    self.push(format!(
+                        "{} {}/{} in {}s…",
+                        label,
+                        attempt,
+                        max,
+                        delay.as_secs()
+                    ))
+                }
             }
             // Free-form status: pass the producer's message
             // through verbatim.  Used by the realtime path for
@@ -726,6 +740,7 @@ mod tests {
             attempt: 2,
             max: 5,
             reason: "transient".into(),
+            delay: std::time::Duration::ZERO,
             t: now,
         });
         sink.emit(PipelineEvent::RetryScheduled {
@@ -733,6 +748,7 @@ mod tests {
             attempt: 1,
             max: 3,
             reason: "5xx".into(),
+            delay: std::time::Duration::from_secs(30),
             t: now,
         });
 
@@ -741,7 +757,10 @@ mod tests {
             .iter()
             .filter_map(|o| o.as_ref().map(|(_, _, s)| s.as_str()))
             .collect();
-        assert_eq!(strings, vec!["connect retry 2/5…", "server retry 1/3…"]);
+        assert_eq!(
+            strings,
+            vec!["connect retry 2/5…", "server retry 1/3 in 30s…"]
+        );
     }
 
     /// Spec: non-2xx response headers do NOT produce a
