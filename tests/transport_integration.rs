@@ -86,6 +86,43 @@ impl TelemetrySink for CapturingSink {
     }
 }
 
+/// A telemetry sink that cancels on the first scheduled retry and
+/// records when the cancellation was triggered.
+struct CancelOnRetrySink {
+    cancel: CancellationToken,
+    cancelled_at: std::sync::Mutex<Option<Instant>>,
+}
+
+impl CancelOnRetrySink {
+    fn new(cancel: CancellationToken) -> Self {
+        Self {
+            cancel,
+            cancelled_at: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn cancelled_at(&self) -> Option<Instant> {
+        *self.cancelled_at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl TelemetrySink for CancelOnRetrySink {
+    fn emit(&self, event: talk_rs::telemetry::TranscriptionEvent) {
+        if !matches!(
+            event,
+            talk_rs::telemetry::TranscriptionEvent::RetryScheduled { .. }
+        ) {
+            return;
+        }
+
+        let mut cancelled_at = self.cancelled_at.lock().unwrap_or_else(|e| e.into_inner());
+        if cancelled_at.is_none() {
+            *cancelled_at = Some(Instant::now());
+            self.cancel.cancel();
+        }
+    }
+}
+
 /// Build a minimal `Request` for the transport against the given URL.
 fn make_request(url: impl Into<String>, phase: PipelinePhase) -> Request {
     Request {
@@ -573,28 +610,26 @@ async fn transport_cancellation_aborts_backoff_wait() {
     let server = wiremock::MockServer::start().await;
     mount_fail_then_succeed(&server, 503, Some(30), 1).await;
 
-    let sink: Arc<dyn TelemetrySink> = Arc::new(NoOpSink);
     let req = make_request(
         format!("{}/v1/models", server.uri()),
         PipelinePhase::Validate,
     );
 
     let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        cancel_clone.cancel();
-    });
+    let cancelling = Arc::new(CancelOnRetrySink::new(cancel.clone()));
+    let sink: Arc<dyn TelemetrySink> = cancelling.clone();
 
-    let started = Instant::now();
     let result = http_request(req, &sink, cancel).await;
-    let elapsed = started.elapsed();
+    let returned_at = Instant::now();
 
     assert!(result.is_err(), "cancellation must surface as Err");
+    let cancelled_at = cancelling
+        .cancelled_at()
+        .expect("a retry must be scheduled before cancellation");
     assert!(
-        elapsed < Duration::from_millis(800),
-        "cancel during backoff must return promptly; elapsed {:?}",
-        elapsed
+        returned_at.duration_since(cancelled_at) < Duration::from_millis(500),
+        "cancel during backoff must return within 500ms; elapsed {:?}",
+        returned_at.duration_since(cancelled_at)
     );
 }
 
