@@ -153,9 +153,9 @@ impl AudioWriter for OggOpusWriter {
         head.push(1); // version
         head.push(self.channels); // channel count
                                   // Pre-skip: standard value for Opus
-        head.write_u16::<LittleEndian>(3840).unwrap(); // pre-skip (infallible on Vec)
-        head.write_u32::<LittleEndian>(48000).unwrap(); // input sample rate (always 48kHz for Opus)
-        head.write_i16::<LittleEndian>(0).unwrap(); // output gain
+        head.extend_from_slice(&3840u16.to_le_bytes()); // pre-skip
+        head.extend_from_slice(&48000u32.to_le_bytes()); // input sample rate (always 48kHz for Opus)
+        head.extend_from_slice(&0i16.to_le_bytes()); // output gain
         head.push(0); // mapping family 0
 
         self.packet_writer
@@ -166,9 +166,9 @@ impl AudioWriter for OggOpusWriter {
         let mut tags = Vec::new();
         tags.extend_from_slice(b"OpusTags");
         let vendor = b"talk-rs";
-        tags.write_u32::<LittleEndian>(vendor.len() as u32).unwrap(); // infallible on Vec
+        tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
         tags.extend_from_slice(vendor);
-        tags.write_u32::<LittleEndian>(0).unwrap(); // 0 user comments (infallible on Vec)
+        tags.extend_from_slice(&0u32.to_le_bytes()); // 0 user comments
 
         self.packet_writer
             .write_packet(tags, self.serial, PacketWriteEndInfo::EndPage, 0)
