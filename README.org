@@ -397,6 +397,27 @@ Options:
 | ~--model~    | Override model for this invocation            |
 | ~--diarize~  | Enable speaker diarization (tag by speaker)  |
 
+**** Provider overload
+
+Cloud providers periodically answer =503 high load= or
+=429 backend_out_of_capacity=, especially on long recordings.
+~talk-rs~ treats every 5xx and 429 as "busy, try again later" and
+waits between attempts: 5 s, 15 s, 30 s, 60 s, 120 s, 120 s (about
+5.5 minutes in total, seven attempts).  A =Retry-After= header from
+the provider overrides the schedule slot (capped at 120 s).  Each wait
+is logged at ~-v~ as =server retry N/6=.  Other 4xx answers are
+permanent and fail immediately.
+
+Connection failures (DNS, unreachable host, TLS timeout) use a
+separate, shorter schedule and never consume the server-retry
+budget.  Large uploads are given the whole request time budget on
+every attempt, so an 80-minute recording is not cut off by the early
+connection slots.
+
+If all seven attempts fail the recording is kept in the cache;
+re-run ~transcribe~ on the ~.ogg~ (or ~dictate --retry-last~) once
+the provider has recovered.
+
 *** Speak (text-to-speech)
 
 The architectural mirror of ~transcribe~: text in, speech out.

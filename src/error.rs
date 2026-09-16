@@ -341,15 +341,20 @@ impl std::fmt::Display for PipelineFailure {
                     body_trimmed.to_string()
                 };
                 // 4xx is permanent (no retry could change the
-                // answer); 5xx is data-phase-retryable (the
-                // transport exhausted its data-retry budget if
-                // attempts > 1).  Annotate so users don't
-                // think the "1/5" attempts in a 404 means we
-                // gave up early.
-                let retry_note: &'static str = if (400..500).contains(status) {
+                // answer) — except 429, which the transport
+                // treats like a 5xx: provider overload, retried
+                // with backoff.  Annotate so users don't think
+                // the "1/5" attempts in a 404 means we gave up
+                // early, and so an exhausted 429/5xx says so.
+                let server_retryable = *status == 429 || (500..600).contains(status);
+                let retry_note: &'static str = if server_retryable {
+                    if self.attempts >= self.max_attempts {
+                        " — server-retry budget exhausted"
+                    } else {
+                        ""
+                    }
+                } else if (400..500).contains(status) {
                     " — 4xx permanent, no retry"
-                } else if (500..600).contains(status) && self.attempts >= self.max_attempts {
-                    " — server-retry budget exhausted"
                 } else {
                     ""
                 };
@@ -779,6 +784,43 @@ mod tests {
             "mid-retry 5xx must not annotate yet; got: {}",
             s
         );
+    }
+
+    /// Spec: 429 is retried by the transport (provider overload),
+    /// so it must annotate like a 5xx — "server-retry budget
+    /// exhausted" once attempts reach max — and must NEVER carry
+    /// the "4xx permanent, no retry" note.
+    #[test]
+    fn pipeline_failure_http_status_429_annotates_like_5xx() {
+        let exhausted = PipelineFailure::new(
+            "Mistral",
+            PipelinePhase::Request,
+            7,
+            7,
+            "https://x",
+            PipelineFailureKind::HttpStatus {
+                status: 429,
+                body: "backend_out_of_capacity".into(),
+            },
+        );
+        let s = exhausted.to_string();
+        assert!(s.contains("server-retry budget exhausted"), "got: {}", s);
+        assert!(!s.contains("4xx permanent"), "got: {}", s);
+
+        let mid = PipelineFailure::new(
+            "Mistral",
+            PipelinePhase::Request,
+            2,
+            7,
+            "https://x",
+            PipelineFailureKind::HttpStatus {
+                status: 429,
+                body: "backend_out_of_capacity".into(),
+            },
+        );
+        let s = mid.to_string();
+        assert!(!s.contains("server-retry budget exhausted"), "got: {}", s);
+        assert!(!s.contains("4xx permanent"), "got: {}", s);
     }
 
     /// Spec: PipelineFailure converts via `?` from `TalkError`

@@ -59,12 +59,31 @@ use tokio_util::sync::CancellationToken;
 /// `i` is the connect-timeout used on attempt `i+1`.  Matches the
 /// historical `VALIDATE_BUDGET_SECS` schedule so the consolidated
 /// transport doesn't regress validate-path behaviour.
-const CONNECTION_BUDGETS_SECS: [u64; 7] = [2, 5, 8, 11, 15, 30, 120];
+///
+/// The budget caps the whole attempt (TCP + TLS + upload + response)
+/// **unless** the request carries a larger [`Request::wall_clock`],
+/// in which case the wall-clock wins — see [`attempt_cap`].  Without
+/// that rule a 26 MB upload is structurally doomed on the first six
+/// slots and only the 120 s slot can ever succeed.
+pub const CONNECTION_BUDGETS_SECS: [u64; 7] = [2, 5, 8, 11, 15, 30, 120];
 
-/// Maximum number of data-phase attempts (the initial call plus
-/// `DATA_MAX_ATTEMPTS - 1` retries) when the server returns 5xx or
-/// a transient body-decode error after headers arrived.
-const DATA_MAX_ATTEMPTS: u32 = 3;
+/// Wait (seconds) before data-phase retry `n` (1-based) when the
+/// server answered with a retryable status (5xx or 429) and sent no
+/// usable `Retry-After`.  Length = number of data-phase retries; the
+/// data-phase attempt budget is `len() + 1` (initial call + retries).
+///
+/// Sized for a *saturated* provider, not a flaky one: field reports
+/// show Mistral answering `503 high load, please retry` and
+/// `429 backend_out_of_capacity` for several minutes at a time.
+/// Retrying seven times in under two minutes (the previous
+/// behaviour) just burns upload bandwidth; the schedule below gives
+/// the provider ~5.5 minutes to recover before giving up.
+pub const DATA_BACKOFF_SECS: [u64; 6] = [5, 15, 30, 60, 120, 120];
+
+/// Upper bound applied to a server-supplied `Retry-After` so a
+/// misbehaving header cannot park an unattended pipeline for hours.
+/// Equal to the largest schedule slot.
+const RETRY_AFTER_CAP_SECS: u64 = 120;
 
 // ── Public vocabulary ───────────────────────────────────────────────
 
@@ -260,37 +279,137 @@ pub enum ConnectionEvent {
 /// `max_attempts` counters when all retries are exhausted, or when
 /// the server returns a permanent failure (model-not-found, 401, …).
 ///
-/// # Implementation notes (Step 2)
+/// # Implementation notes
 ///
-/// The body runs two nested retry loops:
+/// The body runs two nested retry loops, each with its own budget:
 ///
-/// 1. **Connection retry** — outer loop, attempts indexed against
+/// 1. **Data retry** — outer loop, waits indexed against
+///    [`DATA_BACKOFF_SECS`].  A retryable status (5xx or 429) after
+///    a completed HTTP transaction triggers a wait (the server's
+///    `Retry-After` when present, else the schedule slot) and a
+///    fresh connection-phase loop.  Emits [`RetryKind::Data`].
+///
+/// 2. **Connection retry** — inner loop, attempts indexed against
 ///    [`CONNECTION_BUDGETS_SECS`].  Each attempt builds a fresh
 ///    reqwest client with the current per-attempt connect timeout
 ///    and tries once.  On a connect-class failure (DNS, ECONNREFUSED,
-///    TCP/TLS timeout) the loop emits
-///    [`RetryKind::Connection`] and advances to the next attempt.
-///    On any other outcome it forwards to the data-retry decision.
+///    TCP/TLS timeout) the loop emits [`RetryKind::Connection`] and
+///    advances to the next attempt.  The connection schedule restarts
+///    from its first slot on every data retry, so a server retry is
+///    never charged against the connection budget (and vice versa).
 ///
-/// 2. **Data retry** — inner check on a successful HTTP transaction.
-///    A 5xx response triggers a fresh outer attempt counted as a
-///    [`RetryKind::Data`] retry, up to [`DATA_MAX_ATTEMPTS`].
-///
-/// Cancellation is wired via `tokio::select!` so the call returns
+/// Cancellation is wired via `tokio::select!` around both the
+/// in-flight request and the backoff wait, so the call returns
 /// promptly the moment the token fires.
 pub async fn http_request(
     req: Request,
     sink: &Arc<dyn TelemetrySink>,
     cancel: CancellationToken,
 ) -> Result<Response, PipelineFailure> {
-    let max_connection_attempts = CONNECTION_BUDGETS_SECS.len() as u32;
-    let mut data_retries_used: u32 = 0;
-    let mut last_failure: Option<PipelineFailure> = None;
+    let max_data_attempts = DATA_BACKOFF_SECS.len() as u32 + 1;
 
     sink.emit(TranscriptionEvent::RequestStarted {
         endpoint: req.url.clone(),
         t: Instant::now(),
     });
+
+    let mut data_attempt: u32 = 1;
+    loop {
+        let outcome =
+            run_connection_phase(&req, sink, &cancel, data_attempt, max_data_attempts).await;
+
+        let (pf, retry_after) = match outcome {
+            ConnectionPhase::Done(result) => {
+                sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: result.is_ok(),
+                    t: Instant::now(),
+                });
+                return result;
+            }
+            ConnectionPhase::DataRetryable {
+                failure,
+                retry_after,
+            } => (failure, retry_after),
+        };
+
+        // Data-phase retry decision.  `data_attempt` is the attempt
+        // that just failed; retry `n` (1-based) waits
+        // `DATA_BACKOFF_SECS[n-1]` unless the server said otherwise.
+        let retry_index = data_attempt as usize - 1;
+        let Some(&slot_secs) = DATA_BACKOFF_SECS.get(retry_index) else {
+            sink.emit(TranscriptionEvent::RequestCompleted {
+                success: false,
+                t: Instant::now(),
+            });
+            return Err(pf);
+        };
+        let wait = retry_after
+            .map(|d| d.min(Duration::from_secs(RETRY_AFTER_CAP_SECS)))
+            .unwrap_or_else(|| Duration::from_secs(slot_secs));
+        let retry_num = data_attempt;
+        let reason = pf.to_string();
+        log::info!(
+            "{} busy — retrying in {}s (server retry {}/{}): {}",
+            req.provider_name,
+            wait.as_secs(),
+            retry_num,
+            DATA_BACKOFF_SECS.len(),
+            reason,
+        );
+        sink.emit(TranscriptionEvent::RetryScheduled {
+            kind: crate::telemetry::RetryKind::Data,
+            attempt: retry_num,
+            max: DATA_BACKOFF_SECS.len() as u32,
+            reason,
+            t: Instant::now(),
+        });
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                return Err(build_cancellation_failure(&req, data_attempt, max_data_attempts));
+            }
+            _ = tokio::time::sleep(wait) => {}
+        }
+        data_attempt += 1;
+    }
+}
+
+/// Outcome of one full pass through the connection-phase schedule.
+enum ConnectionPhase {
+    /// Terminal for this request: success, cancellation, permanent
+    /// failure, or connection budget exhausted.
+    Done(Result<Response, PipelineFailure>),
+    /// The server answered with a retryable status; the caller
+    /// decides whether to wait and run another pass.  `retry_after`
+    /// is the parsed `Retry-After` header when the server sent one.
+    DataRetryable {
+        failure: PipelineFailure,
+        retry_after: Option<Duration>,
+    },
+}
+
+/// Run the connection-phase schedule once: up to
+/// `CONNECTION_BUDGETS_SECS.len()` attempts with growing budgets.
+///
+/// `data_attempt` / `max_data_attempts` are stamped into any
+/// [`PipelineFailure`] produced by a completed HTTP transaction so
+/// the counters describe the *server* retry budget (the one that was
+/// actually exhausted); connection-class failures keep reporting the
+/// connection budget.
+async fn run_connection_phase(
+    req: &Request,
+    sink: &Arc<dyn TelemetrySink>,
+    cancel: &CancellationToken,
+    data_attempt: u32,
+    max_data_attempts: u32,
+) -> ConnectionPhase {
+    let max_connection_attempts = CONNECTION_BUDGETS_SECS.len() as u32;
+    let mut last_failure: Option<PipelineFailure> = None;
 
     for (idx, &budget_secs) in CONNECTION_BUDGETS_SECS.iter().enumerate() {
         let connect_budget = Duration::from_secs(budget_secs);
@@ -298,8 +417,7 @@ pub async fn http_request(
 
         // Emit a `RetryScheduled` BEFORE every attempt past the
         // first.  This is the connection-phase retry signal; the
-        // data-phase retry is signalled separately below when a
-        // 5xx triggers an outer retry.
+        // data-phase retry is signalled by the caller.
         if idx > 0 {
             let reason = last_failure
                 .as_ref()
@@ -316,80 +434,85 @@ pub async fn http_request(
 
         // ── Bail early if the caller cancelled. ─────────────────
         if cancel.is_cancelled() {
-            let pf = build_cancellation_failure(&req, attempt_num, max_connection_attempts);
-            sink.emit(TranscriptionEvent::RequestCompleted {
-                success: false,
-                t: Instant::now(),
-            });
-            return Err(pf);
+            return ConnectionPhase::Done(Err(build_cancellation_failure(
+                req,
+                attempt_num,
+                max_connection_attempts,
+            )));
         }
 
         // ── Single attempt ──────────────────────────────────────
         let attempt_outcome = run_single_http_attempt(
-            &req,
+            req,
             connect_budget,
             sink,
-            &cancel,
+            cancel,
             attempt_num,
             max_connection_attempts,
+            data_attempt,
+            max_data_attempts,
         )
         .await;
 
         match attempt_outcome {
-            SingleAttempt::Success(resp) => {
-                sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: true,
-                    t: Instant::now(),
-                });
-                return Ok(resp);
-            }
-            SingleAttempt::Cancelled(pf) => {
-                sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
-                return Err(pf);
+            SingleAttempt::Success(resp) => return ConnectionPhase::Done(Ok(resp)),
+            SingleAttempt::Cancelled(pf) | SingleAttempt::Permanent(pf) => {
+                return ConnectionPhase::Done(Err(pf));
             }
             SingleAttempt::ConnectionRetryable(pf) => {
                 last_failure = Some(pf);
                 continue;
             }
-            SingleAttempt::DataRetryable(pf) => {
-                data_retries_used = data_retries_used.saturating_add(1);
-                if data_retries_used >= DATA_MAX_ATTEMPTS.saturating_sub(1) {
-                    sink.emit(TranscriptionEvent::RequestCompleted {
-                        success: false,
-                        t: Instant::now(),
-                    });
-                    return Err(pf);
-                }
-                let reason = pf.to_string();
-                sink.emit(TranscriptionEvent::RetryScheduled {
-                    kind: crate::telemetry::RetryKind::Data,
-                    attempt: data_retries_used,
-                    max: DATA_MAX_ATTEMPTS.saturating_sub(1),
-                    reason,
-                    t: Instant::now(),
-                });
-                last_failure = Some(pf);
-                continue;
-            }
-            SingleAttempt::Permanent(pf) => {
-                sink.emit(TranscriptionEvent::RequestCompleted {
-                    success: false,
-                    t: Instant::now(),
-                });
-                return Err(pf);
+            SingleAttempt::DataRetryable {
+                failure,
+                retry_after,
+            } => {
+                return ConnectionPhase::DataRetryable {
+                    failure,
+                    retry_after,
+                };
             }
         }
     }
 
-    sink.emit(TranscriptionEvent::RequestCompleted {
-        success: false,
-        t: Instant::now(),
-    });
-    Err(last_failure
-        .unwrap_or_else(|| build_generic_exhausted_failure(&req, max_connection_attempts)))
+    ConnectionPhase::Done(Err(last_failure.unwrap_or_else(|| {
+        build_generic_exhausted_failure(req, max_connection_attempts)
+    })))
+}
+
+/// Per-attempt wall-clock cap: the connection-phase budget, lifted to
+/// the request's own `wall_clock` when that is larger.
+///
+/// The connection schedule starts at 2 s — fine for a `/v1/models`
+/// GET, hopeless for a multi-megabyte upload.  A caller that sized
+/// its `wall_clock` to the payload (see
+/// `transport::http::proportional_timeout`) has already stated how
+/// long one attempt may legitimately take; the connection slot must
+/// not undercut it.  Requests without a `wall_clock` (user-attended
+/// mode, small GETs) keep the growing connection schedule as their
+/// only cap.
+fn attempt_cap(connect_budget: Duration, wall_clock: Option<Duration>) -> Duration {
+    match wall_clock {
+        Some(wc) if wc > connect_budget => wc,
+        _ => connect_budget,
+    }
+}
+
+/// True for HTTP statuses the transport treats as "provider busy,
+/// try again later": every 5xx, plus 429 (rate limit / capacity).
+fn is_data_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// Parse a `Retry-After` header value as delay-seconds.  The
+/// HTTP-date form is not supported (no provider we talk to uses
+/// it); an unparsable value yields `None` so the schedule applies.
+fn parse_retry_after_secs(headers: &[(String, String)]) -> Option<Duration> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 /// Outcome of a single HTTP attempt inside [`http_request`].
@@ -403,9 +526,14 @@ enum SingleAttempt {
     /// Connection-class failure — eligible for a connection retry
     /// (next attempt in the growing-budget schedule).
     ConnectionRetryable(PipelineFailure),
-    /// Server returned a 5xx — eligible for a data retry (up to
-    /// [`DATA_MAX_ATTEMPTS`]).
-    DataRetryable(PipelineFailure),
+    /// Server returned a retryable status (5xx or 429) — eligible
+    /// for a data retry after a backoff wait (schedule:
+    /// [`DATA_BACKOFF_SECS`]).  `retry_after` carries the server's
+    /// own hint when it sent one.
+    DataRetryable {
+        failure: PipelineFailure,
+        retry_after: Option<Duration>,
+    },
     /// Permanent failure (4xx, decode error mid-body, …).  Do not
     /// retry; return the failure to the caller.
     Permanent(PipelineFailure),
@@ -417,6 +545,7 @@ enum SingleAttempt {
 /// the attempt produces so the caller sees the truthful retry
 /// counter — killing the historical `1/1` lie in
 /// `mistral::send_once` / `openai::send_once`.
+#[allow(clippy::too_many_arguments)] // two (attempt, max) pairs: connection budget + data budget
 async fn run_single_http_attempt(
     req: &Request,
     connect_budget: Duration,
@@ -424,6 +553,8 @@ async fn run_single_http_attempt(
     cancel: &CancellationToken,
     attempt_num: u32,
     max_attempts: u32,
+    data_attempt: u32,
+    max_data_attempts: u32,
 ) -> SingleAttempt {
     // ── Build a per-attempt client with the right connect timeout ──
     let client = match build_client_with_connect_timeout(connect_budget) {
@@ -509,9 +640,11 @@ async fn run_single_http_attempt(
     //     via `.timeout(budget)` on the RequestBuilder — that
     //     governs successful-connect, slow-server cases.
     //
-    // The outer cap below uses `connect_budget` so the
-    // growing-budget schedule actually grows the wait per attempt.
-    let send_with_cap = tokio::time::timeout(connect_budget, send_fut);
+    // The outer cap is the larger of the two (see `attempt_cap`):
+    // the growing schedule still grows for small requests, while a
+    // payload-sized `wall_clock` is never undercut by an early slot.
+    let cap = attempt_cap(connect_budget, req.wall_clock);
+    let send_with_cap = tokio::time::timeout(cap, send_fut);
 
     let outcome = tokio::select! {
         biased;
@@ -534,13 +667,13 @@ async fn run_single_http_attempt(
                 req.url.clone(),
                 PipelineFailureKind::Network {
                     kind: NetworkKind::Connect,
-                    timer: Some(TimerLabel::from_duration("connect_timeout", connect_budget)),
+                    timer: Some(TimerLabel::from_duration("connect_timeout", cap)),
                     source: Box::new(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
                             "connection attempt did not complete \
                              within {}s",
-                            connect_budget.as_secs()
+                            cap.as_secs()
                         ),
                     )),
                 },
@@ -580,19 +713,25 @@ async fn run_single_http_attempt(
     // ── Classify HTTP status ──────────────────────────────────
     if (200..300).contains(&response.status) {
         SingleAttempt::Success(response)
-    } else if (500..600).contains(&response.status) {
-        // 5xx: data-phase retryable.
-        SingleAttempt::DataRetryable(PipelineFailure::new(
-            req.provider_name.clone(),
-            req.phase,
-            attempt_num,
-            max_attempts,
-            req.url.clone(),
-            PipelineFailureKind::HttpStatus {
-                status: response.status,
-                body: String::from_utf8_lossy(&response.body).into_owned(),
-            },
-        ))
+    } else if is_data_retryable_status(response.status) {
+        // 5xx / 429: data-phase retryable.  The counters describe
+        // the *data* budget, which is the one this failure will
+        // exhaust if the server never recovers.
+        let retry_after = parse_retry_after_secs(&response.headers);
+        SingleAttempt::DataRetryable {
+            failure: PipelineFailure::new(
+                req.provider_name.clone(),
+                req.phase,
+                data_attempt,
+                max_data_attempts,
+                req.url.clone(),
+                PipelineFailureKind::HttpStatus {
+                    status: response.status,
+                    body: String::from_utf8_lossy(&response.body).into_owned(),
+                },
+            ),
+            retry_after,
+        }
     } else {
         // 4xx and other non-2xx: permanent.
         SingleAttempt::Permanent(PipelineFailure::new(
