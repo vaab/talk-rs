@@ -26,6 +26,7 @@ pub fn spawn_audio_tee(
     mut input: mpsc::Receiver<Vec<i16>>,
     ring: Arc<Mutex<RingBuffer>>,
     pause: Arc<AtomicBool>,
+    pause_forwarding: bool,
 ) -> mpsc::Receiver<Vec<i16>> {
     let (tx, rx) = mpsc::channel(super::CHANNEL_CAPACITY);
 
@@ -44,7 +45,7 @@ pub fn spawn_audio_tee(
                 guard.push(&f32_samples);
             }
 
-            let paused = pause.load(Ordering::Relaxed);
+            let paused = pause_forwarding && pause.load(Ordering::Relaxed);
 
             if paused {
                 // While paused, accumulate chunks in a rolling window.

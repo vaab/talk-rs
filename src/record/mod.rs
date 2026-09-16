@@ -19,6 +19,12 @@ use crate::audio::bt_profile;
 use crate::audio::monitor_capture::MonitorCapture;
 #[cfg(feature = "capture")]
 use crate::audio::pipewire_capture::PipeWireCapture;
+#[cfg(all(feature = "capture", feature = "ui"))]
+use crate::audio::recording_feedback::RecordingOverlayOptions;
+#[cfg(feature = "capture")]
+use crate::audio::recording_feedback::{
+    RecordingBadgeTeardown, RecordingFeedback, RecordingFeedbackOptions,
+};
 #[cfg(feature = "capture")]
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter, WavWriter};
 #[cfg(feature = "capture")]
@@ -113,6 +119,11 @@ fn create_writer(path: &Path, config: AudioConfig) -> Result<Box<dyn AudioWriter
 pub struct RecordOpts {
     pub args: Vec<String>,
     pub monitor: bool,
+    pub no_sounds: bool,
+    pub no_boop: bool,
+    pub no_overlay: bool,
+    pub viz: Option<crate::config::VizMode>,
+    pub mono: bool,
     pub no_bt_auto_switch: bool,
 }
 
@@ -188,7 +199,36 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
         log::info!("recording with mic (PipeWire)");
         Box::new(PipeWireCapture::new(audio_config.clone()))
     };
-    let mut rx = capture.start()?;
+
+    let viz_mode = opts.viz.or_else(|| {
+        config_for_bt
+            .as_ref()
+            .and_then(|config| config.indicators.as_ref())
+            .and_then(|indicators| indicators.viz)
+    });
+    let boop_interval_ms = config_for_bt
+        .as_ref()
+        .and_then(|config| config.indicators.as_ref())
+        .map(|indicators| indicators.boop_interval_ms)
+        .unwrap_or(5_000);
+    let mut feedback = RecordingFeedback::new(RecordingFeedbackOptions {
+        no_sounds: opts.no_sounds,
+        no_boop: opts.no_boop,
+        no_overlay: opts.no_overlay,
+        viz: viz_mode,
+        mono: opts.mono,
+        boop_interval_ms,
+        capture_rate: audio_config.sample_rate,
+        pause_audio: false,
+        suppress_boop: None,
+        #[cfg(feature = "ui")]
+        overlay: RecordingOverlayOptions {
+            silence_tx: None,
+            auto_pause: true,
+            telemetry_rx: None,
+        },
+    });
+    let mut rx = start_capture_with_feedback(&mut feedback, &mut *capture).await?;
 
     // Initialize audio writer
     let mut writer = create_writer(&output_path, audio_config.clone())?;
@@ -291,19 +331,46 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
 
     println!("Stopping recording...");
 
-    // Stop capture (closes channel)
-    capture.stop()?;
-    bt_guard.restore_now_async();
-
-    // Wait for encode task to complete
-    match encode_task.await {
-        Ok(Ok(())) => {
-            println!("Recording saved to: {}", output_path.display());
-            Ok(())
+    stop_capture_with_feedback(&mut feedback, &mut *capture, || async move {
+        bt_guard.restore_now_async();
+        match encode_task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(err),
+            Err(err) => Err(TalkError::Audio(format!("Encode task panicked: {}", err))),
         }
-        Ok(Err(err)) => Err(err),
-        Err(err) => Err(TalkError::Audio(format!("Encode task panicked: {}", err))),
-    }
+    })
+    .await?;
+
+    println!("Recording saved to: {}", output_path.display());
+    Ok(())
+}
+
+#[cfg(feature = "capture")]
+async fn start_capture_with_feedback(
+    feedback: &mut RecordingFeedback,
+    capture: &mut dyn AudioCapture,
+) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
+    feedback.play_start().await;
+    let raw_audio = capture.start()?;
+    feedback.begin_recording();
+    Ok(feedback.route_audio(raw_audio))
+}
+
+#[cfg(feature = "capture")]
+async fn stop_capture_with_feedback<Finalize, FinalizeFuture>(
+    feedback: &mut RecordingFeedback,
+    capture: &mut dyn AudioCapture,
+    finalize: Finalize,
+) -> Result<(), TalkError>
+where
+    Finalize: FnOnce() -> FinalizeFuture,
+    FinalizeFuture: std::future::Future<Output = Result<(), TalkError>>,
+{
+    feedback.teardown_recording(RecordingBadgeTeardown::Hide);
+    capture.stop()?;
+    finalize().await?;
+    feedback.play_stop().await;
+    Ok(())
 }
 
 #[cfg(feature = "capture")]
@@ -317,6 +384,72 @@ pub async fn record_daemon(opts: RecordOpts) -> Result<(), TalkError> {
 mod tests {
     use super::*;
     use chrono::Datelike;
+    use std::sync::{Arc, Mutex};
+
+    struct OrderedCapture {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl AudioCapture for OrderedCapture {
+        fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
+            if let Ok(mut events) = self.events.lock() {
+                events.push("capture-start");
+            }
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+
+        fn stop(&mut self) -> Result<(), TalkError> {
+            if let Ok(mut events) = self.events.lock() {
+                events.push("capture-stop");
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn record_feedback_wraps_capture_and_durable_finalization_in_order() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut feedback = crate::audio::recording_feedback::RecordingFeedback::new_for_test(
+            Arc::clone(&events),
+            true,
+        );
+        let mut capture = OrderedCapture {
+            events: Arc::clone(&events),
+        };
+
+        let _rx = start_capture_with_feedback(&mut feedback, &mut capture)
+            .await
+            .expect("start should succeed");
+        stop_capture_with_feedback(&mut feedback, &mut capture, || async {
+            if let Ok(mut events) = events.lock() {
+                events.push("encoder-finalize");
+                events.push("file-sync-all");
+            }
+            Ok(())
+        })
+        .await
+        .expect("stop should succeed");
+
+        assert_eq!(
+            events
+                .lock()
+                .map(|events| events.clone())
+                .unwrap_or_default(),
+            vec![
+                "start-tone",
+                "capture-start",
+                "badge-show",
+                "boop-start",
+                "boop-cancel",
+                "badge-hide",
+                "capture-stop",
+                "encoder-finalize",
+                "file-sync-all",
+                "stop-tone",
+            ]
+        );
+    }
 
     #[test]
     fn test_resolve_output_path_no_args_nests_by_year_and_month() {

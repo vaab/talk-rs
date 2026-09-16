@@ -18,6 +18,8 @@ pub mod monitor_capture;
 pub mod pipewire_capture;
 #[cfg(feature = "playback")]
 pub mod player;
+#[cfg(feature = "capture")]
+pub mod recording_feedback;
 pub mod resample;
 pub mod ring_buffer;
 pub mod tee;

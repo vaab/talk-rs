@@ -7,12 +7,12 @@
 
 use super::realtime::{buffer_feeder, ogg_recording_task, AudioBuffer};
 use crate::audio::bt_profile;
-use crate::audio::indicator::SoundPlayer;
+use crate::audio::recording_feedback::{RecordingBadgeTeardown, RecordingFeedback};
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::{AudioConfig, Config, Provider};
 use crate::error::TalkError;
 use crate::transcription::{self, OneShotTranscriber, TranscriptionBody, TranscriptionResult};
-use crate::x11::overlay::{IndicatorKind, OverlayHandle};
+use crate::x11::overlay::IndicatorKind;
 use crate::x11::visualizer::VisualizerHandle;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -124,9 +124,7 @@ pub(crate) async fn dictate_oneshot(
     cache_ogg_path: &std::path::Path,
     transcriber: Box<dyn OneShotTranscriber>,
     shutdown: &CancellationToken,
-    player: Option<&SoundPlayer>,
-    boop_token: Option<&CancellationToken>,
-    overlay: Option<&OverlayHandle>,
+    feedback: &mut RecordingFeedback,
     visualizer: Option<&VisualizerHandle>,
     config: &Config,
     provider: Provider,
@@ -317,16 +315,12 @@ pub(crate) async fn dictate_oneshot(
         // Immediate audible + visual feedback: the user hears the
         // stop sound and sees the "transcribing" badge the instant
         // they toggle, not after the API call finishes.
-        if let Some(token) = boop_token {
-            token.cancel();
-        }
-        if let Some(p) = player {
-            p.play_stop().await;
-        }
+        feedback.teardown_recording(RecordingBadgeTeardown::KeepVisible);
+        feedback.play_stop().await;
         if let Some(viz) = visualizer {
             viz.hide();
         }
-        if let Some(o) = overlay {
+        if let Some(o) = feedback.overlay() {
             o.show(IndicatorKind::Transcribing);
         }
         if let Some(t) = t_stop {
@@ -360,7 +354,10 @@ pub(crate) async fn dictate_oneshot(
     //  - buffer is empty (instant stop, or dead signal paused the pipeline)
     //  - overlay reports no live audio was ever detected (entire session
     //    was dead signal)
-    let skip = buffer.is_empty().await || overlay.is_some_and(|o| !o.had_live_audio());
+    let skip = buffer.is_empty().await
+        || feedback
+            .overlay()
+            .is_some_and(|overlay| !overlay.had_live_audio());
     if skip {
         log::warn!("no usable audio recorded — skipping transcription");
         feeder_handle.abort();

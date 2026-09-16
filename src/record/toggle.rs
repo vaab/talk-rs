@@ -5,6 +5,11 @@ use std::path::PathBuf;
 pub struct RecordToggleOpts {
     pub file: Option<PathBuf>,
     pub monitor: bool,
+    pub no_sounds: bool,
+    pub no_boop: bool,
+    pub no_overlay: bool,
+    pub viz: Option<crate::config::VizMode>,
+    pub mono: bool,
     pub no_bt_auto_switch: bool,
     pub verbose: u8,
 }
@@ -18,6 +23,22 @@ fn build_daemon_args(opts: &RecordToggleOpts) -> Vec<String> {
     args.push("--daemon".to_string());
     if opts.monitor {
         args.push("--monitor".to_string());
+    }
+    if opts.no_sounds {
+        args.push("--no-sounds".to_string());
+    }
+    if opts.no_boop {
+        args.push("--no-boop".to_string());
+    }
+    if opts.no_overlay {
+        args.push("--no-overlay".to_string());
+    }
+    if let Some(viz) = opts.viz {
+        args.push("--viz".to_string());
+        args.push(viz.to_string());
+    }
+    if opts.mono {
+        args.push("--mono".to_string());
     }
     if opts.no_bt_auto_switch {
         args.push("--no-bt-auto-switch".to_string());
@@ -55,6 +76,11 @@ mod tests {
         let opts = RecordToggleOpts {
             file: Some(PathBuf::from("/tmp/meeting.ogg")),
             monitor: true,
+            no_sounds: true,
+            no_boop: true,
+            no_overlay: true,
+            viz: Some(crate::config::VizMode::Waterfall),
+            mono: true,
             no_bt_auto_switch: true,
             verbose: 2,
         };
@@ -68,6 +94,12 @@ mod tests {
                 "record",
                 "--daemon",
                 "--monitor",
+                "--no-sounds",
+                "--no-boop",
+                "--no-overlay",
+                "--viz",
+                "waterfall",
+                "--mono",
                 "--no-bt-auto-switch",
                 "/tmp/meeting.ogg",
             ]
@@ -82,6 +114,11 @@ mod tests {
         let opts = RecordToggleOpts {
             file: None,
             monitor: false,
+            no_sounds: false,
+            no_boop: false,
+            no_overlay: false,
+            viz: None,
+            mono: false,
             no_bt_auto_switch: false,
             verbose: 0,
         };

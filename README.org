@@ -350,12 +350,25 @@ audio file, then exits.  Its PID remains published during finalization,
 so repeated stop calls cannot start a second writer for the same toggle
 slot.  Toggle mode conflicts with ~--ui~.
 
+Foreground and toggle recording use the same feedback as dictation: the
+start tone finishes before capture begins, an optional X11 badge visualizes
+the captured PCM, and the periodic boop sounds only while the badge detects
+silence.  On stop, the boop and badge are torn down before capture closes.
+The stop tone sounds only after the encoder has finalized the file and
+~sync_all()~ has made it durable.  If X11 is unavailable, recording and
+sound feedback continue without the badge.
+
 Options:
 
 | Flag                  | Effect                                           |
 |-----------------------+--------------------------------------------------|
 | ~--toggle~            | Toggle background recording on the first/second call |
 | ~--monitor~           | Mix system audio (monitor) with microphone input |
+| ~--no-sounds~         | Disable start, stop, and boop sounds             |
+| ~--no-boop~           | Disable silence-gated boops (keep start/stop)    |
+| ~--no-overlay~        | Disable the recording badge                      |
+| ~--viz <MODE>~        | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ |
+| ~--mono~              | Monochrome visualizer (theme-aware)              |
 | ~--ui~                | Open GTK4 recordings browser (play, delete, open folder) |
 | ~--no-bt-auto-switch~ | Disable Bluetooth headset HFP auto-switch (overrides ~audio.bt_auto_switch~) |
 

@@ -26,6 +26,25 @@ pub enum Commands {
         /// Mix system audio (monitor) with microphone input
         #[arg(long)]
         monitor: bool,
+        /// Disable sound indicators (start/stop/boop)
+        #[arg(long, conflicts_with = "ui")]
+        no_sounds: bool,
+        /// Disable periodic boop sounds (keep start/stop tones)
+        #[arg(long, conflicts_with = "ui")]
+        no_boop: bool,
+        /// Disable visual overlay indicator
+        #[arg(long, conflicts_with = "ui")]
+        no_overlay: bool,
+        /// Visualizer inside the recording badge (waterfall, amplitude, spectrum)
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(crate::config::VizMode),
+            conflicts_with = "ui"
+        )]
+        viz: Option<crate::config::VizMode>,
+        /// Use monochrome colors for the visualizer (theme-aware)
+        #[arg(long, conflicts_with = "ui")]
+        mono: bool,
         /// Open GTK recordings browser to manage cached recordings
         #[arg(long)]
         ui: bool,
@@ -190,6 +209,12 @@ mod tests {
             "record",
             "--toggle",
             "--monitor",
+            "--no-sounds",
+            "--no-boop",
+            "--no-overlay",
+            "--viz",
+            "waterfall",
+            "--mono",
             "--no-bt-auto-switch",
             "meeting.ogg",
         ])
@@ -201,6 +226,11 @@ mod tests {
                 file,
                 monitor,
                 ui,
+                no_sounds,
+                no_boop,
+                no_overlay,
+                viz,
+                mono,
                 no_bt_auto_switch,
                 toggle,
                 daemon,
@@ -208,6 +238,11 @@ mod tests {
                 assert_eq!(file.as_deref(), Some("meeting.ogg"));
                 assert!(monitor);
                 assert!(!ui);
+                assert!(no_sounds);
+                assert!(no_boop);
+                assert!(no_overlay);
+                assert_eq!(viz, Some(crate::config::VizMode::Waterfall));
+                assert!(mono);
                 assert!(no_bt_auto_switch);
                 assert!(toggle);
                 assert!(!daemon);
@@ -229,5 +264,24 @@ mod tests {
             .expect_err("record toggle and UI must conflict");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn record_feedback_flags_conflict_with_ui() {
+        for flag in [
+            "--no-sounds",
+            "--no-boop",
+            "--no-overlay",
+            "--viz",
+            "--mono",
+        ] {
+            let mut args = vec!["talk-rs", "record", "--ui", flag];
+            if flag == "--viz" {
+                args.push("waterfall");
+            }
+            let error = Cli::try_parse_from(args)
+                .expect_err("recording feedback flags must conflict with the recordings UI");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 }

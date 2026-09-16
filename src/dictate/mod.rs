@@ -12,9 +12,11 @@ mod toggle;
 
 use crate::audio::bt_profile;
 use crate::audio::file_source::{OggFileSource, WavFileSource};
-use crate::audio::indicator::SoundPlayer;
 use crate::audio::monitor_capture::MonitorCapture;
 use crate::audio::pipewire_capture::PipeWireCapture;
+use crate::audio::recording_feedback::{
+    RecordingBadgeTeardown, RecordingFeedback, RecordingFeedbackOptions, RecordingOverlayOptions,
+};
 use crate::audio::resample;
 use crate::audio::{AudioCapture, CHUNK_DURATION_MS};
 
@@ -28,8 +30,7 @@ use crate::paste::{
 use crate::recording_cache;
 use crate::telemetry::{BroadcastSink, TelemetrySink, TranscriptionEvent};
 use crate::transcription;
-use crate::x11::overlay::{IndicatorKind, OverlayHandle};
-use crate::x11::render_util::RingBuffer;
+use crate::x11::overlay::IndicatorKind;
 use crate::x11::visualizer::VisualizerHandle;
 use models::{resolve_model, resolve_provider};
 use oneshot::dictate_oneshot;
@@ -200,22 +201,49 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     }
 
-    // Initialize sound player (single-channel with preemption)
-    let player = if opts.no_sounds {
-        log::debug!("sound indicators disabled");
-        None
+    // Resolve recording feedback before GTK, capture-source construction, and
+    // Bluetooth switching, preserving dictate's established sound-device
+    // initialization order.  The two source branches below use these exact
+    // rates (16 kHz file input, 48 kHz live PipeWire capture).
+    let feedback_capture_rate = if input_audio_file.is_some() {
+        AudioConfig::new().sample_rate
     } else {
-        match SoundPlayer::new() {
-            Ok(p) => {
-                log::debug!("sound player initialized");
-                Some(p)
-            }
-            Err(e) => {
-                log::warn!("sound indicators unavailable: {}", e);
-                None
-            }
-        }
+        48_000
     };
+    let viz_mode = opts.viz.or_else(|| {
+        config
+            .indicators
+            .as_ref()
+            .and_then(|indicators| indicators.viz)
+    });
+    if let Some(mode) = viz_mode {
+        log::info!("visualizer mode: {}", mode);
+    }
+    let (silence_tx, silence_rx) = std::sync::mpsc::channel::<bool>();
+    let broker = std::sync::Arc::new(BroadcastSink::new(256));
+    let sink: std::sync::Arc<dyn TelemetrySink> = broker.clone();
+    let suppress_boop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let boop_interval_ms = config
+        .indicators
+        .as_ref()
+        .map(|indicators| indicators.boop_interval_ms)
+        .unwrap_or(5_000);
+    let mut feedback = RecordingFeedback::new(RecordingFeedbackOptions {
+        no_sounds: opts.no_sounds,
+        no_boop: opts.no_boop,
+        no_overlay: opts.no_overlay,
+        viz: viz_mode,
+        mono: opts.mono,
+        boop_interval_ms,
+        capture_rate: feedback_capture_rate,
+        pause_audio: true,
+        suppress_boop: Some(suppress_boop.clone()),
+        overlay: RecordingOverlayOptions {
+            silence_tx: Some(silence_tx),
+            auto_pause: !opts.no_auto_pause,
+            telemetry_rx: Some(broker.subscribe()),
+        },
+    });
 
     // Ensure GTK4/GDK4 is initialised so the overlay and visualizer can
     // query monitor geometry via GDK.  `gtk4::init()` is idempotent —
@@ -225,14 +253,6 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             "GTK4 init failed (overlay/visualizer may be unavailable): {}",
             e
         );
-    }
-
-    // Resolve visualizer mode: CLI flag overrides config.
-    let viz_mode = opts
-        .viz
-        .or_else(|| config.indicators.as_ref().and_then(|ind| ind.viz));
-    if let Some(mode) = viz_mode {
-        log::info!("visualizer mode: {}", mode);
     }
 
     // Overlay is created AFTER capture_rate is determined (see below),
@@ -393,68 +413,11 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         bt_profile::HeadsetGuard::new(saved)
     };
 
-    // Play start sound BEFORE starting capture so that the tone is
-    // never captured in the recording.
-    if let Some(ref p) = player {
-        log::debug!("playing start sound");
-        p.play_start().await;
-    }
-
-    // Start capture AFTER the start sound so the tone is not recorded.
+    // The start sound is awaited before capture so it cannot enter the
+    // recording.  Recording-phase badge and boop begin after capture starts.
+    feedback.play_start().await;
     let raw_audio_rx = capture.start()?;
-
-    // Create shared ring buffer for overlay visualization (reads from
-    // the same PipeWire stream as the recording pipeline).
-    let ring = std::sync::Arc::new(std::sync::Mutex::new(RingBuffer::new(
-        capture_rate as usize / 2,
-    )));
-
-    // Silence notification channel (overlay → text panel).
-    let (silence_tx, silence_rx) = std::sync::mpsc::channel::<bool>();
-
-    // Auto-pause flag: overlay sets this when it detects silence during
-    // recording; the audio tee stops forwarding samples downstream.
-    let pause_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Create the telemetry broadcast sink.  Transcription producers
-    // emit events into this channel; the overlay thread subscribes
-    // to receive them for the phase-colour layer.  The broker is
-    // created before the overlay so the receiver can be passed in.
-    let broker = std::sync::Arc::new(BroadcastSink::new(256));
-    let sink: std::sync::Arc<dyn TelemetrySink> = broker.clone();
-
-    // Initialize overlay (visual indicator on X11).
-    // Created here (after capture_rate is known) so we can pass
-    // the shared ring buffer and sample rate.
-    let overlay = if opts.no_overlay {
-        log::debug!("visual overlay disabled");
-        None
-    } else {
-        let telemetry_rx = broker.subscribe();
-        match OverlayHandle::new(
-            viz_mode,
-            opts.mono,
-            ring.clone(),
-            capture_rate,
-            Some(silence_tx),
-            pause_flag.clone(),
-            !opts.no_auto_pause,
-            Some(telemetry_rx),
-        ) {
-            Ok(h) => {
-                log::debug!(
-                    "overlay initialized (viz={:?}, mono={})",
-                    viz_mode,
-                    opts.mono
-                );
-                Some(h)
-            }
-            Err(e) => {
-                log::warn!("visual overlay unavailable: {}", e);
-                None
-            }
-        }
-    };
+    feedback.initialize_after_capture();
 
     // Parakeet is a local backend whose model must be downloaded once
     // (~640 MB).  The transcribe pipeline never downloads silently, so
@@ -466,7 +429,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     if provider == Provider::Parakeet {
         let status = crate::transcription::parakeet::consent::resolve(&config)?;
         if !status.present {
-            if let Some(ref o) = overlay {
+            if let Some(o) = feedback.overlay() {
                 o.show(IndicatorKind::DownloadingModel);
             }
             log::info!(
@@ -481,65 +444,25 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     }
 
-    // Show recording indicator
-    if let Some(ref o) = overlay {
-        log::debug!("showing recording overlay");
-        o.show(IndicatorKind::Recording);
-    }
-
     // Show visualizer text panel (positioned relative to recording badge)
     if let Some(ref viz) = visualizer {
         log::debug!("showing visualizer text panel");
+        feedback.show_recording_badge();
         viz.show(crate::x11::overlay::BADGE_W);
-    }
-
-    // Shared flag: suppresses the boop heartbeat while a no-sound
-    // alert is active so the two sounds don't collide.
-    let suppress_boop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Start boop loop (configurable interval, disabled by --no-boop or interval=0)
-    let boop_interval_ms = config
-        .indicators
-        .as_ref()
-        .map(|i| i.boop_interval_ms)
-        .unwrap_or(5000);
-    let boop_token = if opts.no_boop || boop_interval_ms == 0 {
-        log::debug!("boop sounds disabled");
-        None
     } else {
-        player.as_ref().map(|p| {
-            // Gate the heartbeat on the LISTENING (auto-pause) state:
-            // boops only fire while the overlay's `pause_flag` is set,
-            // so the user hears the chirp during silence but not while
-            // actively speaking.  When `--no-auto-pause` is in effect,
-            // `pause_flag` never flips on and the boop stays silent —
-            // matching the user's mental model that boops belong to
-            // the "LISTENING" badge.
-            //
-            // Independently, `suppress_boop` silences the heartbeat
-            // while a no-sound alert is active so the two tones don't
-            // collide.
-            let play_when = Some(pause_flag.clone());
-            let suppress = Some(suppress_boop.clone());
-            p.start_boop_loop(
-                std::time::Duration::from_millis(boop_interval_ms),
-                play_when,
-                suppress,
-            )
-        })
-    };
+        feedback.show_recording_badge();
+    }
+    feedback.start_boop();
 
-    // Tee audio: split the raw capture stream so the overlay
-    // visualizer reads the same PipeWire data as the recording
-    // pipeline.  When the overlay is disabled, pass through directly.
-    let raw_for_resample = if overlay.is_some() {
-        let teed =
-            crate::audio::tee::spawn_audio_tee(raw_audio_rx, ring.clone(), pause_flag.clone());
+    // Tee audio through the shared feedback component.  Dictate keeps its
+    // existing auto-pause forwarding policy; record selects pass-through.
+    let raw_for_resample = if feedback.overlay().is_some() {
+        let teed = feedback.route_audio(raw_audio_rx);
         // Spawn silence notification thread: forwards silence events
         // from the overlay to the visualizer text panel and plays
         // periodic alert sounds when no audio is detected.
         let vis_push = visualizer.as_ref().map(|v| v.message_pusher());
-        let alert_player = player.as_ref().map(|p| p.alert_player());
+        let alert_player = feedback.player().map(|player| player.alert_player());
         if vis_push.is_some() || alert_player.is_some() {
             let suppress = suppress_boop.clone();
             let _ = std::thread::Builder::new()
@@ -687,8 +610,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             audio_rx,
             &mut *capture,
             from_file,
-            player.as_ref(),
-            boop_token.as_ref(),
+            &mut feedback,
             Some(seg_tx),
             visualizer.as_ref(),
             &shutdown,
@@ -735,9 +657,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             &cache_path,
             transcriber,
             &shutdown,
-            player.as_ref(),
-            boop_token.as_ref(),
-            overlay.as_ref(),
+            &mut feedback,
             visualizer.as_ref(),
             &config,
             provider,
@@ -799,7 +719,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
                         if let Some(ref viz) = visualizer {
                             viz.push_message(&format!("Error: {}", final_msg));
                         }
-                        if let Some(ref o) = overlay {
+                        if let Some(o) = feedback.overlay() {
                             o.hide();
                         }
                         return Ok(());
@@ -816,25 +736,19 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         );
     }
 
-    // Stop boop loop (idempotent — may already be cancelled by
-    // dictate_oneshot or dictate_realtime).
-    if let Some(token) = boop_token {
-        log::debug!("stopping boop loop");
-        token.cancel();
-    }
+    // Idempotent recording-phase teardown; mode-specific paths may already
+    // have cancelled the boop at the instant capture stopped.
+    feedback.teardown_recording(RecordingBadgeTeardown::KeepVisible);
 
     // For realtime mode, play stop sound and hide visualizer here
     // (one-shot mode already did this inside dictate_oneshot on SIGINT).
     if opts.realtime {
-        if let Some(ref p) = player {
-            log::debug!("playing stop sound");
-            p.play_stop().await;
-        }
+        feedback.play_stop().await;
         if let Some(ref viz) = visualizer {
             log::debug!("hiding visualizer");
             viz.hide();
         }
-        if let Some(ref o) = overlay {
+        if let Some(o) = feedback.overlay() {
             log::debug!("hiding overlay");
             o.hide();
         }
@@ -926,7 +840,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // Hide transcribing overlay and visualizer (one-shot mode keeps
         // them visible until now).
         if !opts.realtime {
-            if let Some(ref o) = overlay {
+            if let Some(o) = feedback.overlay() {
                 o.hide();
             }
         }
@@ -953,7 +867,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         // alongside the red overlay driven by the `Failed` telemetry
         // event.  `None` when sound is disabled / unavailable.
         let paste_alert: Option<std::sync::Arc<dyn Fn() + Send + Sync>> =
-            player.as_ref().map(|p| {
+            feedback.player().map(|p| {
                 let ap = p.alert_player();
                 std::sync::Arc::new(move || ap.play()) as std::sync::Arc<dyn Fn() + Send + Sync>
             });
@@ -973,7 +887,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             t: std::time::Instant::now(),
         });
         // Hide AFTER paste so the overlay stays visible throughout.
-        if let Some(ref o) = overlay {
+        if let Some(o) = feedback.overlay() {
             o.hide();
         }
     }

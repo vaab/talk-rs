@@ -10,7 +10,7 @@
 
 use super::text::flush_sentences;
 use crate::audio::bt_profile;
-use crate::audio::indicator::SoundPlayer;
+use crate::audio::recording_feedback::{RecordingBadgeTeardown, RecordingFeedback};
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::{AudioConfig, Config, Provider};
 use crate::error::TalkError;
@@ -357,9 +357,8 @@ impl NormalTranscriptAccumulator {
 /// Audio is always tee'd to `cache_ogg_path` so the recording is
 /// cached for later review.
 ///
-/// `player` and `boop_token` are passed so that when recording stops
-/// (SIGINT), the stop sound fires immediately — the user hears it the
-/// instant they toggle, not after the WebSocket finishes.
+/// `feedback` is passed so recording-phase feedback tears down and the stop
+/// sound starts immediately on SIGINT rather than after the WebSocket closes.
 ///
 /// When `visualizer` is provided, the live transcription text is pushed
 /// to the text overlay as words arrive.
@@ -372,8 +371,7 @@ pub(crate) async fn dictate_realtime(
     audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
     capture: &mut dyn AudioCapture,
     from_file: bool,
-    player: Option<&SoundPlayer>,
-    boop_token: Option<&CancellationToken>,
+    feedback: &mut RecordingFeedback,
     segment_tx: Option<tokio::sync::mpsc::Sender<String>>,
     visualizer: Option<&VisualizerHandle>,
     shutdown: &CancellationToken,
@@ -442,13 +440,8 @@ pub(crate) async fn dictate_realtime(
             // Immediate audible + visual feedback: the user hears the
             // stop sound the instant they toggle, not after the
             // transcription WebSocket finishes.
-            if let Some(token) = boop_token {
-                token.cancel();
-            }
-            if let Some(p) = player {
-                let stop = p.sounds.stop.clone();
-                p.play(&stop);
-            }
+            feedback.teardown_recording(RecordingBadgeTeardown::KeepVisible);
+            feedback.play_stop_now();
 
             capture.stop()?;
             // Restore the Bluetooth headset to its high-quality

@@ -12,6 +12,11 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
         Commands::Record {
             file,
             monitor,
+            no_sounds,
+            no_boop,
+            no_overlay,
+            viz,
+            mono,
             ui,
             toggle,
             no_bt_auto_switch,
@@ -23,6 +28,11 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
                 crate::record::toggle::toggle_dispatch(&crate::record::toggle::RecordToggleOpts {
                     file: file.map(PathBuf::from),
                     monitor,
+                    no_sounds,
+                    no_boop,
+                    no_overlay,
+                    viz,
+                    mono,
                     no_bt_auto_switch,
                     verbose,
                 })
@@ -32,6 +42,11 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
                 let opts = RecordOpts {
                     args,
                     monitor,
+                    no_sounds,
+                    no_boop,
+                    no_overlay,
+                    viz,
+                    mono,
                     no_bt_auto_switch,
                 };
                 if daemon {
