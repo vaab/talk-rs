@@ -130,7 +130,7 @@ recording.  On PipeWire systems, ~pipewire-pulse~ supplies the
 ~libpulse.so~ shared object at runtime, so no PulseAudio daemon is
 needed -- only the development headers for compilation.
 
-A working Rust toolchain is required (1.70+). Install via
+A working Rust toolchain is required (1.87+). Install via
 [[https://rustup.rs][rustup]] if needed.
 
 *** Runtime dependencies
