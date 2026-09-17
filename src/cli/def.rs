@@ -98,8 +98,8 @@ pub enum Commands {
         /// Mistral preset voice id
         #[arg(long, value_name = "NAME_OR_ID")]
         voice: Option<String>,
-        /// Phonemization language for Kokoro (e.g. en, fr).  Ignored by
-        /// the Mistral provider (voice implies language)
+        /// Language for Kokoro phonemization; for Mistral, selects/validates the
+        /// preset voice (auto-detected from the text when omitted)
         #[arg(long, value_name = "LANG")]
         lang: Option<String>,
         /// Speech rate multiplier (Kokoro only; 1.0 = normal)

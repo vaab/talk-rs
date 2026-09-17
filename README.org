@@ -25,9 +25,9 @@ happening.
 
 - *Dictation workflow* -- press a key to start recording, press again
   to stop; transcribed text is pasted automatically.
-- *Multiple providers* -- Mistral (Voxtral) and OpenAI (Whisper /
-  GPT-4o) for batch transcription; Mistral and OpenAI realtime
-  streaming via WebSocket.
+- *Multiple providers* -- Mistral (Voxtral), OpenAI (Whisper / GPT-4o),
+  and local on-device Parakeet for batch transcription; Mistral and
+  OpenAI realtime streaming via WebSocket.
 - *Text-to-speech* -- the ~speak~ command synthesizes text and plays
   it (or saves a WAV).  Two providers mirror the transcription side:
   ~kokoro~ (local, offline, multi-language via sherpa-onnx) and
@@ -138,10 +138,14 @@ A working Rust toolchain is required (1.87+). Install via
 =PipeWire= must be running (used for audio capture). Most modern Linux
 desktops ship with PipeWire by default.
 
-An API key for at least one transcription provider is required:
+Cloud transcription providers require an API key:
 
 - [[https://console.mistral.ai/][Mistral]] (default)
 - [[https://platform.openai.com/][OpenAI]]
+
+Parakeet is a local, on-device ASR backend using sherpa-onnx on the
+CPU and needs no API key.  After a consent prompt, its model is
+downloaded on first use into ~~/.local/share/talk-rs/models/~.
 
 ** Installation
 
@@ -311,9 +315,10 @@ Options:
 | Flag                        | Effect                                          |
 |-----------------------------+-------------------------------------------------|
 | ~--toggle~                  | Daemon toggle mode                              |
-| ~--provider~                | Choose ~mistral~ or ~openai~                    |
+| ~--provider~                | Choose ~mistral~, ~openai~, or ~parakeet~       |
 | ~--model~                   | Override model for this invocation               |
 | ~--diarize~                 | Enable speaker diarization (batch mode only)    |
+| ~--timestamp~               | Include timestamps in output (~HH:MM:SS~ prefix) |
 | ~--realtime~                | Stream audio via WebSocket (incremental text)   |
 | ~--pick~                    | Show multi-candidate picker (GTK window)        |
 | ~--retry-last~              | Re-transcribe the last cached recording         |
@@ -391,11 +396,12 @@ talk-rs transcribe voice-memo.m4a               # imported m4a also works
 
 Options:
 
-| Flag         | Effect                                       |
-|--------------+----------------------------------------------|
-| ~--provider~ | Choose ~mistral~ or ~openai~                 |
-| ~--model~    | Override model for this invocation            |
-| ~--diarize~  | Enable speaker diarization (tag by speaker)  |
+| Flag          | Effect                                            |
+|---------------+---------------------------------------------------|
+| ~--provider~  | Choose ~mistral~, ~openai~, or ~parakeet~         |
+| ~--model~     | Override model for this invocation                 |
+| ~--diarize~   | Enable speaker diarization (tag by speaker)       |
+| ~--timestamp~ | Include timestamps in output (~HH:MM:SS~ prefix)  |
 
 **** Provider overload
 
@@ -451,10 +457,11 @@ Options:
 |---------------------+------------------------------------------------------------------------|
 | ~--provider~        | Choose ~kokoro~ (local) or ~mistral~ (remote Voxtral)                   |
 | ~--voice~           | Kokoro voice name (~af_heart~, ~am_michael~, ~ff_siwis~, …) or a Mistral preset voice id |
-| ~--lang~            | Phonemization language for Kokoro (~en~, ~fr~, …); ignored by Mistral   |
+| ~--lang~            | Language for Kokoro phonemization; for Mistral, selects/validates the preset voice (auto-detected from the text when omitted) |
 | ~--speed~           | Speech rate multiplier for Kokoro (~1.0~ = normal)                     |
 | ~-f~, ~--file~      | Read the text to speak from a file                                     |
 | ~-o~, ~--output~    | Save synthesized audio to a WAV file instead of playing it             |
+| ~--force~           | Bypass the voice/language mismatch guard                               |
 
 Language handling is config-driven and agnostic: the requested
 language selects the phonemizer.  The stock Kokoro model ships one
