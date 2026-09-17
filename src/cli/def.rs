@@ -284,4 +284,249 @@ mod tests {
             assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
     }
+
+    #[test]
+    fn global_options_apply_before_the_subcommand() {
+        let cli = Cli::try_parse_from([
+            "talk-rs",
+            "-vvv",
+            "--log-file",
+            "/tmp/talk.log",
+            "transcribe",
+            "in.ogg",
+        ])
+        .expect("global options should parse");
+
+        assert_eq!(cli.verbose, 3);
+        assert_eq!(cli.log_file.as_deref(), Some("/tmp/talk.log"));
+        assert!(matches!(cli.command, Commands::Transcribe { .. }));
+    }
+
+    #[test]
+    fn transcribe_parses_every_documented_option() {
+        let cli = Cli::try_parse_from([
+            "talk-rs",
+            "transcribe",
+            "--provider",
+            "parakeet",
+            "--model",
+            "parakeet-tdt",
+            "--diarize",
+            "--timestamp",
+            "in.m4a",
+            "out.txt",
+        ])
+        .expect("transcribe arguments should parse");
+
+        match cli.command {
+            Commands::Transcribe {
+                input,
+                output,
+                provider,
+                model,
+                diarize,
+                timestamp,
+            } => {
+                assert_eq!(input, "in.m4a");
+                assert_eq!(output.as_deref(), Some("out.txt"));
+                assert_eq!(provider, Some(Provider::Parakeet));
+                assert_eq!(model.as_deref(), Some("parakeet-tdt"));
+                assert!(diarize);
+                assert!(timestamp);
+            }
+            other => panic!("expected transcribe command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transcribe_requires_an_input_file() {
+        let error = Cli::try_parse_from(["talk-rs", "transcribe"])
+            .expect_err("transcribe without input must fail");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn provider_rejects_unknown_names() {
+        let error =
+            Cli::try_parse_from(["talk-rs", "transcribe", "--provider", "whisperx", "a.ogg"])
+                .expect_err("unknown provider must be rejected at parse time");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn speak_parses_every_documented_option() {
+        let cli = Cli::try_parse_from([
+            "talk-rs",
+            "speak",
+            "--provider",
+            "mistral",
+            "--voice",
+            "alice",
+            "--lang",
+            "fr",
+            "--speed",
+            "1.25",
+            "-f",
+            "msg.txt",
+            "-o",
+            "out.wav",
+            "--force",
+            "Bonjour",
+        ])
+        .expect("speak arguments should parse");
+
+        match cli.command {
+            Commands::Speak {
+                text,
+                file,
+                provider,
+                voice,
+                lang,
+                speed,
+                output,
+                force,
+            } => {
+                assert_eq!(text.as_deref(), Some("Bonjour"));
+                assert_eq!(file.as_deref(), Some("msg.txt"));
+                assert_eq!(provider, Some(SynthesisProvider::Mistral));
+                assert_eq!(voice.as_deref(), Some("alice"));
+                assert_eq!(lang.as_deref(), Some("fr"));
+                assert_eq!(speed, Some(1.25));
+                assert_eq!(output.as_deref(), Some("out.wav"));
+                assert!(force);
+            }
+            other => panic!("expected speak command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn speak_text_is_optional_so_stdin_can_be_used() {
+        let cli = Cli::try_parse_from(["talk-rs", "speak"]).expect("bare speak should parse");
+        match cli.command {
+            Commands::Speak { text, file, .. } => {
+                assert!(text.is_none());
+                assert!(file.is_none());
+            }
+            other => panic!("expected speak command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dictate_parses_every_documented_option() {
+        let cli = Cli::try_parse_from([
+            "talk-rs",
+            "dictate",
+            "--save",
+            "rec.ogg",
+            "--output-yaml",
+            "meta.yml",
+            "--input-audio-file",
+            "in.wav",
+            "--retry-last",
+            "--pick",
+            "--replace-last-paste",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-transcribe",
+            "--diarize",
+            "--timestamp",
+            "--realtime",
+            "--toggle",
+            "--no-sounds",
+            "--no-boop",
+            "--no-chunk-paste",
+            "--no-paste",
+            "--monitor",
+            "--no-overlay",
+            "--no-auto-pause",
+            "--viz",
+            "spectrum",
+            "--mono",
+            "--upload-format",
+            "ogg",
+            "--no-bt-auto-switch",
+        ])
+        .expect("dictate arguments should parse");
+
+        match cli.command {
+            Commands::Dictate {
+                save,
+                output_yaml,
+                input_audio_file,
+                retry_last,
+                pick,
+                replace_last_paste,
+                provider,
+                model,
+                diarize,
+                timestamp,
+                realtime,
+                toggle,
+                no_sounds,
+                no_boop,
+                no_chunk_paste,
+                no_paste,
+                monitor,
+                no_overlay,
+                no_auto_pause,
+                viz,
+                mono,
+                upload_format,
+                no_bt_auto_switch,
+                daemon,
+                target_window,
+            } => {
+                assert_eq!(save.as_deref(), Some("rec.ogg"));
+                assert_eq!(output_yaml.as_deref(), Some("meta.yml"));
+                assert_eq!(input_audio_file.as_deref(), Some("in.wav"));
+                assert!(retry_last);
+                assert!(pick);
+                assert!(replace_last_paste);
+                assert_eq!(provider, Some(Provider::OpenAI));
+                assert_eq!(model.as_deref(), Some("gpt-transcribe"));
+                assert!(diarize);
+                assert!(timestamp);
+                assert!(realtime);
+                assert!(toggle);
+                assert!(no_sounds);
+                assert!(no_boop);
+                assert!(no_chunk_paste);
+                assert!(no_paste);
+                assert!(monitor);
+                assert!(no_overlay);
+                assert!(no_auto_pause);
+                assert_eq!(viz, Some(crate::config::VizMode::Spectrum));
+                assert!(mono);
+                assert_eq!(upload_format, crate::transcription::UploadFormat::Ogg);
+                assert!(no_bt_auto_switch);
+                assert!(!daemon);
+                assert!(target_window.is_none());
+            }
+            other => panic!("expected dictate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dictate_defaults_to_wav_uploads_and_no_flags() {
+        let cli = Cli::try_parse_from(["talk-rs", "dictate"]).expect("bare dictate should parse");
+        match cli.command {
+            Commands::Dictate {
+                upload_format,
+                realtime,
+                toggle,
+                provider,
+                ..
+            } => {
+                assert_eq!(upload_format, crate::transcription::UploadFormat::Wav);
+                assert!(!realtime);
+                assert!(!toggle);
+                assert!(provider.is_none());
+            }
+            other => panic!("expected dictate command, got {other:?}"),
+        }
+    }
 }
