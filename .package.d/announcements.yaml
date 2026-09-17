@@ -1,0 +1,9 @@
+announcements:
+  - name: talk-rs-community
+    transport: matrix
+    room: "#talk-rs:0k.io"
+    sender: "@0kbot:0k.io"
+    language: fr
+    audience: users
+    changes-since: last-announcement
+    style: short
