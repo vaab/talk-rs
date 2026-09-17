@@ -30,7 +30,7 @@ use crate::synthesis::{OneShotSynthesizer, SynthesisRequest, SynthesisResult};
 /// Local Kokoro one-shot synthesizer.
 ///
 /// Construction is cheap (path resolution only); the heavy
-/// `OfflineTts::create` happens lazily inside [`Self::synthesize`].
+/// `OfflineTts::create` happens lazily inside `Self::synthesize`.
 pub struct KokoroOneShotSynthesizer {
     model_dir: PathBuf,
     /// Default voice name from config (`providers.kokoro.voice`).

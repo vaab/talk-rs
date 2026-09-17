@@ -7,7 +7,7 @@
 //!   playback, e.g. conference call audio).
 //!
 //! Both streams deliver s16le PCM at the same rate and channel count.
-//! A shared [`MixerState`] accumulates samples from each stream and
+//! A shared `MixerState` accumulates samples from each stream and
 //! emits mixed, fixed-size chunks through a tokio mpsc channel.
 //!
 //! Because both streams live on the same PipeWire main loop their

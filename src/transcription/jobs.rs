@@ -59,14 +59,14 @@ const LOCK_PAYLOAD_VERSION: u32 = 1;
 /// existing readers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockPayload {
-    /// On-disk format version.  Equal to [`LOCK_PAYLOAD_VERSION`]
+    /// On-disk format version.  Equal to `LOCK_PAYLOAD_VERSION`
     /// when written.  Observers refuse to attach to an unknown
     /// future version (graceful degradation: treat as "in flight,
     /// not observable").
     pub version: u32,
     /// PID of the talk-rs process that holds the lock.  Used by
     /// [`cancel_remote`] (`kill(pid, SIGUSR1)`) and by
-    /// [`is_stale`] (`/proc/<pid>` existence check).
+    /// `is_stale` (`/proc/<pid>` existence check).
     pub owner_pid: u32,
     /// When the owner started this job (`SystemTime` epoch
     /// seconds + nanos).  Carried so a stale-PID check can

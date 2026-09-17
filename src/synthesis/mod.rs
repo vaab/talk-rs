@@ -5,7 +5,7 @@
 //! out*.  A single trait models the one mode of operation the `speak`
 //! command needs:
 //!
-//! - [`OneShotSynthesizer`]: text in, full PCM buffer out.
+//! - `OneShotSynthesizer`: text in, full PCM buffer out.
 //!
 //! Two backends implement it, exactly paralleling the transcription
 //! providers:
@@ -17,9 +17,9 @@
 //!   synthesis sibling of [`crate::transcription::parakeet`].  Gated on
 //!   the `kokoro` build feature.
 //!
-//! The [`create_oneshot_synthesizer`] factory dispatches on
+//! The `create_oneshot_synthesizer` factory dispatches on
 //! [`SynthesisProvider`] with cfg-gated arms mirroring
-//! [`crate::transcription::create_oneshot_transcriber`]: the
+//! `crate::transcription::create_oneshot_transcriber`: the
 //! `#[cfg(feature = "kokoro")]` arm constructs, the
 //! `#[cfg(not(feature = "kokoro"))]` arm returns a clear rebuild
 //! instruction.
@@ -112,7 +112,7 @@ pub(crate) trait OneShotSynthesizer: Send + Sync {
 ///
 /// THE public one-shot synthesis entry point, mirroring
 /// [`crate::transcription::transcribe_audio`].  Constructs the backend
-/// via [`create_oneshot_synthesizer`], runs its `validate` pre-flight,
+/// via `create_oneshot_synthesizer`, runs its `validate` pre-flight,
 /// then `synthesize`.  Callers that need the lower-level trait object
 /// (e.g. to reuse it across requests) can use the crate-internal
 /// factory directly.

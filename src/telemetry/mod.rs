@@ -69,7 +69,7 @@ pub enum RetryKind {
 #[derive(Debug, Clone)]
 pub enum TranscriptionEvent {
     /// Model preflight (`/v1/models` validation) started — emitted
-    /// by [`crate::transcription::transport::http::validate_model`]
+    /// by `crate::transcription::transport::http::validate_model`
     /// only on cache miss.  When the validate-cache hits, the
     /// preflight is skipped entirely and no `Preflight*` events are
     /// emitted, so consumers must be prepared for [`Self::RequestStarted`]

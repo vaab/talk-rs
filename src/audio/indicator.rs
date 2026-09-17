@@ -304,7 +304,7 @@ impl SoundPlayer {
     /// Create a new player using the default output device.
     ///
     /// After starting the stream, blocks until the output pipeline has
-    /// processed at least [`WARMUP_SECS`] worth of frames. This
+    /// processed at least `WARMUP_SECS` worth of frames. This
     /// deterministically primes PulseAudio's internal ring-buffer so the
     /// first real sound is not clipped.
     pub fn new() -> Result<Self, TalkError> {
@@ -403,7 +403,7 @@ impl SoundPlayer {
     /// Play a sound and wait until the output device has fully emitted it.
     ///
     /// Uses position tracking to detect when the callback has consumed
-    /// all samples, then sleeps for [`DRAIN_SECS`] to let the output
+    /// all samples, then sleeps for `DRAIN_SECS` to let the output
     /// pipeline flush. A wall-clock deadline ensures this never blocks
     /// longer than the sound's natural duration plus drain overhead,
     /// even if the audio callback stalls.

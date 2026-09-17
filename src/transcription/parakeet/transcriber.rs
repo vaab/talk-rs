@@ -61,7 +61,7 @@ fn pcm_i16_to_f32_normalised(samples: &[i16]) -> Vec<f32> {
 ///
 /// Construction is cheap (path resolution only); the heavy
 /// `OfflineRecognizer::create` happens lazily inside
-/// [`Self::fetch_transcription`].
+/// `Self::fetch_transcription`.
 pub struct ParakeetOneShotTranscriber {
     model_dir: PathBuf,
     variant: ParakeetVariant,

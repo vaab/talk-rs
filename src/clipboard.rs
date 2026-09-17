@@ -74,7 +74,7 @@ impl X11Clipboard {
     /// document and dropping the last chunk.
     ///
     /// Polls [`last_served_count`](Self::last_served_count) every
-    /// [`SERVED_POLL_INTERVAL_MS`] milliseconds.  Returns as soon as
+    /// `SERVED_POLL_INTERVAL_MS` milliseconds.  Returns as soon as
     /// the count crosses `baseline`; on timeout returns the
     /// last-observed (possibly unchanged) count so the caller can
     /// decide whether to emit a warning.
@@ -98,7 +98,7 @@ impl X11Clipboard {
     /// handle is held (i.e. no clipboard content is currently
     /// served), or when the target client-base has not yet fetched.
     ///
-    /// This is the per-target counterpart of [`last_served_count`]
+    /// This is the per-target counterpart of [`Self::last_served_count`]
     /// (the legacy total).  The deterministic paste gate uses it to
     /// confirm "the actual target consumed this chunk" rather than
     /// the unreliable "anyone fetched at least once" signal that

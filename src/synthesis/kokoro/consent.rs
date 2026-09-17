@@ -34,7 +34,7 @@ pub fn resolve(config: &Config) -> Result<ModelStatus, TalkError> {
 
 /// Ensure the Kokoro model is present, asking for consent on the
 /// terminal when it is not (a no-op when already present).  Delegates
-/// to [`model::ensure_with_cli_consent`].
+/// to `model::ensure_with_cli_consent`.
 pub async fn ensure_with_cli_consent(config: &Config) -> Result<(), TalkError> {
     let status = resolve(config)?;
     if status.present {

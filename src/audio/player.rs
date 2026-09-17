@@ -8,7 +8,7 @@
 //!   play a mono `i16` PCM buffer at a given sample rate, blocking
 //!   until playback finishes.
 //! * The recordings browser's `WavPlayer` (in
-//!   [`crate::record::player`]), which delegates its stream + transport
+//!   `crate::record::player`), which delegates its stream + transport
 //!   controls (play / pause / seek / progress) to an `AudioPlayer` via
 //!   [`AudioPlayer::load_f32`] and the control methods here.
 //!

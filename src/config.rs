@@ -186,7 +186,7 @@ impl std::str::FromStr for Provider {
 /// variants are ALWAYS present regardless of build features so a YAML
 /// config naming `provider: kokoro` always parses — the feature gate
 /// only affects whether the concrete backend can be *constructed*
-/// (see [`crate::synthesis::create_oneshot_synthesizer`]).
+/// (see `crate::synthesis::create_oneshot_synthesizer`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SynthesisProvider {
@@ -755,7 +755,7 @@ pub struct FlatPasteConfig {
 
     /// Number of automatic per-chunk retries on the deterministic
     /// target-confirmation path (default `2` = up to 3 attempts).
-    /// See [`crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES`].
+    /// See `crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES`.
     #[serde(default = "default_paste_target_fetch_retries")]
     pub target_fetch_retries: u32,
 }

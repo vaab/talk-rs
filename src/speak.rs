@@ -28,7 +28,7 @@ pub struct SpeakOpts {
     /// Voice name / id override.
     pub voice: Option<String>,
     /// Phonemization language override (`--lang`).  Highest-priority
-    /// input to the language-resolution chain (see [`resolve_lang`]).
+    /// input to the language-resolution chain (see `resolve_lang`).
     pub lang: Option<String>,
     /// Speech rate multiplier (Kokoro).
     pub speed: Option<f32>,

@@ -110,10 +110,10 @@ impl PipelinePhase {
 /// Stringified description of a single timer that was active at a
 /// pipeline-failure call site.
 ///
-/// Sibling to [`crate::transcription::transport::http::TimerSpec`]
-/// but carries already-rendered duration text so [`error`] does not
+/// Sibling to `crate::transcription::transport::http::TimerSpec`
+/// but carries already-rendered duration text so `error` does not
 /// import the transport-layer types.  Built by
-/// [`crate::transcription::transport::http::build_pipeline_failure_kind`]
+/// `crate::transcription::transport::http::build_pipeline_failure_kind`
 /// from the `TimerSpec` slice that was active at the call site.
 #[derive(Debug, Clone)]
 pub struct TimerLabel {
@@ -155,7 +155,7 @@ fn fmt_duration(d: Duration) -> String {
 
 /// Coarse classification of a network-layer failure during a
 /// pipeline call.  Mirrors the structural attribution rules used
-/// by [`crate::transcription::transport::http::attribute_timer`]
+/// by `crate::transcription::transport::http::attribute_timer`
 /// but in typed form so renderers don't re-parse strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
@@ -193,7 +193,7 @@ pub enum PipelineFailureKind {
         /// classification applies.
         timer: Option<TimerLabel>,
         /// The underlying reqwest / hyper / OS error.  Walked by
-        /// [`PipelineFailure::Display`] for novel layers (DNS,
+        /// [`std::fmt::Display`] for novel layers (DNS,
         /// ECONNREFUSED, TLS messages) and dedup'd against the
         /// already-emitted structured fields.
         #[source]
@@ -234,7 +234,7 @@ pub struct PipelineFailure {
     /// as the human-facing form because producers already have
     /// the title-cased name in scope (e.g. the `provider_name`
     /// argument to
-    /// [`crate::transcription::transport::http::validate_model`]).
+    /// `crate::transcription::transport::http::validate_model`).
     /// Stored as `String` (not `crate::config::Provider`) to
     /// avoid the import cycle: `config` already imports `error`.
     pub provider: String,

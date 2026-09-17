@@ -28,17 +28,17 @@
 //!
 //! # Legacy sub-modules (being migrated)
 //!
-//! - [`http`]: reqwest client configuration, per-request
+//! - `http`: reqwest client configuration, per-request
 //!   proportional timeout, progress-reporting request body, model
 //!   validation, and model-error enrichment.  Functions here will
 //!   either move behind [`http_request`] or become private helpers
 //!   over the course of the transport consolidation.
-//! - [`retry`]: the legacy retry primitive used by one-shot HTTP calls
+//! - `retry`: the legacy retry primitive used by one-shot HTTP calls
 //!   and realtime WebSocket upgrade handshakes.  Being absorbed
 //!   into [`http_request`] / [`ws_upgrade`].
-//! - [`validate_cache`]: disk-backed memoization of `/v1/models`
+//! - `validate_cache`: disk-backed memoization of `/v1/models`
 //!   preflight results — unchanged.
-//! - [`ws`]: shared WebSocket helpers — being populated as part of
+//! - `ws`: shared WebSocket helpers — being populated as part of
 //!   the consolidation.
 
 pub(crate) mod http;
@@ -62,7 +62,7 @@ use tokio_util::sync::CancellationToken;
 ///
 /// The budget caps the whole attempt (TCP + TLS + upload + response)
 /// **unless** the request carries a larger [`Request::wall_clock`],
-/// in which case the wall-clock wins — see [`attempt_cap`].  Without
+/// in which case the wall-clock wins — see `attempt_cap`.  Without
 /// that rule a 26 MB upload is structurally doomed on the first six
 /// slots and only the 120 s slot can ever succeed.
 pub const CONNECTION_BUDGETS_SECS: [u64; 7] = [2, 5, 8, 11, 15, 30, 120];

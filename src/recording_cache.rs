@@ -537,7 +537,7 @@ fn model_lock_path(
     Ok(dir.join(model_lock_filename(stem, provider, model, realtime)))
 }
 
-/// Public wrapper for [`model_lock_path`] used by
+/// Public wrapper for `model_lock_path` used by
 /// [`crate::transcription::jobs`].  Exposes the lock-path
 /// computation so the jobs module can write the YAML payload at
 /// the same location the legacy `acquire_model_lock` would have

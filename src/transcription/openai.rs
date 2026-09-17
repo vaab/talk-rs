@@ -1,6 +1,6 @@
 //! OpenAI API one-shot transcription backend.
 //!
-//! This module provides a [`OneShotTranscriber`] implementation that uses the
+//! This module provides a `OneShotTranscriber` implementation that uses the
 //! OpenAI API to transcribe audio files (Whisper, GPT-4o-transcribe, etc.).
 
 use crate::config::{OpenAIConfig, OpenAIRealtimeDelay};

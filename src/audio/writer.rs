@@ -48,7 +48,7 @@ fn rand_serial() -> u32 {
 /// Encodes PCM input with Opus and wraps the output in OGG pages
 /// conforming to RFC 7845 (OpusHead + OpusTags headers).
 pub struct OggOpusWriter {
-    /// Ogg page writer, wrapping a Vec<u8> buffer.
+    /// Ogg page writer, wrapping a `Vec<u8>` buffer.
     packet_writer: PacketWriter<'static, Vec<u8>>,
     /// Opus encoder.
     encoder: opus::Encoder,

@@ -5,8 +5,8 @@
 //!
 //! Two traits model the two modes of operation:
 //!
-//! - [`OneShotTranscriber`]: file or byte-stream in, full text out.
-//! - [`RealtimeTranscriber`]: raw PCM stream in, incremental event stream out.
+//! - `OneShotTranscriber`: file or byte-stream in, full text out.
+//! - `RealtimeTranscriber`: raw PCM stream in, incremental event stream out.
 
 use crate::config::{Config, Provider};
 use crate::error::TalkError;
@@ -133,7 +133,7 @@ fn encode_16k_mono_ogg(path: &std::path::Path) -> Result<Vec<u8>, TalkError> {
 ///   as it takes" — the user can dismiss the picker if a candidate
 ///   is taking forever.  These callers pick [`Self::UserAttended`].
 ///
-/// The policy is stored on each [`OneShotTranscriber`] (chosen at
+/// The policy is stored on each `OneShotTranscriber` (chosen at
 /// construction via `with_policy`) and consulted by `send_once`
 /// when it issues the HTTP request.  In both cases the
 /// `connect_timeout` from `build_client()` and the kernel-level TCP
@@ -714,11 +714,11 @@ pub fn read_cached_transcript(audio_path: &std::path::Path, config: &Config) -> 
 
 /// Produce the authoritative transcript for a recording (Layer 2).
 ///
-/// 1. Calls [`recording_cache::get_transcript`]:
-///    - [`TranscriptStatus::Available`] -> returns the text.
-///    - [`TranscriptStatus::InProgress`] -> returns
+/// 1. Calls [`crate::recording_cache::get_transcript`]:
+///    - [`crate::recording_cache::TranscriptStatus::Available`] -> returns the text.
+///    - [`crate::recording_cache::TranscriptStatus::InProgress`] -> returns
 ///      [`TalkError::TranscriptInProgress`].
-///    - [`TranscriptStatus::NotAvailable`] -> continues.
+///    - [`crate::recording_cache::TranscriptStatus::NotAvailable`] -> continues.
 /// 2. Acquires the pick lock.
 /// 3. Calls [`transcribe_audio`] with `allow_api = true`.
 /// 4. Writes the pick file with the resulting text.

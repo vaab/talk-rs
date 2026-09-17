@@ -1,6 +1,6 @@
 //! Mistral API one-shot transcription backend.
 //!
-//! This module provides a [`OneShotTranscriber`] implementation that uses the
+//! This module provides a `OneShotTranscriber` implementation that uses the
 //! Mistral API to transcribe audio files.
 
 use crate::config::MistralConfig;

@@ -75,14 +75,14 @@ pub(crate) const DEFAULT_TARGET_QUIESCENCE_MS: u64 = 50;
 /// are the canonical spec fields.  `clipboard` is an internal routing
 /// field: the [`crate::paste::paste_with_root`] wrapper owns the
 /// [`X11Clipboard`] handle (so save / restore can reach its serve
-/// counter), and the [`ClipboardNode`] reuses the SAME instance
+/// counter), and the `ClipboardNode` reuses the SAME instance
 /// — without this shared handle the per-chunk gate would observe a
 /// fresh-zero counter on a different X11Clipboard and the existing
 /// race-protection would be lost.
 ///
 /// `target_client_base` and `expected_target_fetches` carry the
 /// per-paste-operation state for the deterministic per-chunk gate
-/// implemented in [`crate::paste::nodes::clipboard::ClipboardNode`].
+/// implemented in `crate::paste::nodes::clipboard::ClipboardNode`.
 /// See the field docs for the contract.
 pub struct PasteCtx<'a> {
     /// XID of the target window as a base-10 string, or `None` when

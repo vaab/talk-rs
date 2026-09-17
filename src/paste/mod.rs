@@ -28,7 +28,7 @@ const PASTE_PREVIEW_CHARS: usize = 60;
 
 /// Render a short, single-line preview of `text` for paste-diagnostic
 /// trace logs: the character count plus the first
-/// [`PASTE_PREVIEW_CHARS`] characters with newlines/tabs escaped so a
+/// `PASTE_PREVIEW_CHARS` characters with newlines/tabs escaped so a
 /// multi-line paste stays on one log line.
 ///
 /// This DOES include clipboard content (potentially sensitive), which
@@ -249,7 +249,7 @@ pub fn timing_from_root(cfg: &PasteNodeConfig) -> PasteTiming {
 /// focus → optional backspace → resolve target client-base → save
 /// clipboard → root.paste(text) → restore.  No "settle" stability
 /// window is needed at the wrapper level: the
-/// [`crate::paste::nodes::clipboard::ClipboardNode`] gate confirms
+/// `crate::paste::nodes::clipboard::ClipboardNode` gate confirms
 /// the target consumed the LAST chunk before returning, so we can
 /// restore the original clipboard immediately afterwards.
 ///
