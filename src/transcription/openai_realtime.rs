@@ -404,7 +404,6 @@ impl OpenAIRealtimeTranscriber {
     /// Uses [`super::transport::ws_upgrade`] for the handshake so
     /// retries / growing budget / cancellation share the unified
     /// transport machinery.
-    #[allow(dead_code)]
     async fn validate_realtime_session(&self) -> Result<(), TalkError> {
         let session_update = build_session_update(&self.config, &self.model)?;
         let ws_url = build_ws_url(&self.endpoint);

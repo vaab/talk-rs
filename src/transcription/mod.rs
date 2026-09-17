@@ -491,9 +491,13 @@ pub(crate) trait OneShotTranscriber: Send + Sync {
 pub(crate) trait RealtimeTranscriber: Send + Sync {
     /// Pre-flight check: verify API connectivity and model validity.
     ///
-    /// Same purpose as [`OneShotTranscriber::validate`] — called before
-    /// starting audio capture to give the user immediate feedback.
-    #[allow(dead_code)]
+    /// Same purpose as [`OneShotTranscriber::validate`]: called by
+    /// `dictate_realtime` right after the transcriber is created and
+    /// before the streaming session is opened, so a bad key or model
+    /// surfaces as an immediate, enriched error rather than from inside
+    /// the streaming loop.  Capture has already started at that point
+    /// (audio is buffered meanwhile); the check gates the provider
+    /// session, not the microphone.
     async fn validate(&self) -> Result<(), TalkError>;
 
     /// Connect and start streaming.  Returns a channel of events.

@@ -389,6 +389,10 @@ pub(crate) async fn dictate_realtime(
 
     // Create initial transcription pipeline: buffer → feeder → transcriber.
     let transcriber = transcription::create_realtime_transcriber(&config, provider, model)?;
+    // Pre-flight so a bad key or model fails immediately with an enriched error
+    // instead of surfacing mid-session. Reconnects intentionally skip validation:
+    // the session was already validated, and retries should not add a round-trip.
+    transcriber.validate().await?;
     let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
     let mut feeder_handle = tokio::spawn(buffer_feeder(Arc::clone(&buffer), fwd_tx, 0));
     let mut event_rx = transcriber.transcribe_realtime(fwd_rx).await?;

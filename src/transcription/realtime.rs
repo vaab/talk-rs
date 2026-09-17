@@ -481,7 +481,6 @@ impl MistralRealtimeTranscriber {
     /// Uses [`super::transport::ws_upgrade`] for the handshake so
     /// retries / growing connect budget / cancellation are shared
     /// with the live transcription path.
-    #[allow(dead_code)]
     async fn validate_realtime_session(&self) -> Result<(), TalkError> {
         let ws_url = build_ws_url(&self.endpoint, self.realtime_model());
 
@@ -1206,5 +1205,47 @@ mod tests {
         assert!(SESSION_CREATED_TIMEOUT.as_secs() <= 60);
         assert!(WS_PING_INTERVAL.as_secs() >= 10);
         assert!(WS_PING_INTERVAL.as_secs() <= 120);
+    }
+
+    /// Pre-flight contract used by ``dictate --realtime``: when the
+    /// provider rejects the WebSocket upgrade (bad API key -> 401),
+    /// ``validate`` fails from that single handshake, before any
+    /// audio could be streamed.
+    #[tokio::test]
+    async fn validate_fails_on_rejected_ws_upgrade_without_streaming() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let upgrade = Mock::given(method("GET"))
+            .and(path(REALTIME_PATH))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let config = MistralConfig {
+            api_key: "bad-key".to_string(),
+            url: None,
+            model: "voxtral-mini-transcribe-realtime-2602".to_string(),
+            context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".to_string(),
+            tts_voice: None,
+            tts_voices: None,
+        };
+        let transcriber =
+            MistralRealtimeTranscriber::with_endpoint(config, http_to_ws(&server.uri()));
+
+        let result = transcriber.validate().await;
+
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("validate must fail when the upgrade is rejected"),
+        };
+        assert!(
+            err.contains("401"),
+            "error must carry the HTTP status: {err}"
+        );
+        drop(upgrade); // asserts exactly one handshake request was made
     }
 }
