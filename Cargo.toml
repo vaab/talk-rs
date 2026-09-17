@@ -6,6 +6,9 @@ rust-version = "1.87"
 authors = ["Valentin Lab <valentin.lab@kalysto.org>"]
 license = "MIT"
 description = "Voice dictation for Linux -- record, transcribe, and paste"
+repository = "https://github.com/vaab/talk-rs"
+keywords = ["dictation", "speech-to-text", "voice", "transcription", "linux"]
+categories = ["command-line-utilities", "multimedia::audio", "accessibility"]
 readme = "README.md"
 exclude = [
     "README.org",
