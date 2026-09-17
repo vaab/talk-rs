@@ -19,19 +19,13 @@ pub trait AudioEncoder: Send {
 
 /// Mock encoder for testing that passes through PCM data.
 pub struct MockEncoder {
-    /// Configuration kept for potential future use (e.g., validation, logging).
-    #[allow(dead_code)]
-    config: AudioConfig,
     buffer: Vec<u8>,
 }
 
 impl MockEncoder {
     /// Create a new mock encoder with the given configuration.
-    pub fn new(config: AudioConfig) -> Self {
-        Self {
-            config,
-            buffer: Vec::new(),
-        }
+    pub fn new(_config: AudioConfig) -> Self {
+        Self { buffer: Vec::new() }
     }
 }
 
