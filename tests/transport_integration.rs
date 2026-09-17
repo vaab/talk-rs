@@ -289,14 +289,22 @@ async fn cancellation_aborts_in_flight_request_within_100ms() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // The mock notifies the moment it receives the request, so the
+    // cancellation is triggered while the request is provably in
+    // flight and latency is measured from that instant.  A fixed
+    // pre-cancel sleep would race connection setup, which under
+    // coverage instrumentation alone can exceed the budget.
     let server = MockServer::start().await;
+    let in_flight = Arc::new(tokio::sync::Notify::new());
+    let notify = in_flight.clone();
     Mock::given(method("GET"))
         .and(path("/v1/models"))
-        .respond_with(
+        .respond_with(move |_: &wiremock::Request| {
+            notify.notify_one();
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_secs(30))
-                .set_body_string("{\"data\":[]}"),
-        )
+                .set_body_string("{\"data\":[]}")
+        })
         .mount(&server)
         .await;
 
@@ -306,21 +314,23 @@ async fn cancellation_aborts_in_flight_request_within_100ms() {
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let cancelled_at = tokio::spawn(async move {
+        in_flight.notified().await;
         cancel_clone.cancel();
+        Instant::now()
     });
 
-    let started = Instant::now();
     let result = http_request(req, &sink, cancel).await;
-    let elapsed = started.elapsed();
+    let returned_at = Instant::now();
+    let cancelled_at = cancelled_at.await.expect("cancel task must complete");
 
     assert!(result.is_err(), "cancellation must surface as Err");
+    let latency = returned_at.saturating_duration_since(cancelled_at);
     assert!(
-        elapsed < Duration::from_millis(500),
+        latency < Duration::from_millis(500),
         "cancellation must abort within 500ms of trigger; \
-         elapsed was {:?}",
-        elapsed
+         latency was {:?}",
+        latency
     );
 }
 

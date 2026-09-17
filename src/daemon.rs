@@ -712,7 +712,11 @@ mod tests {
             .process_group(0);
         let mut child = TestChild(command.spawn().expect("spawn finalizing helper"));
         let pid = child.0.id();
-        let ready_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // Ceilings only: the polls below return as soon as the
+        // condition holds.  They are generous because the helper is
+        // this very test binary (large, and slow to start under
+        // coverage instrumentation or a loaded parallel run).
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !ready_path.exists() && std::time::Instant::now() < ready_deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -743,7 +747,7 @@ mod tests {
             "repeated stop during finalization must not release the slot"
         );
 
-        let exit_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let exit_deadline = std::time::Instant::now() + Duration::from_secs(30);
         while child.0.try_wait().expect("query helper status").is_none()
             && std::time::Instant::now() < exit_deadline
         {
