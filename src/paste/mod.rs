@@ -532,16 +532,10 @@ pub fn paste_keysyms(shortcut: &PasteShortcut) -> Vec<u32> {
 pub async fn simulate_paste(shortcut: PasteShortcut) -> Result<(), TalkError> {
     let keysyms = paste_keysyms(&shortcut);
 
-    let ok = tokio::task::spawn_blocking(move || crate::x11::x11_send_key_combo(&keysyms))
+    tokio::task::spawn_blocking(move || crate::x11::x11_send_key_combo_checked(&keysyms))
         .await
-        .unwrap_or(false);
-
-    if !ok {
-        return Err(TalkError::Clipboard(
-            "XTest key simulation failed".to_string(),
-        ));
-    }
-    Ok(())
+        .map_err(|error| TalkError::Clipboard(format!("XTest paste worker failed: {error}")))?
+        .map_err(|error| TalkError::Clipboard(format!("XTest paste shortcut failed: {error}")))
 }
 
 /// Simulate deleting the previous text by sending repeated BackSpace
@@ -554,16 +548,10 @@ pub async fn simulate_backspace(count: usize) -> Result<(), TalkError> {
     // X11 keysym for BackSpace.
     const BACKSPACE: u32 = 0xff08;
 
-    let ok = tokio::task::spawn_blocking(move || crate::x11::x11_send_key_repeat(BACKSPACE, count))
+    tokio::task::spawn_blocking(move || crate::x11::x11_send_key_repeat_checked(BACKSPACE, count))
         .await
-        .unwrap_or(false);
-
-    if !ok {
-        return Err(TalkError::Clipboard(
-            "XTest backspace simulation failed".to_string(),
-        ));
-    }
-    Ok(())
+        .map_err(|error| TalkError::Clipboard(format!("XTest backspace worker failed: {error}")))?
+        .map_err(|error| TalkError::Clipboard(format!("XTest backspace failed: {error}")))
 }
 
 #[cfg(test)]

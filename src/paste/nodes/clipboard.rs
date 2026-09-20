@@ -88,6 +88,19 @@ pub(crate) enum GateDecision {
     AbortedTimeout { observed: u32, required: u32 },
 }
 
+async fn focus_then_inject<FocusFuture, Inject, InjectFuture>(
+    focus: FocusFuture,
+    inject: Inject,
+) -> Result<(), TalkError>
+where
+    FocusFuture: std::future::Future<Output = Result<(), TalkError>>,
+    Inject: FnOnce() -> InjectFuture,
+    InjectFuture: std::future::Future<Output = Result<(), TalkError>>,
+{
+    focus.await?;
+    inject().await
+}
+
 #[async_trait]
 impl PasteNode for ClipboardNode {
     async fn paste(&self, text: &str, ctx: &PasteCtx<'_>) -> Result<(), TalkError> {
@@ -110,10 +123,9 @@ impl PasteNode for ClipboardNode {
         // Deterministic target-confirmation path WITH automatic retry.
         //
         // Each attempt re-serves the chunk (fresh serve handle = fresh
-        // per-chunk fetch counter), re-focuses the target window (the
-        // observed root cause: the paste keystroke was sent before the
-        // keyboard focus was effective), re-sends the paste keystroke
-        // and re-runs the gate.  On chunk 1 (LEARN) each retry resets
+        // per-chunk fetch counter), re-focuses the target window before
+        // re-sending the paste keystroke, and re-runs the gate.  On
+        // chunk 1 (LEARN) each retry resets
         // `expected_target_fetches` to 0 so the gate re-LEARNS instead
         // of wrongly entering CONFIRM.
         //
@@ -133,22 +145,29 @@ impl PasteNode for ClipboardNode {
                 if learn_phase {
                     ctx.expected_target_fetches.store(0, Ordering::Relaxed);
                 }
-                // Re-focus the target window before re-sending the
-                // keystroke — this is the actual root-cause fix.
-                if let Some(wid) = ctx.target_window {
-                    if let Err(e) = crate::paste::ensure_focus(wid).await {
-                        log::warn!(
-                            "paste(clipboard-node): retry {} could not re-focus \
-                             target window {}: {} — retrying anyway",
-                            attempt,
-                            wid,
-                            e,
-                        );
-                    }
-                }
             }
 
-            self.serve_and_simulate(clipboard, text).await?;
+            let injection_result = if attempt > 0 {
+                if let Some(wid) = ctx.target_window {
+                    focus_then_inject(crate::paste::ensure_focus(wid), || {
+                        self.serve_and_simulate(clipboard, text)
+                    })
+                    .await
+                } else {
+                    self.serve_and_simulate(clipboard, text).await
+                }
+            } else {
+                self.serve_and_simulate(clipboard, text).await
+            };
+            if let Err(error) = injection_result {
+                log::error!(
+                    "paste(clipboard-node): retry {} focus/shortcut attempt failed: {}",
+                    attempt,
+                    error,
+                );
+                self.signal_final_abort(ctx, &error);
+                return Err(error);
+            }
 
             match self.run_target_gate(clipboard, target_base, ctx).await {
                 Ok(()) => {
@@ -479,6 +498,26 @@ async fn wait_and_confirm(
 mod tests {
     use super::*;
     use crate::x11::clipboard::client_base;
+
+    #[tokio::test]
+    async fn retry_focus_failure_stops_before_injection() {
+        let injection_count = std::sync::atomic::AtomicU32::new(0);
+        let result = focus_then_inject(
+            async {
+                Err(TalkError::Clipboard(
+                    "target focus remained elsewhere".to_string(),
+                ))
+            },
+            || async {
+                injection_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(injection_count.load(Ordering::Relaxed), 0);
+    }
 
     // ── client_base masking ─────────────────────────────────────
 

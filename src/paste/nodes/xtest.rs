@@ -54,15 +54,20 @@ impl PasteNode for XtestTypeNode {
                     continue;
                 }
             };
-            let ok = tokio::task::spawn_blocking(move || crate::x11::x11_send_key_combo(&syms))
+            tokio::task::spawn_blocking(move || crate::x11::x11_send_key_combo_checked(&syms))
                 .await
-                .unwrap_or(false);
-            if !ok {
-                return Err(TalkError::Clipboard(format!(
-                    "XTest typing failed for character {:?}",
-                    c,
-                )));
-            }
+                .map_err(|error| {
+                    TalkError::Clipboard(format!(
+                        "XTest typing worker failed for character {:?}: {}",
+                        c, error,
+                    ))
+                })?
+                .map_err(|error| {
+                    TalkError::Clipboard(format!(
+                        "XTest typing failed for character {:?}: {}",
+                        c, error,
+                    ))
+                })?;
         }
         Ok(())
     }

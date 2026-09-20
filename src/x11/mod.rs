@@ -4,6 +4,8 @@
 //! Shared by the dictate picker and recordings browser.
 
 pub mod clipboard;
+mod keyboard;
+pub use keyboard::KeyComboError;
 pub mod monitor;
 pub mod overlay;
 pub mod render_util;
@@ -275,158 +277,33 @@ pub fn x11_activate_window(wid: u32) -> bool {
 /// All keys are pressed in order, then released in reverse order,
 /// matching the behaviour of `xdotool key`.
 ///
-/// Returns `true` if the key events were sent, `false` on error.
+/// Compatibility wrapper returning whether checked injection succeeded.
 pub fn x11_send_key_combo(keysyms: &[u32]) -> bool {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::*;
-    use x11rb::protocol::xtest;
+    x11_send_key_combo_checked(keysyms).is_ok()
+}
 
-    if keysyms.is_empty() {
-        return true;
-    }
-
-    let (conn, _screen_num) = match x11rb::connect(None) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let setup = conn.setup();
-    let min_keycode = setup.min_keycode;
-    let max_keycode = setup.max_keycode;
-
-    // Fetch the full keyboard mapping so we can resolve keysym → keycode.
-    let count = max_keycode - min_keycode + 1;
-    let mapping = match conn.get_keyboard_mapping(min_keycode, count) {
-        Ok(cookie) => match cookie.reply() {
-            Ok(m) => m,
-            Err(_) => return false,
-        },
-        Err(_) => return false,
-    };
-    let syms_per_code = mapping.keysyms_per_keycode as usize;
-
-    let keysym_to_keycode = |sym: u32| -> Option<u8> {
-        for i in 0..count as usize {
-            for col in 0..syms_per_code {
-                if mapping.keysyms[i * syms_per_code + col] == sym {
-                    return Some((i as u8) + min_keycode);
-                }
-            }
-        }
-        None
-    };
-
-    // Resolve all keysyms to keycodes up-front.
-    let keycodes: Vec<u8> = match keysyms.iter().map(|s| keysym_to_keycode(*s)).collect() {
-        Some(v) => v,
-        None => return false,
-    };
-
-    const KEY_PRESS: u8 = 2;
-    const KEY_RELEASE: u8 = 3;
-    // xdotool default inter-key delay: 12 000 µs.
-    const DELAY: std::time::Duration = std::time::Duration::from_millis(12);
-
-    // root=0 for key events (XTest spec: root is ignored for
-    // KeyPress/KeyRelease; xdotool also passes None).
-    let send = |type_: u8, kc: u8| -> bool {
-        if xtest::fake_input(&conn, type_, kc, 0, 0u32, 0, 0, 0).is_err() {
-            return false;
-        }
-        // Flush after every event, matching xdotool's XFlush-per-key.
-        if conn.flush().is_err() {
-            return false;
-        }
-        std::thread::sleep(DELAY);
-        true
-    };
-
-    // Press all keys in order.
-    for &kc in &keycodes {
-        if !send(KEY_PRESS, kc) {
-            return false;
-        }
-    }
-    // Release all keys in reverse order.
-    for &kc in keycodes.iter().rev() {
-        if !send(KEY_RELEASE, kc) {
-            return false;
-        }
-    }
-
-    true
+/// Checked key-combination injection used by internal paste callers.
+///
+/// Returns a phase-specific error if keyboard state cannot be read, a
+/// conflicting key remains active past the bounded wait, or a checked XTest
+/// request fails. Cleanup attempts releases for every key that may have been
+/// injected; server failure or disconnect can still prevent a release.
+pub fn x11_send_key_combo_checked(keysyms: &[u32]) -> Result<(), KeyComboError> {
+    keyboard::send_key_combo(keysyms)
 }
 
 /// Send a single key press+release `count` times with no inter-key
 /// delay, matching `xdotool key --delay 0 --repeat N <key>`.
 ///
-/// Returns `true` if all events were sent, `false` on error.
+/// Compatibility wrapper returning whether checked repeated injection
+/// succeeded.
 pub fn x11_send_key_repeat(keysym: u32, count: usize) -> bool {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::*;
-    use x11rb::protocol::xtest;
+    x11_send_key_repeat_checked(keysym, count).is_ok()
+}
 
-    if count == 0 {
-        return true;
-    }
-
-    let (conn, _screen_num) = match x11rb::connect(None) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let setup = conn.setup();
-    let min_keycode = setup.min_keycode;
-    let max_keycode = setup.max_keycode;
-
-    let km_count = max_keycode - min_keycode + 1;
-    let mapping = match conn.get_keyboard_mapping(min_keycode, km_count) {
-        Ok(cookie) => match cookie.reply() {
-            Ok(m) => m,
-            Err(_) => return false,
-        },
-        Err(_) => return false,
-    };
-    let syms_per_code = mapping.keysyms_per_keycode as usize;
-
-    let keycode = (|| -> Option<u8> {
-        for i in 0..km_count as usize {
-            for col in 0..syms_per_code {
-                if mapping.keysyms[i * syms_per_code + col] == keysym {
-                    return Some((i as u8) + min_keycode);
-                }
-            }
-        }
-        None
-    })();
-
-    let kc = match keycode {
-        Some(v) => v,
-        None => return false,
-    };
-
-    const KEY_PRESS: u8 = 2;
-    const KEY_RELEASE: u8 = 3;
-
-    // Flush after every event, matching xdotool's XFlush-per-key.
-    // Yield between events: xdotool calls usleep(0) even with
-    // --delay 0, giving the X server time to consume each event.
-    for _ in 0..count {
-        if xtest::fake_input(&conn, KEY_PRESS, kc, 0, 0u32, 0, 0, 0).is_err() {
-            return false;
-        }
-        if conn.flush().is_err() {
-            return false;
-        }
-        std::thread::yield_now();
-        if xtest::fake_input(&conn, KEY_RELEASE, kc, 0, 0u32, 0, 0, 0).is_err() {
-            return false;
-        }
-        if conn.flush().is_err() {
-            return false;
-        }
-        std::thread::yield_now();
-    }
-
-    true
+/// Checked repeated key injection used for replacement backspaces.
+pub fn x11_send_key_repeat_checked(keysym: u32, count: usize) -> Result<(), KeyComboError> {
+    keyboard::send_key_repeat(keysym, count)
 }
 
 /// Resolve the X11 client-base of a window XID via a fresh server
@@ -535,4 +412,13 @@ pub fn x11_get_wm_class(wid: u32) -> Option<(String, String)> {
         String::from_utf8_lossy(instance).into_owned(),
         String::from_utf8_lossy(class).into_owned(),
     ))
+}
+
+#[cfg(test)]
+mod keyboard_api_tests {
+    #[test]
+    fn public_bool_wrappers_remain_compatible() {
+        let _combo: fn(&[u32]) -> bool = super::x11_send_key_combo;
+        let _repeat: fn(u32, usize) -> bool = super::x11_send_key_repeat;
+    }
 }

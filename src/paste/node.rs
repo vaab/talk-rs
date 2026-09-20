@@ -53,8 +53,8 @@ pub(crate) const DEFAULT_CHUNK_FETCH_TIMEOUT_MS: u64 = 500;
 /// attempt plus two re-tries.  Each retry re-serves the chunk
 /// (`set_text`), re-focuses the target window, re-sends the paste
 /// keystroke and re-waits on the gate — the retry directly addresses
-/// the observed root cause (focus not yet effective when the keystroke
-/// was sent).  Only the deterministic target-confirmation path retries;
+/// one observed failure mode (focus not yet effective when the keystroke
+/// was sent). Only the deterministic target-confirmation path retries;
 /// the blind-paste fallback gate is unchanged.
 pub(crate) const DEFAULT_TARGET_FETCH_RETRIES: u32 = 2;
 

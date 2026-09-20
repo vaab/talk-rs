@@ -522,6 +522,24 @@ To change the key, replace ~<Super>slash~ with the desired binding
 (e.g. ~<Super>semicolon~, ~<Super>d~). Add ~--realtime~ to use
 streaming transcription instead of batch mode.
 
+*** Automatic paste keyboard safety
+
+Before sending a paste shortcut, =talk-rs= waits briefly while any
+shortcut key is down or any non-lock server modifier slot is active.
+This includes custom mappings and AltGr. If the keyboard remains busy,
+the paste aborts with an error instead of resetting modifier state or
+injecting into an ambiguous state. CapsLock and NumLock remain
+unchanged; pressing either lock key during the wait also defers the
+shortcut. A failed target window refocus aborts the retry attempt.
+
+Every synthesized key request is checked with the X server. On success,
+=talk-rs= releases its chord in reverse order; on failure, it attempts
+release requests for every key it may have injected. X11 does not
+provide an atomic keyboard transaction: physical input, focus changes,
+grabs, or keymap changes can still interleave after the final state
+check. A process kill or X server disconnect can likewise prevent
+cleanup.
+
 ** Development
 
 #+begin_src sh
@@ -529,6 +547,13 @@ cargo fmt                     # format
 cargo clippy --all-targets    # lint
 cargo test                    # test
 cargo build                   # build
+#+end_src
+
+The real-X11 keyboard integration test is opt-in because it starts and
+owns an isolated ~Xvfb~ server (or ~Xephyr~ when ~Xvfb~ is unavailable):
+
+#+begin_src sh
+cargo test --test integration_x11_keyboard -- --ignored --nocapture
 #+end_src
 
 *** Cargo feature flags
