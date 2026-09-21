@@ -6,6 +6,7 @@
 pub(crate) mod chunk;
 pub(crate) mod clipboard;
 pub(crate) mod detect;
+pub(crate) mod foreground_app;
 pub(crate) mod wm_class;
 pub(crate) mod xtest;
 

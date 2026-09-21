@@ -232,6 +232,24 @@ transcription: audio sent to the providers is always downsampled to
 16 kHz mono internally (both Voxtral and Whisper operate at 16 kHz),
 so these knobs do not affect transcription accuracy or upload size.
 
+*** Foreground application paste routing
+
+The recursive ~paste:~ tree supports ~match-foreground-app~ beneath
+the ~@terminal~ WM_CLASS group.  It resolves the application attached
+to the remembered terminal surface immediately before dispatch.
+
+Only a positively identified interactive ~opencode~ process, or an
+~opencode attach URL~ process, receives the ~opencode-tui~ label.
+Server, run, SSH, copy-mode, ambiguous multi-surface, permission, and
+timeout cases use the configured default branch.  Global flags before
+~attach~ are intentionally classified as unknown rather than guessed.
+
+The example in ~config.example.yaml~ keeps GUI paste on ~ctrl_v~ and
+terminal paste on ~ctrl_shift_v~.  Only ~opencode-tui~ receives the
+150-character chunk decorator; Pi, Emacs, shells, and unknown targets
+remain unchunked.  Kitty remote control is never enabled; a Kitty
+process exposing multiple PTYs therefore remains unknown.
+
 *** OpenAI model migration
 
 The OpenAI batch default is exactly ~gpt-transcribe~, and the realtime

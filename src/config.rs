@@ -724,6 +724,7 @@ pub enum PasteShortcut {
 /// predate the node-tree refactor.  New configs should prefer the
 /// tree form via [`PasteConfig::Tree`].
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlatPasteConfig {
     /// Maximum characters per clipboard paste chunk.
     ///
@@ -758,6 +759,10 @@ pub struct FlatPasteConfig {
     /// See `crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES`.
     #[serde(default = "default_paste_target_fetch_retries")]
     pub target_fetch_retries: u32,
+
+    /// Quiet window used to learn the target's per-chunk fetch count.
+    #[serde(default = "default_paste_target_quiescence_ms")]
+    pub target_quiescence_ms: u64,
 }
 
 /// Paste behaviour configuration.
@@ -837,6 +842,7 @@ impl PasteConfig {
                 crate::paste::PasteNodeConfig::Chunk { chunk_chars, .. } => Some(*chunk_chars),
                 crate::paste::PasteNodeConfig::DetectDisplayServer { x11, .. } => find(x11),
                 crate::paste::PasteNodeConfig::MatchWmClass { default, .. } => find(default),
+                crate::paste::PasteNodeConfig::MatchForegroundApp { default, .. } => find(default),
                 crate::paste::PasteNodeConfig::Clipboard { .. }
                 | crate::paste::PasteNodeConfig::XtestType {} => None,
             }
@@ -859,6 +865,7 @@ impl PasteConfig {
                 crate::paste::PasteNodeConfig::Chunk { child, .. } => find(child),
                 crate::paste::PasteNodeConfig::DetectDisplayServer { x11, .. } => find(x11),
                 crate::paste::PasteNodeConfig::MatchWmClass { default, .. } => find(default),
+                crate::paste::PasteNodeConfig::MatchForegroundApp { default, .. } => find(default),
                 crate::paste::PasteNodeConfig::XtestType {} => None,
             }
         }
@@ -890,15 +897,11 @@ impl PasteConfig {
 
 #[cfg(feature = "ui")]
 fn flat_to_tree(f: &FlatPasteConfig) -> crate::paste::PasteNodeConfig {
-    // Flat YAML has no `target_quiescence_ms` knob — it lives only
-    // on the node-tree surface.  Fall back to the runtime default so
-    // existing flat configs pick up the Phase-2 gate behaviour
-    // transparently.
     let clipboard = crate::paste::PasteNodeConfig::Clipboard {
         shortcut: f.shortcut,
         restore_settle_ms: f.restore_settle_ms,
         chunk_fetch_timeout_ms: f.chunk_fetch_timeout_ms,
-        target_quiescence_ms: crate::paste::PasteTiming::default().target_quiescence_ms,
+        target_quiescence_ms: f.target_quiescence_ms,
         target_fetch_retries: f.target_fetch_retries,
     };
     if f.chunk_chars == 0 {
@@ -934,6 +937,10 @@ fn default_paste_target_fetch_retries() -> u32 {
     // (the runtime source of truth); inlined here so core config parsing
     // does not depend on the `ui`-gated `paste` module.
     2
+}
+
+fn default_paste_target_quiescence_ms() -> u64 {
+    50
 }
 
 /// Expand a leading `~` (or `~/…`) in a path to the user's home

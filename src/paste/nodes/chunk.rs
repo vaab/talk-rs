@@ -52,4 +52,8 @@ impl PasteNode for ChunkNode {
 
         Ok(())
     }
+
+    fn chunks_text(&self) -> bool {
+        self.chunk_chars > 0
+    }
 }

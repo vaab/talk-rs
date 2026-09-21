@@ -218,68 +218,73 @@ indicators:
 #
 # ── SCHEMA 2: NEW TREE (composable node tree) ────────────────────────────────
 #
-# The tree schema lets you route paste behaviour per display server and
-# per target application.  Each node has a `node:` key that selects its
-# type.  Nodes are composable: most accept a `child:` (or `children:`)
-# that is itself a node.
+# The tree schema lets you route paste behaviour per display server,
+# target window, and foreground terminal application. Each node has a
+# `node:` key that selects its type. Nodes are recursive.
 #
 # Available node types:
 #   detect-display-server  -- routes by $WAYLAND_DISPLAY (x11 / wayland branch)
 #   match-wm-class         -- first-match routing on "<instance>.<class>" glob
+#                             (`@terminal` groups supported terminal classes)
+#   match-foreground-app   -- resolves the app bound to the remembered terminal
+#                             surface; labels include `opencode-tui`, `pi-tui`,
+#                             `emacs`, `shell`, and the safe `unknown` fallback
 #   chunk                  -- splits text into word-boundary chunks, delegates each
 #   clipboard              -- sets clipboard + sends paste shortcut, waits for target fetch
 #   xtest-type             -- types text via XTest synthetic keystrokes (no clipboard;
 #                             ASCII/Latin-1 only; non-Latin-1 chars skipped with a warning)
 #
-# Full example (uncomment and adjust to taste):
+# Full safety-oriented example: GUI apps paste once with Ctrl+V; terminals
+# paste once with Ctrl+Shift+V except positively identified interactive
+# OpenCode (`opencode` or `opencode attach`), which uses 150-character chunks.
+# The terminal shortcut belongs to the clipboard leaves and is independent
+# from foreground-app classification.
 #
 # paste:
 #   node: detect-display-server
 #   x11:
 #     node: match-wm-class
 #     patterns:
-#       # Terminals: type directly via XTest (no clipboard needed)
-#       - match: "*.Alacritty"
+#       - match: "@terminal"
 #         child:
-#           node: xtest-type
-#       # Terminals using Ctrl+Shift+V (most VTE-based terminals)
-#       - match: "*.gnome-terminal-server"
-#         child:
-#           node: clipboard
-#           shortcut: ctrl_shift_v
-#           chunk_fetch_timeout_ms: 500
-#           target_fetch_retries: 2
-#           target_quiescence_ms: 50
-#       # Emacs: uses Ctrl+Y (yank); no chunking needed
-#       - match: "emacs.*"
-#         child:
-#           node: clipboard
-#           shortcut: ctrl_v
-#           chunk_fetch_timeout_ms: 500
-#           target_fetch_retries: 2
-#           target_quiescence_ms: 50
-#       # Firefox and most GUI apps: chunk then paste via Ctrl+Shift+V
-#       - match: "*.firefox"
-#         child:
-#           node: chunk
-#           chunk_chars: 150
-#           child:
+#           node: match-foreground-app
+#           patterns:
+#             - match: opencode-tui
+#               child:
+#                 node: chunk
+#                 chunk_chars: 150
+#                 child:
+#                   node: clipboard
+#                   shortcut: ctrl_shift_v
+#                   chunk_fetch_timeout_ms: 500
+#                   target_fetch_retries: 2
+#                   target_quiescence_ms: 50
+#           # Pi, Emacs TUI, shells, SSH, tmux copy mode, and unknown targets.
+#           default:
 #             node: clipboard
 #             shortcut: ctrl_shift_v
 #             chunk_fetch_timeout_ms: 500
 #             target_fetch_retries: 2
 #             target_quiescence_ms: 50
-#     # Default for any window not matched above
+#     # GUI default (including graphical Emacs): no terminal introspection.
 #     default:
-#       node: chunk
-#       chunk_chars: 150
-#       child:
-#         node: clipboard
-#         shortcut: ctrl_shift_v
-#         chunk_fetch_timeout_ms: 500
-#         target_fetch_retries: 2
-#         target_quiescence_ms: 50
+#       node: clipboard
+#       shortcut: ctrl_v
+#       chunk_fetch_timeout_ms: 500
+#       target_fetch_retries: 2
+#       target_quiescence_ms: 50
 #   # wayland: currently errors ("Wayland paste not supported"); X11 only for now.
+#
+# Foreground resolution is intentionally conservative. It re-reads the mapped
+# remembered XID after focus, requires an unambiguous PTY, follows the exact
+# attached tmux client to its selected pane, and rejects copy mode or unstable
+# pane selection. Multi-tab terminal servers (including Kitty when one X11 PID
+# exposes several PTYs) resolve to `unknown` unless the active surface can be
+# bound uniquely; talk-rs does not enable Kitty remote control or inspect screen
+# content. Nested tmux is bounded. Any timeout, permission error, SSH boundary,
+# unsupported terminal, or process ambiguity selects `default`.
+# OpenCode global flags before `attach` are also conservative `unknown`; the
+# positive attach form is exactly `opencode attach URL [options]`.
 
 # Optional: Runtime Audio Settings
 # audio:

@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use super::nodes::{
     chunk::ChunkNode, clipboard::ClipboardNode, detect::DetectDisplayServerNode,
-    wm_class::MatchWmClassNode, xtest::XtestTypeNode,
+    foreground_app::MatchForegroundAppNode, wm_class::MatchWmClassNode, xtest::XtestTypeNode,
 };
 
 /// Default chunk size when not specified in config — matches the
@@ -151,6 +151,11 @@ pub struct PasteCtx<'a> {
 #[async_trait]
 pub trait PasteNode: Send + Sync {
     async fn paste(&self, text: &str, ctx: &PasteCtx<'_>) -> Result<(), TalkError>;
+
+    /// Whether this node starts delivery by splitting the payload.
+    fn chunks_text(&self) -> bool {
+        false
+    }
 }
 
 /// WM_CLASS routing pattern: glob plus the child to invoke on match.
@@ -162,6 +167,15 @@ pub struct WmClassPattern {
     #[serde(rename = "match")]
     pub pattern: String,
     /// Sub-tree to run when this pattern matches.
+    pub child: Box<PasteNodeConfig>,
+}
+
+/// Foreground-application routing pattern: normalized label plus child.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForegroundAppPattern {
+    /// Glob matched against labels such as `opencode-tui`.
+    #[serde(rename = "match")]
+    pub pattern: String,
     pub child: Box<PasteNodeConfig>,
 }
 
@@ -185,6 +199,12 @@ pub enum PasteNodeConfig {
     /// pattern matches (or when WM_CLASS is unavailable).
     MatchWmClass {
         patterns: Vec<WmClassPattern>,
+        default: Box<PasteNodeConfig>,
+    },
+    /// Route by the foreground process bound to the remembered terminal
+    /// surface. Unknown or ambiguous identities use `default`.
+    MatchForegroundApp {
+        patterns: Vec<ForegroundAppPattern>,
         default: Box<PasteNodeConfig>,
     },
     /// Split the text into chunks of at most `chunk_chars` characters
@@ -280,6 +300,13 @@ impl PasteNodeConfig {
                     default: default.build(),
                 })
             }
+            Self::MatchForegroundApp { patterns, default } => {
+                let compiled = patterns
+                    .iter()
+                    .map(|pattern| (pattern.pattern.clone(), pattern.child.build()))
+                    .collect();
+                Box::new(MatchForegroundAppNode::system(compiled, default.build()))
+            }
             Self::Chunk { chunk_chars, child } => Box::new(ChunkNode {
                 chunk_chars: *chunk_chars,
                 child: child.build(),
@@ -322,6 +349,16 @@ impl PasteNodeConfig {
                     .collect(),
                 default: Box::new(default.strip_chunks()),
             },
+            Self::MatchForegroundApp { patterns, default } => Self::MatchForegroundApp {
+                patterns: patterns
+                    .into_iter()
+                    .map(|pattern| ForegroundAppPattern {
+                        pattern: pattern.pattern,
+                        child: Box::new(pattern.child.strip_chunks()),
+                    })
+                    .collect(),
+                default: Box::new(default.strip_chunks()),
+            },
             leaf @ (Self::Clipboard { .. } | Self::XtestType {}) => leaf,
         }
     }
@@ -353,6 +390,7 @@ pub(crate) fn timing_from_tree(cfg: &PasteNodeConfig) -> super::PasteTiming {
         PasteNodeConfig::Chunk { child, .. } => timing_from_tree(child),
         PasteNodeConfig::DetectDisplayServer { x11, .. } => timing_from_tree(x11),
         PasteNodeConfig::MatchWmClass { default, .. } => timing_from_tree(default),
+        PasteNodeConfig::MatchForegroundApp { default, .. } => timing_from_tree(default),
         PasteNodeConfig::XtestType {} => super::PasteTiming::default(),
     }
 }

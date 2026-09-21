@@ -373,9 +373,15 @@ pub fn x11_get_active_window() -> Option<u32> {
 /// Per ICCCM § 4.1.2.5.  This is what `xprop -id <wid> WM_CLASS`
 /// prints and what the `match-wm-class` paste node uses for routing.
 pub fn x11_get_wm_class(wid: u32) -> Option<(String, String)> {
-    use x11rb::protocol::xproto::*;
-
     let (conn, _screen_num) = x11rb::connect(None).ok()?;
+    x11_get_wm_class_from_connection(&conn, wid)
+}
+
+fn x11_get_wm_class_from_connection<C: x11rb::connection::Connection>(
+    conn: &C,
+    wid: u32,
+) -> Option<(String, String)> {
+    use x11rb::protocol::xproto::*;
 
     // WM_CLASS is a pre-defined ICCCM atom — fetch via `intern_atom`
     // (cheaper than hard-coding the atom id, robust across servers).
@@ -412,6 +418,45 @@ pub fn x11_get_wm_class(wid: u32) -> Option<(String, String)> {
         String::from_utf8_lossy(instance).into_owned(),
         String::from_utf8_lossy(class).into_owned(),
     ))
+}
+
+/// Stable fields used to bind a foreground-process probe to one mapped X11
+/// client window. Callers query this before and after probing and reject a
+/// changed snapshot rather than applying stale identity to a new surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X11TargetSnapshot {
+    pub pid: u32,
+    pub wm_class: (String, String),
+}
+
+/// Read the mapped target's `_NET_WM_PID` and `WM_CLASS` in one fresh X11
+/// connection. This does not claim X11 atomicity; callers must re-read and
+/// compare the result after process inspection.
+pub fn x11_target_snapshot(wid: u32) -> Option<X11TargetSnapshot> {
+    use x11rb::protocol::xproto::*;
+
+    let (conn, _screen_num) = x11rb::connect(None).ok()?;
+    let attributes = conn.get_window_attributes(wid).ok()?.reply().ok()?;
+    if attributes.map_state != MapState::VIEWABLE {
+        return None;
+    }
+    let pid_atom = conn
+        .intern_atom(false, b"_NET_WM_PID")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let pid_property = conn
+        .get_property(false, wid, pid_atom, AtomEnum::CARDINAL, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    let pid = pid_property.value32()?.next()?;
+    if pid == 0 {
+        return None;
+    }
+    let wm_class = x11_get_wm_class_from_connection(&conn, wid)?;
+    Some(X11TargetSnapshot { pid, wm_class })
 }
 
 #[cfg(test)]

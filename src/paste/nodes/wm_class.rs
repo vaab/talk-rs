@@ -37,7 +37,7 @@ impl PasteNode for MatchWmClassNode {
             let key = format!("{}.{}", instance, class);
             log::trace!("paste(wm-class): WM_CLASS={:?}", key);
             for (pattern, child) in &self.patterns {
-                if glob_match(pattern, &key) {
+                if wm_class_matches(pattern, instance, class) {
                     log::trace!(
                         "paste(wm-class): matched pattern {:?} → routing to child",
                         pattern,
@@ -51,5 +51,37 @@ impl PasteNode for MatchWmClassNode {
         }
 
         self.default.paste(text, ctx).await
+    }
+}
+
+fn wm_class_matches(pattern: &str, instance: &str, class: &str) -> bool {
+    if pattern == "@terminal" {
+        crate::paste::target::normalize_terminal_class(&(instance.to_string(), class.to_string()))
+            .is_some()
+    } else {
+        glob_match(pattern, &format!("{instance}.{class}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wm_class_matches;
+
+    #[test]
+    fn terminal_group_matches_supported_terminals_but_not_gui_apps() {
+        assert!(wm_class_matches("@terminal", "kitty", "kitty"));
+        assert!(wm_class_matches(
+            "@terminal",
+            "org.wezfurlong.wezterm",
+            "org.wezfurlong.wezterm"
+        ));
+        assert!(!wm_class_matches("@terminal", "emacs", "Emacs"));
+        assert!(!wm_class_matches("@terminal", "Navigator", "Firefox"));
+    }
+
+    #[test]
+    fn ordinary_wm_class_globs_remain_unchanged() {
+        assert!(wm_class_matches("*.Emacs", "emacs", "Emacs"));
+        assert!(!wm_class_matches("*.Emacs", "kitty", "kitty"));
     }
 }

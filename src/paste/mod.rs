@@ -16,8 +16,9 @@
 
 pub mod node;
 pub mod nodes;
+pub mod target;
 
-pub use node::{PasteCtx, PasteNode, PasteNodeConfig, WmClassPattern};
+pub use node::{ForegroundAppPattern, PasteCtx, PasteNode, PasteNodeConfig, WmClassPattern};
 
 use crate::clipboard::{Clipboard, X11Clipboard};
 use crate::config::PasteShortcut;
@@ -732,6 +733,7 @@ paste:
                 assert_eq!(f.shortcut, PasteShortcut::CtrlV);
                 assert_eq!(f.restore_settle_ms, 250);
                 assert_eq!(f.chunk_fetch_timeout_ms, 600);
+                assert_eq!(f.target_quiescence_ms, 50);
             }
             PasteConfig::Tree(_) => panic!("expected flat variant for legacy YAML"),
         }
@@ -753,9 +755,6 @@ paste:
                         assert_eq!(shortcut, PasteShortcut::CtrlV);
                         assert_eq!(restore_settle_ms, 250);
                         assert_eq!(chunk_fetch_timeout_ms, 600);
-                        // Flat YAML has no target_quiescence_ms knob
-                        // (added by Phase 2 at the node-tree level only);
-                        // flat → tree adapter falls back to the default.
                         assert_eq!(target_quiescence_ms, 50);
                         // Flat YAML also omits target_fetch_retries here;
                         // flat → tree adapter falls back to the default.
@@ -825,6 +824,109 @@ paste:
             },
             PasteConfig::Flat(_) => panic!("expected tree variant for `node:`-tagged YAML"),
         }
+    }
+
+    #[test]
+    fn foreground_app_router_yaml_deserialises_as_tree_variant() {
+        let yaml = indoc::indoc! {r#"
+            output_dir: /tmp/x
+            providers: {}
+            paste:
+              node: match-foreground-app
+              patterns:
+                - match: opencode-tui
+                  child:
+                    node: chunk
+                    chunk_chars: 150
+                    child:
+                      node: clipboard
+                      shortcut: ctrl_shift_v
+              default:
+                node: clipboard
+                shortcut: ctrl_shift_v
+        "#};
+
+        assert!(matches!(parse_paste(yaml), Some(PasteConfig::Tree(_))));
+    }
+
+    #[test]
+    fn outer_shortcut_is_independent_from_foreground_app_classification() {
+        let yaml = indoc::indoc! {r#"
+            output_dir: /tmp/x
+            providers: {}
+            paste:
+              node: match-wm-class
+              patterns:
+                - match: "@terminal"
+                  child:
+                    node: match-foreground-app
+                    patterns:
+                      - match: opencode-tui
+                        child:
+                          node: chunk
+                          chunk_chars: 150
+                          child:
+                            node: clipboard
+                            shortcut: ctrl_shift_v
+                    default:
+                      node: clipboard
+                      shortcut: ctrl_shift_v
+              default:
+                node: clipboard
+                shortcut: ctrl_v
+        "#};
+        let paste = parse_paste(yaml).expect("paste tree").to_tree();
+        let (terminal, gui) = match paste {
+            PasteNodeConfig::MatchWmClass { patterns, default } => {
+                (patterns[0].child.clone(), default)
+            }
+            other => panic!("expected WM_CLASS router, got {other:?}"),
+        };
+        match *terminal {
+            PasteNodeConfig::MatchForegroundApp { patterns, default } => {
+                assert!(matches!(
+                    &*patterns[0].child,
+                    PasteNodeConfig::Chunk { child, .. }
+                        if matches!(&**child, PasteNodeConfig::Clipboard {
+                            shortcut: PasteShortcut::CtrlShiftV,
+                            ..
+                        })
+                ));
+                assert!(matches!(
+                    *default,
+                    PasteNodeConfig::Clipboard {
+                        shortcut: PasteShortcut::CtrlShiftV,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected foreground-app router, got {other:?}"),
+        }
+        assert!(matches!(
+            *gui,
+            PasteNodeConfig::Clipboard {
+                shortcut: PasteShortcut::CtrlV,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_foreground_app_router_does_not_fall_back_to_flat_config() {
+        let yaml = indoc::indoc! {r#"
+            output_dir: /tmp/x
+            providers: {}
+            paste:
+              node: match-foreground-app
+              patterns:
+                - match: opencode-tui
+                  child:
+                    node: clipboard
+                    shortcut: ctrl_shift_v
+        "#};
+
+        serde_yaml::from_str::<Config>(yaml)
+            .expect_err("router without a default child must be rejected");
     }
 
     #[test]
@@ -945,6 +1047,52 @@ providers: {}
                 assert!(matches!(*default, PasteNodeConfig::Clipboard { .. }));
             }
             other => panic!("expected MatchWmClass after strip, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_chunk_paste_strips_chunks_inside_foreground_app_router() {
+        let tree = PasteNodeConfig::MatchForegroundApp {
+            patterns: vec![super::node::ForegroundAppPattern {
+                pattern: "opencode-tui".to_string(),
+                child: Box::new(PasteNodeConfig::Chunk {
+                    chunk_chars: 150,
+                    child: Box::new(PasteNodeConfig::Clipboard {
+                        shortcut: PasteShortcut::CtrlShiftV,
+                        restore_settle_ms: 200,
+                        chunk_fetch_timeout_ms: 500,
+                        target_quiescence_ms: 50,
+                        target_fetch_retries: 2,
+                    }),
+                }),
+            }],
+            default: Box::new(PasteNodeConfig::Clipboard {
+                shortcut: PasteShortcut::CtrlShiftV,
+                restore_settle_ms: 200,
+                chunk_fetch_timeout_ms: 500,
+                target_quiescence_ms: 50,
+                target_fetch_retries: 2,
+            }),
+        };
+
+        match tree.strip_chunks() {
+            PasteNodeConfig::MatchForegroundApp { patterns, default } => {
+                assert!(matches!(
+                    *patterns[0].child,
+                    PasteNodeConfig::Clipboard {
+                        shortcut: PasteShortcut::CtrlShiftV,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    *default,
+                    PasteNodeConfig::Clipboard {
+                        shortcut: PasteShortcut::CtrlShiftV,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected foreground-app router, got {other:?}"),
         }
     }
 
