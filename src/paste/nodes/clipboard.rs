@@ -58,14 +58,14 @@ pub(crate) struct ClipboardNode {
     /// runtime.  The legacy "pre-restore settle" window it governed
     /// has been replaced by the deterministic per-chunk
     /// target-confirmation gate; see the module doc.
-    #[allow(dead_code)] // Surfaced indirectly via `node::timing_from_tree`.
+    #[allow(dead_code)] // Surfaced indirectly via `paste_config::timing_from_tree`.
     pub(crate) restore_settle_ms: u64,
     /// Per-chunk ABORT deadline.  See module doc.
     pub(crate) chunk_fetch_timeout_ms: u64,
     /// Per-chunk target-quiescence window.  See module doc.
     pub(crate) target_quiescence_ms: u64,
     /// Automatic per-chunk retries on the target-confirmation path.
-    /// See module doc and [`crate::paste::node::DEFAULT_TARGET_FETCH_RETRIES`].
+    /// See module doc and [`crate::paste_config::DEFAULT_TARGET_FETCH_RETRIES`].
     pub(crate) target_fetch_retries: u32,
 }
 

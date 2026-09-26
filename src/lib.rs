@@ -30,6 +30,7 @@ pub mod gtk_theme;
 pub mod model_fetch;
 #[cfg(feature = "ui")]
 pub mod paste;
+pub mod paste_config;
 pub mod record;
 pub mod recording_cache;
 pub mod speak;

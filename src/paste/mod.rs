@@ -63,39 +63,9 @@ const FOCUS_MAX_RETRIES: u32 = 5;
 /// Initial delay between focus retry attempts (doubles each retry).
 const FOCUS_INITIAL_DELAY_MS: u64 = 50;
 
-/// Timing knobs for the paste pipeline.
-///
-/// Threaded through [`paste_with_root`] for callers that want to
-/// override the per-chunk gate deadline / quiescence window without
-/// growing the call-site signature unboundedly.
-///
-/// `restore_settle_ms` is RETAINED on this struct (and in the YAML
-/// schema) for backward compatibility but is no longer used at
-/// runtime: the pre-restore "settle" heuristic has been replaced by
-/// the deterministic per-chunk target-confirmation gate inside the
-/// clipboard node, which removes the race between the last chunk's
-/// fetch and the clipboard restore by construction.
-///
-/// `Default` matches the config defaults (200 / 300 / 50).
-#[derive(Debug, Clone, Copy)]
-pub struct PasteTiming {
-    /// **Backward-compat only.**  See struct doc.
-    pub restore_settle_ms: u64,
-    /// See `paste.chunk_fetch_timeout_ms`.
-    pub chunk_fetch_timeout_ms: u64,
-    /// See `paste.target_quiescence_ms`.
-    pub target_quiescence_ms: u64,
-}
-
-impl Default for PasteTiming {
-    fn default() -> Self {
-        Self {
-            restore_settle_ms: 200,
-            chunk_fetch_timeout_ms: node::DEFAULT_CHUNK_FETCH_TIMEOUT_MS,
-            target_quiescence_ms: node::DEFAULT_TARGET_QUIESCENCE_MS,
-        }
-    }
-}
+/// Timing knobs for the paste pipeline (defined with the config
+/// schema in [`crate::paste_config`]).
+pub use crate::paste_config::PasteTiming;
 
 /// Maximum number of characters per clipboard paste operation.
 ///
@@ -214,7 +184,7 @@ pub fn default_root(no_chunk_paste: bool) -> Box<dyn PasteNode> {
             restore_settle_ms: PasteTiming::default().restore_settle_ms,
             chunk_fetch_timeout_ms: PasteTiming::default().chunk_fetch_timeout_ms,
             target_quiescence_ms: PasteTiming::default().target_quiescence_ms,
-            target_fetch_retries: node::DEFAULT_TARGET_FETCH_RETRIES,
+            target_fetch_retries: crate::paste_config::DEFAULT_TARGET_FETCH_RETRIES,
         }),
     };
     if no_chunk_paste {
@@ -239,7 +209,7 @@ pub fn build_root_from_config(cfg: &PasteNodeConfig, no_chunk_paste: bool) -> Bo
 /// [`RealtimeClipboardGuard`]) — see the deviation note on
 /// [`PasteCtx`] for the rationale.
 pub fn timing_from_root(cfg: &PasteNodeConfig) -> PasteTiming {
-    node::timing_from_tree(cfg)
+    crate::paste_config::timing_from_tree(cfg)
 }
 
 /// Paste `text` through the supplied root node, wrapping with
@@ -983,10 +953,10 @@ providers: {}
                 restore_settle_ms: super::PasteTiming::default().restore_settle_ms,
                 chunk_fetch_timeout_ms: super::PasteTiming::default().chunk_fetch_timeout_ms,
                 target_quiescence_ms: super::PasteTiming::default().target_quiescence_ms,
-                target_fetch_retries: super::node::DEFAULT_TARGET_FETCH_RETRIES,
+                target_fetch_retries: crate::paste_config::DEFAULT_TARGET_FETCH_RETRIES,
             }),
         };
-        let timing = super::node::timing_from_tree(&default);
+        let timing = crate::paste_config::timing_from_tree(&default);
         assert_eq!(timing.restore_settle_ms, 200);
         assert_eq!(timing.chunk_fetch_timeout_ms, 500);
         assert_eq!(timing.target_quiescence_ms, 50);
