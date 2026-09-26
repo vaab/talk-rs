@@ -41,7 +41,10 @@ happening.
   A waterfall spectrogram of the recording is shown above the
   candidate list; it loads asynchronously and adapts to window width.
   Non-default models are transcribed on demand via a per-candidate
-  button to avoid unnecessary API calls.
+  button to avoid unnecessary API calls.  Previous/next recording
+  arrows beside the player move through the current cache or recordings
+  collection in newest-first order, saving edits before each move.  Arrow
+  navigation never auto-transcribes; click ~T~ to transcribe a recording.
 - *Visual overlay* -- non-intrusive X11 badge at the top of the screen
   (works without a compositor).
 - *Live transcription overlay* -- a dynamic phase-coloured waterfall

@@ -7,6 +7,8 @@ pub(crate) mod audio;
 #[cfg(feature = "ui")]
 mod entries;
 #[cfg(feature = "ui")]
+pub(crate) use entries::recording_navigation;
+#[cfg(feature = "ui")]
 pub(crate) mod player;
 #[cfg(all(feature = "capture", feature = "ui"))]
 pub(crate) mod toggle;

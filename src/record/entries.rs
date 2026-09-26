@@ -180,6 +180,107 @@ fn collect_audio_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Tal
     Ok(())
 }
 
+/// Collect supported audio files directly inside `dir` without descending.
+fn collect_audio_flat(dir: &Path) -> Result<Vec<PathBuf>, TalkError> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        TalkError::Config(format!(
+            "failed to read recordings directory {}: {}",
+            dir.display(),
+            e
+        ))
+    })?;
+
+    let mut audio = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
+        let path = entry.path();
+        if !path.is_symlink() && path.is_file() && has_audio_extension(&path) {
+            audio.push(path);
+        }
+    }
+    Ok(audio)
+}
+
+/// Sort timestamp-bearing recording basenames newest-first.
+fn sort_recording_paths_newest_first(audio: &mut [PathBuf]) {
+    audio.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RecordingNavigation {
+    pub(crate) previous: Option<PathBuf>,
+    pub(crate) next: Option<PathBuf>,
+}
+
+fn navigation_in_collection(
+    current: &Path,
+    mut paths: Vec<PathBuf>,
+) -> Option<RecordingNavigation> {
+    sort_recording_paths_newest_first(&mut paths);
+    let current_index = paths.iter().position(|path| {
+        std::fs::canonicalize(path)
+            .map(|canonical| canonical == current)
+            .unwrap_or(false)
+    })?;
+
+    Some(RecordingNavigation {
+        previous: current_index
+            .checked_sub(1)
+            .and_then(|index| paths.get(index).cloned()),
+        next: paths.get(current_index + 1).cloned(),
+    })
+}
+
+fn canonical_root(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path)
+        .ok()
+        .filter(|root| root.is_dir())
+}
+
+fn recording_navigation_in_roots(
+    current: &Path,
+    cache_root: &Path,
+    output_root: &Path,
+) -> Result<Option<RecordingNavigation>, TalkError> {
+    let current = match std::fs::canonicalize(current) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+
+    // Cache wins deliberately if roots overlap. Its collection is flat;
+    // output recordings use the browser's recursive walk.
+    if let Some(cache_root) = canonical_root(cache_root) {
+        if current.starts_with(&cache_root) {
+            if let Some(navigation) =
+                navigation_in_collection(&current, collect_audio_flat(&cache_root)?)
+            {
+                return Ok(Some(navigation));
+            }
+        }
+    }
+
+    if let Some(output_root) = canonical_root(output_root) {
+        if current.starts_with(&output_root) {
+            let mut audio = Vec::new();
+            collect_audio_recursive(&output_root, &mut audio)?;
+            return Ok(navigation_in_collection(&current, audio));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Resolve the current recording's immediate neighbours in the same
+/// collection used by the recordings browser.
+pub(crate) fn recording_navigation(
+    current: &Path,
+    output_root: &Path,
+) -> Result<Option<RecordingNavigation>, TalkError> {
+    let cache_root = recording_cache::recordings_dir()?;
+    recording_navigation_in_roots(current, &cache_root, output_root)
+}
+
 /// Gather audio recordings (actual `talk-rs record` output plus any
 /// imported audio in the same tree), sorted newest-first.
 ///
@@ -210,8 +311,7 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     // `2026-04-05T…` before `2026/04/2026-04-10T…` because `-` < `/` in
     // ASCII, producing an out-of-order result.  Sorting by file name
     // alone ignores the directory prefix and yields the right order.
-    audio.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-    audio.reverse();
+    sort_recording_paths_newest_first(&mut audio);
 
     let mut result = Vec::with_capacity(audio.len());
     for audio_path in audio {
@@ -273,36 +373,10 @@ pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> 
         return Ok(Vec::new());
     }
 
-    let entries = std::fs::read_dir(&dir).map_err(|e| {
-        TalkError::Config(format!(
-            "failed to read recordings directory {}: {}",
-            dir.display(),
-            e
-        ))
-    })?;
-
-    let mut audio: Vec<PathBuf> = Vec::new();
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
-        let path = entry.path();
-
-        // Skip symlinks (last_recording.ogg, last_metadata.yml).  The
-        // cache is flat (no subdirectories), so a non-recursive walk
-        // is intentional here — unlike `list_ogg_recordings` which
-        // walks `output_dir` recursively.
-        if path.is_symlink() {
-            continue;
-        }
-        if has_audio_extension(&path) {
-            audio.push(path);
-        }
-    }
-
-    // Sort lexicographically (timestamp-based names → chronological)
-    audio.sort();
-    // Reverse for newest-first
-    audio.reverse();
+    // The cache is intentionally flat and symlinks such as
+    // `last_recording.ogg` are not separate browser entries.
+    let mut audio = collect_audio_flat(&dir)?;
+    sort_recording_paths_newest_first(&mut audio);
 
     let mut result = Vec::with_capacity(audio.len());
     for audio_path in audio {
@@ -746,5 +820,121 @@ mod tests {
         let bare = tmp.path().join("noext");
         std::fs::write(&bare, b"x").unwrap();
         assert_eq!(audio_duration_secs(&bare), None);
+    }
+
+    #[test]
+    fn recording_navigation_uses_flat_cache_newest_first() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache = tmp.path().join("cache");
+        let output = tmp.path().join("output");
+        std::fs::create_dir_all(cache.join("ignored-nested")).expect("create cache");
+        std::fs::create_dir_all(&output).expect("create output");
+
+        let newest = cache.join("2026-04-03T10-00-00+0200.ogg");
+        let current = cache.join("2026-04-02T10-00-00+0200.ogg");
+        let oldest = cache.join("2026-04-01T10-00-00+0200.ogg");
+        for path in [&newest, &current, &oldest] {
+            std::fs::write(path, b"").expect("write audio");
+        }
+        std::fs::write(
+            cache.join("ignored-nested/2026-04-04T10-00-00+0200.ogg"),
+            b"",
+        )
+        .expect("write nested cache audio");
+
+        let navigation = recording_navigation_in_roots(&current, &cache, &output)
+            .expect("resolve navigation")
+            .expect("cache collection");
+
+        assert_eq!(navigation.previous.as_deref(), Some(newest.as_path()));
+        assert_eq!(navigation.next.as_deref(), Some(oldest.as_path()));
+    }
+
+    #[test]
+    fn recording_navigation_uses_recursive_output_and_disables_boundaries() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache = tmp.path().join("cache");
+        let output = tmp.path().join("output");
+        std::fs::create_dir_all(&cache).expect("create cache");
+        std::fs::create_dir_all(output.join("2026/04")).expect("create output");
+
+        let newest = output.join("2026/04/2026-04-03T10-00-00+0200.ogg");
+        let oldest = output.join("2026-04-01T10-00-00+0200.ogg");
+        std::fs::write(&newest, b"").expect("write newest");
+        std::fs::write(&oldest, b"").expect("write oldest");
+
+        let newest_navigation = recording_navigation_in_roots(&newest, &cache, &output)
+            .expect("resolve newest")
+            .expect("output collection");
+        assert_eq!(newest_navigation.previous, None);
+        assert_eq!(newest_navigation.next.as_deref(), Some(oldest.as_path()));
+
+        let oldest_navigation = recording_navigation_in_roots(&oldest, &cache, &output)
+            .expect("resolve oldest")
+            .expect("output collection");
+        assert_eq!(
+            oldest_navigation.previous.as_deref(),
+            Some(newest.as_path())
+        );
+        assert_eq!(oldest_navigation.next, None);
+    }
+
+    #[test]
+    fn recording_navigation_falls_through_to_output_nested_under_cache() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache = tmp.path().join("cache");
+        let output = cache.join("output").join("2026").join("04");
+        std::fs::create_dir_all(&output).expect("create nested output");
+
+        let newest = output.join("2026-04-03T10-00-00+0200.ogg");
+        let oldest = output.join("2026-04-01T10-00-00+0200.ogg");
+        std::fs::write(&newest, b"").expect("write newest");
+        std::fs::write(&oldest, b"").expect("write oldest");
+
+        let newest_navigation = recording_navigation_in_roots(&newest, &cache, &output)
+            .expect("resolve newest")
+            .expect("nested output collection");
+        assert_eq!(newest_navigation.previous, None);
+        assert_eq!(newest_navigation.next.as_deref(), Some(oldest.as_path()));
+
+        let oldest_navigation = recording_navigation_in_roots(&oldest, &cache, &output)
+            .expect("resolve oldest")
+            .expect("nested output collection");
+        assert_eq!(
+            oldest_navigation.previous.as_deref(),
+            Some(newest.as_path())
+        );
+        assert_eq!(oldest_navigation.next, None);
+    }
+
+    #[test]
+    fn recording_navigation_canonicalizes_current_and_rejects_foreign_files() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache = tmp.path().join("cache");
+        let output = tmp.path().join("output");
+        let foreign_dir = tmp.path().join("foreign");
+        std::fs::create_dir_all(&cache).expect("create cache");
+        std::fs::create_dir_all(&output).expect("create output");
+        std::fs::create_dir_all(&foreign_dir).expect("create foreign");
+
+        let current = cache.join("2026-04-02T10-00-00+0200.ogg");
+        let older = cache.join("2026-04-01T10-00-00+0200.ogg");
+        std::fs::write(&current, b"").expect("write current");
+        std::fs::write(&older, b"").expect("write older");
+        let retry_last = cache.join("last_recording.ogg");
+        std::os::unix::fs::symlink(&current, &retry_last).expect("create retry-last symlink");
+
+        let navigation = recording_navigation_in_roots(&retry_last, &cache, &output)
+            .expect("resolve symlink")
+            .expect("cache collection");
+        assert_eq!(navigation.previous, None);
+        assert_eq!(navigation.next.as_deref(), Some(older.as_path()));
+
+        let foreign = foreign_dir.join("2026-04-04T10-00-00+0200.ogg");
+        std::fs::write(&foreign, b"").expect("write foreign");
+        assert_eq!(
+            recording_navigation_in_roots(&foreign, &cache, &output).expect("resolve foreign"),
+            None
+        );
     }
 }

@@ -121,6 +121,864 @@ pub(super) struct PickerSelection {
     pub(super) is_cached: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PickerNavigation {
+    Previous,
+    Next,
+}
+
+pub(super) enum PickerOutcome {
+    Selected(PickerSelection),
+    Navigate(PickerNavigation),
+    Cancelled,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PickerNavigationAvailability {
+    pub(super) previous: bool,
+    pub(super) next: bool,
+}
+
+pub(super) struct PickerUiInput {
+    pub(super) transcribers: Vec<(Provider, String)>,
+    pub(super) audio_path: PathBuf,
+    pub(super) cached_entries: Vec<(Provider, String, String, bool, bool)>,
+    pub(super) config: std::sync::Arc<Config>,
+    pub(super) realtime_transcribers: Vec<(Provider, String, Box<dyn RealtimeTranscriber>)>,
+    pub(super) deferred_candidates: Vec<(Provider, String, bool)>,
+    pub(super) navigation: PickerNavigationAvailability,
+}
+
+#[derive(Clone)]
+struct RealtimeSamples {
+    audio_path: PathBuf,
+    samples: std::sync::Arc<tokio::sync::OnceCell<Option<std::sync::Arc<Vec<i16>>>>>,
+}
+
+impl RealtimeSamples {
+    fn new(audio_path: PathBuf) -> Self {
+        Self {
+            audio_path,
+            samples: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    async fn get(&self) -> Option<std::sync::Arc<Vec<i16>>> {
+        let audio_path = self.audio_path.clone();
+        self.samples
+            .get_or_init(|| async move {
+                #[cfg(test)]
+                GTK_TEST_REALTIME_DECODES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match tokio::task::spawn_blocking(move || {
+                    crate::record::audio::read_audio_as_i16(&audio_path)
+                })
+                .await
+                {
+                    Ok(Ok(samples)) => Some(std::sync::Arc::new(samples)),
+                    Ok(Err(error)) => {
+                        log::warn!("failed to read audio for realtime: {}", error);
+                        None
+                    }
+                    Err(error) => {
+                        log::warn!("failed to read audio for realtime: {}", error);
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+}
+
+enum PickerExit {
+    Selected(usize),
+    Navigate(PickerNavigation),
+    Cancelled,
+}
+
+struct SelectionSaveCtx {
+    audio_path: PathBuf,
+    dirty: bool,
+    current: Option<(Provider, String, bool)>,
+}
+
+fn persist_selection_with<F>(
+    ctx: &mut SelectionSaveCtx,
+    text: &str,
+    write: F,
+) -> Result<(), TalkError>
+where
+    F: FnOnce(&std::path::Path, Provider, &str, bool, &str) -> Result<(), TalkError>,
+{
+    if !ctx.dirty {
+        return Ok(());
+    }
+    let (provider, model, streaming) = ctx.current.clone().ok_or_else(|| {
+        TalkError::Config("cannot save picker edits without a selected candidate".to_string())
+    })?;
+    write(&ctx.audio_path, provider, &model, streaming, text)?;
+    ctx.dirty = false;
+    Ok(())
+}
+
+fn persist_selection(ctx: &mut SelectionSaveCtx, text: &str) -> Result<(), TalkError> {
+    #[cfg(test)]
+    if GTK_TEST_SAVE_FAILURES
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |remaining| remaining.checked_sub(1),
+        )
+        .is_ok()
+    {
+        return Err(TalkError::Config(
+            "injected picker save failure".to_string(),
+        ));
+    }
+    persist_selection_with(ctx, text, |path, provider, model, streaming, text| {
+        crate::recording_cache::write_pick(path, &provider.to_string(), model, streaming, text)
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) enum GtkTestExit {
+    Navigate(PickerNavigation),
+    RawNextBurst(usize),
+    Wait,
+    Confirm,
+}
+
+#[cfg(test)]
+pub(super) struct GtkTestAction {
+    pub(super) expected_provider: Provider,
+    pub(super) expected_model: String,
+    pub(super) expected_streaming: bool,
+    pub(super) expected_text: String,
+    pub(super) previous_sensitive: bool,
+    pub(super) next_sensitive: bool,
+    pub(super) edit_text: Option<String>,
+    pub(super) fail_first_save: bool,
+    pub(super) wait: Option<GtkTestWait>,
+    pub(super) exit: GtkTestExit,
+}
+
+#[cfg(test)]
+pub(super) struct GtkTestWait {
+    pub(super) click_action: bool,
+    pub(super) expected_text: String,
+    pub(super) expected_action_label_before: Option<String>,
+    pub(super) expected_action_label_after: Option<String>,
+    pub(super) request_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) expected_requests_before: Option<usize>,
+    pub(super) expected_requests_after: usize,
+}
+
+#[cfg(test)]
+static GTK_TEST_ACTIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<GtkTestAction>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+static GTK_TEST_SAVE_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_WINDOWS_CREATED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_WINDOWS_DESTROYED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_RECORDS_SEEN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_STALE_SOURCE_TICKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_ACTIVE_RECORD_GENERATION: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_WINDOW_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_WINDOW_ID_CHANGES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_PREVIOUS_BUTTON_ID: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_PREVIOUS_BUTTON_ID_CHANGES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_NEXT_BUTTON_ID: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_NEXT_BUTTON_ID_CHANGES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_UNMAPPED_NAVIGATION_BUTTONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_INVISIBLE_RECORDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_HIDDEN_TRANSITIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_REALTIME_DECODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static GTK_TEST_SESSION_FINALIZING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+type GtkTestInputThread = std::thread::JoinHandle<Result<(), String>>;
+#[cfg(test)]
+static GTK_TEST_INPUT_THREAD: std::sync::OnceLock<std::sync::Mutex<Option<GtkTestInputThread>>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+static GTK_TEST_INPUT_ERROR: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct GtkTestMetrics {
+    pub(super) remaining_actions: usize,
+    pub(super) windows_created: usize,
+    pub(super) windows_destroyed: usize,
+    pub(super) records_seen: usize,
+    pub(super) window_id_changes: usize,
+    pub(super) previous_button_id_changes: usize,
+    pub(super) next_button_id_changes: usize,
+    pub(super) unmapped_navigation_buttons: usize,
+    pub(super) invisible_records: usize,
+    pub(super) hidden_transitions: usize,
+    pub(super) stale_source_ticks: usize,
+    pub(super) realtime_decodes: usize,
+}
+
+#[cfg(test)]
+pub(super) fn install_gtk_test_actions(actions: Vec<GtkTestAction>) {
+    *GTK_TEST_ACTIONS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = actions.into();
+    GTK_TEST_SAVE_FAILURES.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_WINDOWS_CREATED.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_WINDOWS_DESTROYED.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_RECORDS_SEEN.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_STALE_SOURCE_TICKS.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_ACTIVE_RECORD_GENERATION.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_WINDOW_ID.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_WINDOW_ID_CHANGES.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_PREVIOUS_BUTTON_ID.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_PREVIOUS_BUTTON_ID_CHANGES.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_NEXT_BUTTON_ID.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_NEXT_BUTTON_ID_CHANGES.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_UNMAPPED_NAVIGATION_BUTTONS.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_INVISIBLE_RECORDS.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_HIDDEN_TRANSITIONS.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_REALTIME_DECODES.store(0, std::sync::atomic::Ordering::SeqCst);
+    GTK_TEST_SESSION_FINALIZING.store(false, std::sync::atomic::Ordering::SeqCst);
+    *GTK_TEST_INPUT_ERROR
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+#[cfg(test)]
+pub(super) fn finish_gtk_test_input() -> Result<(), String> {
+    let handle = GTK_TEST_INPUT_THREAD
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(handle) = handle {
+        handle
+            .join()
+            .map_err(|_| "raw picker input thread panicked".to_string())??;
+    }
+    if let Some(error) = GTK_TEST_INPUT_ERROR
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn gtk_test_metrics() -> GtkTestMetrics {
+    let remaining = GTK_TEST_ACTIONS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len();
+    GtkTestMetrics {
+        remaining_actions: remaining,
+        windows_created: GTK_TEST_WINDOWS_CREATED.load(std::sync::atomic::Ordering::SeqCst),
+        windows_destroyed: GTK_TEST_WINDOWS_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+        records_seen: GTK_TEST_RECORDS_SEEN.load(std::sync::atomic::Ordering::SeqCst),
+        window_id_changes: GTK_TEST_WINDOW_ID_CHANGES.load(std::sync::atomic::Ordering::SeqCst),
+        previous_button_id_changes: GTK_TEST_PREVIOUS_BUTTON_ID_CHANGES
+            .load(std::sync::atomic::Ordering::SeqCst),
+        next_button_id_changes: GTK_TEST_NEXT_BUTTON_ID_CHANGES
+            .load(std::sync::atomic::Ordering::SeqCst),
+        unmapped_navigation_buttons: GTK_TEST_UNMAPPED_NAVIGATION_BUTTONS
+            .load(std::sync::atomic::Ordering::SeqCst),
+        invisible_records: GTK_TEST_INVISIBLE_RECORDS.load(std::sync::atomic::Ordering::SeqCst),
+        hidden_transitions: GTK_TEST_HIDDEN_TRANSITIONS.load(std::sync::atomic::Ordering::SeqCst),
+        stale_source_ticks: GTK_TEST_STALE_SOURCE_TICKS.load(std::sync::atomic::Ordering::SeqCst),
+        realtime_decodes: GTK_TEST_REALTIME_DECODES.load(std::sync::atomic::Ordering::SeqCst),
+    }
+}
+
+#[cfg(test)]
+fn register_gtk_test_window(window: &gtk4::Window) {
+    use gtk4::prelude::*;
+
+    GTK_TEST_WINDOWS_CREATED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    window.connect_visible_notify(|window| {
+        if !window.is_visible()
+            && !GTK_TEST_SESSION_FINALIZING.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            GTK_TEST_HIDDEN_TRANSITIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+}
+
+#[cfg(test)]
+fn begin_gtk_test_record() -> usize {
+    GTK_TEST_ACTIVE_RECORD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+#[cfg(test)]
+fn mark_gtk_test_session_finalizing() {
+    GTK_TEST_SESSION_FINALIZING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn note_gtk_test_source_tick(generation: usize) {
+    if GTK_TEST_ACTIVE_RECORD_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        GTK_TEST_STALE_SOURCE_TICKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn note_gtk_test_widget_identity<T: gtk4::prelude::ObjectType>(
+    widget: &T,
+    first_id: &std::sync::atomic::AtomicUsize,
+    changes: &std::sync::atomic::AtomicUsize,
+) {
+    let widget_id = widget.as_ptr() as usize;
+    let initial_id = first_id
+        .compare_exchange(
+            0,
+            widget_id,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .unwrap_or_else(|existing| existing);
+    if initial_id != 0 && initial_id != widget_id {
+        changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn start_gtk_test_raw_next_burst(
+    window: &gtk4::Window,
+    next: &gtk4::Button,
+    click_count: usize,
+) -> Result<(), String> {
+    use gtk4::prelude::*;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    let surface = window
+        .surface()
+        .ok_or_else(|| "picker window has no GDK surface".to_string())?;
+    let xid = surface
+        .downcast_ref::<gdk4_x11::X11Surface>()
+        .ok_or_else(|| "picker test requires the GDK X11 backend".to_string())?
+        .xid() as u32;
+    let point = next
+        .compute_point(
+            window,
+            &gtk4::graphene::Point::new(next.width() as f32 / 2.0, next.height() as f32 / 2.0),
+        )
+        .ok_or_else(|| "could not locate next button in picker window".to_string())?;
+    let (connection, screen_num) = x11rb::connect(None)
+        .map_err(|error| format!("failed to connect to isolated X11 display: {error}"))?;
+    let root = connection.setup().roots[screen_num].root;
+    let translated = connection
+        .translate_coordinates(xid, root, point.x() as i16, point.y() as i16)
+        .map_err(|error| format!("failed to request picker coordinate translation: {error}"))?
+        .reply()
+        .map_err(|error| format!("failed to translate picker coordinates: {error}"))?;
+    let root_x = translated.dst_x.to_string();
+    let root_y = translated.dst_y.to_string();
+
+    let handle = std::thread::spawn(move || {
+        let mut command = std::process::Command::new("xdotool");
+        command
+            .arg("mousemove")
+            .arg(root_x)
+            .arg(root_y)
+            .arg("sleep")
+            .arg("0.05");
+        for click_index in 0..click_count {
+            if click_index > 0 {
+                command.arg("sleep").arg("0.15");
+            }
+            command.arg("mousedown").arg("1").arg("mouseup").arg("1");
+        }
+        // On the broken implementation clicks after the first navigation
+        // miss the replacement button. Escape bounds the test instead of
+        // leaving its per-record main loop blocked forever.
+        let status = command
+            .arg("sleep")
+            .arg("0.5")
+            .arg("key")
+            .arg("Escape")
+            .status()
+            .map_err(|error| format!("failed to launch xdotool: {error}"))?;
+        if !status.success() {
+            return Err(format!("xdotool exited with {status}"));
+        }
+        Ok(())
+    });
+    *GTK_TEST_INPUT_THREAD
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+    Ok(())
+}
+
+#[cfg(test)]
+struct GtkTestWindowRefs<'a> {
+    audio_path: &'a std::path::Path,
+    previous: &'a gtk4::Button,
+    next: &'a gtk4::Button,
+    buffer: &'a gtk4::TextBuffer,
+    error_label: &'a gtk4::Label,
+    list: &'a gtk4::ListBox,
+    action_buttons: &'a std::rc::Rc<std::cell::RefCell<Vec<gtk4::Button>>>,
+    selection_ctx: &'a std::rc::Rc<std::cell::RefCell<SelectionSaveCtx>>,
+    window: &'a gtk4::Window,
+}
+
+#[cfg(test)]
+struct GtkTestFinishRefs<'a> {
+    audio_path: &'a std::path::Path,
+    previous: &'a gtk4::Button,
+    next: &'a gtk4::Button,
+    buffer: &'a gtk4::TextBuffer,
+    error_label: &'a gtk4::Label,
+    list: &'a gtk4::ListBox,
+    window: &'a gtk4::Window,
+}
+
+#[cfg(test)]
+fn finish_gtk_test_action(action: &GtkTestAction, refs: GtkTestFinishRefs<'_>) {
+    use gtk4::prelude::*;
+
+    if let Some(text) = action.edit_text.as_ref() {
+        refs.buffer.set_text(text);
+    }
+    let emit_exit = || match action.exit {
+        GtkTestExit::Navigate(PickerNavigation::Previous) => {
+            refs.previous.emit_by_name::<()>("clicked", &[])
+        }
+        GtkTestExit::Navigate(PickerNavigation::Next) => {
+            refs.next.emit_by_name::<()>("clicked", &[])
+        }
+        GtkTestExit::RawNextBurst(click_count) => {
+            if let Err(error) = start_gtk_test_raw_next_burst(refs.window, refs.next, click_count) {
+                *GTK_TEST_INPUT_ERROR
+                    .get_or_init(|| std::sync::Mutex::new(None))
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+                refs.window.close();
+            }
+        }
+        GtkTestExit::Wait => {}
+        GtkTestExit::Confirm => {
+            let row = refs
+                .list
+                .selected_row()
+                .expect("test picker has selected row");
+            refs.list.emit_by_name::<()>("row-activated", &[&row]);
+        }
+    };
+
+    if action.fail_first_save {
+        GTK_TEST_SAVE_FAILURES.store(1, std::sync::atomic::Ordering::SeqCst);
+        emit_exit();
+        assert!(refs.error_label.is_visible());
+        assert_eq!(
+            refs.buffer
+                .text(&refs.buffer.start_iter(), &refs.buffer.end_iter(), false)
+                .as_str(),
+            action.edit_text.as_deref().unwrap_or(&action.expected_text)
+        );
+        assert_eq!(
+            crate::recording_cache::read_pick(refs.audio_path).map(|(_, _, _, text)| text),
+            Some(action.expected_text.clone())
+        );
+        emit_exit();
+    } else {
+        emit_exit();
+    }
+}
+
+#[cfg(test)]
+fn drive_gtk_test_window(refs: GtkTestWindowRefs<'_>) {
+    use gtk4::prelude::*;
+
+    let action = GTK_TEST_ACTIONS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop_front();
+    let Some(action) = action else {
+        return;
+    };
+    let audio_path = refs.audio_path.to_path_buf();
+    let previous = refs.previous.clone();
+    let next = refs.next.clone();
+    let buffer = refs.buffer.clone();
+    let error_label = refs.error_label.clone();
+    let list = refs.list.clone();
+    let action_buttons = std::rc::Rc::clone(refs.action_buttons);
+    let selection_ctx = std::rc::Rc::clone(refs.selection_ctx);
+    let window = refs.window.clone();
+    gtk4::glib::idle_add_local_once(move || {
+        GTK_TEST_RECORDS_SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let window_id = window.as_ptr() as usize;
+        let first_id = GTK_TEST_WINDOW_ID
+            .compare_exchange(
+                0,
+                window_id,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .unwrap_or_else(|existing| existing);
+        if first_id != 0 && first_id != window_id {
+            GTK_TEST_WINDOW_ID_CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        note_gtk_test_widget_identity(
+            &previous,
+            &GTK_TEST_PREVIOUS_BUTTON_ID,
+            &GTK_TEST_PREVIOUS_BUTTON_ID_CHANGES,
+        );
+        note_gtk_test_widget_identity(
+            &next,
+            &GTK_TEST_NEXT_BUTTON_ID,
+            &GTK_TEST_NEXT_BUTTON_ID_CHANGES,
+        );
+        if !previous.is_mapped() || !next.is_mapped() {
+            GTK_TEST_UNMAPPED_NAVIGATION_BUTTONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if !window.is_visible() || !window.is_mapped() {
+            GTK_TEST_INVISIBLE_RECORDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert_eq!(previous.is_sensitive(), action.previous_sensitive);
+        assert_eq!(next.is_sensitive(), action.next_sensitive);
+        assert_eq!(
+            selection_ctx.borrow().current.as_ref(),
+            Some(&(
+                action.expected_provider,
+                action.expected_model.clone(),
+                action.expected_streaming,
+            ))
+        );
+        let displayed_text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        if let Some(wait) = action.wait.as_ref().filter(|wait| !wait.click_action) {
+            assert!(
+                displayed_text == action.expected_text || displayed_text == wait.expected_text,
+                "unexpected picker text before auto-result: {displayed_text:?}"
+            );
+        } else {
+            assert_eq!(displayed_text, action.expected_text);
+        }
+        if let Some(wait) = action.wait.as_ref() {
+            let row = list.selected_row().expect("test picker has selected row");
+            let row_index = row.index() as usize;
+            let action_button = action_buttons
+                .borrow()
+                .get(row_index)
+                .cloned()
+                .expect("selected picker row has an action button");
+            if let Some(expected) = wait.expected_action_label_before.as_deref() {
+                assert_eq!(action_button.label().as_deref(), Some(expected));
+            }
+            if let Some(expected) = wait.expected_requests_before {
+                assert_eq!(
+                    wait.request_count.load(std::sync::atomic::Ordering::SeqCst),
+                    expected
+                );
+            }
+            if wait.click_action {
+                action_button.emit_by_name::<()>("clicked", &[]);
+            }
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let request_count = std::sync::Arc::clone(&wait.request_count);
+            let expected_requests = wait.expected_requests_after;
+            let expected_text = wait.expected_text.clone();
+            let expected_label = wait.expected_action_label_after.clone();
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
+                let text_matches = buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                    .as_str()
+                    == expected_text;
+                let requests_match =
+                    request_count.load(std::sync::atomic::Ordering::SeqCst) == expected_requests;
+                let label_matches = expected_label
+                    .as_deref()
+                    .is_none_or(|expected| action_button.label().as_deref() == Some(expected));
+                if text_matches && requests_match && label_matches {
+                    finish_gtk_test_action(
+                        &action,
+                        GtkTestFinishRefs {
+                            audio_path: &audio_path,
+                            previous: &previous,
+                            next: &next,
+                            buffer: &buffer,
+                            error_label: &error_label,
+                            list: &list,
+                            window: &window,
+                        },
+                    );
+                    gtk4::glib::ControlFlow::Break
+                } else if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "picker test timed out: text={:?}, requests={}, action={:?}",
+                        buffer
+                            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                            .as_str(),
+                        request_count.load(std::sync::atomic::Ordering::SeqCst),
+                        action_button.label(),
+                    );
+                } else {
+                    gtk4::glib::ControlFlow::Continue
+                }
+            });
+        } else {
+            finish_gtk_test_action(
+                &action,
+                GtkTestFinishRefs {
+                    audio_path: &audio_path,
+                    previous: &previous,
+                    next: &next,
+                    buffer: &buffer,
+                    error_label: &error_label,
+                    list: &list,
+                    window: &window,
+                },
+            );
+        }
+    });
+}
+
+fn picker_css(theme: &crate::gtk_theme::ThemeColors) -> String {
+    theme.base_css(&format!(
+        ".transcript {{ font-family: monospace; }} \
+         .error {{ font-style: italic; color: alpha({err}, 0.8); }} \
+         .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }} \
+         .action-btn {{ \
+             min-width: 28px; min-height: 28px; \
+             padding: 0; margin: 0; \
+             font-family: monospace; font-weight: bold; font-size: 14px; \
+         }} \
+         .play-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
+         .waterfall {{ background-color: black; border-radius: 0.25em; }} \
+         .copy-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
+         .editor-view {{ font-family: monospace; }} \
+         textview.editor-view text {{ background-color: transparent; }} \
+        ",
+        err = theme.error,
+    ))
+}
+
+/// Initialize GTK and install picker CSS once for the whole record session.
+pub(super) fn initialize_picker_gtk() -> Result<(), TalkError> {
+    gtk4::init()
+        .map_err(|error| TalkError::Config(format!("failed to initialize GTK: {error}")))?;
+    let theme = crate::gtk_theme::ThemeColors::resolve();
+    crate::gtk_theme::load_css(&picker_css(&theme));
+    Ok(())
+}
+
+type PickerNavigationCallback = std::rc::Rc<dyn Fn(PickerNavigation)>;
+
+pub(super) struct PickerSession {
+    window: gtk4::Window,
+    close_button: gtk4::Button,
+    waterfall_slot: gtk4::Box,
+    previous_button: gtk4::Button,
+    next_button: gtk4::Button,
+    controls_slot: gtk4::Box,
+    content_slot: gtk4::Box,
+    navigation_callback: std::rc::Rc<std::cell::RefCell<Option<PickerNavigationCallback>>>,
+    presented: std::cell::Cell<bool>,
+    destroyed: std::cell::Cell<bool>,
+}
+
+impl PickerSession {
+    pub(super) fn new() -> Self {
+        use gtk4::prelude::*;
+
+        let window = gtk4::Window::builder()
+            .title(PICKER_TITLE)
+            .default_width(900)
+            .default_height(500)
+            .decorated(false)
+            .resizable(true)
+            .build();
+        window.set_size_request(400, 250);
+        crate::gtk_theme::install_edge_resize(&window);
+
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        root.set_margin_top(6);
+        root.set_margin_bottom(6);
+        root.set_margin_start(6);
+        root.set_margin_end(6);
+
+        let (title_bar, close_button) = crate::gtk_theme::build_title_bar();
+        root.append(&title_bar);
+
+        let play_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        play_bar.set_margin_start(4);
+        play_bar.set_margin_end(4);
+        play_bar.set_margin_bottom(4);
+
+        let waterfall_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        waterfall_slot.set_hexpand(true);
+        play_bar.append(&waterfall_slot);
+
+        let previous_button = gtk4::Button::from_icon_name("go-previous-symbolic");
+        previous_button.set_tooltip_text(Some("Previous recording (newer)"));
+        previous_button.add_css_class("play-btn");
+        previous_button.set_widget_name("picker-previous-record");
+        play_bar.append(&previous_button);
+
+        let next_button = gtk4::Button::from_icon_name("go-next-symbolic");
+        next_button.set_tooltip_text(Some("Next recording (older)"));
+        next_button.add_css_class("play-btn");
+        next_button.set_widget_name("picker-next-record");
+        play_bar.append(&next_button);
+
+        let controls_slot = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        play_bar.append(&controls_slot);
+        root.append(&play_bar);
+
+        let content_slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_slot.set_vexpand(true);
+        root.append(&content_slot);
+
+        let handle = gtk4::WindowHandle::new();
+        handle.set_child(Some(&root));
+        window.set_child(Some(&handle));
+
+        let navigation_callback: std::rc::Rc<std::cell::RefCell<Option<PickerNavigationCallback>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        {
+            let callback = std::rc::Rc::clone(&navigation_callback);
+            previous_button.connect_clicked(move |_| {
+                if let Some(callback) = callback.borrow().as_ref() {
+                    callback(PickerNavigation::Previous);
+                }
+            });
+        }
+        {
+            let callback = std::rc::Rc::clone(&navigation_callback);
+            next_button.connect_clicked(move |_| {
+                if let Some(callback) = callback.borrow().as_ref() {
+                    callback(PickerNavigation::Next);
+                }
+            });
+        }
+        #[cfg(test)]
+        register_gtk_test_window(&window);
+        Self {
+            window,
+            close_button,
+            waterfall_slot,
+            previous_button,
+            next_button,
+            controls_slot,
+            content_slot,
+            navigation_callback,
+            presented: std::cell::Cell::new(false),
+            destroyed: std::cell::Cell::new(false),
+        }
+    }
+
+    fn mount(
+        &self,
+        waterfall: &gtk4::Widget,
+        controls: &gtk4::Widget,
+        content: &gtk4::Widget,
+        navigation: PickerNavigationAvailability,
+        navigation_callback: PickerNavigationCallback,
+    ) {
+        use gtk4::prelude::*;
+
+        fn replace_child(slot: &gtk4::Box, child: &gtk4::Widget) {
+            while let Some(existing) = slot.first_child() {
+                slot.remove(&existing);
+            }
+            slot.append(child);
+        }
+
+        self.previous_button.set_sensitive(navigation.previous);
+        self.next_button.set_sensitive(navigation.next);
+        *self.navigation_callback.borrow_mut() = Some(navigation_callback);
+        replace_child(&self.waterfall_slot, waterfall);
+        replace_child(&self.controls_slot, controls);
+        replace_child(&self.content_slot, content);
+        if !self.presented.replace(true) {
+            crate::gtk_theme::present_centred(&self.window);
+        }
+    }
+
+    fn clear_navigation_callback(&self) {
+        self.navigation_callback.borrow_mut().take();
+    }
+
+    pub(super) fn destroy(&self) {
+        use gtk4::prelude::*;
+
+        if self.destroyed.replace(true) {
+            return;
+        }
+        self.clear_navigation_callback();
+        #[cfg(test)]
+        mark_gtk_test_session_finalizing();
+        self.window.set_child(None::<&gtk4::Widget>);
+        self.window.destroy();
+        #[cfg(test)]
+        {
+            let window_widget = self.window.clone().upcast::<gtk4::Widget>();
+            assert!(
+                !gtk4::Window::list_toplevels()
+                    .iter()
+                    .any(|widget| widget == &window_widget),
+                "destroyed picker window remained in GTK toplevel registry"
+            );
+            GTK_TEST_WINDOWS_DESTROYED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for PickerSession {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
 /// Escape text for use in Pango markup.
 fn escape_pango(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -188,22 +1046,26 @@ fn diff_markup(reference: &str, candidate: &str, del_color: &str, ins_color: &st
 /// marks the entry that was already pasted in a previous run
 /// (selecting it again skips re-pasting).
 ///
-/// Returns `Some(PickerSelection)` for the selected candidate, or
-/// `None` if the user cancelled.
+/// Returns a selection, navigation request, or cancellation.
 pub(super) async fn pick_with_streaming_gtk(
-    mut transcribers: Vec<(Provider, String)>,
-    audio_path: PathBuf,
-    mut cached_entries: Vec<(Provider, String, String, bool, bool)>,
-    config: std::sync::Arc<Config>,
-    mut realtime_transcribers: Vec<(Provider, String, Box<dyn RealtimeTranscriber>)>,
-    mut deferred_candidates: Vec<(Provider, String, bool)>,
-) -> Result<Option<PickerSelection>, TalkError> {
+    session: &PickerSession,
+    input: PickerUiInput,
+) -> Result<PickerOutcome, TalkError> {
+    let PickerUiInput {
+        mut transcribers,
+        audio_path,
+        mut cached_entries,
+        config,
+        mut realtime_transcribers,
+        mut deferred_candidates,
+        navigation,
+    } = input;
     if transcribers.is_empty()
         && cached_entries.is_empty()
         && realtime_transcribers.is_empty()
         && deferred_candidates.is_empty()
     {
-        return Ok(None);
+        return Ok(PickerOutcome::Cancelled);
     }
 
     // Stable display order: sort by (provider, model, streaming) so
@@ -256,7 +1118,7 @@ pub(super) async fn pick_with_streaming_gtk(
 
     // Channels: transcription tasks → GTK, GTK → caller.
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<PickerMessage>();
-    let (sel_tx, sel_rx) = tokio::sync::oneshot::channel::<Option<usize>>();
+    let (sel_tx, sel_rx) = tokio::sync::oneshot::channel::<PickerExit>();
 
     // Retry channel: GTK thread → async retry listener.
     // The bool indicates whether this is a streaming (realtime) retry.
@@ -287,9 +1149,8 @@ pub(super) async fn pick_with_streaming_gtk(
     let audio_path_for_waterfall = audio_path.clone();
     // Clone audio path for picker selection auto-save.
     let audio_path_for_selection = audio_path.clone();
-
-    // Check before spawn_blocking moves deferred_candidates.
-    let has_deferred_realtime = deferred_candidates.iter().any(|(_, _, s)| *s);
+    #[cfg(test)]
+    let audio_path_for_test = audio_path_for_selection.clone();
 
     // Clone the config Arc for the GTK thread: the per-row "T" click
     // handler may need to gate Parakeet on a download-consent dialog,
@@ -299,27 +1160,36 @@ pub(super) async fn pick_with_streaming_gtk(
     // is consumed by the async transcription tasks below.
     #[cfg(feature = "parakeet")]
     let config_for_gtk = config.clone();
+    let window = session.window.clone();
 
-    // ── GTK window ──────────────────────────────────────────────
-    let gtk_handle = tokio::task::spawn_blocking(move || -> Result<(), TalkError> {
+    // ── Per-record GTK contents ─────────────────────────────────
+    let gtk_window = move || -> Result<(), TalkError> {
         use gtk4::glib;
         use gtk4::prelude::*;
-        use std::cell::RefCell;
+        use std::cell::{Cell, RefCell};
         use std::rc::Rc;
 
-        gtk4::init().map_err(|e| TalkError::Config(format!("failed to initialize GTK: {}", e)))?;
+        type SourceSlot = Rc<RefCell<Option<glib::SourceId>>>;
+        fn source_slot(registry: &Rc<RefCell<Vec<SourceSlot>>>) -> SourceSlot {
+            let slot = Rc::new(RefCell::new(None));
+            registry.borrow_mut().push(Rc::clone(&slot));
+            slot
+        }
+        fn remove_sources(registry: &Rc<RefCell<Vec<SourceSlot>>>) {
+            for slot in registry.borrow().iter() {
+                if let Some(source) = slot.borrow_mut().take() {
+                    source.remove();
+                }
+            }
+        }
+
+        let source_registry: Rc<RefCell<Vec<SourceSlot>>> = Rc::new(RefCell::new(Vec::new()));
 
         let theme = crate::gtk_theme::ThemeColors::resolve();
         let error_hex = &theme.error;
 
-        let window = gtk4::Window::builder()
-            .title(PICKER_TITLE)
-            .default_width(900)
-            .default_height(500)
-            .decorated(false)
-            .resizable(true)
-            .build();
-        window.set_size_request(400, 250);
+        #[cfg(test)]
+        let gtk_test_generation = begin_gtk_test_record();
 
         // CSS notes:
         //   - GtkListBox CSS node is "list", not "listbox"
@@ -327,44 +1197,14 @@ pub(super) async fn pick_with_streaming_gtk(
         //     to prevent the theme from lightening on focus loss
         //   - row:selected uses a translucent accent instead of
         //     the theme's solid #E95420
-        crate::gtk_theme::load_css(&theme.base_css(&format!(
-            ".transcript {{ font-family: monospace; }} \
-             .error {{ font-style: italic; color: alpha({err}, 0.8); }} \
-             .retry-btn {{ min-width: 0; min-height: 0; padding: 2px 6px; font-size: 14px; }} \
-             .action-btn {{ \
-                min-width: 28px; min-height: 28px; \
-                padding: 0; margin: 0; \
-                font-family: monospace; font-weight: bold; font-size: 14px; \
-             }} \
-             .play-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
-             .waterfall {{ background-color: black; border-radius: 0.25em; }} \
-             .copy-btn {{ min-width: 32px; min-height: 32px; padding: 0; font-size: 16px; }} \
-             .editor-view {{ font-family: monospace; }} \
-             textview.editor-view text {{ background-color: transparent; }} \
-",
-            err = error_hex,
-        )));
-
-        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-        root.set_margin_top(6);
-        root.set_margin_bottom(6);
-        root.set_margin_start(6);
-        root.set_margin_end(6);
-
-        // ── Title bar with close button ──────────────────────────
-        let (title_bar, close_btn) = crate::gtk_theme::build_title_bar();
-        root.append(&title_bar);
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        content.set_vexpand(true);
+        let close_btn = session.close_button.clone();
 
         // ── Audio player for playback button ─────────────────────
         // Initialized in background after window presentation to avoid
         // blocking the UI on cpal device probing (~1-2 s on PipeWire).
         let player: Rc<RefCell<Option<WavPlayer>>> = Rc::new(RefCell::new(None));
-
-        // Play-button bar above the transcription list.
-        let play_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        play_bar.set_margin_start(4);
-        play_bar.set_margin_end(4);
-        play_bar.set_margin_bottom(4);
 
         // ── Waterfall spectrogram (base layer) ─────────────────────
         let waterfall_area = gtk4::DrawingArea::new();
@@ -480,8 +1320,14 @@ pub(super) async fn pick_with_streaming_gtk(
 
             let wf_data_ref = Rc::clone(&waterfall_data);
             let wf_area_ref = waterfall_area.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                match wf_rx.try_recv() {
+            let source = source_slot(&source_registry);
+            let source_callback = Rc::clone(&source);
+            #[cfg(test)]
+            let source_generation = gtk_test_generation;
+            let id = glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                #[cfg(test)]
+                note_gtk_test_source_tick(source_generation);
+                let flow = match wf_rx.try_recv() {
                     Ok(result) => {
                         *wf_data_ref.borrow_mut() = Some(result);
                         wf_area_ref.queue_draw();
@@ -489,11 +1335,14 @@ pub(super) async fn pick_with_streaming_gtk(
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                };
+                if flow == glib::ControlFlow::Break {
+                    *source_callback.borrow_mut() = None;
                 }
+                flow
             });
+            *source.borrow_mut() = Some(id);
         }
-
-        play_bar.append(&wf_overlay);
 
         // ── Rewind button ────────────────────────────────────────
         let rewind_btn = gtk4::Button::from_icon_name("media-skip-backward-symbolic");
@@ -515,7 +1364,8 @@ pub(super) async fn pick_with_streaming_gtk(
             });
         }
 
-        play_bar.append(&rewind_btn);
+        let player_controls = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        player_controls.append(&rewind_btn);
 
         // ── Play/Pause button ─────────────────────────────────────
         let play_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
@@ -587,7 +1437,12 @@ pub(super) async fn pick_with_streaming_gtk(
             let interp: Rc<RefCell<(f64, std::time::Instant)>> =
                 Rc::new(RefCell::new((0.0, std::time::Instant::now())));
 
-            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            let source = source_slot(&source_registry);
+            #[cfg(test)]
+            let source_generation = gtk_test_generation;
+            let id = glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                #[cfg(test)]
+                note_gtk_test_source_tick(source_generation);
                 let player_guard = player_poll.borrow();
                 let Some(ref p) = *player_guard else {
                     return glib::ControlFlow::Continue;
@@ -633,9 +1488,10 @@ pub(super) async fn pick_with_streaming_gtk(
                 }
                 glib::ControlFlow::Continue
             });
+            *source.borrow_mut() = Some(id);
         }
 
-        play_bar.append(&play_btn);
+        player_controls.append(&play_btn);
 
         // ── Drag-to-seek on the waterfall ────────────────────────
         // Dragging pauses playback; releasing resumes.
@@ -653,7 +1509,7 @@ pub(super) async fn pick_with_streaming_gtk(
             {
                 let player_ref = Rc::clone(&player_drag);
                 let pos_ref = Rc::clone(&pos_drag);
-                let cursor_ref = cursor_drag.clone();
+                let cursor_ref = cursor_drag.downgrade();
                 let btn_ref = btn_drag.clone();
                 let flag_ref = Rc::clone(&flag_drag);
                 let was_ref = Rc::clone(&was_playing);
@@ -676,7 +1532,9 @@ pub(super) async fn pick_with_streaming_gtk(
                             let frac = (x / w).clamp(0.0, 1.0);
                             p.seek(frac);
                             *pos_ref.borrow_mut() = frac;
-                            cursor_ref.queue_draw();
+                            if let Some(cursor) = cursor_ref.upgrade() {
+                                cursor.queue_draw();
+                            }
                         }
                     }
                 });
@@ -685,7 +1543,7 @@ pub(super) async fn pick_with_streaming_gtk(
             {
                 let player_ref = Rc::clone(&player_drag);
                 let pos_ref = Rc::clone(&pos_drag);
-                let cursor_ref = cursor_drag.clone();
+                let cursor_ref = cursor_drag.downgrade();
                 let rewind_ref = rewind_drag.clone();
                 drag.connect_drag_update(move |gesture, offset_x, _offset_y| {
                     let player_guard = player_ref.borrow();
@@ -700,7 +1558,9 @@ pub(super) async fn pick_with_streaming_gtk(
                             p.seek(frac);
                             *pos_ref.borrow_mut() = frac;
                             rewind_ref.set_sensitive(frac > 0.0);
-                            cursor_ref.queue_draw();
+                            if let Some(cursor) = cursor_ref.upgrade() {
+                                cursor.queue_draw();
+                            }
                         }
                     }
                 });
@@ -729,8 +1589,6 @@ pub(super) async fn pick_with_streaming_gtk(
             cursor_area.add_controller(drag);
         }
 
-        root.append(&play_bar);
-
         // ── Editable text area + copy button ─────────────────────
         let editor_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         editor_bar.set_margin_start(4);
@@ -758,7 +1616,14 @@ pub(super) async fn pick_with_streaming_gtk(
         copy_btn.set_valign(gtk4::Align::Start);
         editor_bar.append(&copy_btn);
 
-        root.append(&editor_bar);
+        content.append(&editor_bar);
+
+        let save_error_label = gtk4::Label::new(None);
+        save_error_label.set_xalign(0.0);
+        save_error_label.set_wrap(true);
+        save_error_label.add_css_class("error");
+        save_error_label.set_visible(false);
+        content.append(&save_error_label);
 
         let scrolled = gtk4::ScrolledWindow::builder()
             .vexpand(true)
@@ -768,17 +1633,12 @@ pub(super) async fn pick_with_streaming_gtk(
         list.set_selection_mode(gtk4::SelectionMode::Single);
         list.set_activate_on_single_click(false);
         scrolled.set_child(Some(&list));
-        root.append(&scrolled);
-
-        // WindowHandle enables dragging the window from any non-
-        // interactive area (help label, table background, margins).
-        let handle = gtk4::WindowHandle::new();
-        handle.set_child(Some(&root));
-        window.set_child(Some(&handle));
+        content.append(&scrolled);
 
         let main_loop = glib::MainLoop::new(None, false);
-        let sel_sender: Rc<RefCell<Option<tokio::sync::oneshot::Sender<Option<usize>>>>> =
+        let sel_sender: Rc<RefCell<Option<tokio::sync::oneshot::Sender<PickerExit>>>> =
             Rc::new(RefCell::new(Some(sel_tx)));
+        let retry_sender = Rc::new(RefCell::new(Some(retry_tx)));
         type CandidateList = Vec<(
             Provider,
             String,
@@ -797,10 +1657,12 @@ pub(super) async fn pick_with_streaming_gtk(
         // Transcript labels for live diff updates (None for error/spinner rows).
         let transcript_labels: Rc<RefCell<Vec<Option<gtk4::Label>>>> =
             Rc::new(RefCell::new(Vec::new()));
-        // Deferred row indices — rows awaiting user click, excluded
-        // from the InitialOneShotDone "no response" sweep.
+        // Deferred row indices — rows awaiting user click.
         let deferred_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
+        // The initial-completion sweep must never inspect a deferred
+        // row's spinner, even after its T button starts a retry.
+        let mut initial_oneshot_indices = std::collections::HashSet::new();
         // Per-row "has-transcription" flag — true once the row has
         // received a non-empty transcript (cached or live).  Used to
         // prevent selecting a non-transcribed row (spinner, deferred,
@@ -819,38 +1681,31 @@ pub(super) async fn pick_with_streaming_gtk(
         // Saved: on first result arrival, after 5 s of inactivity
         // when dirty, and on picker close.
 
-        struct SelectionSaveCtx {
-            audio_path: PathBuf,
-            dirty: bool,
-            current: Option<(Provider, String, bool)>,
-        }
-
         /// Flush the pick to disk if dirty, reading the current text
         /// from `buf`.  Cancels any pending debounce timer.
         fn save_selection_now(
             ctx_ref: &Rc<RefCell<SelectionSaveCtx>>,
             pending: &Rc<RefCell<Option<glib::SourceId>>>,
             buf: &gtk4::TextBuffer,
-        ) {
+            error_label: &gtk4::Label,
+        ) -> bool {
             use gtk4::prelude::*;
             if let Some(id) = pending.borrow_mut().take() {
                 id.remove();
             }
-            let mut ctx = ctx_ref.borrow_mut();
-            if ctx.dirty {
-                if let Some((provider, ref model, streaming)) = ctx.current {
-                    let text = buf
-                        .text(&buf.start_iter(), &buf.end_iter(), false)
-                        .to_string();
-                    let _ = crate::recording_cache::write_pick(
-                        &ctx.audio_path,
-                        &provider.to_string(),
-                        model,
-                        streaming,
-                        &text,
-                    );
+            let text = buf
+                .text(&buf.start_iter(), &buf.end_iter(), false)
+                .to_string();
+            match persist_selection(&mut ctx_ref.borrow_mut(), &text) {
+                Ok(()) => {
+                    error_label.set_visible(false);
+                    true
                 }
-                ctx.dirty = false;
+                Err(error) => {
+                    error_label.set_text(&format!("Could not save edits: {error}"));
+                    error_label.set_visible(true);
+                    false
+                }
             }
         }
 
@@ -866,11 +1721,11 @@ pub(super) async fn pick_with_streaming_gtk(
             ctx_ref: &Rc<RefCell<SelectionSaveCtx>>,
             pending: &Rc<RefCell<Option<glib::SourceId>>>,
             buf: &gtk4::TextBuffer,
-            provider: Provider,
-            model: &str,
-            streaming: bool,
+            selection: (Provider, &str, bool),
             has_result: bool,
+            error_label: &gtk4::Label,
         ) {
+            let (provider, model, streaming) = selection;
             {
                 let mut ctx = ctx_ref.borrow_mut();
                 ctx.current = Some((provider, model.to_string(), streaming));
@@ -888,9 +1743,10 @@ pub(super) async fn pick_with_streaming_gtk(
             let ctx_clone = Rc::clone(ctx_ref);
             let pending_clone = Rc::clone(pending);
             let buf_clone = buf.clone();
+            let error_clone = error_label.clone();
             let id = glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
                 *pending_clone.borrow_mut() = None;
-                save_selection_now(&ctx_clone, &pending_clone, &buf_clone);
+                save_selection_now(&ctx_clone, &pending_clone, &buf_clone, &error_clone);
             });
             *pending.borrow_mut() = Some(id);
         }
@@ -1083,7 +1939,7 @@ pub(super) async fn pick_with_streaming_gtk(
         // deferred candidate for the same model — clicking T on
         // the deferred row would otherwise spin the primary row).
         let make_action_button = {
-            let retry_tx = retry_tx.clone();
+            let retry_tx = Rc::clone(&retry_sender);
             let cells_for_btn = Rc::clone(&transcript_cells);
             let labels_for_btn = Rc::clone(&transcript_labels);
             let raw_for_btn = Rc::clone(&raw_texts);
@@ -1099,7 +1955,7 @@ pub(super) async fn pick_with_streaming_gtk(
             // factory scope unconditionally so the closure shape
             // stays identical across cfg flavours.
             #[cfg(feature = "parakeet")]
-            let window_for_btn = window.clone();
+            let window_for_btn = window.downgrade();
             #[cfg(feature = "parakeet")]
             let config_for_btn = config_for_gtk.clone();
             move |provider: Provider,
@@ -1113,7 +1969,7 @@ pub(super) async fn pick_with_streaming_gtk(
                 btn.add_css_class("action-btn");
                 btn.set_valign(gtk4::Align::Center);
                 {
-                    let tx = retry_tx.clone();
+                    let tx = Rc::clone(&retry_tx);
                     let cells_ref = Rc::clone(&cells_for_btn);
                     let labels_ref = Rc::clone(&labels_for_btn);
                     let raw_ref = Rc::clone(&raw_for_btn);
@@ -1182,7 +2038,7 @@ pub(super) async fn pick_with_streaming_gtk(
                             let deferred_ref = Rc::clone(&deferred_ref);
                             let buttons_ref = Rc::clone(&buttons_ref);
                             let has_tx_ref = Rc::clone(&has_tx_ref);
-                            let tx = tx.clone();
+                            let tx = Rc::clone(&tx);
                             let model = model.clone();
                             let clicked = clicked.clone();
                             move || {
@@ -1246,7 +2102,9 @@ pub(super) async fn pick_with_streaming_gtk(
                                     set_action_icon_stop(btn);
                                 }
 
-                                let _ = tx.send((provider, model.clone(), streaming));
+                                if let Some(tx) = tx.borrow().as_ref() {
+                                    let _ = tx.send((provider, model.clone(), streaming));
+                                }
                             }
                         };
 
@@ -1289,6 +2147,9 @@ pub(super) async fn pick_with_streaming_gtk(
                                     .default_button(1)
                                     .cancel_button(0)
                                     .build();
+                                let Some(window_ref) = window_ref.upgrade() else {
+                                    return;
+                                };
                                 dialog.choose(
                                     Some(&window_ref),
                                     None::<&gtk4::gio::Cancellable>,
@@ -1431,6 +2292,9 @@ pub(super) async fn pick_with_streaming_gtk(
             if is_deferred {
                 deferred_indices.borrow_mut().insert(row_idx);
             }
+            if matches!(kind, RowKind::PendingOneShot) {
+                initial_oneshot_indices.insert(row_idx);
+            }
         }
 
         // ── Row selection → populate text area ──────────────────
@@ -1442,6 +2306,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let sel_ctx = Rc::clone(&selection_ctx);
             let sel_pending = Rc::clone(&selection_pending);
             let has_tx_sel = Rc::clone(&has_transcription);
+            let save_error_sel = save_error_label.clone();
             list.connect_row_selected(move |_, row| {
                 if let Some(row) = row {
                     let idx = row.index() as usize;
@@ -1483,10 +2348,9 @@ pub(super) async fn pick_with_streaming_gtk(
                             &sel_ctx,
                             &sel_pending,
                             &buf_sel,
-                            provider,
-                            &model,
-                            streaming,
+                            (provider, &model, streaming),
                             has_result,
+                            &save_error_sel,
                         );
                     }
                     // Only overwrite the text area when this row
@@ -1516,6 +2380,7 @@ pub(super) async fn pick_with_streaming_gtk(
             let ic = ins_color.clone();
             let sel_ctx_edit = Rc::clone(&selection_ctx);
             let sel_pending_edit = Rc::clone(&selection_pending);
+            let save_error_edit = save_error_label.clone();
             text_buffer.connect_changed(move |buf| {
                 // Diff update (existing logic).
                 let reference = buf
@@ -1556,10 +2421,11 @@ pub(super) async fn pick_with_streaming_gtk(
                 let ctx_clone = Rc::clone(&sel_ctx_edit);
                 let pending_clone = Rc::clone(&sel_pending_edit);
                 let buf_clone = buf.clone();
+                let error_clone = save_error_edit.clone();
                 let id =
                     glib::timeout_add_local_once(std::time::Duration::from_secs(5), move || {
                         *pending_clone.borrow_mut() = None;
-                        save_selection_now(&ctx_clone, &pending_clone, &buf_clone);
+                        save_selection_now(&ctx_clone, &pending_clone, &buf_clone, &error_clone);
                     });
                 *sel_pending_edit.borrow_mut() = Some(id);
             });
@@ -1592,15 +2458,58 @@ pub(super) async fn pick_with_streaming_gtk(
             });
         }
 
+        let finished = Rc::new(Cell::new(false));
+        let finish_picker: Rc<dyn Fn(PickerExit) -> bool> = {
+            let finished = Rc::clone(&finished);
+            let sources = Rc::clone(&source_registry);
+            let selection_ctx = Rc::clone(&selection_ctx);
+            let selection_pending = Rc::clone(&selection_pending);
+            let buffer = text_buffer.clone();
+            let save_error = save_error_label.clone();
+            let player = Rc::clone(&player);
+            let retry_sender = Rc::clone(&retry_sender);
+            let action_buttons = Rc::clone(&action_buttons);
+            let sender = Rc::clone(&sel_sender);
+            let main_loop = main_loop.clone();
+            let content = content.downgrade();
+            let waterfall = wf_overlay.downgrade();
+            let controls = player_controls.downgrade();
+            Rc::new(move |exit| {
+                if finished.get() {
+                    return true;
+                }
+                if !save_selection_now(&selection_ctx, &selection_pending, &buffer, &save_error) {
+                    return false;
+                }
+                finished.set(true);
+                remove_sources(&sources);
+                if let Some(ref player) = *player.borrow() {
+                    player.stop();
+                }
+                retry_sender.borrow_mut().take();
+                action_buttons.borrow_mut().clear();
+                if let Some(content) = content.upgrade() {
+                    content.set_sensitive(false);
+                }
+                if let Some(waterfall) = waterfall.upgrade() {
+                    waterfall.set_sensitive(false);
+                }
+                if let Some(controls) = controls.upgrade() {
+                    controls.set_sensitive(false);
+                }
+                if let Some(sender) = sender.borrow_mut().take() {
+                    let _ = sender.send(exit);
+                }
+                main_loop.quit();
+                true
+            })
+        };
+
         // Enter / double-click confirms selection (only if text is loaded)
-        {
-            let sel = Rc::clone(&sel_sender);
-            let ml = main_loop.clone();
+        let row_activated_handler = {
             let cands = Rc::clone(&local_candidates);
-            let win = window.clone();
             let buf_confirm = text_buffer.clone();
-            let sc = Rc::clone(&selection_ctx);
-            let sp = Rc::clone(&selection_pending);
+            let finish = Rc::clone(&finish_picker);
             list.connect_row_activated(move |_, row| {
                 let idx = row.index() as usize;
                 let ready = cands
@@ -1615,88 +2524,52 @@ pub(super) async fn pick_with_streaming_gtk(
                     if !edited.is_empty() {
                         cands.borrow_mut()[idx].2 = edited;
                     }
-                    save_selection_now(&sc, &sp, &buf_confirm);
-                    win.set_visible(false);
-                    if let Some(tx) = sel.borrow_mut().take() {
-                        let _ = tx.send(Some(idx));
-                    }
-                    ml.quit();
+                    finish(PickerExit::Selected(idx));
                 }
-            });
-        }
+            })
+        };
+
+        // Previous/next recording navigation dispatches through the
+        // session-owned buttons. The callback slot changes per record,
+        // while each button's GTK signal handler is connected only once.
+        let navigation_callback: PickerNavigationCallback = {
+            let finish = Rc::clone(&finish_picker);
+            Rc::new(move |direction| {
+                finish(PickerExit::Navigate(direction));
+            })
+        };
 
         // Close button cancels (same as Escape)
-        {
-            let sel = Rc::clone(&sel_sender);
-            let ml = main_loop.clone();
-            let win = window.clone();
-            let player_ref = Rc::clone(&player);
-            let sc = Rc::clone(&selection_ctx);
-            let sp = Rc::clone(&selection_pending);
-            let buf_close = text_buffer.clone();
+        let close_handler = {
+            let finish = Rc::clone(&finish_picker);
             close_btn.connect_clicked(move |_| {
-                save_selection_now(&sc, &sp, &buf_close);
-                if let Some(ref p) = *player_ref.borrow() {
-                    p.stop();
-                }
-                win.set_visible(false);
-                if let Some(tx) = sel.borrow_mut().take() {
-                    let _ = tx.send(None);
-                }
-                ml.quit();
-            });
-        }
+                finish(PickerExit::Cancelled);
+            })
+        };
 
         // Escape cancels
-        {
-            let sel = Rc::clone(&sel_sender);
-            let ml = main_loop.clone();
-            let win = window.clone();
-            let player_ref = Rc::clone(&player);
-            let sc = Rc::clone(&selection_ctx);
-            let sp = Rc::clone(&selection_pending);
-            let buf_esc = text_buffer.clone();
-            let key_ctl = gtk4::EventControllerKey::new();
+        let key_ctl = gtk4::EventControllerKey::new();
+        let key_handler = {
+            let finish = Rc::clone(&finish_picker);
             key_ctl.connect_key_pressed(move |_, key, _, _| {
                 if key == gtk4::gdk::Key::Escape {
-                    save_selection_now(&sc, &sp, &buf_esc);
-                    if let Some(ref p) = *player_ref.borrow() {
-                        p.stop();
-                    }
-                    win.set_visible(false);
-                    if let Some(tx) = sel.borrow_mut().take() {
-                        let _ = tx.send(None);
-                    }
-                    ml.quit();
+                    finish(PickerExit::Cancelled);
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
                 }
-            });
-            window.add_controller(key_ctl);
-        }
+            })
+        };
+        window.add_controller(key_ctl.clone());
 
         // Window close
-        {
-            let sel = Rc::clone(&sel_sender);
-            let ml = main_loop.clone();
-            let player_ref = Rc::clone(&player);
-            let sc = Rc::clone(&selection_ctx);
-            let sp = Rc::clone(&selection_pending);
-            let buf_wc = text_buffer.clone();
-            window.connect_close_request(move |win| {
-                save_selection_now(&sc, &sp, &buf_wc);
-                if let Some(ref p) = *player_ref.borrow() {
-                    p.stop();
-                }
-                win.set_visible(false);
-                if let Some(tx) = sel.borrow_mut().take() {
-                    let _ = tx.send(None);
-                }
-                ml.quit();
-                glib::Propagation::Proceed
-            });
-        }
+        let window_close_handler = {
+            let finish = Rc::clone(&finish_picker);
+            window.connect_close_request(move |_| {
+                finish(PickerExit::Cancelled);
+                glib::Propagation::Stop
+            })
+        };
 
         // Build an error cell containing just the error message.
         //
@@ -1727,6 +2600,7 @@ pub(super) async fn pick_with_streaming_gtk(
         // Poll transcription results — update existing rows in-place.
         {
             let list = list.clone();
+            let initial_oneshot_indices = initial_oneshot_indices;
             let cands = Rc::clone(&local_candidates);
             let cells = Rc::clone(&transcript_cells);
             let raw_poll = Rc::clone(&raw_texts);
@@ -1739,7 +2613,14 @@ pub(super) async fn pick_with_streaming_gtk(
             let make_err = make_error_cell.clone();
             let sel_ctx_poll = Rc::clone(&selection_ctx);
             let sel_pending_poll = Rc::clone(&selection_pending);
-            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let save_error_poll = save_error_label.clone();
+            let source = source_slot(&source_registry);
+            let source_callback = Rc::clone(&source);
+            #[cfg(test)]
+            let source_generation = gtk_test_generation;
+            let id = glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                #[cfg(test)]
+                note_gtk_test_source_tick(source_generation);
                 // Cap messages per tick so the cursor timer and other
                 // main-loop sources stay responsive.
                 const MAX_MSGS_PER_TICK: usize = 5;
@@ -1807,6 +2688,7 @@ pub(super) async fn pick_with_streaming_gtk(
                                             &sel_ctx_poll,
                                             &sel_pending_poll,
                                             &buf_poll,
+                                            &save_error_poll,
                                         );
                                     }
 
@@ -2008,11 +2890,12 @@ pub(super) async fn pick_with_streaming_gtk(
                                 let mut cands = cands.borrow_mut();
                                 let indices: Vec<usize> = (0..cands.len())
                                     .filter(|i| {
-                                        cells_ref.get(*i).is_some_and(|cell| {
-                                            cell.first_child().is_some_and(|w| {
-                                                w.downcast_ref::<gtk4::Spinner>().is_some()
+                                        initial_oneshot_indices.contains(i)
+                                            && cells_ref.get(*i).is_some_and(|cell| {
+                                                cell.first_child().is_some_and(|w| {
+                                                    w.downcast_ref::<gtk4::Spinner>().is_some()
+                                                })
                                             })
-                                        })
                                     })
                                     .collect();
                                 for &idx in &indices {
@@ -2045,38 +2928,72 @@ pub(super) async fn pick_with_streaming_gtk(
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             // All senders dropped (including retry
                             // listener) — stop polling.
+                            *source_callback.borrow_mut() = None;
                             return glib::ControlFlow::Break;
                         }
                     }
                 }
                 glib::ControlFlow::Continue
             });
+            *source.borrow_mut() = Some(id);
         }
 
-        crate::gtk_theme::install_edge_resize(&window);
-
-        crate::gtk_theme::present_centred(&window);
+        session.mount(
+            wf_overlay.upcast_ref(),
+            player_controls.upcast_ref(),
+            content.upcast_ref(),
+            navigation,
+            navigation_callback,
+        );
+        #[cfg(test)]
+        drive_gtk_test_window(GtkTestWindowRefs {
+            audio_path: &audio_path_for_test,
+            previous: &session.previous_button,
+            next: &session.next_button,
+            buffer: &text_buffer,
+            error_label: &save_error_label,
+            list: &list,
+            action_buttons: &action_buttons,
+            selection_ctx: &selection_ctx,
+            window: &window,
+        });
         list.grab_focus();
 
         // Initialize the audio player after the window is presented so
         // the picker appears instantly instead of blocking on cpal
         // device probing (~1-2 s on PipeWire).
+        #[cfg(not(test))]
         {
             let player_init = Rc::clone(&player);
             let play_btn_init = play_btn.clone();
-            glib::idle_add_local_once(move || match WavPlayer::new() {
-                Ok(p) => {
-                    *player_init.borrow_mut() = Some(p);
-                    play_btn_init.set_sensitive(true);
-                }
-                Err(e) => {
-                    log::warn!("audio output unavailable, play button disabled: {}", e);
+            let source = source_slot(&source_registry);
+            let source_callback = Rc::clone(&source);
+            #[cfg(test)]
+            let source_generation = gtk_test_generation;
+            let id = glib::idle_add_local_once(move || {
+                #[cfg(test)]
+                note_gtk_test_source_tick(source_generation);
+                *source_callback.borrow_mut() = None;
+                match WavPlayer::new() {
+                    Ok(p) => {
+                        *player_init.borrow_mut() = Some(p);
+                        play_btn_init.set_sensitive(true);
+                    }
+                    Err(e) => {
+                        log::warn!("audio output unavailable, play button disabled: {}", e);
+                    }
                 }
             });
+            *source.borrow_mut() = Some(id);
         }
 
         main_loop.run();
-        window.close();
+        session.clear_navigation_callback();
+        list.disconnect(row_activated_handler);
+        close_btn.disconnect(close_handler);
+        key_ctl.disconnect(key_handler);
+        window.remove_controller(&key_ctl);
+        window.disconnect(window_close_handler);
 
         // Publish the candidate list so the caller can look up the
         // selected index after this thread finishes.
@@ -2085,34 +3002,23 @@ pub(super) async fn pick_with_streaming_gtk(
         }
 
         Ok(())
-    });
+    };
 
     // ── Parallel transcriptions ─────────────────────────────────
     // Fire initial one-shot.
     let done_tx = msg_tx.clone();
     let retry_msg_tx = msg_tx.clone();
 
-    // Read audio samples once for realtime transcribers (shared via Arc).
-    // Also pre-load when deferred streaming models exist — they will
-    // need samples when the user triggers them via the retry channel.
-    let wav_samples = if !realtime_transcribers.is_empty() || has_deferred_realtime {
-        match crate::record::audio::read_audio_as_i16(&audio_path) {
-            Ok(samples) => Some(std::sync::Arc::new(samples)),
-            Err(e) => {
-                log::warn!("failed to read audio for realtime: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Realtime consumers decode on first use. The shared OnceCell keeps
+    // concurrent rows and later retries on one decode for this record.
+    let realtime_samples = RealtimeSamples::new(audio_path.clone());
 
     // Spawn realtime transcription tasks.
     for (provider, model, transcriber) in realtime_transcribers {
         let tx = msg_tx.clone();
-        let samples = wav_samples.clone();
+        let realtime_samples = realtime_samples.clone();
         tokio::spawn(async move {
-            let Some(samples) = samples else {
+            let Some(samples) = realtime_samples.get().await else {
                 let _ = tx.send(PickerMessage::Candidate(Box::new(PickerCandidate::error(
                     provider,
                     model,
@@ -2164,25 +3070,21 @@ pub(super) async fn pick_with_streaming_gtk(
         let audio = audio_path;
         let config = config.clone();
         let tx = retry_msg_tx;
-        let wav_for_retry = wav_samples;
+        let realtime_samples = realtime_samples;
         tokio::spawn(async move {
             while let Some((provider, model, streaming)) = retry_rx.recv().await {
                 log::info!("retrying {}:{} (streaming={})", provider, model, streaming);
                 if streaming {
                     // Realtime retry: re-stream WAV samples.
-                    let samples = match wav_for_retry {
-                        Some(ref s) => s.clone(),
-                        None => {
-                            let _ = tx.send(PickerMessage::Candidate(Box::new(
-                                PickerCandidate::error(
-                                    provider,
-                                    model,
-                                    "WAV samples unavailable".into(),
-                                    true,
-                                ),
-                            )));
-                            continue;
-                        }
+                    let Some(samples) = realtime_samples.get().await else {
+                        let _ =
+                            tx.send(PickerMessage::Candidate(Box::new(PickerCandidate::error(
+                                provider,
+                                model,
+                                "WAV samples unavailable".into(),
+                                true,
+                            ))));
+                        continue;
                     };
                     match transcription::create_realtime_transcriber(
                         config.as_ref(),
@@ -2278,29 +3180,95 @@ pub(super) async fn pick_with_streaming_gtk(
     }
 
     // ── Wait for result ─────────────────────────────────────────
-    let selected_index = sel_rx
+    gtk_window()?;
+
+    let picker_exit = sel_rx
         .await
         .map_err(|_| TalkError::Config("GTK picker closed unexpectedly".into()))?;
 
-    gtk_handle
-        .await
-        .map_err(|e| TalkError::Config(format!("GTK picker task failed: {}", e)))??;
-
-    match selected_index {
-        Some(idx) => {
+    match picker_exit {
+        PickerExit::Selected(idx) => {
             let items = results
                 .lock()
                 .map_err(|_| TalkError::Config("results lock poisoned".into()))?;
             if idx < items.len() {
                 let (_p, _m, t, cached, _is_error, _s, _segments, _metadata) = items[idx].clone();
-                Ok(Some(PickerSelection {
+                Ok(PickerOutcome::Selected(PickerSelection {
                     text: t,
                     is_cached: cached,
                 }))
             } else {
-                Ok(None)
+                Ok(PickerOutcome::Cancelled)
             }
         }
-        None => Ok(None),
+        PickerExit::Navigate(direction) => Ok(PickerOutcome::Navigate(direction)),
+        PickerExit::Cancelled => Ok(PickerOutcome::Cancelled),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrent_realtime_sample_consumers_share_one_decode() {
+        GTK_TEST_REALTIME_DECODES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sine_440_0.5s_mono.m4a");
+        let samples = RealtimeSamples::new(path);
+
+        let (first, second) = tokio::join!(samples.get(), samples.get());
+        let first = first.expect("first consumer receives decoded samples");
+        let second = second.expect("second consumer receives decoded samples");
+
+        assert!(!first.is_empty());
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            GTK_TEST_REALTIME_DECODES.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn persist_selection_clears_dirty_after_successful_write() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let audio_path = temp.path().join("recording.ogg");
+        std::fs::write(&audio_path, b"").expect("audio fixture");
+        let mut ctx = SelectionSaveCtx {
+            audio_path: audio_path.clone(),
+            dirty: true,
+            current: Some((Provider::Mistral, "voxtral-test".to_string(), false)),
+        };
+
+        persist_selection(&mut ctx, "edited transcript").expect("save selection");
+
+        assert!(!ctx.dirty);
+        assert_eq!(
+            crate::recording_cache::read_pick(&audio_path),
+            Some((
+                Provider::Mistral,
+                "voxtral-test".to_string(),
+                false,
+                "edited transcript".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn persist_selection_keeps_dirty_when_write_fails() {
+        let mut ctx = SelectionSaveCtx {
+            audio_path: PathBuf::from("/fixture/recording.ogg"),
+            dirty: true,
+            current: Some((Provider::OpenAI, "whisper-test".to_string(), false)),
+        };
+
+        let result = persist_selection_with(&mut ctx, "edited transcript", |_, _, _, _, _| {
+            Err(TalkError::Config("injected write failure".to_string()))
+        });
+
+        assert!(
+            matches!(result, Err(TalkError::Config(message)) if message == "injected write failure")
+        );
+        assert!(ctx.dirty);
     }
 }
