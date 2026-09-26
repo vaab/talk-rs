@@ -781,20 +781,44 @@ pub struct FlatPasteConfig {
 ///   `chunk_fetch_timeout_ms`).  Behaves byte-for-byte identically
 ///   to pre-refactor `talk-rs`.
 ///
-/// Selection is via `#[serde(untagged)]`: tree parsing is tried
-/// first; if it fails (because no `node:` key is present) the flat
-/// parser runs.  See `tests::test_paste_config_*` for the contract.
+/// Selection is by the presence of a top-level `node:` key: with it the
+/// section is parsed as a tree, without it as the flat form.  Dispatching
+/// explicitly (instead of `#[serde(untagged)]` trial-and-error) lets the
+/// chosen form's own error surface, so a misspelled key is reported by
+/// name rather than as "did not match any variant".
 ///
 /// Both forms parse in every feature set: headless builds share the
 /// user's config file and must accept any valid `paste:` section even
 /// though only `ui` builds can materialise it ([`PasteConfig::build_root`]).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum PasteConfig {
     /// New tree form.  Always carries a `node:` key.
     Tree(PasteNodeConfig),
     /// Legacy flat form.
     Flat(FlatPasteConfig),
+}
+
+impl<'de> Deserialize<'de> for PasteConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let is_tree = value
+            .as_mapping()
+            .is_some_and(|map| map.contains_key("node"));
+        if is_tree {
+            PasteNodeConfig::deserialize(value)
+                .map(Self::Tree)
+                .map_err(|err| D::Error::custom(format!("paste (tree form): {err}")))
+        } else {
+            FlatPasteConfig::deserialize(value)
+                .map(Self::Flat)
+                .map_err(|err| D::Error::custom(format!("paste (flat form): {err}")))
+        }
+    }
 }
 
 impl PasteConfig {
@@ -2189,6 +2213,34 @@ paste: {}
         assert_eq!(paste.chunk_chars(), 90);
         assert_eq!(paste.shortcut(), PasteShortcut::CtrlV);
         assert_eq!(paste.chunk_fetch_timeout_ms(), 700);
+        Ok(())
+    }
+
+    /// A misspelled key in the flat `paste:` form is rejected, and the
+    /// error names the key — a generic "did not match any variant"
+    /// message would leave the user no clue which line is wrong.
+    #[test]
+    fn test_config_paste_flat_unknown_key_error_names_the_key() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+
+        let yaml = indoc! {"
+            output_dir: /tmp/test-output
+            providers: {}
+            paste:
+              chunk_chars: 90
+              chunk_fetch_timout_ms: 700
+        "};
+        let file = write_config(yaml)?;
+
+        let err = match Config::load(Some(file.path())) {
+            Ok(_) => return Err("unknown flat paste key must be rejected".into()),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("unknown field `chunk_fetch_timout_ms`"),
+            "error must name the key, got: {err}"
+        );
         Ok(())
     }
 
