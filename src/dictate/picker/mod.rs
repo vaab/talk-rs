@@ -276,19 +276,7 @@ async fn run_pick_record(
     // selection should skip paste is decided separately at outcome handoff:
     // only the original record can represent text already in the target.
     // Tuple: (provider, model, text, is_primary, streaming)
-    let mut cached_entries: Vec<(Provider, String, String, bool, bool)> = Vec::new();
-    if let Some((ref sp, ref sm, ss)) = selected_key {
-        if let Some(idx) = all_entries
-            .iter()
-            .position(|(p, m, _, s)| p == sp && m == sm && *s == ss)
-        {
-            let (p, m, t, s) = all_entries.remove(idx);
-            cached_entries.push((p, m, t, true, s));
-        }
-    }
-    for (p, m, t, s) in all_entries {
-        cached_entries.push((p, m, t, false, s));
-    }
+    let cached_entries = prioritize_selected_entry(all_entries, selected_key);
 
     log::debug!(
         "picker cache: {} cached entries (primary={})",
@@ -307,18 +295,7 @@ async fn run_pick_record(
 
     // Filter out every (provider, model, streaming) triple that
     // already has a cached result — no need to re-transcribe.
-    let filtered: Vec<(Provider, String, bool)> = candidates
-        .into_iter()
-        .filter(|(p, m, s)| {
-            let dominated = cached_entries
-                .iter()
-                .any(|(cp, cm, _, _, cs)| cp == p && cm == m && cs == s);
-            if dominated {
-                log::debug!("  filtered out (cached): {}:{} (streaming={})", p, m, s);
-            }
-            !dominated
-        })
-        .collect();
+    let filtered = uncached_candidates(candidates, &cached_entries);
     log::debug!(
         "picker: {} transcribers needed (after filtering)",
         filtered.len(),
@@ -445,6 +422,48 @@ async fn run_pick_record(
     Ok(outcome)
 }
 
+type PickerCachedEntry = (Provider, String, String, bool, bool);
+
+fn prioritize_selected_entry(
+    mut entries: Vec<(Provider, String, String, bool)>,
+    selected: Option<PickerCandidateKey>,
+) -> Vec<PickerCachedEntry> {
+    let mut cached = Vec::new();
+    if let Some((provider, model, streaming)) = selected {
+        if let Some(index) = entries
+            .iter()
+            .position(|(p, m, _, s)| *p == provider && *m == model && *s == streaming)
+        {
+            let (p, m, text, s) = entries.remove(index);
+            cached.push((p, m, text, true, s));
+        }
+    }
+    cached.extend(
+        entries
+            .into_iter()
+            .map(|(p, m, text, s)| (p, m, text, false, s)),
+    );
+    cached
+}
+
+fn uncached_candidates(
+    candidates: Vec<PickerCandidateKey>,
+    cached: &[PickerCachedEntry],
+) -> Vec<PickerCandidateKey> {
+    candidates
+        .into_iter()
+        .filter(|(p, m, s)| {
+            let dominated = cached
+                .iter()
+                .any(|(cp, cm, _, _, cs)| cp == p && cm == m && cs == s);
+            if dominated {
+                log::debug!("  filtered out (cached): {}:{} (streaming={})", p, m, s);
+            }
+            !dominated
+        })
+        .collect()
+}
+
 fn split_transcription_candidates<F>(
     filtered: Vec<PickerCandidateKey>,
     is_default: F,
@@ -484,10 +503,10 @@ async fn paste_picker_selection(
         // including picker selections) over recording metadata so
         // that successive picker replacements delete the correct
         // number of characters.
-        recording_cache::read_last_paste_state()?
-            .map(|s| s.char_count)
-            .or(params.replace_char_count)
-            .unwrap_or(0)
+        replacement_char_count(
+            recording_cache::read_last_paste_state()?.map(|s| s.char_count),
+            params.replace_char_count,
+        )
     } else {
         0
     };
@@ -510,6 +529,10 @@ async fn paste_picker_selection(
     Ok(())
 }
 
+fn replacement_char_count(last_paste: Option<usize>, fallback: Option<usize>) -> usize {
+    last_paste.or(fallback).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +546,72 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     const PICKER_TEST_MODEL: &str = "aaa-picker-test";
+
+    #[test]
+    fn saved_pick_stays_primary_and_suppresses_matching_candidate_only() {
+        let picked = (Provider::OpenAI, "gpt-transcribe".to_string(), false);
+        let cached = prioritize_selected_entry(
+            vec![
+                (Provider::Mistral, "voxtral".into(), "other".into(), false),
+                (picked.0, picked.1.clone(), "user edit".into(), false),
+            ],
+            Some(picked.clone()),
+        );
+        assert_eq!(
+            cached[0],
+            (
+                Provider::OpenAI,
+                "gpt-transcribe".into(),
+                "user edit".into(),
+                true,
+                false
+            )
+        );
+        assert_eq!(
+            cached[1],
+            (
+                Provider::Mistral,
+                "voxtral".into(),
+                "other".into(),
+                false,
+                false
+            )
+        );
+        let remaining = uncached_candidates(
+            vec![picked, (Provider::OpenAI, "gpt-transcribe".into(), true)],
+            &cached,
+        );
+        assert_eq!(
+            remaining,
+            vec![(Provider::OpenAI, "gpt-transcribe".into(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn selecting_cached_result_does_not_paste_again() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut params = openai_picker_params(PathBuf::from("unused.ogg"));
+        params.paste_root = Arc::new(RecordingPaste {
+            calls: calls.clone(),
+        });
+        paste_picker_selection(
+            &params,
+            PickerSelection {
+                text: "already delivered".into(),
+                is_cached: true,
+            },
+        )
+        .await
+        .expect("cached selection");
+        assert!(calls.lock().expect("paste calls").is_empty());
+    }
+
+    #[test]
+    fn replacement_prefers_last_paste_character_count() {
+        assert_eq!(replacement_char_count(Some(11), Some(4)), 11);
+        assert_eq!(replacement_char_count(None, Some(4)), 4);
+        assert_eq!(replacement_char_count(None, None), 0);
+    }
 
     struct RecordingPaste {
         calls: Arc<Mutex<Vec<String>>>,

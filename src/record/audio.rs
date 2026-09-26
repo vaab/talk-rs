@@ -617,6 +617,70 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[cfg(feature = "ui")]
+    fn waterfall_fixture() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("audio.m4a");
+        std::fs::copy(fixture("sine_440_0.5s_mono.m4a"), &audio).expect("copy audio fixture");
+        (temp, audio)
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn waterfall_cache_round_trip_reuses_saved_columns() {
+        let (_temp, audio) = waterfall_fixture();
+        let fresh = load_waterfall(&audio).expect("compute waterfall");
+        assert!(!fresh.0.is_empty());
+        assert!(fresh
+            .0
+            .iter()
+            .all(|column| column.len() == fresh.0[0].len()));
+        assert!(fresh.1.is_finite());
+        assert_eq!(read_waterfall_cache(&audio), Some(fresh.clone()));
+        assert_eq!(load_waterfall(&audio).expect("cache hit"), fresh);
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn corrupt_waterfall_cache_is_recomputed_from_audio() {
+        let (_temp, audio) = waterfall_fixture();
+        let expected = load_waterfall(&audio).expect("fresh waterfall");
+        let cache = waterfall_cache_path(&audio);
+        std::fs::write(&cache, [1u8, 2, 3]).expect("truncate cache header");
+        assert_eq!(
+            load_waterfall(&audio).expect("recover corrupt header"),
+            expected
+        );
+        let bytes = std::fs::read(&cache).expect("recomputed cache");
+        std::fs::write(&cache, &bytes[..bytes.len() - 4]).expect("truncate cache payload");
+        assert_eq!(
+            load_waterfall(&audio).expect("recover truncated payload"),
+            expected
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn newer_audio_invalidates_waterfall_cache() {
+        let (_temp, audio) = waterfall_fixture();
+        let expected = load_waterfall(&audio).expect("fresh waterfall");
+        let cache_modified = std::fs::metadata(waterfall_cache_path(&audio))
+            .expect("cache metadata")
+            .modified()
+            .expect("cache mtime");
+        std::fs::File::options()
+            .write(true)
+            .open(&audio)
+            .expect("open audio")
+            .set_modified(cache_modified + std::time::Duration::from_secs(60))
+            .expect("make audio newer");
+        assert_eq!(read_waterfall_cache(&audio), None);
+        assert_eq!(
+            load_waterfall(&audio).expect("recompute stale cache"),
+            expected
+        );
+    }
+
     /// Absolute path to the project's `tests/fixtures/` directory.
     ///
     /// Anchored on `CARGO_MANIFEST_DIR` so the tests work regardless of

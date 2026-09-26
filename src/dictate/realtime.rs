@@ -986,15 +986,12 @@ mod tests {
         let (_chunks, cursor) = buf.read_from(0).await;
         assert_eq!(cursor, 1);
 
-        // Close from another task.
-        let buf2 = Arc::clone(&buf);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            buf2.close();
-        });
-
-        // read_from should return empty once closed.
-        let (chunks, cursor) = buf.read_from(1).await;
+        // Poll the waiter to Pending before closing, rather than guessing
+        // when a spawned task reaches its wait with a fixed delay.
+        let mut waiting = Box::pin(buf.read_from(1));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        buf.close();
+        let (chunks, cursor) = waiting.await;
         assert!(chunks.is_empty());
         assert_eq!(cursor, 1);
     }
@@ -1062,6 +1059,21 @@ mod tests {
         let c2 = rx.recv().await;
         assert_eq!(c1, Some(vec![300]));
         assert!(c2.is_none());
+    }
+
+    #[tokio::test]
+    async fn buffer_feeder_replays_requested_cursor_and_drains_on_close() {
+        let buffer = Arc::new(AudioBuffer::new());
+        buffer.push(vec![10]).await;
+        buffer.push(vec![20]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let feeder = tokio::spawn(buffer_feeder(Arc::clone(&buffer), tx, 1));
+        assert_eq!(rx.recv().await, Some(vec![20]));
+        buffer.push(vec![30]).await;
+        buffer.close();
+        assert_eq!(rx.recv().await, Some(vec![30]));
+        assert_eq!(rx.recv().await, None);
+        feeder.await.expect("feeder completed");
     }
 
     fn read_ogg_packets(path: &std::path::Path) -> Vec<Vec<u8>> {
@@ -1164,7 +1176,7 @@ mod tests {
         // Kill the feeder by dropping the receiver.
         drop(fwd_rx);
         // Wait for feeder to notice and exit.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), feeder).await;
+        feeder.await.expect("feeder stopped when downstream closed");
 
         // Send more audio AFTER the feeder died — OGG must still record.
         tx.send(vec![30; 320])
@@ -1177,6 +1189,16 @@ mod tests {
         // All 3 chunks must be encoded into the OGG stream.
         let packets = read_ogg_packets(&ogg_path);
         assert_eq!(packets.len(), 5);
+
+        let mut source =
+            crate::audio::file_source::OggFileSource::new(&ogg_path).expect("valid cached OGG");
+        let mut decoded_rx = source.start().expect("decode cached OGG");
+        let mut decoded = Vec::new();
+        while let Some(chunk) = decoded_rx.recv().await {
+            decoded.extend(chunk);
+        }
+        assert!(decoded.len().abs_diff(3 * 320) <= 320);
+        assert!(decoded.iter().any(|sample| *sample != 0));
 
         // All 3 chunks must be in the buffer.
         let (chunks, _) = buffer.read_from(0).await;

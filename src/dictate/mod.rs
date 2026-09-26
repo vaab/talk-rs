@@ -81,6 +81,10 @@ impl StartTiming {
     }
 }
 
+fn should_paste_oneshot(text: &str, realtime: bool, no_paste: bool) -> bool {
+    !text.is_empty() && !realtime && !no_paste
+}
+
 /// Dictate: record audio, transcribe, and paste into focused application.
 pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Toggle mode: start or stop a daemon
@@ -885,7 +889,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     // Paste into focused application (one-shot mode only;
     // realtime mode pastes per-segment during recording)
-    if !opts.realtime && !opts.no_paste {
+    if should_paste_oneshot(&text, opts.realtime, opts.no_paste) {
         // Keep the overlay visible during paste so the phase layer
         // continues to show.  Emit telemetry events so consumers
         // can track the paste duration on the time axis.
@@ -937,90 +941,13 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn test_dictate_pipeline_with_mocks() {
-        use crate::audio::mock::MockAudioCapture;
-        use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
-        use crate::clipboard::{Clipboard, MockClipboard};
-        use crate::config::AudioConfig;
-        use crate::transcription::{MockOneShotTranscriber, OneShotTranscriber, TranscriptionBody};
+    use super::should_paste_oneshot;
 
-        let audio_config = AudioConfig::new();
-
-        // Initialize mock capture
-        let mut capture =
-            MockAudioCapture::new(audio_config.sample_rate, audio_config.channels, 440.0);
-        let audio_rx = capture.start().expect("start capture");
-
-        // Initialize writer
-        let mut writer = OggOpusWriter::new(audio_config).expect("create writer");
-
-        // Create stream channel
-        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(25);
-
-        // Spawn encode task (process a few chunks then stop)
-        let encode_task = tokio::spawn(async move {
-            let mut rx = audio_rx;
-            let mut count = 0;
-            let header = writer.header().expect("header");
-            if stream_tx.send(header).await.is_err() {
-                return;
-            }
-            while let Some(pcm_chunk) = rx.recv().await {
-                let encoded = writer.write_pcm(&pcm_chunk).expect("encode");
-                if !encoded.is_empty() && stream_tx.send(encoded).await.is_err() {
-                    break;
-                }
-                count += 1;
-                if count >= 3 {
-                    break;
-                }
-            }
-            // Finalize
-            let remaining = writer.finalize().expect("finalize");
-            if !remaining.is_empty() {
-                let _ = stream_tx.send(remaining).await;
-            }
-            // stream_tx dropped here
-        });
-
-        // Spawn transcription with mock
-        let transcriber = MockOneShotTranscriber::new("Hello world from dictation");
-        let transcribe_task = tokio::spawn(async move {
-            transcriber
-                .fetch_transcription(TranscriptionBody::Pipe {
-                    chunks: stream_rx,
-                    file_name: "audio.ogg".to_string(),
-                })
-                .await
-        });
-
-        // Wait for encode to finish
-        encode_task.await.expect("encode task");
-
-        // Stop capture
-        capture.stop().expect("stop capture");
-
-        // Get transcription
-        let result = transcribe_task
-            .await
-            .expect("transcribe task")
-            .expect("transcription");
-        let text = result.text;
-        assert_eq!(text, "Hello world from dictation");
-
-        // Test clipboard operations with mock
-        let clipboard = MockClipboard::with_content("original");
-        let saved = clipboard.get_text().await.expect("get clipboard");
-        assert_eq!(saved, "original");
-
-        clipboard.set_text(&text).await.expect("set clipboard");
-        let current = clipboard.get_text().await.expect("get clipboard");
-        assert_eq!(current, "Hello world from dictation");
-
-        // Restore
-        clipboard.set_text(&saved).await.expect("restore clipboard");
-        let restored = clipboard.get_text().await.expect("get clipboard");
-        assert_eq!(restored, "original");
+    #[test]
+    fn empty_transcript_never_reaches_oneshot_paste() {
+        assert!(!should_paste_oneshot("", false, false));
+        assert!(should_paste_oneshot("recognized", false, false));
+        assert!(!should_paste_oneshot("recognized", true, false));
+        assert!(!should_paste_oneshot("recognized", false, true));
     }
 }

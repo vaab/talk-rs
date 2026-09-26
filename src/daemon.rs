@@ -553,6 +553,15 @@ mod tests {
         dir.path().join("daemon.pid")
     }
 
+    fn reaped_child_pid() -> u32 {
+        let mut child = Command::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("reap short-lived child");
+        pid
+    }
+
     #[test]
     fn test_check_status_no_file() {
         let dir = TempDir::new().expect("create temp dir");
@@ -577,8 +586,7 @@ mod tests {
         let dir = TempDir::new().expect("create temp dir");
         let path = test_pid_path(&dir);
 
-        // Write a PID that almost certainly doesn't exist
-        write_pid_file(&path, 4_000_000).expect("write pid");
+        write_pid_file(&path, reaped_child_pid()).expect("write pid");
 
         let status = check_status(&path).expect("check status");
         assert_eq!(status, DaemonStatus::NotRunning);
@@ -638,8 +646,7 @@ mod tests {
 
     #[test]
     fn test_is_process_alive_dead() {
-        // PID 4000000 is almost certainly not alive
-        assert!(!is_process_alive(4_000_000));
+        assert!(!is_process_alive(reaped_child_pid()));
     }
 
     #[test]
@@ -661,7 +668,7 @@ mod tests {
         let dir = TempDir::new().expect("create temp dir");
         let dictate = DaemonSlot::<DictateDaemon>::in_dir(dir.path());
         let record = DaemonSlot::<RecordDaemon>::in_dir(dir.path());
-        fs::write(dictate.pid_path(), "4000000\n").expect("write dictate pid");
+        write_pid_file(&dictate.pid_path(), reaped_child_pid()).expect("write dictate pid");
         fs::write(record.pid_path(), format!("{}\n", std::process::id()))
             .expect("write record pid");
 
@@ -672,6 +679,26 @@ mod tests {
         );
         assert!(!dictate.pid_path().exists());
         assert!(record.pid_path().exists());
+        // With the stale entry gone, the next start owns a clean slot.
+        write_pid_file(&dictate.pid_path(), std::process::id()).expect("publish new owner");
+        assert_eq!(
+            dictate_lock.status().expect("new status"),
+            SlotStatus::Running(DaemonProcess {
+                pid: std::process::id(),
+                marker: PhantomData
+            })
+        );
+        assert_eq!(
+            record
+                .acquire_lock()
+                .expect("independent lock")
+                .status()
+                .expect("record status"),
+            SlotStatus::Running(DaemonProcess {
+                pid: std::process::id(),
+                marker: PhantomData
+            })
+        );
     }
 
     #[test]
@@ -776,6 +803,21 @@ mod tests {
         assert!(dictate.cleanup_if_owner(owner).expect("cleanup dictate"));
         assert!(!dictate.pid_path().exists());
         assert!(record.pid_path().exists());
+    }
+
+    #[test]
+    fn owner_guard_keeps_replacement_pid_in_same_slot() {
+        let dir = TempDir::new().expect("tempdir");
+        let slot = DaemonSlot::<DictateDaemon>::in_dir(dir.path());
+        write_pid_file(&slot.pid_path(), std::process::id()).expect("original owner");
+        let guard = slot.owner_guard();
+        let replacement = reaped_child_pid();
+        write_pid_file(&slot.pid_path(), replacement).expect("replacement owner");
+        drop(guard);
+        assert_eq!(
+            read_pid_file(&slot.pid_path()).expect("replacement remains"),
+            Some(replacement)
+        );
     }
 
     #[tokio::test]

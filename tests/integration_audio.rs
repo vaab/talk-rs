@@ -21,6 +21,7 @@ fn test_audio_config() -> AudioConfig {
 }
 
 #[test]
+#[ignore = "requires an audio input device"]
 fn test_default_input_device_exists() {
     let host = cpal::default_host();
     let device = host

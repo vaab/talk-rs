@@ -50,7 +50,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 /// format matches the ``memo`` tool so recordings from both tools can
 /// coexist in the same directory.
 #[cfg(feature = "capture")]
-fn default_filename() -> String {
+pub fn default_filename() -> String {
     let now = Local::now();
     now.format("%Y-%m-%dT%H-%M-%S%z.ogg").to_string()
 }

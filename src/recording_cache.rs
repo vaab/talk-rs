@@ -1083,6 +1083,14 @@ pub fn read_metadata_brief(path: &std::path::Path) -> Result<RecordingMetadataBr
 
 pub fn write_last_paste_state(window_id: Option<&str>, text: &str) -> Result<PathBuf, TalkError> {
     let dir = ensure_recordings_dir()?;
+    write_last_paste_state_in_dir(&dir, window_id, text)
+}
+
+fn write_last_paste_state_in_dir(
+    dir: &Path,
+    window_id: Option<&str>,
+    text: &str,
+) -> Result<PathBuf, TalkError> {
     let state = LastPasteState {
         timestamp: Local::now().format("%Y-%m-%dT%H-%M-%S%z").to_string(),
         char_count: text.chars().count(),
@@ -1121,11 +1129,14 @@ pub fn rotate_cache() -> Result<(), TalkError> {
         Ok(d) if d.exists() => d,
         _ => return Ok(()), // Nothing to rotate
     };
+    rotate_cache_in_dir(&dir, MAX_CACHED_RECORDINGS)
+}
 
+fn rotate_cache_in_dir(dir: &Path, keep: usize) -> Result<(), TalkError> {
     // Collect OGG files sorted by name (which is timestamp-based,
     // so lexicographic order == chronological order).
     let mut oggs: Vec<PathBuf> = Vec::new();
-    let entries = fs::read_dir(&dir).map_err(|e| {
+    let entries = fs::read_dir(dir).map_err(|e| {
         TalkError::Config(format!(
             "failed to read recordings directory {}: {}",
             dir.display(),
@@ -1149,12 +1160,12 @@ pub fn rotate_cache() -> Result<(), TalkError> {
     oggs.sort();
 
     // If within limit, nothing to do
-    if oggs.len() <= MAX_CACHED_RECORDINGS {
+    if oggs.len() <= keep {
         return Ok(());
     }
 
     // Remove oldest entries beyond the limit
-    let to_remove = oggs.len() - MAX_CACHED_RECORDINGS;
+    let to_remove = oggs.len() - keep;
     for ogg_path in &oggs[..to_remove] {
         // Extract the timestamp prefix from the OGG filename
         let stem = ogg_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -1168,7 +1179,7 @@ pub fn rotate_cache() -> Result<(), TalkError> {
 
         // Delete all matching YAML files (same timestamp prefix)
         if !stem.is_empty() {
-            if let Ok(entries) = fs::read_dir(&dir) {
+            if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1473,6 +1484,137 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_writer_preserves_realtime_diagnostics_and_omits_absent_fields() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = dir.path().join("realtime.ogg");
+        fs::write(&audio, b"audio").expect("audio");
+        let mut result = TranscriptionResult {
+            text: "bonjour".into(),
+            metadata: TranscriptionMetadata {
+                session_elapsed_ms: Some(42),
+                provider_specific: Some(ProviderSpecificMetadata::OpenAI(OpenAIProviderMetadata {
+                    realtime: Some(OpenAIRealtimeMetadata {
+                        session_id: Some("sess_1".into()),
+                        event_counts: std::collections::BTreeMap::from([("completed".into(), 2)]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let path = TranscriptionCache::store(&audio, Provider::OpenAI, "gpt-live", true, &result)
+            .expect("store");
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(path).expect("read")).expect("yaml");
+        let api = &yaml["provider_api"]["openai"];
+        assert_eq!(api["realtime"]["session_id"].as_str(), Some("sess_1"));
+        assert_eq!(
+            api["realtime"]["event_counts"]["completed"].as_u64(),
+            Some(2)
+        );
+        assert!(api["realtime"].get("conversation_id").is_none());
+        assert!(api.get("mistral").is_none());
+        assert!(yaml.get("segments").is_none());
+        assert!(yaml.get("diarization").is_none());
+        assert_eq!(
+            TranscriptionCache::get(&audio, Provider::OpenAI, "gpt-live")
+                .expect("cached")
+                .metadata
+                .session_elapsed_ms,
+            Some(42)
+        );
+
+        result.metadata = TranscriptionMetadata::default();
+        let minimal = TranscriptionCache::store(&audio, Provider::OpenAI, "empty", false, &result)
+            .expect("store minimal");
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(minimal).expect("read")).expect("yaml");
+        assert!(yaml.get("metadata").is_none());
+        assert!(yaml.get("provider_api").is_none());
+    }
+
+    #[test]
+    fn sidecar_writer_preserves_mistral_optional_payload() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = dir.path().join("meeting.ogg");
+        fs::write(&audio, b"audio").expect("audio");
+        let result = TranscriptionResult {
+            text: "hello".into(),
+            metadata: TranscriptionMetadata {
+                provider_specific: Some(ProviderSpecificMetadata::Mistral(
+                    MistralProviderMetadata {
+                        model: Some("voxtral".into()),
+                        usage_raw: Some(serde_json::json!({"tokens": 7})),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+            segments: Some(vec![crate::transcription::TranscriptSegment {
+                start: 0.25,
+                end: 1.5,
+                text: "hello".into(),
+            }]),
+            diarization: Some(vec![crate::transcription::DiarizationSegment {
+                speaker: "speaker_1".into(),
+                start: 0.25,
+                end: 1.5,
+                text: "hello".into(),
+            }]),
+        };
+        let path = TranscriptionCache::store(&audio, Provider::Mistral, "voxtral", false, &result)
+            .expect("store");
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(path).expect("read")).expect("yaml");
+        assert_eq!(
+            yaml["provider_api"]["mistral"]["usage"]["tokens"].as_u64(),
+            Some(7)
+        );
+        assert!(yaml["provider_api"].get("openai").is_none());
+        let cached = TranscriptionCache::get(&audio, Provider::Mistral, "voxtral").expect("cached");
+        assert_eq!(cached.segments, result.segments);
+        assert_eq!(cached.diarization, result.diarization);
+    }
+
+    #[test]
+    fn cache_reads_legacy_sidecar_when_newer_format_is_corrupt() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = dir.path().join("legacy.ogg");
+        fs::write(&audio, b"audio").expect("audio");
+        fs::write(
+            dir.path().join("legacy_openai_whisper-1_oneshot.yml"),
+            "invalid: [",
+        )
+        .expect("corrupt preferred sidecar");
+        fs::write(
+            dir.path().join("legacy_openai_whisper-1_batch.yml"),
+            sample_metadata("old transcript", "openai", "whisper-1", false),
+        )
+        .expect("legacy sidecar");
+
+        assert_eq!(
+            TranscriptionCache::get(&audio, Provider::OpenAI, "whisper-1")
+                .expect("legacy cache hit")
+                .text,
+            "old transcript"
+        );
+    }
+
+    #[test]
+    fn last_paste_counts_unicode_scalars_not_utf8_bytes() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = write_last_paste_state_in_dir(dir.path(), Some("42"), "é猫🙂")
+            .expect("save paste state");
+        let state: LastPasteState =
+            serde_yaml::from_str(&fs::read_to_string(path).expect("read")).expect("parse");
+        assert_eq!(state.char_count, 3);
+        assert_eq!(state.text, "é猫🙂");
+        assert_eq!(state.window_id.as_deref(), Some("42"));
+    }
+
+    #[test]
     fn test_rotate_cache_removes_oldest() {
         let dir = TempDir::new().expect("create temp dir");
         let rec_dir = dir.path();
@@ -1487,7 +1629,7 @@ mod tests {
         }
 
         // Manually run rotation on this directory
-        rotate_in_dir(rec_dir, MAX_CACHED_RECORDINGS).expect("rotate");
+        rotate_cache_in_dir(rec_dir, MAX_CACHED_RECORDINGS).expect("rotate");
 
         // Count remaining OGG files
         let remaining_oggs: Vec<_> = fs::read_dir(rec_dir)
@@ -1530,7 +1672,7 @@ mod tests {
             .expect("write selection");
         }
 
-        rotate_in_dir(rec_dir, MAX_CACHED_RECORDINGS).expect("rotate");
+        rotate_cache_in_dir(rec_dir, MAX_CACHED_RECORDINGS).expect("rotate");
 
         assert!(!rec_dir.join("2026-02-01T12-00-00.pick.yml").exists());
         assert!(!rec_dir.join("2026-02-02T12-00-00.pick.yml").exists());
@@ -1549,7 +1691,7 @@ mod tests {
             fs::write(&ogg, "fake ogg").expect("write ogg");
         }
 
-        rotate_in_dir(rec_dir, MAX_CACHED_RECORDINGS).expect("rotate");
+        rotate_cache_in_dir(rec_dir, MAX_CACHED_RECORDINGS).expect("rotate");
 
         let remaining: Vec<_> = fs::read_dir(rec_dir)
             .expect("read dir")
@@ -1562,7 +1704,47 @@ mod tests {
     #[test]
     fn test_rotate_cache_empty_dir() {
         let dir = TempDir::new().expect("create temp dir");
-        rotate_in_dir(dir.path(), MAX_CACHED_RECORDINGS).expect("rotate");
+        rotate_cache_in_dir(dir.path(), MAX_CACHED_RECORDINGS).expect("rotate");
+    }
+
+    #[test]
+    fn rotation_preserves_last_pointer_and_its_newest_target() {
+        let dir = TempDir::new().expect("tempdir");
+        for n in 1..=3 {
+            let stem = format!("2026-02-{n:02}");
+            fs::write(dir.path().join(format!("{stem}.ogg")), b"audio").expect("audio");
+            fs::write(
+                dir.path()
+                    .join(format!("{stem}_openai_whisper_oneshot.yml")),
+                b"meta",
+            )
+            .expect("sidecar");
+        }
+        let target = dir.path().join("2026-02-03.ogg");
+        symlink(&target, dir.path().join(LAST_RECORDING_POINTER)).expect("audio pointer");
+        symlink(
+            dir.path().join("2026-02-03_openai_whisper_oneshot.yml"),
+            dir.path().join(LAST_METADATA_POINTER),
+        )
+        .expect("metadata pointer");
+
+        rotate_cache_in_dir(dir.path(), 1).expect("rotate");
+
+        assert_eq!(
+            fs::read_link(dir.path().join(LAST_RECORDING_POINTER)).expect("pointer"),
+            target
+        );
+        assert!(target.exists());
+        assert!(dir.path().join(LAST_METADATA_POINTER).exists());
+        assert!(!dir.path().join("2026-02-01.ogg").exists());
+        assert!(!dir
+            .path()
+            .join("2026-02-01_openai_whisper_oneshot.yml")
+            .exists());
+        assert!(dir
+            .path()
+            .join("2026-02-03_openai_whisper_oneshot.yml")
+            .exists());
     }
 
     #[test]
@@ -1804,56 +1986,6 @@ mod tests {
 
         // No lock to begin with — should not error.
         release_pick_lock(&audio_path).expect("release missing lock");
-    }
-
-    /// Testable rotation function that operates on an arbitrary directory.
-    fn rotate_in_dir(dir: &std::path::Path, max: usize) -> Result<(), TalkError> {
-        let mut oggs: Vec<PathBuf> = Vec::new();
-        let entries = fs::read_dir(dir).map_err(|e| {
-            TalkError::Config(format!(
-                "failed to read recordings directory {}: {}",
-                dir.display(),
-                e
-            ))
-        })?;
-
-        for entry in entries {
-            let entry = entry
-                .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("ogg") {
-                oggs.push(path);
-            }
-        }
-
-        oggs.sort();
-
-        if oggs.len() <= max {
-            return Ok(());
-        }
-
-        let to_remove = oggs.len() - max;
-        for ogg_path in &oggs[..to_remove] {
-            let stem = ogg_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-
-            let _ = fs::remove_file(ogg_path);
-
-            if !stem.is_empty() {
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if name.starts_with(stem)
-                            && path.extension().and_then(|e| e.to_str()) == Some("yml")
-                        {
-                            let _ = fs::remove_file(&path);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     #[test]

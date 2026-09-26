@@ -296,13 +296,20 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
     let t = std::time::Instant::now();
     let config = Config::load(None)?;
     log::debug!("list_audio: config load {:.0?}", t.elapsed());
-    let dir = config.output_dir.clone();
+    list_ogg_recordings_in_dir(&config.output_dir, &config)
+}
+
+fn list_ogg_recordings_in_dir(
+    dir: &Path,
+    config: &Config,
+) -> Result<Vec<RecordingEntry>, TalkError> {
+    let t = std::time::Instant::now();
     if !dir.exists() {
         return Ok(Vec::new());
     }
 
     let mut audio: Vec<PathBuf> = Vec::new();
-    collect_audio_recursive(&dir, &mut audio)?;
+    collect_audio_recursive(dir, &mut audio)?;
 
     // Sort by file name (the timestamp-bearing basename) rather than by
     // full path.  This keeps chronological ordering correct when flat
@@ -335,7 +342,7 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
         // show "transcription ongoing".
         let status = match crate::recording_cache::get_transcript(&audio_path) {
             status @ crate::recording_cache::TranscriptStatus::InProgress => status,
-            _ => match crate::transcription::read_cached_transcript(&audio_path, &config) {
+            _ => match crate::transcription::read_cached_transcript(&audio_path, config) {
                 Some(text) => crate::recording_cache::TranscriptStatus::Available(text),
                 None => crate::recording_cache::TranscriptStatus::NotAvailable,
             },
@@ -366,16 +373,23 @@ pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
 
 /// Gather dictation cache entries (with companion YML), sorted newest-first.
 pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
-    let t = std::time::Instant::now();
     let config = Config::load(None)?;
     let dir = recording_cache::recordings_dir()?;
+    list_cache_recordings_in_dir(&dir, &config)
+}
+
+fn list_cache_recordings_in_dir(
+    dir: &Path,
+    config: &Config,
+) -> Result<Vec<RecordingEntry>, TalkError> {
+    let t = std::time::Instant::now();
     if !dir.exists() {
         return Ok(Vec::new());
     }
 
     // The cache is intentionally flat and symlinks such as
     // `last_recording.ogg` are not separate browser entries.
-    let mut audio = collect_audio_flat(&dir)?;
+    let mut audio = collect_audio_flat(dir)?;
     sort_recording_paths_newest_first(&mut audio);
 
     let mut result = Vec::with_capacity(audio.len());
@@ -398,7 +412,7 @@ pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> 
         // sidecar (no API call).
         let status = match recording_cache::get_transcript(&audio_path) {
             status @ recording_cache::TranscriptStatus::InProgress => status,
-            _ => match crate::transcription::read_cached_transcript(&audio_path, &config) {
+            _ => match crate::transcription::read_cached_transcript(&audio_path, config) {
                 Some(text) => recording_cache::TranscriptStatus::Available(text),
                 None => recording_cache::TranscriptStatus::NotAvailable,
             },
@@ -432,6 +446,10 @@ pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> 
 /// For cache audio files, also removes matching `*_<model>.yml`
 /// companion files.
 pub(super) fn delete_recording(file_path: &std::path::Path) -> Result<(), TalkError> {
+    delete_recording_in_dir(file_path, recording_cache::recordings_dir().ok().as_deref())
+}
+
+fn delete_recording_in_dir(file_path: &Path, dir: Option<&Path>) -> Result<(), TalkError> {
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
@@ -448,9 +466,9 @@ pub(super) fn delete_recording(file_path: &std::path::Path) -> Result<(), TalkEr
     // native `.ogg` recordings.
     let is_known_audio = ext == "wav" || AUDIO_EXTENSIONS.contains(&ext);
     if is_known_audio && !stem.is_empty() {
-        if let Ok(dir) = recording_cache::recordings_dir() {
+        if let Some(dir) = dir {
             // Remove companion YAML files (<stem>_*.yml and <stem>.pick.yml).
-            if let Ok(entries) = std::fs::read_dir(&dir) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -502,6 +520,152 @@ pub(super) fn open_in_file_manager(file_path: &std::path::Path, parent_window: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{MistralConfig, ProvidersConfig};
+    use crate::recording_cache::TranscriptionCache;
+    use crate::transcription::TranscriptionResult;
+
+    fn listing_config(root: &Path) -> Config {
+        Config {
+            output_dir: root.to_path_buf(),
+            providers: ProvidersConfig {
+                mistral: Some(MistralConfig {
+                    api_key: "test-key".into(),
+                    url: None,
+                    model: "voxtral-mini-2507".into(),
+                    context_bias: None,
+                    tts_model: "voxtral-mini-tts-latest".into(),
+                    tts_voice: None,
+                    tts_voices: None,
+                }),
+                openai: None,
+                parakeet: None,
+                kokoro: None,
+            },
+            indicators: None,
+            transcription: None,
+            speak: None,
+            paste: None,
+            audio: None,
+            recording: None,
+        }
+    }
+
+    fn cached_text(path: &Path, text: &str) {
+        TranscriptionCache::store(
+            path,
+            crate::config::Provider::Mistral,
+            "voxtral-mini-2507",
+            false,
+            &TranscriptionResult {
+                text: text.into(),
+                ..TranscriptionResult::default()
+            },
+        )
+        .expect("write sidecar");
+    }
+
+    #[test]
+    fn assembled_output_entries_mix_flat_imports_and_nested_recordings_newest_first() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old = temp.path().join("2026-04-01T10-00-00+0200.m4a");
+        let nested = temp.path().join("2026/04");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        let new = nested.join("2026-04-02T10-00-00+0200.ogg");
+        std::fs::write(&old, b"import").expect("import");
+        std::fs::write(&new, b"recording").expect("recording");
+        cached_text(&old, "sidecar text");
+        recording_cache::write_pick(&old, "mistral", "voxtral-mini-2507", false, "edited\ntext")
+            .expect("pick");
+
+        let rows = list_ogg_recordings_in_dir(temp.path(), &listing_config(temp.path()))
+            .expect("assembled rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path, new);
+        assert_eq!(rows[0].date_label, "2026-04-02 10:00:00");
+        assert_eq!(
+            rows[0].status,
+            recording_cache::TranscriptStatus::NotAvailable
+        );
+        assert_eq!(rows[0].size_label, "9 B");
+        assert_eq!(rows[1].path, old);
+        assert_eq!(
+            rows[1].status,
+            recording_cache::TranscriptStatus::Available("edited\ntext".into())
+        );
+        assert_eq!(rows[1].transcript_full, "edited text");
+        assert_eq!(rows[1].transcript_preview, "edited text");
+    }
+
+    #[test]
+    fn assembled_cache_entry_prefers_active_pick_lock_over_sidecar_and_pick() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("2026-04-02T10-00-00+0200.ogg");
+        std::fs::write(&audio, b"audio").expect("audio");
+        cached_text(&audio, "sidecar text");
+        recording_cache::write_pick(&audio, "mistral", "voxtral-mini-2507", false, "old pick")
+            .expect("pick");
+        recording_cache::acquire_pick_lock(&audio).expect("pick lock");
+
+        let rows = list_cache_recordings_in_dir(temp.path(), &listing_config(temp.path()))
+            .expect("assembled rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status,
+            recording_cache::TranscriptStatus::InProgress
+        );
+        assert_eq!(
+            (&*rows[0].transcript_full, &*rows[0].transcript_preview),
+            ("", "")
+        );
+    }
+
+    #[test]
+    fn assembled_cache_entry_falls_back_to_default_sidecar() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("2026-04-02T10-00-00+0200.ogg");
+        std::fs::write(&audio, b"audio").expect("audio");
+        cached_text(&audio, "sidecar text");
+
+        let rows = list_cache_recordings_in_dir(temp.path(), &listing_config(temp.path()))
+            .expect("assembled rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status,
+            recording_cache::TranscriptStatus::Available("sidecar text".into())
+        );
+        assert_eq!(rows[0].transcript_full, "sidecar text");
+    }
+
+    #[test]
+    fn deletion_removes_audio_sidecars_and_waterfall() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("memo.ogg");
+        let pick = temp.path().join("memo.pick.yml");
+        let sidecar = temp.path().join("memo_mistral_model_oneshot.yml");
+        let waterfall = temp.path().join("memo.wf");
+        for path in [&audio, &pick, &sidecar, &waterfall] {
+            std::fs::write(path, b"fixture").expect("fixture");
+        }
+        delete_recording_in_dir(&audio, Some(temp.path())).expect("delete");
+        for path in [&audio, &pick, &sidecar, &waterfall] {
+            assert!(!path.exists(), "{} should be removed", path.display());
+        }
+    }
+
+    #[test]
+    #[ignore = "BUG: deletion matches YAML sidecars by raw stem prefix and removes another recording's metadata"]
+    fn deletion_preserves_similarly_prefixed_recording() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("memo.ogg");
+        let other = temp.path().join("memo-extra.ogg");
+        let other_pick = temp.path().join("memo-extra.pick.yml");
+        for path in [&audio, &other, &other_pick] {
+            std::fs::write(path, b"fixture").expect("fixture");
+        }
+        delete_recording_in_dir(&audio, Some(temp.path())).expect("delete");
+        assert!(other.exists());
+        assert!(other_pick.exists(), "another recording's pick must survive");
+    }
 
     #[test]
     fn transcript_variants_empty_stays_empty() {

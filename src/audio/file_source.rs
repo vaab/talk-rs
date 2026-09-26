@@ -535,7 +535,7 @@ async fn read_ogg_chunks(
 mod tests {
     use super::*;
     use crate::audio::AudioWriter;
-    use crate::audio::WavWriter;
+    use crate::audio::{OggOpusWriter, WavWriter};
     use tempfile::NamedTempFile;
 
     /// Create a valid 16kHz mono 16-bit WAV file with synthetic PCM data.
@@ -563,6 +563,155 @@ mod tests {
         std::io::Write::write_all(&mut file, &final_header).expect("write final header");
 
         file
+    }
+
+    fn sine_samples(num_samples: usize) -> Vec<i16> {
+        (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                (f32::sin(2.0 * std::f32::consts::PI * 440.0 * t) * 10000.0) as i16
+            })
+            .collect()
+    }
+
+    fn create_test_ogg(samples: &[i16]) -> NamedTempFile {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        let mut writer = OggOpusWriter::new(AudioConfig::new()).expect("create OGG writer");
+        std::io::Write::write_all(&mut file, &writer.header().expect("OGG header"))
+            .expect("write header");
+        std::io::Write::write_all(&mut file, &writer.write_pcm(samples).expect("encode PCM"))
+            .expect("write PCM");
+        std::io::Write::write_all(&mut file, &writer.finalize().expect("finalize OGG"))
+            .expect("write tail");
+        file
+    }
+
+    #[test]
+    fn wav_constructor_rejects_truncated_format_and_wrong_channel_count() {
+        let valid = create_test_wav(320);
+        let bytes = std::fs::read(valid.path()).expect("read WAV");
+        let mut truncated = NamedTempFile::new().expect("temp WAV");
+        std::io::Write::write_all(&mut truncated, &bytes[..30]).expect("write truncated fmt");
+        let error = WavFileSource::new(truncated.path(), &AudioConfig::new())
+            .err()
+            .expect("truncated fmt must fail at construction");
+        assert!(error.to_string().contains("truncated fmt chunk"), "{error}");
+
+        let mut stereo = bytes;
+        stereo[22..24].copy_from_slice(&2u16.to_le_bytes());
+        let mut wrong_channels = NamedTempFile::new().expect("temp WAV");
+        std::io::Write::write_all(&mut wrong_channels, &stereo).expect("write stereo header");
+        let error = WavFileSource::new(wrong_channels.path(), &AudioConfig::new())
+            .err()
+            .expect("wrong channel count must fail at construction");
+        assert!(
+            error.to_string().contains("expected 1 channel(s), got 2"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wav_source_delivers_exact_pcm_including_partial_final_chunk_then_closes() {
+        let expected = sine_samples(2 * 320 + 73);
+        let file = create_test_wav(expected.len());
+        let mut source = WavFileSource::new(file.path(), &AudioConfig::new()).expect("source");
+        let mut receiver = source.start().expect("start");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            chunks.push(chunk);
+        }
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![320, 320, 73]
+        );
+        assert_eq!(chunks.concat(), expected);
+    }
+
+    #[tokio::test]
+    async fn ogg_source_decodes_audio_in_order_and_closes() {
+        let expected = sine_samples(3 * 320 + 77);
+        let file = create_test_ogg(&expected);
+        let mut source = OggFileSource::new(file.path()).expect("source");
+        let mut receiver = source.start().expect("start");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            chunks.push(chunk);
+        }
+        let decoded = chunks.concat();
+        assert!(decoded.len() >= expected.len());
+        assert!(decoded.len() - expected.len() < 320);
+        assert!(chunks
+            .iter()
+            .all(|chunk| !chunk.is_empty() && chunk.len() <= 320));
+        assert!(decoded.iter().any(|sample| sample.abs() > 1000));
+        // Opus adds pre-roll; check signal polarity/order after the first frame.
+        let aligned: i64 = decoded[320..expected.len()]
+            .iter()
+            .zip(&expected[320..])
+            .map(|(&a, &b)| i64::from(a) * i64::from(b))
+            .sum();
+        assert!(
+            aligned > 0,
+            "decoded signal should retain the input waveform"
+        );
+    }
+
+    #[test]
+    fn ogg_constructor_rejects_non_ogg_and_truncated_header() {
+        let mut invalid = NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(&mut invalid, b"not an ogg").expect("write");
+        let error = OggFileSource::new(invalid.path())
+            .err()
+            .expect("reject invalid OGG");
+        assert!(error.to_string().contains("OGG header"), "{error}");
+
+        let valid = create_test_ogg(&sine_samples(320));
+        let mut truncated = NamedTempFile::new().expect("temp file");
+        std::io::Write::write_all(
+            &mut truncated,
+            &std::fs::read(valid.path()).expect("read")[..8],
+        )
+        .expect("write truncated OGG");
+        assert!(OggFileSource::new(truncated.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn ogg_source_stop_ends_delivery_before_file_exhaustion() {
+        let file = create_test_ogg(&sine_samples(320 * 100));
+        let mut source = OggFileSource::new(file.path()).expect("source");
+        let mut receiver = source.start().expect("start");
+        let first = receiver.recv().await.expect("first chunk");
+        assert_eq!(first.len(), 320);
+        source.stop().expect("stop");
+        let mut received = first.len();
+        while let Some(chunk) = receiver.recv().await {
+            received += chunk.len();
+        }
+        assert!(received < 320 * 100, "stop must end delivery early");
+    }
+
+    /// A recording cut short (crash, full disk) keeps a header that
+    /// declares more PCM than the file holds.  Its audio is still worth
+    /// transcribing: the source delivers every complete sample present,
+    /// then closes, instead of rejecting the file or hanging.
+    #[tokio::test]
+    async fn wav_source_with_truncated_pcm_delivers_available_samples_then_closes() {
+        let expected = sine_samples(320 + 40);
+        let valid = create_test_wav(expected.len());
+        let bytes = std::fs::read(valid.path()).expect("read WAV");
+        let mut truncated = NamedTempFile::new().expect("temp WAV");
+        std::io::Write::write_all(&mut truncated, &bytes[..bytes.len() - 20])
+            .expect("drop the last 10 samples");
+
+        let mut source = WavFileSource::new(truncated.path(), &AudioConfig::new())
+            .expect("truncated PCM is accepted");
+        let mut receiver = source.start().expect("start");
+        let mut delivered = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            delivered.extend(chunk);
+        }
+
+        assert_eq!(delivered, expected[..expected.len() - 10]);
     }
 
     #[test]

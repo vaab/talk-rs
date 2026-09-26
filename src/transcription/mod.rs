@@ -1490,6 +1490,21 @@ providers:
         .expect("write pick");
 
         let config = minimal_config();
+        crate::recording_cache::TranscriptionCache::store(
+            &audio_path,
+            Provider::Mistral,
+            "voxtral-mini-2507",
+            false,
+            &TranscriptionResult {
+                text: "older provider output".into(),
+                ..Default::default()
+            },
+        )
+        .expect("write lower-priority sidecar");
+        assert_eq!(
+            read_cached_transcript(&audio_path, &config),
+            Some("cached text".into())
+        );
         let result = produce_transcript(
             &audio_path,
             &config,
@@ -1520,6 +1535,30 @@ providers:
         )
         .await;
         assert!(matches!(result, Err(TalkError::TranscriptInProgress)));
+    }
+
+    #[test]
+    fn read_cached_transcript_falls_back_to_default_sidecar_without_network() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let audio = dir.path().join("fallback.ogg");
+        std::fs::write(&audio, b"audio").expect("write audio");
+        let config = minimal_config();
+        crate::recording_cache::TranscriptionCache::store(
+            &audio,
+            Provider::Mistral,
+            "voxtral-mini-2507",
+            false,
+            &TranscriptionResult {
+                text: "sidecar transcript".into(),
+                ..Default::default()
+            },
+        )
+        .expect("write sidecar");
+
+        assert_eq!(
+            read_cached_transcript(&audio, &config),
+            Some("sidecar transcript".into())
+        );
     }
 
     #[tokio::test]

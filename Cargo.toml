@@ -145,6 +145,7 @@ ui = [
 ]
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 insta = "1"
 tempfile = "3"
 ## 0.6.5 uses let-chains (Rust 1.88); keep the dev toolchain at the declared MSRV.

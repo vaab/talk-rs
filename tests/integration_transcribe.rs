@@ -10,7 +10,6 @@ use std::path::Path;
 use talk_rs::config::{Config, MistralConfig, Provider, ProvidersConfig};
 use talk_rs::transcription::transcribe_audio;
 use tempfile::TempDir;
-use tokio::io::AsyncWriteExt;
 
 /// Create a minimal WAV file with synthetic PCM data.
 ///
@@ -57,44 +56,6 @@ fn create_test_wav_file(path: &Path) -> std::io::Result<()> {
     file.write_all(&silence)?;
 
     Ok(())
-}
-
-/// Test transcription output writing with a synthetic result.
-///
-/// This test verifies that:
-/// 1. Output is correctly written to a file
-/// 2. File content matches the transcribed text
-#[tokio::test]
-async fn test_transcribe_with_mock_writes_to_file() {
-    // Create temporary directory for test files
-    let temp_dir = TempDir::new().expect("create temp dir");
-
-    // Create a temporary input audio file
-    let input_path = temp_dir.path().join("test-audio.wav");
-    fs::write(&input_path, b"fake audio data").expect("write input file");
-
-    // Create output path
-    let output_path = temp_dir.path().join("transcript.txt");
-
-    let transcription = talk_rs::transcription::TranscriptionResult {
-        text: "This is a test transcription from mock".to_string(),
-        metadata: Default::default(),
-        diarization: None,
-        segments: None,
-    };
-
-    // Write output (simulating what transcribe() does)
-    let mut file = tokio::fs::File::create(&output_path)
-        .await
-        .expect("create output file");
-    file.write_all(transcription.text.as_bytes())
-        .await
-        .expect("write to file");
-    file.sync_all().await.expect("sync file");
-
-    // Verify output file was created and has correct content
-    let content = fs::read_to_string(&output_path).expect("read output file");
-    assert_eq!(content, "This is a test transcription from mock");
 }
 
 /// Test that public transcribe entry point reports cache-only misses.

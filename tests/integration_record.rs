@@ -86,18 +86,16 @@ async fn test_record_with_mock_capture_creates_file() {
 /// The default filename is an ISO 8601 local datetime with a numeric
 /// timezone offset (e.g. `2026-04-11T13-15-52+0200.ogg`), matching the
 /// `memo` tool's naming scheme.  This test verifies that the filename
-/// produced by the format string round-trips through `chrono`'s parser
-/// and resolves to approximately "now", without requiring a real
+/// produced by the record module round-trips through `chrono`'s parser
+/// and falls within the call's timestamp window, without requiring a real
 /// recording.
 #[test]
 fn test_record_default_filename_format() {
     use chrono::{DateTime, Datelike, Local};
     use std::path::PathBuf;
 
-    // Reproduce the format string used by `record::default_filename()`.
-    // Keep this in sync with `src/record/mod.rs`.
     let before = Local::now();
-    let filename = before.format("%Y-%m-%dT%H-%M-%S%z.ogg").to_string();
+    let filename = talk_rs::record::default_filename();
     let after = Local::now();
     let path = PathBuf::from(&filename);
 

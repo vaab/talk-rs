@@ -4063,6 +4063,10 @@ mod tests {
     /// suitable system font is available (e.g. minimal CI
     /// environments without DejaVu / Liberation / Noto).
     fn decode_font_or_skip() -> Option<fontdue::Font> {
-        super::super::render_util::load_system_font(RETRY_COUNTER_FONT_SIZE)
+        let font = super::super::render_util::load_system_font(RETRY_COUNTER_FONT_SIZE);
+        if font.is_none() {
+            eprintln!("skipped: no system font available for retry counter rendering");
+        }
+        font
     }
 }

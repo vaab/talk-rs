@@ -451,3 +451,225 @@ pub(crate) async fn dictate_oneshot(
 
     (result, t_stop)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::file_source::OggFileSource;
+    use crate::audio::mock::MockAudioCapture;
+    use crate::audio::recording_feedback::{RecordingFeedbackOptions, RecordingOverlayOptions};
+    use crate::transcription::TranscriptionMetadata;
+    use async_trait::async_trait;
+    use std::path::Path;
+    use tokio::sync::{mpsc, oneshot};
+
+    struct InspectingTranscriber {
+        payload: std::sync::Mutex<Option<oneshot::Sender<Vec<u8>>>>,
+        fail_early: bool,
+    }
+
+    #[async_trait]
+    impl OneShotTranscriber for InspectingTranscriber {
+        async fn validate(&self) -> Result<(), TalkError> {
+            Ok(())
+        }
+
+        async fn fetch_transcription(
+            &self,
+            body: TranscriptionBody,
+        ) -> Result<TranscriptionResult, TalkError> {
+            if self.fail_early {
+                return Err(TalkError::Transcription("mock downstream failure".into()));
+            }
+            let TranscriptionBody::Pipe {
+                mut chunks,
+                file_name,
+            } = body
+            else {
+                panic!("production pipeline must pass encoded chunks");
+            };
+            assert_eq!(file_name, "audio.ogg");
+            let mut bytes = Vec::new();
+            while let Some(chunk) = chunks.recv().await {
+                bytes.extend(chunk);
+            }
+            self.payload
+                .lock()
+                .expect("lock payload")
+                .take()
+                .expect("payload sender")
+                .send(bytes)
+                .expect("receive payload");
+            Ok(TranscriptionResult {
+                text: "captured speech".into(),
+                metadata: TranscriptionMetadata::default(),
+                diarization: None,
+                segments: None,
+            })
+        }
+    }
+
+    fn inspecting_transcriber() -> (Box<dyn OneShotTranscriber>, oneshot::Receiver<Vec<u8>>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Box::new(InspectingTranscriber {
+                payload: std::sync::Mutex::new(Some(tx)),
+                fail_early: false,
+            }),
+            rx,
+        )
+    }
+
+    fn no_device_feedback() -> RecordingFeedback {
+        RecordingFeedback::new(RecordingFeedbackOptions {
+            no_sounds: true,
+            no_boop: true,
+            no_overlay: true,
+            viz: None,
+            mono: false,
+            boop_interval_ms: 0,
+            capture_rate: 16_000,
+            pause_audio: false,
+            suppress_boop: None,
+            overlay: RecordingOverlayOptions {
+                silence_tx: None,
+                auto_pause: false,
+                telemetry_rx: None,
+            },
+        })
+    }
+
+    fn offline_config(dir: &Path) -> Config {
+        serde_yaml::from_str(&format!("output_dir: {}\nproviders: {{}}\n", dir.display()))
+            .expect("offline configuration")
+    }
+
+    async fn decoded_samples(bytes: &[u8]) -> Vec<i16> {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let path = dir.path().join("payload.ogg");
+        tokio::fs::write(&path, bytes).await.expect("write payload");
+        let mut source = OggFileSource::new(&path).expect("valid OGG header");
+        let mut rx = source.start().expect("decode OGG");
+        let mut decoded = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            decoded.extend(chunk);
+        }
+        decoded
+    }
+
+    #[tokio::test]
+    async fn production_pipeline_flushes_complete_decodable_ogg_to_transcriber() {
+        let buffer = Arc::new(AudioBuffer::new());
+        let samples: Vec<i16> = (0..(3 * 320 + 67))
+            .map(|i| ((i as f32 * 0.12).sin() * 12000.0) as i16)
+            .collect();
+        buffer.push(samples.clone()).await;
+        buffer.close();
+        let (transcriber, payload) = inspecting_transcriber();
+
+        let (feeder, encoder, transcription, done) =
+            spawn_encode_pipeline(&buffer, AudioConfig::new(), transcriber);
+        done.await.expect("encoder completion signal");
+        feeder.await.expect("feeder completed");
+        encoder.await.expect("encoder joined").expect("encoded");
+        assert_eq!(
+            transcription
+                .await
+                .expect("transcriber joined")
+                .expect("text")
+                .text,
+            "captured speech"
+        );
+        let decoded = decoded_samples(&payload.await.expect("transcriber payload")).await;
+        assert!(decoded.len() >= samples.len());
+        assert!(decoded.len() - samples.len() < 320);
+        assert!(decoded.iter().any(|&sample| sample.abs() > 1000));
+    }
+
+    #[tokio::test]
+    async fn mock_capture_composes_with_production_oneshot_and_cache() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let cache = dir.path().join("capture.ogg");
+        let mut capture = MockAudioCapture::new(16_000, 1, 440.0);
+        let mut raw_rx = capture.start().expect("start mock capture");
+        let (tx, rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let relay = tokio::spawn(async move {
+            for _ in 0..5 {
+                tx.send(raw_rx.recv().await.expect("mock PCM chunk"))
+                    .await
+                    .expect("relay PCM");
+            }
+            drop(tx);
+            stop.cancel();
+        });
+        let (transcriber, payload) = inspecting_transcriber();
+        let mut feedback = no_device_feedback();
+        let (result, _) = dictate_oneshot(
+            &mut capture,
+            false,
+            AudioConfig::new(),
+            rx,
+            &cache,
+            transcriber,
+            &shutdown,
+            &mut feedback,
+            None,
+            &offline_config(dir.path()),
+            Provider::Mistral,
+            None,
+            false,
+            bt_profile::HeadsetGuard::new(None),
+        )
+        .await;
+        relay.await.expect("relay finished");
+        assert_eq!(result.expect("dictation result").text, "captured speech");
+        let uploaded = decoded_samples(&payload.await.expect("uploaded OGG")).await;
+        let cached = decoded_samples(&tokio::fs::read(&cache).await.expect("cache OGG")).await;
+        for pcm in [uploaded, cached] {
+            assert!(pcm.len().abs_diff(5 * 320) <= 320);
+            assert!(pcm.iter().any(|&sample| sample.abs() > 1000));
+        }
+    }
+
+    #[tokio::test]
+    async fn downstream_failure_does_not_truncate_cached_ogg() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let cache = dir.path().join("failed.ogg");
+        let mut capture = MockAudioCapture::new(16_000, 1, 440.0);
+        let (tx, rx) = mpsc::channel(8);
+        for _ in 0..4 {
+            tx.send(vec![9000; 320]).await.expect("send PCM");
+        }
+        drop(tx);
+        let mut feedback = no_device_feedback();
+        let (result, _) = dictate_oneshot(
+            &mut capture,
+            true,
+            AudioConfig::new(),
+            rx,
+            &cache,
+            Box::new(InspectingTranscriber {
+                payload: std::sync::Mutex::new(None),
+                fail_early: true,
+            }),
+            &CancellationToken::new(),
+            &mut feedback,
+            None,
+            &offline_config(dir.path()),
+            Provider::Mistral,
+            None,
+            false,
+            bt_profile::HeadsetGuard::new(None),
+        )
+        .await;
+        assert_eq!(
+            result.expect_err("transcriber fails").to_string(),
+            "Transcription error: mock downstream failure"
+        );
+        let cached = decoded_samples(&tokio::fs::read(&cache).await.expect("cached OGG")).await;
+        assert!(cached.len().abs_diff(4 * 320) <= 320);
+        assert!(cached.iter().any(|&sample| sample.abs() > 1000));
+    }
+}

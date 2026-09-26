@@ -137,14 +137,15 @@ fn make_request(url: impl Into<String>, phase: PipelinePhase) -> Request {
     }
 }
 
-/// 127.0.0.1:1 is reserved and rejects connections immediately on
-/// localhost, but for the connect-budget test we want a destination
-/// that *times out* (silently drops SYN), not one that rejects.
-///
-/// 192.0.2.1 is in TEST-NET-1 (RFC 5737), guaranteed not to be
-/// routed.  TCP SYNs to it never get a response, so reqwest's
-/// connect path exercises the full configured connect timeout.
-const BLACKHOLE_TCP: &str = "http://192.0.2.1:81/v1/models";
+/// Reserve a loopback port and release it before sending; connection
+/// refusal exercises the complete connection-retry budget without relying
+/// on an external router silently dropping SYN packets.
+fn refused_loopback_url(scheme: &str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let port = listener.local_addr().expect("local address").port();
+    drop(listener);
+    format!("{scheme}://127.0.0.1:{port}/v1/models")
+}
 
 // ── §3 Step 1 tests ─────────────────────────────────────────────────
 //
@@ -165,12 +166,12 @@ const BLACKHOLE_TCP: &str = "http://192.0.2.1:81/v1/models";
 async fn transport_connection_phase_retries_with_growing_budget() {
     let capturing = Arc::new(CapturingSink::new());
     let sink: Arc<dyn TelemetrySink> = capturing.clone();
-    let req = make_request(BLACKHOLE_TCP, PipelinePhase::Request);
+    let req = make_request(refused_loopback_url("http"), PipelinePhase::Request);
 
     let result = http_request(req, &sink, CancellationToken::new()).await;
     assert!(
         result.is_err(),
-        "blackhole TCP destination must fail; got Ok"
+        "refused loopback connection must fail; got Ok"
     );
 
     let retries = capturing.retry_events();
@@ -233,10 +234,10 @@ async fn transport_data_phase_retries_three_times_on_503() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pipeline_failure_carries_real_attempt_counter_connection() {
     let sink: Arc<dyn TelemetrySink> = Arc::new(NoOpSink);
-    let req = make_request(BLACKHOLE_TCP, PipelinePhase::Request);
+    let req = make_request(refused_loopback_url("http"), PipelinePhase::Request);
 
     let result = http_request(req, &sink, CancellationToken::new()).await;
-    let pf = result.expect_err("blackhole destination must fail");
+    let pf = result.expect_err("refused loopback connection must fail");
     assert!(
         pf.attempts > 1,
         "Step 2 must kill the 1/1 lie — got {}/{}",
@@ -650,10 +651,13 @@ async fn transport_cancellation_aborts_backoff_wait() {
 async fn ws_upgrade_retries_on_connection_failure() {
     let capturing = Arc::new(CapturingSink::new());
     let sink: Arc<dyn TelemetrySink> = capturing.clone();
-    let req = make_request("ws://192.0.2.1:81/v1/audio/stream", PipelinePhase::Request);
+    let req = make_request(refused_loopback_url("ws"), PipelinePhase::Request);
 
     let result = ws_upgrade(req, &sink, CancellationToken::new()).await;
-    assert!(result.is_err(), "ws upgrade to blackhole must fail");
+    assert!(
+        result.is_err(),
+        "ws upgrade to a refused loopback port must fail"
+    );
 
     let retries = capturing.retry_events();
     assert!(
