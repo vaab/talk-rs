@@ -1726,8 +1726,17 @@ fn overlay_thread(
     // via the audio tee task (no independent CPAL capture).
     let rms_chunk: usize = sample_rate as usize / FPS as usize;
 
-    // Load a system font for rendering "NO SOUND" text on the badge.
-    let badge_font = super::render_util::load_system_font(24.0);
+    // Badge and centred-overlay labels are Latin-only, so load a small
+    // Latin font once and share it: `rasterise_glyphs` takes an explicit
+    // pixel size, so one parsed font serves both.  This runs before the
+    // thread can map the badge, so it must stay cheap (see
+    // `LATIN_FONT_SEARCH_PATHS`).
+    let font_load_start = std::time::Instant::now();
+    let badge_font = super::render_util::load_latin_font(24.0);
+    log::debug!(
+        "overlay font loaded in {}ms",
+        font_load_start.elapsed().as_millis()
+    );
 
     // ── Centered "no sound" overlay ─────────────────────────────────
     // Pre-compute dimensions and pre-render the content so the window
@@ -1736,7 +1745,7 @@ fn overlay_thread(
     let centered_h = centered_h.max(CENTERED_MIN_HEIGHT);
     let centered_w = (centered_h as f32 * CENTERED_ASPECT_RATIO) as u16;
     let centered_w = centered_w.min(mon_w); // don't exceed monitor width
-    let centered_font = super::render_util::load_system_font(centered_h as f32 * 0.55);
+    let centered_font = badge_font.clone();
     let centered_bg = if argb_ctx.is_some() {
         CENTERED_BG_ARGB
     } else {
@@ -1934,6 +1943,7 @@ fn overlay_thread(
                         .map_err(|e| TalkError::Config(format!("X11 map_window failed: {}", e)))?;
                     conn.sync()
                         .map_err(|e| TalkError::Config(format!("X11 sync failed: {}", e)))?;
+                    log::debug!("recording badge window mapped");
 
                     let gc = conn
                         .generate_id()

@@ -546,13 +546,41 @@ pub const FONT_SEARCH_PATHS: &[&str] = &[
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
 ];
 
-/// Load a system TrueType font for text rendering.
+/// System font paths for text that is known to be Latin-only (the
+/// recording badge labels and the centred "NO SOUND" overlay).
 ///
-/// Searches well-known paths; returns `None` if no font is found.
-/// `scale` sets the default rasterisation size (e.g. 30.0 for the
-/// text panel, 24.0 for the badge).
+/// Small Latin fonts come first: parsing the 19 MB Noto Sans CJK
+/// collection costs ~0.5 s per load, which used to delay the recording
+/// badge by about a second.  CJK-capable fonts stay as a last resort so
+/// a system without any Latin font still renders the labels.
+pub const LATIN_FONT_SEARCH_PATHS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+];
+
+/// Load a system TrueType font able to render any script (CJK first).
+///
+/// Used for transcription text, whose language is unknown.  Returns
+/// `None` if no font is found.  `scale` sets the default rasterisation
+/// size (e.g. 30.0 for the text panel).
 pub fn load_system_font(scale: f32) -> Option<fontdue::Font> {
-    for path in FONT_SEARCH_PATHS {
+    load_font_from(FONT_SEARCH_PATHS, scale)
+}
+
+/// Load a system TrueType font for Latin-only labels (fast to parse).
+pub fn load_latin_font(scale: f32) -> Option<fontdue::Font> {
+    load_font_from(LATIN_FONT_SEARCH_PATHS, scale)
+}
+
+/// Load the first parseable font among `paths`, in order.
+pub fn load_font_from(paths: &[&str], scale: f32) -> Option<fontdue::Font> {
+    for path in paths {
         if let Ok(data) = std::fs::read(path) {
             let settings = fontdue::FontSettings {
                 collection_index: 0,
@@ -781,6 +809,61 @@ pub fn generate_waterfall_columns(samples: &[i16], sample_rate: u32) -> (Vec<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Font loading ─────────────────────────────────────────────────
+
+    fn is_cjk_collection(path: &str) -> bool {
+        path.contains("CJK") || path.contains("DroidSansFallback")
+    }
+
+    /// The badge must never pay for parsing a CJK collection while a
+    /// Latin font exists: every Latin path precedes every CJK path.
+    #[test]
+    fn latin_font_search_tries_every_latin_font_before_any_cjk_font() {
+        let first_cjk = LATIN_FONT_SEARCH_PATHS
+            .iter()
+            .position(|p| is_cjk_collection(p))
+            .unwrap_or(LATIN_FONT_SEARCH_PATHS.len());
+        let latin_after_cjk: Vec<&&str> = LATIN_FONT_SEARCH_PATHS[first_cjk..]
+            .iter()
+            .filter(|p| !is_cjk_collection(p))
+            .collect();
+        assert!(first_cjk > 0, "Latin search must start with a Latin font");
+        assert!(
+            latin_after_cjk.is_empty(),
+            "Latin fonts listed after a CJK font: {:?}",
+            latin_after_cjk
+        );
+    }
+
+    /// Latin search still falls back to every font the general search
+    /// knows, so no system loses badge text because of the reordering.
+    #[test]
+    fn latin_font_search_covers_every_general_font_path() {
+        let missing: Vec<&&str> = FONT_SEARCH_PATHS
+            .iter()
+            .filter(|p| !LATIN_FONT_SEARCH_PATHS.contains(p))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "paths missing from Latin search: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn load_font_from_skips_missing_and_unparseable_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let garbage = dir.path().join("garbage.ttf");
+        std::fs::write(&garbage, b"not a font").expect("write garbage font");
+        let missing = dir.path().join("missing.ttf");
+        let paths = [
+            missing.to_str().expect("utf-8 path"),
+            garbage.to_str().expect("utf-8 path"),
+        ];
+
+        assert!(load_font_from(&paths, 24.0).is_none());
+    }
 
     // ── FFT ──────────────────────────────────────────────────────────
 

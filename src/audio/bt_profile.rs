@@ -583,6 +583,71 @@ fn card_info_to_snapshot(card: &CardInfo) -> Option<CardSnapshot> {
     })
 }
 
+/// Describe the current default output sink as `"<name> (<state>)"`.
+///
+/// Diagnostic only: lets the startup log show whether the start tone is
+/// about to be played on a Bluetooth sink and whether that sink was
+/// suspended (asleep) beforehand.  Returns `Ok(None)` when the server
+/// reports no default sink.
+pub fn describe_default_sink() -> Result<Option<String>, TalkError> {
+    with_pulse_context(|mainloop, context| {
+        let sink_name: Rc<RefCell<Option<Option<String>>>> = Rc::new(RefCell::new(None));
+        let sink_name_cb = sink_name.clone();
+        let _server_op = context.borrow().introspect().get_server_info(move |info| {
+            *sink_name_cb.borrow_mut() =
+                Some(info.default_sink_name.as_deref().map(str::to_string));
+        });
+        drive_until(&mainloop, "get_server_info", || {
+            sink_name.borrow().is_some()
+        })?;
+
+        let Some(Some(name)) = sink_name.borrow().clone() else {
+            return Ok(None);
+        };
+
+        let state: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let done = Rc::new(RefCell::new(false));
+        let state_cb = state.clone();
+        let done_cb = done.clone();
+        let _sink_op = context.borrow().introspect().get_sink_info_by_name(
+            &name,
+            move |result: ListResult<&pulse::context::introspect::SinkInfo>| match result {
+                ListResult::Item(sink) => {
+                    *state_cb.borrow_mut() = Some(format!("{:?}", sink.state));
+                }
+                ListResult::End | ListResult::Error => *done_cb.borrow_mut() = true,
+            },
+        );
+        drive_until(&mainloop, "get_sink_info_by_name", || *done.borrow())?;
+
+        let state = state
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(Some(format!("{} ({})", name, state)))
+    })
+}
+
+/// Iterate the PulseAudio mainloop until `done()` holds.
+fn drive_until(
+    mainloop: &Rc<RefCell<Mainloop>>,
+    what: &str,
+    done: impl Fn() -> bool,
+) -> Result<(), TalkError> {
+    while !done() {
+        match mainloop.borrow_mut().iterate(true) {
+            IterateResult::Quit(_) | IterateResult::Err(_) => {
+                return Err(TalkError::Audio(format!(
+                    "bt_profile: PA mainloop terminated during {}",
+                    what
+                )));
+            }
+            IterateResult::Success(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Switch a card to a named profile.  Blocks until PulseAudio confirms
 /// success or failure.
 fn set_card_profile(card_name: &str, profile: &str) -> Result<(), TalkError> {

@@ -70,12 +70,24 @@ pub struct DictateOpts {
     pub verbose: u8,
 }
 
+/// Start-side counterpart of the `timing: stop +Nms <step>` log lines:
+/// logs `timing: start +Nms <step>` relative to the moment `dictate`
+/// began, so startup latency can be attributed per step.
+struct StartTiming(std::time::Instant);
+
+impl StartTiming {
+    fn mark(&self, step: &str) {
+        log::info!("timing: start +{}ms {}", self.0.elapsed().as_millis(), step);
+    }
+}
+
 /// Dictate: record audio, transcribe, and paste into focused application.
 pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
     // Toggle mode: start or stop a daemon
     if opts.toggle {
         return toggle_dispatch(&opts).await;
     }
+    let t_start = StartTiming(std::time::Instant::now());
 
     let _daemon_owner = if opts.daemon {
         Some(daemon::dictate_slot()?.owner_guard())
@@ -87,6 +99,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
     // Load configuration
     let config = Config::load(None)?;
+    t_start.mark("config_loaded");
 
     // Build the runtime paste-node tree from config (or fall back to
     // the default `chunk(150) → clipboard(ctrl-shift-v, 200, 400)`
@@ -228,6 +241,18 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         .as_ref()
         .map(|indicators| indicators.boop_interval_ms)
         .unwrap_or(5_000);
+    // Diagnose inaudible start tones on Bluetooth: record which sink the
+    // tone will go to and whether it was asleep BEFORE the sound player
+    // opens its stream (opening it wakes the sink).  Debug-only because
+    // it costs an extra PulseAudio round trip.
+    if !opts.no_sounds && log::log_enabled!(log::Level::Debug) {
+        match bt_profile::describe_default_sink() {
+            Ok(Some(sink)) => log::debug!("start tone output sink before wake: {}", sink),
+            Ok(None) => log::debug!("start tone output sink before wake: no default sink"),
+            Err(e) => log::debug!("start tone output sink before wake: unavailable: {}", e),
+        }
+        t_start.mark("sink_probed");
+    }
     let mut feedback = RecordingFeedback::new(RecordingFeedbackOptions {
         no_sounds: opts.no_sounds,
         no_boop: opts.no_boop,
@@ -244,6 +269,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             telemetry_rx: Some(broker.subscribe()),
         },
     });
+    t_start.mark("sound_player_ready");
 
     // Ensure GTK4/GDK4 is initialised so the overlay and visualizer can
     // query monitor geometry via GDK.  `gtk4::init()` is idempotent —
@@ -254,6 +280,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
             e
         );
     }
+    t_start.mark("gtk_ready");
 
     // Overlay is created AFTER capture_rate is determined (see below),
     // because it needs the sample rate and a shared ring buffer.
@@ -412,12 +439,18 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         };
         bt_profile::HeadsetGuard::new(saved)
     };
+    t_start.mark("bt_profile_done");
 
-    // The start sound is awaited before capture so it cannot enter the
-    // recording.  Recording-phase badge and boop begin after capture starts.
+    // The badge is shown first so the shortcut is acknowledged visually
+    // without waiting for the tone.  The start sound is awaited before
+    // capture so it cannot enter the recording.  Boop begins after
+    // capture starts.
+    feedback.prepare_recording();
+    t_start.mark("badge_requested");
     feedback.play_start().await;
+    t_start.mark("start_tone_done");
     let raw_audio_rx = capture.start()?;
-    feedback.initialize_after_capture();
+    t_start.mark("capture_started");
 
     // Parakeet is a local backend whose model must be downloaded once
     // (~640 MB).  The transcribe pipeline never downloads silently, so
@@ -444,13 +477,14 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
         }
     }
 
-    // Show visualizer text panel (positioned relative to recording badge)
+    // Show visualizer text panel (positioned relative to recording badge).
+    // The badge itself was requested before the start tone; re-requesting
+    // it here restores it after a model-download badge and is otherwise a
+    // cheap state reset in the overlay thread.
+    feedback.show_recording_badge();
     if let Some(ref viz) = visualizer {
         log::debug!("showing visualizer text panel");
-        feedback.show_recording_badge();
         viz.show(crate::x11::overlay::BADGE_W);
-    } else {
-        feedback.show_recording_badge();
     }
     feedback.start_boop();
 

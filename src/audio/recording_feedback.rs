@@ -146,16 +146,19 @@ impl RecordingFeedback {
         }
     }
 
-    /// Start recording-phase feedback after capture has started.
-    pub fn begin_recording(&mut self) {
-        self.initialize_after_capture();
+    /// Show the recording badge before the start tone.
+    ///
+    /// The badge is the user's immediate visual acknowledgement of the
+    /// shortcut, so it must not wait for the tone (~0.4 s) or capture.
+    /// Capture itself still starts only after [`play_start`](Self::play_start)
+    /// so the tone never enters the recording.
+    pub fn prepare_recording(&mut self) {
+        self.initialize_display();
         self.show_recording_badge();
-        self.start_boop();
     }
 
-    /// Initialize display resources after capture has started.  Kept separate
-    /// so dictate can preserve its model-download badge ordering.
-    pub fn initialize_after_capture(&mut self) {
+    /// Initialize display resources (overlay thread).  Idempotent.
+    pub fn initialize_display(&mut self) {
         #[cfg(feature = "ui")]
         self.initialize_overlay();
     }
@@ -370,15 +373,16 @@ mod tests {
         let log = event_log();
         let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&log), true);
 
+        feedback.prepare_recording();
         feedback.play_start().await;
-        feedback.begin_recording();
+        feedback.start_boop();
         feedback.teardown_recording(RecordingBadgeTeardown::Hide);
 
         assert_eq!(
             events(&log),
             vec![
-                "start-tone",
                 "badge-show",
+                "start-tone",
                 "boop-start",
                 "boop-cancel",
                 "badge-hide"
@@ -402,8 +406,9 @@ mod tests {
         let log = event_log();
         let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&log), false);
 
+        feedback.prepare_recording();
         feedback.play_start().await;
-        feedback.begin_recording();
+        feedback.start_boop();
         feedback.teardown_recording(RecordingBadgeTeardown::Hide);
         feedback.play_stop().await;
 
@@ -418,7 +423,8 @@ mod tests {
         let log = event_log();
         let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&log), true);
 
-        feedback.begin_recording();
+        feedback.prepare_recording();
+        feedback.start_boop();
         feedback.teardown_recording(RecordingBadgeTeardown::KeepVisible);
         feedback.play_stop().await;
 

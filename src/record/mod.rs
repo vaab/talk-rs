@@ -352,9 +352,12 @@ async fn start_capture_with_feedback(
     feedback: &mut RecordingFeedback,
     capture: &mut dyn AudioCapture,
 ) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
+    // Badge first (instant visual acknowledgement), then the awaited tone,
+    // then capture so the tone never enters the recording.
+    feedback.prepare_recording();
     feedback.play_start().await;
     let raw_audio = capture.start()?;
-    feedback.begin_recording();
+    feedback.start_boop();
     Ok(feedback.route_audio(raw_audio))
 }
 
@@ -439,9 +442,9 @@ mod tests {
                 .map(|events| events.clone())
                 .unwrap_or_default(),
             vec![
+                "badge-show",
                 "start-tone",
                 "capture-start",
-                "badge-show",
                 "boop-start",
                 "boop-cancel",
                 "badge-hide",
