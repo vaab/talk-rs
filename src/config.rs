@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 /// Main configuration structure.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Output directory for recordings, screenshots, and clipboard saves.
     ///
@@ -70,6 +71,7 @@ pub struct Config {
 
 /// User-facing audio settings (loaded from `config.yaml`).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AudioSettings {
     /// Auto-switch a connected Bluetooth headset to its Hands-Free
     /// Profile (HFP) for the duration of a recording, then restore
@@ -108,6 +110,7 @@ pub const DEFAULT_RECORDING_BITRATE: u32 = 128_000;
 /// optional and falls back to a fidelity-oriented default; see
 /// [`RecordingConfig::resolved`].
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordingConfig {
     /// Sample rate in Hz for the recorded `.ogg`.  Default: 48000.
     #[serde(default)]
@@ -229,6 +232,7 @@ impl std::str::FromStr for SynthesisProvider {
 
 /// Transcription providers configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
     /// Mistral API configuration (optional — only required when using Mistral).
     #[serde(default)]
@@ -253,8 +257,10 @@ pub struct ProvidersConfig {
 
 /// Mistral API configuration.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MistralConfig {
     /// API key for Mistral transcription service.
+    #[serde(default)]
     pub api_key: String,
 
     /// Base URL for the Mistral API (defaults to `https://api.mistral.ai`).
@@ -361,8 +367,10 @@ impl std::str::FromStr for OpenAIRealtimeDelay {
 
 /// OpenAI API configuration.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct OpenAIConfig {
     /// API key for OpenAI transcription service.
+    #[serde(default)]
     pub api_key: String,
 
     /// Base URL for the OpenAI API (defaults to `https://api.openai.com`).
@@ -462,6 +470,7 @@ impl std::str::FromStr for ParakeetVariant {
 /// default-constructed value is a usable INT8 configuration that
 /// resolves its model directory to the XDG data dir.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParakeetConfig {
     /// Quantization variant.  `int8` (default) or `fp32`.  Selects
     /// which model tarball is fetched (in later phases) and which
@@ -500,7 +509,7 @@ impl ParakeetConfig {
     /// Resolved on-disk model directory.
     ///
     /// Pure path computation — does NOT touch the filesystem.  Returns
-    /// the user-supplied `model_dir` verbatim when present, else
+    /// the user-supplied `model_dir` with a leading tilde expanded when present, else
     /// constructs the XDG default
     /// `<data_dir>/models/parakeet-tdt-0.6b-v3-<variant>` (so the
     /// `int8` and `fp32` caches never collide).  Returns a
@@ -508,7 +517,7 @@ impl ParakeetConfig {
     /// mirroring [`config_dir`].
     pub fn resolved_model_dir(&self) -> Result<PathBuf, TalkError> {
         if let Some(ref dir) = self.model_dir {
-            return Ok(dir.clone());
+            return expand_tilde(dir);
         }
         let data_dir = ProjectDirs::from("org", "kalysto", "talk-rs")
             .map(|dirs| dirs.data_dir().to_path_buf())
@@ -540,6 +549,7 @@ impl ParakeetConfig {
 /// default-constructed value resolves its model directory to the XDG
 /// data dir under `models/kokoro-multi-lang-v1_0`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KokoroConfig {
     /// Reserved for future multi-variant support (mirrors
     /// [`ParakeetConfig::variant`]).  Kokoro currently ships a single
@@ -577,13 +587,13 @@ impl KokoroConfig {
     /// Resolved on-disk model directory.
     ///
     /// Pure path computation — does NOT touch the filesystem.  Returns
-    /// the user-supplied `model_dir` verbatim when present, else
+    /// the user-supplied `model_dir` with a leading tilde expanded when present, else
     /// constructs the XDG default
     /// `<data_dir>/models/kokoro-multi-lang-v1_0`.  Mirrors
     /// [`ParakeetConfig::resolved_model_dir`].
     pub fn resolved_model_dir(&self) -> Result<PathBuf, TalkError> {
         if let Some(ref dir) = self.model_dir {
-            return Ok(dir.clone());
+            return expand_tilde(dir);
         }
         let data_dir = ProjectDirs::from("org", "kalysto", "talk-rs")
             .map(|dirs| dirs.data_dir().to_path_buf())
@@ -603,6 +613,7 @@ impl KokoroConfig {
 
 /// Transcription defaults.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TranscriptionConfig {
     /// Default transcription provider when `--provider` is not specified.
     #[serde(default = "default_provider")]
@@ -615,6 +626,7 @@ fn default_provider() -> Provider {
 
 /// Speech-synthesis defaults for the `speak` command.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SpeakConfig {
     /// Default synthesis provider when `--provider` is not specified.
     ///
@@ -697,17 +709,43 @@ impl std::str::FromStr for VizMode {
 
 /// Indicator configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndicatorsConfig {
     /// Interval between boop sounds in milliseconds.
+    #[serde(default = "default_boop_interval_ms")]
     pub boop_interval_ms: u64,
 
     /// Show visual indicator overlay.
+    #[serde(default = "default_visual_overlay")]
     pub visual_overlay: bool,
 
     /// Visualizer mode rendered inside the recording badge.
     ///
     /// When absent, the badge shows only the red dot (no visualization).
     pub viz: Option<VizMode>,
+
+    /// Render visualizers in monochrome unless the CLI forces it on.
+    #[serde(default)]
+    pub mono: bool,
+}
+
+impl Default for IndicatorsConfig {
+    fn default() -> Self {
+        Self {
+            boop_interval_ms: default_boop_interval_ms(),
+            visual_overlay: default_visual_overlay(),
+            viz: None,
+            mono: false,
+        }
+    }
+}
+
+fn default_boop_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_visual_overlay() -> bool {
+    true
 }
 
 /// Keyboard shortcut used for pasting text into the target application.
@@ -978,7 +1016,7 @@ fn expand_tilde(path: &Path) -> Result<PathBuf, TalkError> {
         .map(|dirs| dirs.home_dir().to_path_buf())
         .ok_or_else(|| {
             TalkError::Config(
-                "Could not determine home directory to expand '~' in output_dir".to_string(),
+                "Could not determine home directory to expand '~' in configured path".to_string(),
             )
         })?;
 
@@ -1004,6 +1042,11 @@ pub fn config_path() -> Result<PathBuf, TalkError> {
 }
 
 impl Config {
+    /// CLI monochrome mode forces the configured mode on.
+    pub fn resolved_mono(&self, cli_mono: bool) -> bool {
+        cli_mono || self.indicators.as_ref().is_some_and(|ind| ind.mono)
+    }
+
     /// Load configuration from file.
     ///
     /// If `path` is provided, loads from that path.
@@ -1034,6 +1077,8 @@ impl Config {
     /// - TALK_RS_PROVIDERS_KOKORO_VOICE
     /// - TALK_RS_PROVIDERS_KOKORO_NUM_THREADS
     /// - TALK_RS_PROVIDERS_KOKORO_LANG
+    /// - TALK_RS_INDICATORS_VIZ
+    /// - TALK_RS_INDICATORS_MONO
     pub fn load(path: Option<&Path>) -> Result<Self, TalkError> {
         let config_path = match path {
             Some(path) => path.to_path_buf(),
@@ -1063,9 +1108,21 @@ impl Config {
         // Indicators env var overrides.
         if let Some(value) = env_var_string("TALK_RS_INDICATORS_VIZ")? {
             let mode: VizMode = value.parse().map_err(TalkError::Config)?;
-            if let Some(ref mut ind) = config.indicators {
-                ind.viz = Some(mode);
-            }
+            config
+                .indicators
+                .get_or_insert_with(IndicatorsConfig::default)
+                .viz = Some(mode);
+        }
+        if let Some(value) = env_var_string("TALK_RS_INDICATORS_MONO")? {
+            let mono = parse_bool_env(&value).ok_or_else(|| {
+                TalkError::Config(format!(
+                    "TALK_RS_INDICATORS_MONO must be true/false/1/0/yes/no, got '{value}'"
+                ))
+            })?;
+            config
+                .indicators
+                .get_or_insert_with(IndicatorsConfig::default)
+                .mono = mono;
         }
 
         // Audio settings env var overrides.
@@ -1098,6 +1155,11 @@ impl Config {
                     value
                 ))
             })?;
+            if !matches!(channels, 1 | 2) {
+                return Err(TalkError::Config(format!(
+                    "TALK_RS_RECORDING_CHANNELS must be 1 or 2, got '{value}'"
+                )));
+            }
             let rec = config
                 .recording
                 .get_or_insert_with(RecordingConfig::default);
@@ -1316,6 +1378,29 @@ impl Config {
         // path under $HOME instead of a literal relative `~` directory.
         config.output_dir = expand_tilde(&config.output_dir)?;
 
+        for (provider, section, env_key) in [
+            (
+                "mistral",
+                config
+                    .providers
+                    .mistral
+                    .as_ref()
+                    .map(|p| p.api_key.as_str()),
+                "TALK_RS_PROVIDERS_MISTRAL_API_KEY",
+            ),
+            (
+                "openai",
+                config.providers.openai.as_ref().map(|p| p.api_key.as_str()),
+                "TALK_RS_PROVIDERS_OPENAI_API_KEY",
+            ),
+        ] {
+            if section.is_some_and(str::is_empty) {
+                return Err(TalkError::Config(format!(
+                    "providers.{provider}.api_key is required in YAML or via {env_key}"
+                )));
+            }
+        }
+
         validate_config(&config)?;
 
         Ok(config)
@@ -1387,6 +1472,14 @@ fn validate_config(config: &Config) -> Result<(), TalkError> {
         )));
     }
 
+    if let Some(channels) = config.recording.as_ref().and_then(|rec| rec.channels) {
+        if !matches!(channels, 1 | 2) {
+            return Err(TalkError::Config(format!(
+                "recording.channels must be 1 or 2, got {channels}"
+            )));
+        }
+    }
+
     // Provider API keys are validated lazily — only when a provider is
     // actually used via the factory function.  This allows configs that
     // only define one provider to work without filling in keys for the
@@ -1452,6 +1545,263 @@ mod tests {
         Ok(file)
     }
 
+    #[test]
+    fn unknown_config_keys_name_the_offending_field() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        for (section, yaml, key) in [
+            (
+                "root",
+                indoc! {"
+                output_dir: /tmp/test-output
+                providers: {}
+                output_directry: /tmp/typo
+            "},
+                "output_directry",
+            ),
+            (
+                "providers",
+                indoc! {"
+                output_dir: /tmp/test-output
+                providers:
+                  mistral_api: {}
+            "},
+                "mistral_api",
+            ),
+            (
+                "transcription",
+                indoc! {"
+                output_dir: /tmp/test-output
+                providers: {}
+                transcription:
+                  default_provder: openai
+            "},
+                "default_provder",
+            ),
+            (
+                "nested provider",
+                indoc! {"
+                output_dir: /tmp/test-output
+                providers:
+                  mistral:
+                    api_key: test
+                    modle: typo
+            "},
+                "modle",
+            ),
+            (
+                "tree node",
+                indoc! {"
+                output_dir: /tmp/test-output
+                providers: {}
+                paste:
+                  node: chunk
+                  chunk_char: 80
+                  child:
+                    node: clipboard
+            "},
+                "chunk_char",
+            ),
+            (
+                "nested tree node",
+                indoc! {"
+                output_dir: /tmp/test-output
+                providers: {}
+                paste:
+                  node: match-wm-class
+                  patterns:
+                    - match: '*'
+                      chld:
+                        node: clipboard
+                      child:
+                        node: clipboard
+                  default:
+                    node: clipboard
+            "},
+                "chld",
+            ),
+        ] {
+            let file = write_config(yaml)?;
+            let err = Config::load(Some(file.path()))
+                .err()
+                .ok_or(format!("{section} accepted unknown key {key}"))?;
+            assert!(err.to_string().contains(key), "{section}: {err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_sections_accept_env_only_keys_and_reject_missing_keys() -> Result<(), Box<dyn Error>>
+    {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        for (provider, env_key) in [
+            ("mistral", "TALK_RS_PROVIDERS_MISTRAL_API_KEY"),
+            ("openai", "TALK_RS_PROVIDERS_OPENAI_API_KEY"),
+        ] {
+            let yaml = format!("output_dir: /tmp/test-output\nproviders:\n  {provider}:\n    model: custom-model\n");
+            let file = write_config(&yaml)?;
+            {
+                let _key = EnvGuard::set(env_key, "env-secret")?;
+                let config = Config::load(Some(file.path()))?;
+                let actual = match provider {
+                    "mistral" => config
+                        .providers
+                        .mistral
+                        .as_ref()
+                        .map(|p| p.api_key.as_str()),
+                    _ => config.providers.openai.as_ref().map(|p| p.api_key.as_str()),
+                };
+                assert_eq!(actual, Some("env-secret"));
+            }
+            let err = Config::load(Some(file.path()))
+                .err()
+                .ok_or(format!("{provider} accepted absent API key"))?;
+            let message = err.to_string();
+            assert!(message.contains("api_key"), "{message}");
+            assert!(message.contains(env_key), "{message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indicator_mono_resolves_yaml_env_and_cli() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _mono = EnvGuard::clear("TALK_RS_INDICATORS_MONO")?;
+        for (yaml_mono, expected) in [("false", false), ("true", true)] {
+            let file = write_config(&format!(
+                "output_dir: /tmp/test-output\nproviders: {{}}\nindicators:\n  boop_interval_ms: 5000\n  visual_overlay: true\n  mono: {yaml_mono}\n"
+            ))?;
+            let config = Config::load(Some(file.path()))?;
+            assert_eq!(config.resolved_mono(false), expected);
+            assert!(config.resolved_mono(true));
+            {
+                let _override = EnvGuard::set("TALK_RS_INDICATORS_MONO", "true")?;
+                assert!(Config::load(Some(file.path()))?.resolved_mono(false));
+            }
+        }
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers: {}
+        "})?;
+        assert!(!Config::load(Some(file.path()))?.resolved_mono(false));
+        let _override = EnvGuard::set("TALK_RS_INDICATORS_MONO", "yes")?;
+        assert!(Config::load(Some(file.path()))?.resolved_mono(false));
+        Ok(())
+    }
+
+    #[test]
+    fn indicator_mono_only_section_keeps_feedback_defaults() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers: {}
+            indicators:
+              mono: true
+        "})?;
+        let config = Config::load(Some(file.path()))?;
+        let indicators = config.indicators.as_ref().ok_or("indicators missing")?;
+        assert!(config.resolved_mono(false));
+        assert_eq!(indicators.boop_interval_ms, 5_000);
+        assert!(indicators.visual_overlay);
+        Ok(())
+    }
+
+    #[test]
+    fn indicator_viz_env_creates_missing_section() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let _viz = EnvGuard::set("TALK_RS_INDICATORS_VIZ", "spectrum")?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers: {}
+        "})?;
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(
+            config.indicators.as_ref().and_then(|i| i.viz),
+            Some(VizMode::Spectrum)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_model_dirs_expand_leading_tilde() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let home = UserDirs::new()
+            .ok_or("home unavailable")?
+            .home_dir()
+            .to_path_buf();
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers:
+              parakeet:
+                model_dir: ~/models/parakeet
+              kokoro:
+                model_dir: ~/models/kokoro
+        "})?;
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(
+            config
+                .providers
+                .parakeet
+                .as_ref()
+                .ok_or("parakeet missing")?
+                .resolved_model_dir()?,
+            home.join("models/parakeet")
+        );
+        assert_eq!(
+            config
+                .providers
+                .kokoro
+                .as_ref()
+                .ok_or("kokoro missing")?
+                .resolved_model_dir()?,
+            home.join("models/kokoro")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recording_channels_reject_values_other_than_mono_or_stereo() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers: {}
+            recording:
+              channels: 3
+        "})?;
+        let err = Config::load(Some(file.path()))
+            .err()
+            .ok_or("YAML channels=3 accepted")?;
+        assert!(err.to_string().contains("channels"), "{err}");
+
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers: {}
+        "})?;
+        let _channels = EnvGuard::set("TALK_RS_RECORDING_CHANNELS", "3")?;
+        let err = Config::load(Some(file.path()))
+            .err()
+            .ok_or("env channels=3 accepted")?;
+        assert!(err.to_string().contains("CHANNELS"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn example_config_loads_without_unknown_keys() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let example = include_str!("../config.example.yaml");
+        let file = write_config(&example.replace("<PLACEHOLDER>", "/tmp/test-output"))?;
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(config.output_dir, PathBuf::from("/tmp/test-output"));
+        Ok(())
+    }
+
     /// Clear all provider-related env vars to prevent cross-test leakage.
     fn clear_all_provider_env_vars() -> Result<Vec<EnvGuard>, Box<dyn Error>> {
         Ok(vec![
@@ -1459,6 +1809,8 @@ mod tests {
             EnvGuard::clear("TALK_RS_RECORDING_SAMPLE_RATE")?,
             EnvGuard::clear("TALK_RS_RECORDING_CHANNELS")?,
             EnvGuard::clear("TALK_RS_RECORDING_BITRATE")?,
+            EnvGuard::clear("TALK_RS_INDICATORS_VIZ")?,
+            EnvGuard::clear("TALK_RS_INDICATORS_MONO")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_API_KEY")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_URL")?,
             EnvGuard::clear("TALK_RS_PROVIDERS_MISTRAL_MODEL")?,
@@ -1701,6 +2053,22 @@ providers:
 
         let config = Config::load(Some(file.path()))?;
         assert_eq!(config.output_dir, home);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_quoted_bare_tilde_output_dir_expanded() -> Result<(), Box<dyn Error>> {
+        let _lock = env_lock()?;
+        let _guards = clear_all_provider_env_vars()?;
+        let home = UserDirs::new()
+            .ok_or("home unavailable")?
+            .home_dir()
+            .to_path_buf();
+        let file = write_config(indoc! {r#"
+            output_dir: "~"
+            providers: {}
+        "#})?;
+        assert_eq!(Config::load(Some(file.path()))?.output_dir, home);
         Ok(())
     }
 
@@ -2100,25 +2468,6 @@ paste: {}
         let config = Config::load(Some(file.path()))?;
         let paste = config.paste.as_ref().expect("paste section present");
         assert_eq!(paste.restore_settle_ms(), 200);
-        Ok(())
-    }
-
-    #[test]
-    fn test_config_paste_restore_settle_ms_custom() -> Result<(), Box<dyn Error>> {
-        let _lock = env_lock()?;
-        let _guards = clear_all_provider_env_vars()?;
-
-        let yaml = r#"
-output_dir: /tmp/test-output
-providers: {}
-paste:
-  restore_settle_ms: 500
-"#;
-        let file = write_config(yaml)?;
-
-        let config = Config::load(Some(file.path()))?;
-        let paste = config.paste.as_ref().expect("paste section present");
-        assert_eq!(paste.restore_settle_ms(), 500);
         Ok(())
     }
 

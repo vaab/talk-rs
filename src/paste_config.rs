@@ -93,6 +93,7 @@ impl Default for PasteTiming {
 
 /// WM_CLASS routing pattern: glob plus the child to invoke on match.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WmClassPattern {
     /// Glob to match against `<instance>.<class>` (e.g.
     /// `"firefox.Firefox"` or `"*.Emacs"`).  Supports `*` as the only
@@ -105,6 +106,7 @@ pub struct WmClassPattern {
 
 /// Foreground-application routing pattern: normalized label plus child.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForegroundAppPattern {
     /// Glob matched against labels such as `opencode-tui`.
     #[serde(rename = "match")]
@@ -119,7 +121,7 @@ pub struct ForegroundAppPattern {
 /// With the `ui` feature, `build()` walks this tree into a runtime
 /// `Box<dyn crate::paste::PasteNode>`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "node", rename_all = "kebab-case")]
+#[serde(tag = "node", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum PasteNodeConfig {
     /// Switch on the running display server.  Currently only the
     /// `x11` branch is wired; `wayland` returns a clear error.

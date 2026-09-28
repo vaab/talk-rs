@@ -2,13 +2,14 @@
 #
 # This file contains all required settings for talk-rs operation.
 # Replace all <PLACEHOLDER> values with your actual configuration.
+# Unknown keys (including misspellings in nested sections) are rejected.
 #
 # For more information, see: https://github.com/talk-rs/talk-rs
 
 # Required: Output directory for recordings, screenshots, and clipboard saves.
 # The `record` command saves recordings here by default (memo-YYYY-MM-DD-HH-MM-SS.ogg).
 # Must be an absolute path that is writable.  A leading `~` (or `~/`)
-# is expanded to your home directory.
+# is expanded to your home directory (including a bare "~").
 output_dir: <PLACEHOLDER>
 
 # Optional: Recording quality for the `record` command's .ogg output.
@@ -24,7 +25,7 @@ output_dir: <PLACEHOLDER>
 # TALK_RS_RECORDING_CHANNELS / TALK_RS_RECORDING_BITRATE env vars.
 # recording:
 #   sample_rate: 48000   # Hz (48000 = full-band, no resampling)
-#   channels: 1          # 1 = mono (recommended for voice), 2 = stereo
+#   channels: 1          # only 1 = mono (recommended for voice), 2 = stereo
 #   bitrate: 128000      # bps (Opus; 128 kbps is transparent for voice)
 
 # Required: Transcription Providers Configuration
@@ -32,7 +33,8 @@ output_dir: <PLACEHOLDER>
 providers:
   # Mistral API Configuration
   mistral:
-    # Your Mistral API key for authentication
+    # Your Mistral API key for authentication (or omit this line and set
+    # TALK_RS_PROVIDERS_MISTRAL_API_KEY in the environment).
     # Get this from: https://console.mistral.ai/
     api_key: <PLACEHOLDER>
 
@@ -65,7 +67,7 @@ providers:
 
   # OpenAI API Configuration (optional)
   # openai:
-  #   api_key: <PLACEHOLDER>
+  #   api_key: <PLACEHOLDER>   # or TALK_RS_PROVIDERS_OPENAI_API_KEY
   #   url: https://api.openai.com               # base URL (optional, for compatible endpoints)
   #   model: gpt-transcribe                     # batch default
   #   realtime_model: gpt-live-transcribe       # realtime WebSocket default
@@ -110,7 +112,7 @@ providers:
   # via `cargo build --release --no-default-features`).
   # parakeet:
   #   variant: int8          # int8 (default, ~640 MB) — fp32 not yet available as a prebuilt download
-  #   # model_dir: ~/.local/share/talk-rs/models/parakeet-tdt-0.6b-v3-int8   # override cache location
+  #   # model_dir: ~/.local/share/talk-rs/models/parakeet-tdt-0.6b-v3-int8   # override cache location; ~/ expands
   #   num_threads: 2         # decode threads (default 2)
   #   # model: parakeet-tdt-0.6b-v3-int8   # logical name surfaced in cache keys / metadata
 
@@ -128,7 +130,7 @@ providers:
   # on demand by patching the model's ONNX voice metadata, cached as
   # model-<lang>.onnx next to the stock model.
   # kokoro:
-  #   # model_dir: ~/.local/share/talk-rs/models/kokoro-multi-lang-v1_0   # override cache location
+  #   # model_dir: ~/.local/share/talk-rs/models/kokoro-multi-lang-v1_0   # override cache location; ~/ expands
   #   voice: af_heart        # default voice name (af_heart, am_michael, ff_siwis, …)
   #   num_threads: 4         # inference threads (default 4)
   #   lang: en               # default phonemization language (en, fr, …)
@@ -162,7 +164,7 @@ indicators:
   # viz: waterfall
 
   # Monochrome visualizer (theme-aware: white on dark, black on light).
-  # Also settable via --mono or TALK_RS_INDICATORS_MONO env var.
+  # Also settable via TALK_RS_INDICATORS_MONO env var; --mono forces it on.
   # mono: false
 
 # Optional: Paste Behaviour
