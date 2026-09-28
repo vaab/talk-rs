@@ -154,6 +154,16 @@ downloaded on first use into ~~/.local/share/talk-rs/models/~.
 
 ** Installation
 
+With the build dependencies above installed, install the latest
+release from crates.io:
+
+#+begin_src sh
+cargo install --locked talk-rs
+#+end_src
+
+The binary lands in ~~/.cargo/bin/~, which rustup puts on your
+~$PATH~.
+
 If building from a git clone, run ~./autogen.sh~ first to resolve
 version placeholders in ~Cargo.toml~:
 
