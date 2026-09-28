@@ -573,6 +573,13 @@ pub fn load_system_font(scale: f32) -> Option<fontdue::Font> {
     load_font_from(FONT_SEARCH_PATHS, scale)
 }
 
+/// Share a Latin font for rendering tests that draw only Latin labels.
+#[cfg(test)]
+pub(crate) fn test_latin_font() -> Option<&'static fontdue::Font> {
+    static FONT: std::sync::OnceLock<Option<fontdue::Font>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| load_latin_font(30.0)).as_ref()
+}
+
 /// Load a system TrueType font for Latin-only labels (fast to parse).
 pub fn load_latin_font(scale: f32) -> Option<fontdue::Font> {
     load_font_from(LATIN_FONT_SEARCH_PATHS, scale)

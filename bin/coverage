@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    printf 'Usage: %s [cargo llvm-cov options...]\n' "${0##*/}" >&2
+}
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+# Display/audio-device-bound code is excluded; the coverage target measures
+# program logic rather than GUI, hardware, examples, or test harnesses.
+ignore='(^|/)(src/(dictate/picker/ui\.rs|x11/(overlay|mod|clipboard|visualizer)\.rs|record/ui\.rs|widgets/|gtk_theme\.rs|audio/(cpal_capture|pipewire_capture|monitor_capture|player)\.rs|cli/action/mod\.rs|main\.rs)|tests/|examples/)'
+
+cargo llvm-cov --summary-only --ignore-filename-regex "$ignore" "$@"

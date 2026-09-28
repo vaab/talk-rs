@@ -900,61 +900,55 @@ mod tests {
     // ── wait_for_playback tests ──────────────────────────────────────
 
     /// With an active callback, wait_for_playback detects completion
-    /// via position tracking and returns output matching the input.
-    #[tokio::test]
+    /// via position tracking and returns every input sample, even if
+    /// a contended callback inserts a silent frame before playback.
+    #[tokio::test(start_paused = true)]
     async fn test_wait_for_playback_completes_with_active_callback() {
         let state = Arc::new(Mutex::new(PlaybackState::new()));
         let frames_output = Arc::new(AtomicU64::new(0));
         let sample_rate = 48_000u32;
 
-        // 4800 samples = 100 ms at 48 kHz
         let input = vec![0.5f32; 4800];
         let target_len = input.len();
         state.lock().unwrap().replace(input);
 
-        // 256 frames every 5 ms ≈ 51 200 frames/s
-        let driver = CallbackDriver::start(
-            Arc::clone(&state),
-            Arc::clone(&frames_output),
-            1,
-            256,
-            std::time::Duration::from_millis(5),
-        );
+        // An output callback can lose the state lock and emit silence;
+        // this must not consume or discard any input samples.
+        let mut contended = vec![-1.0; 256];
+        {
+            let held = state.lock().unwrap();
+            fill_output_buffer(&mut contended, 1, &state, &frames_output);
+            assert_eq!(contended, vec![0.0; 256]);
+            assert_eq!(held.position, 0);
+        }
 
-        let start = std::time::Instant::now();
+        let callback_state = Arc::clone(&state);
+        let callback_frames = Arc::clone(&frames_output);
+        let callback = tokio::spawn(async move {
+            let mut output = contended;
+            for _ in 0..target_len.div_ceil(256) {
+                let mut buffer = vec![0.0; 256];
+                fill_output_buffer(&mut buffer, 1, &callback_state, &callback_frames);
+                output.extend(buffer);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            output
+        });
+
+        let start = tokio::time::Instant::now();
         wait_for_playback(&state, sample_rate, target_len).await;
         let elapsed = start.elapsed();
+        let output = callback.await.expect("callback task");
 
         let pos = state.lock().unwrap().position;
+        assert_eq!(pos, target_len, "wait must observe callback completion");
+        assert!(elapsed >= std::time::Duration::from_millis(150));
         assert!(
-            pos >= target_len,
-            "position {} should be >= {}",
-            pos,
-            target_len,
+            elapsed < std::time::Duration::from_millis(300),
+            "must finish before fallback"
         );
-
-        // ~100 ms playback + 150 ms drain = ~250 ms
-        assert!(
-            elapsed.as_millis() >= 100,
-            "should include drain time, took {:?}",
-            elapsed,
-        );
-        assert!(
-            elapsed.as_millis() < 1000,
-            "should complete well within 1 s, took {:?}",
-            elapsed,
-        );
-
-        // Verify captured output matches input
-        let output = driver.stop();
-        for (i, &s) in output.iter().take(target_len).enumerate() {
-            assert!(
-                (s - 0.5).abs() < f32::EPSILON,
-                "output[{}] should be 0.5, got {}",
-                i,
-                s,
-            );
-        }
+        assert_eq!(&output[..256], &vec![0.0; 256]);
+        assert_eq!(&output[256..256 + target_len], &vec![0.5; target_len]);
     }
 
     /// Without a callback, position never advances. Must fall back to
@@ -1187,7 +1181,7 @@ mod tests {
     /// The key correctness property: play_and_wait never blocks longer
     /// than (duration + DRAIN_SECS + margin), regardless of whether
     /// the callback is running.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_wait_for_playback_timing_is_bounded() {
         let state = Arc::new(Mutex::new(PlaybackState::new()));
 
@@ -1196,14 +1190,14 @@ mod tests {
             let n_samples = (48_000u64 * duration_ms / 1000) as usize;
             state.lock().unwrap().replace(vec![0.1f32; n_samples]);
 
-            let start = std::time::Instant::now();
+            let start = tokio::time::Instant::now();
             wait_for_playback(&state, 48_000, n_samples).await;
             let elapsed = start.elapsed();
 
-            // Upper bound: duration + DRAIN(150) + margin(50) + scheduling(100)
-            let upper_ms = duration_ms + 150 + 50 + 100;
+            // Upper bound: duration + DRAIN(150) + margin(50) + one 2ms poll.
+            let upper_ms = duration_ms + 150 + 50 + 2;
             assert!(
-                elapsed.as_millis() < upper_ms as u128,
+                elapsed.as_millis() <= upper_ms as u128,
                 "{} ms sound: elapsed {:?} should be < {} ms",
                 duration_ms,
                 elapsed,

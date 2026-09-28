@@ -618,10 +618,10 @@ mod tests {
 
     #[test]
     fn render_text_no_panic_with_font() {
-        if let Some(font) = load_viz_font() {
+        if let Some(font) = super::super::render_util::test_latin_font() {
             let mut pb = PixelBuffer::new(600, 36);
             pb.clear(BG);
-            render_text(&mut pb, "Hello world", &font, [0.5, 0.5, 0.5]);
+            render_text(&mut pb, "Hello world", font, [0.5, 0.5, 0.5]);
 
             let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
             assert!(non_bg > 0, "text should produce non-background pixels");
@@ -631,10 +631,10 @@ mod tests {
 
     #[test]
     fn render_text_dots_always_present() {
-        if let Some(font) = load_viz_font() {
+        if let Some(font) = super::super::render_util::test_latin_font() {
             let mut pb = PixelBuffer::new(600, 36);
             pb.clear(BG);
-            render_text(&mut pb, "", &font, [1.0, 1.0, 1.0]);
+            render_text(&mut pb, "", font, [1.0, 1.0, 1.0]);
 
             let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
             assert!(non_bg > 0, "dots alone should produce pixels");
@@ -643,10 +643,10 @@ mod tests {
 
     #[test]
     fn render_text_dots_dim_still_visible() {
-        if let Some(font) = load_viz_font() {
+        if let Some(font) = super::super::render_util::test_latin_font() {
             let mut pb = PixelBuffer::new(600, 36);
             pb.clear(BG);
-            render_text(&mut pb, "", &font, [0.0, 0.0, 0.0]);
+            render_text(&mut pb, "", font, [0.0, 0.0, 0.0]);
 
             // Even at brightness 0.0, DOT_LO (#333333) is not BG (#000000)
             let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
@@ -671,16 +671,29 @@ mod tests {
 
     #[test]
     fn render_text_overflow_clips_left() {
-        if let Some(font) = load_viz_font() {
-            // Narrow buffer — long text + dots should clip from the left.
-            let mut pb = PixelBuffer::new(80, 36);
-            pb.clear(BG);
+        if let Some(font) = super::super::render_util::test_latin_font() {
+            let mut long = PixelBuffer::new(80, 36);
+            long.clear(BG);
             render_text(
-                &mut pb,
-                "This is a very long sentence that will not fit",
-                &font,
+                &mut long,
+                &format!("{} end", "W".repeat(40)),
+                font,
                 [0.8, 0.5, 0.2],
             );
+
+            let mut shorter = PixelBuffer::new(80, 36);
+            shorter.clear(BG);
+            render_text(
+                &mut shorter,
+                &format!("{} end", "W".repeat(20)),
+                font,
+                [0.8, 0.5, 0.2],
+            );
+            assert_eq!(
+                long.data, shorter.data,
+                "clipped leading text must not affect the visible suffix"
+            );
+            assert!(long.data.chunks_exact(4).any(|pixel| pixel != BG));
         }
     }
 }

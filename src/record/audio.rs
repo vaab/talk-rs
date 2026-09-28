@@ -619,9 +619,18 @@ mod tests {
 
     #[cfg(feature = "ui")]
     fn waterfall_fixture() -> (tempfile::TempDir, PathBuf) {
+        use crate::audio::{AudioWriter, WavWriter};
+
         let temp = tempfile::tempdir().expect("tempdir");
-        let audio = temp.path().join("audio.m4a");
-        std::fs::copy(fixture("sine_440_0.5s_mono.m4a"), &audio).expect("copy audio fixture");
+        let audio = temp.path().join("audio.wav");
+        let samples: Vec<i16> = (0..1024)
+            .map(|i| ((i as f32 * 440.0 * std::f32::consts::TAU / 16_000.0).sin() * 12000.0) as i16)
+            .collect();
+        let mut writer = WavWriter::new(crate::config::AudioConfig::new());
+        writer.header().expect("initial header");
+        let pcm = writer.write_pcm(&samples).expect("encode PCM");
+        let wav = [writer.finalize().expect("final header"), pcm].concat();
+        std::fs::write(&audio, wav).expect("write audio fixture");
         (temp, audio)
     }
 
