@@ -22,6 +22,14 @@ exclude = [
     "sample-metadata*.yml",
 ]
 
+# docs.rs builds without `capture`: its build image lacks the
+# `libpipewire-0.3` system library that `libspa-sys` needs, so a
+# default-feature build fails before rustdoc runs.  Every other
+# feature's native dependency is available there.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["parakeet", "kokoro", "playback", "ui"]
+
 [lib]
 name = "talk_rs"
 path = "src/lib.rs"
