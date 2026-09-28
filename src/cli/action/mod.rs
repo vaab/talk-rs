@@ -9,6 +9,7 @@ pub use crate::transcribe::transcribe;
 
 pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std::error::Error>> {
     match command {
+        Commands::ClipboardHold => crate::clipboard::run_holder()?,
         Commands::Record {
             file,
             monitor,

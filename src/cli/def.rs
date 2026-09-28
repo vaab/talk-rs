@@ -18,6 +18,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Serve a restored clipboard selection (internal)
+    #[command(hide = true)]
+    ClipboardHold,
     /// Record audio from the system and save to a file
     Record {
         /// Output file path (defaults to <output_dir>/YYYY/MM/YYYY-MM-DDTHH-MM-SS+ZZZZ.ogg)

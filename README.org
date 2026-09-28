@@ -25,6 +25,8 @@ happening.
 
 - *Dictation workflow* -- press a key to start recording, press again
   to stop; transcribed text is pasted automatically.
+  The original clipboard text is restored after pasting and remains
+  available after ~talk-rs~ exits until you copy something else.
 - *Multiple providers* -- Mistral (Voxtral), OpenAI (Whisper / GPT-4o),
   and local on-device Parakeet for batch transcription; Mistral and
   OpenAI realtime streaming via WebSocket.
@@ -87,9 +89,9 @@ happening.
 - *Daemon toggle mode* -- first invocation spawns a short-lived daemon
   that records; second invocation signals it to stop, transcribe,
   paste, and exit.  Ideal for global shortcuts.
-- *No idle daemon* -- between dictations, zero ~talk-rs~ processes
-  stay resident.  The toggle daemon spawns on press, records, and
-  exits after pasting.  No memory footprint when idle.
+- *No idle dictation daemon* -- the toggle daemon spawns on press,
+  records, and exits after pasting. Only a tiny background clipboard
+  holder may remain; it exits as soon as another app takes the clipboard.
 - *Retry last* -- re-transcribe the last cached recording without
   speaking again (~--retry-last~).
 - *Recordings browser* -- ~record --ui~ opens a GTK4 window listing

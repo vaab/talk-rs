@@ -6,6 +6,7 @@
 //! paste target can retrieve the data.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -310,6 +311,67 @@ pub fn x11_clipboard_set(text: &str) -> Option<ClipboardServeHandle> {
         own_client_base,
         handle: Some(handle),
     })
+}
+
+/// Hold the restored selection until another client takes ownership.
+/// Runs only in the hidden, detached clipboard-hold subprocess.
+pub fn x11_clipboard_hold(text: &str) -> Result<(), String> {
+    let (conn, screen_num) = x11rb::connect(None).map_err(|e| e.to_string())?;
+    let root = conn.setup().roots[screen_num].root;
+    let window = conn.generate_id().map_err(|e| e.to_string())?;
+    conn.create_window(
+        0,
+        window,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        0,
+        &CreateWindowAux::new(),
+    )
+    .map_err(|e| e.to_string())?;
+    let atoms = Atoms {
+        clipboard: intern(&conn, b"CLIPBOARD").ok_or("could not intern CLIPBOARD")?,
+        utf8_string: intern(&conn, b"UTF8_STRING").ok_or("could not intern UTF8_STRING")?,
+        targets: intern(&conn, b"TARGETS").ok_or("could not intern TARGETS")?,
+    };
+    conn.set_selection_owner(window, atoms.clipboard, 0u32)
+        .map_err(|e| e.to_string())?;
+    conn.flush().map_err(|e| e.to_string())?;
+    let owner = conn
+        .get_selection_owner(atoms.clipboard)
+        .map_err(|e| e.to_string())?
+        .reply()
+        .map_err(|e| e.to_string())?
+        .owner;
+    if owner != window {
+        return Err("clipboard holder did not acquire ownership".to_string());
+    }
+
+    std::io::stdout()
+        .write_all(&[1])
+        .map_err(|e| e.to_string())?;
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+
+    let mask = conn.setup().resource_id_mask;
+    let own_base = client_base(conn.setup().resource_id_base, mask);
+    let fetches = Arc::new(Mutex::new(HashMap::new()));
+    // Block on the X connection: the holder may live for hours until
+    // another client takes the selection, so it must not busy-poll.
+    loop {
+        match conn.wait_for_event() {
+            Ok(Event::SelectionRequest(req)) if req.selection == atoms.clipboard => {
+                serve_request(&conn, &req, text, &atoms, &fetches, mask, own_base);
+            }
+            Ok(Event::SelectionClear(ev)) if ev.selection == atoms.clipboard => break,
+            Ok(_) => {}
+            Err(e) => return Err(format!("clipboard holder X11 connection failed: {e}")),
+        }
+    }
+    Ok(())
 }
 
 // ── helpers ──────────────────────────────────────────────────────

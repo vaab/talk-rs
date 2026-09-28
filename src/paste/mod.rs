@@ -308,13 +308,7 @@ pub async fn paste_with_root(
     // Restore the original clipboard regardless of whether paste
     // succeeded: a half-finished paste should not leave clipboard
     // contents from the failed operation in the user's clipboard.
-    if let Some(saved) = saved_clipboard {
-        log::trace!(
-            "paste: restoring original clipboard = {}",
-            log_preview(&saved)
-        );
-        let _ = clipboard.set_text(&saved).await;
-    }
+    crate::clipboard::restore_saved(&clipboard, saved_clipboard.as_deref()).await;
 
     paste_result?;
 
@@ -449,14 +443,7 @@ impl RealtimeClipboardGuard {
     /// `paste_segment` call already confirmed the target consumed
     /// the last segment before returning.
     pub async fn finish(self) {
-        if let Some(saved) = self.saved {
-            log::debug!("restoring original clipboard");
-            log::trace!(
-                "paste(realtime): restoring original clipboard = {}",
-                log_preview(&saved),
-            );
-            let _ = self.clipboard.set_text(&saved).await;
-        }
+        crate::clipboard::restore_saved(&self.clipboard, self.saved.as_deref()).await;
     }
 }
 

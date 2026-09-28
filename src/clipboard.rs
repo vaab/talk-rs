@@ -7,6 +7,14 @@ use crate::error::TalkError;
 #[cfg(feature = "ui")]
 use crate::x11::clipboard::{x11_clipboard_get, x11_clipboard_set, ClipboardServeHandle};
 use async_trait::async_trait;
+#[cfg(feature = "ui")]
+use std::io::{Read, Write};
+#[cfg(feature = "ui")]
+use std::os::unix::{net::UnixStream, process::CommandExt};
+#[cfg(feature = "ui")]
+use std::process::{Command, Stdio};
+#[cfg(feature = "ui")]
+use std::time::Duration;
 
 /// Trait for clipboard operations.
 ///
@@ -169,6 +177,100 @@ impl X11Clipboard {
 #[cfg(feature = "ui")]
 const SERVED_POLL_INTERVAL_MS: u64 = 5;
 
+/// The hidden child reads all bytes before claiming the selection and
+/// acknowledges ownership on stdout; it then serves until SelectionClear.
+#[cfg(feature = "ui")]
+pub fn run_holder() -> Result<(), TalkError> {
+    let mut text = String::new();
+    std::io::stdin().read_to_string(&mut text)?;
+    crate::x11::clipboard::x11_clipboard_hold(&text).map_err(TalkError::Clipboard)
+}
+
+/// Restore only meaningful saved text. Never claim an empty selection
+/// when the original owner offered no UTF8_STRING or the read failed.
+#[cfg(feature = "ui")]
+pub async fn restore_saved(clipboard: &X11Clipboard, saved: Option<&str>) {
+    let Some(text) = restorable_text(saved) else {
+        log::debug!("clipboard restore skipped: original text was empty or could not be read");
+        return;
+    };
+    log::trace!(
+        "clipboard: restoring original clipboard via detached holder = {}",
+        crate::paste::log_preview(text),
+    );
+    if let Err(error) = tokio::task::spawn_blocking({
+        let text = text.to_owned();
+        move || spawn_holder(&text)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r)
+    {
+        log::warn!("detached clipboard restore failed ({error}); using in-process fallback");
+        if let Err(error) = clipboard.set_text(text).await {
+            log::warn!("in-process clipboard restore failed: {error}");
+        }
+    }
+}
+
+#[cfg(feature = "ui")]
+fn restorable_text(saved: Option<&str>) -> Option<&str> {
+    saved.filter(|text| !text.is_empty())
+}
+
+#[cfg(feature = "ui")]
+fn spawn_holder(text: &str) -> Result<(), String> {
+    let (mut parent, child_io) = UnixStream::pair().map_err(|e| e.to_string())?;
+    parent
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| e.to_string())?;
+    parent
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| e.to_string())?;
+    let child_out = child_io.try_clone().map_err(|e| e.to_string())?;
+    let binary = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = Command::new(binary);
+    command
+        .arg("clipboard-hold")
+        // Long-lived: do not pin the caller's working directory.
+        .current_dir("/")
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(child_io)))
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(child_out)))
+        .stderr(Stdio::null());
+    // The child has its own session and no terminal; a dedicated waiter
+    // reaps it even when the parent stays alive after the paste.
+    unsafe {
+        command.pre_exec(|| {
+            nix::unistd::setsid().map_err(std::io::Error::other)?;
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let result = (|| {
+        parent
+            .write_all(text.as_bytes())
+            .map_err(|e| e.to_string())?;
+        parent
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|e| e.to_string())?;
+        let mut ready = [0];
+        parent.read_exact(&mut ready).map_err(|e| e.to_string())?;
+        if ready != [1] {
+            return Err("clipboard holder sent invalid acknowledgement".to_string());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    std::thread::spawn(move || {
+        if let Err(error) = child.wait() {
+            log::warn!("could not reap clipboard holder: {error}");
+        }
+    });
+    result
+}
+
 #[cfg(feature = "ui")]
 #[async_trait]
 impl Clipboard for X11Clipboard {
@@ -177,8 +279,9 @@ impl Clipboard for X11Clipboard {
             .await
             .map_err(|e| TalkError::Clipboard(format!("clipboard task panicked: {e}")))?;
 
-        // Empty/missing clipboard is not an error — return empty string.
-        let text = result.unwrap_or_default();
+        let text = result.ok_or_else(|| {
+            TalkError::Clipboard("could not read UTF8_STRING from clipboard".to_string())
+        })?;
         log::trace!("clipboard get_text -> {}", crate::paste::log_preview(&text),);
         Ok(text)
     }
@@ -252,6 +355,14 @@ impl Clipboard for MockClipboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn empty_or_failed_save_does_not_restore() {
+        assert_eq!(restorable_text(None), None);
+        assert_eq!(restorable_text(Some("")), None);
+        assert_eq!(restorable_text(Some("ORIGINAL")), Some("ORIGINAL"));
+    }
 
     #[tokio::test]
     async fn test_mock_clipboard_starts_empty() {
