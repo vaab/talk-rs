@@ -30,12 +30,19 @@
 use crate::error::TalkError;
 use fs2::FileExt;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 /// Progress-log granularity for the streaming download.
 const PROGRESS_LOG_EVERY_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
+const COMPLETION_MARKER: &str = ".complete";
+
+#[derive(Serialize, Deserialize)]
+struct CompletionMarker {
+    files: std::collections::BTreeMap<String, u64>,
+}
 
 /// Static description of a downloadable model artifact.
 ///
@@ -82,14 +89,41 @@ impl ModelSpec {
     }
 }
 
-/// True iff every required file for `spec` exists under `dir` AND is
-/// non-empty.  Non-empty matters because an interrupted download could
-/// leave a zero-byte placeholder; we must not treat that as "present".
+/// Verify required files against the install marker when one exists.
+/// Legacy manually placed models have no known sizes and retain the
+/// non-empty-file check without being stamped as verified installs.
 pub fn is_present(dir: &Path, spec: &ModelSpec) -> bool {
+    let marker_path = dir.join(COMPLETION_MARKER);
+    let marker = match std::fs::read(&marker_path) {
+        Ok(bytes) => match serde_yaml::from_slice::<CompletionMarker>(&bytes) {
+            Ok(marker) => Some(marker),
+            Err(_) => return false,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::debug!(
+                "model fetch: legacy install without size marker at {}",
+                dir.display()
+            );
+            None
+        }
+        Err(_) => return false,
+    };
+    if marker
+        .as_ref()
+        .is_some_and(|m| m.files.len() != spec.required_files.len())
+    {
+        return false;
+    }
     spec.required_files.iter().all(|name| {
         let p = dir.join(name);
         match std::fs::metadata(&p) {
-            Ok(m) => m.is_file() && m.len() > 0,
+            Ok(m) => {
+                m.is_file()
+                    && m.len() > 0
+                    && marker
+                        .as_ref()
+                        .is_none_or(|marker| marker.files.get(*name) == Some(&m.len()))
+            }
             Err(_) => false,
         }
     })
@@ -181,13 +215,21 @@ pub async fn download_and_install(dir: &Path, spec: &ModelSpec) -> Result<(), Ta
                 e
             ))
         })?;
-    lock_file.lock_exclusive().map_err(|e| {
-        TalkError::Config(format!(
-            "Failed to acquire exclusive flock on {}: {}",
-            lock_path.display(),
-            e
-        ))
-    })?;
+    loop {
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(e) => {
+                return Err(TalkError::Config(format!(
+                    "Failed to acquire exclusive flock on {}: {}",
+                    lock_path.display(),
+                    e
+                )));
+            }
+        }
+    }
     let _lock_guard = LockGuard(&lock_file);
 
     // 3. Re-check under the lock — another process may have completed
@@ -343,7 +385,9 @@ pub fn install_from_tarball(tarball: &Path, dir: &Path, spec: &ModelSpec) -> Res
     }
 
     // Locate the inner dir.
-    let inner_dir = locate_inner_dir(&staging, spec)?;
+    let inner_dir = locate_inner_dir(&staging, spec).inspect_err(|_| {
+        cleanup_staging(&staging);
+    })?;
 
     // Verify all required files are present and non-empty.
     for name in spec.required_files {
@@ -361,26 +405,73 @@ pub fn install_from_tarball(tarball: &Path, dir: &Path, spec: &ModelSpec) -> Res
         }
     }
 
-    // Atomic promote: remove any partial existing dir, then rename.
-    if let Err(e) = std::fs::remove_dir_all(dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
+    let files = spec
+        .required_files
+        .iter()
+        .map(|name| {
+            std::fs::metadata(inner_dir.join(name))
+                .map(|metadata| ((*name).to_string(), metadata.len()))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+        .map_err(TalkError::Io)?;
+    let marker = serde_yaml::to_string(&CompletionMarker { files })
+        .map_err(|e| TalkError::Transcription(format!("serialize model completion marker: {e}")))?;
+    let marker_tmp = inner_dir.join(".complete.tmp");
+    if let Err(e) = std::fs::write(&marker_tmp, marker)
+        .and_then(|()| std::fs::rename(&marker_tmp, inner_dir.join(COMPLETION_MARKER)))
+    {
+        cleanup_staging(&staging);
+        return Err(TalkError::Transcription(format!(
+            "write model completion marker: {e}"
+        )));
+    }
+
+    // Preserve the previous generation until the new generation has
+    // been promoted; never overwrite an existing rollback slot.
+    let backup = parent.join(format!(
+        "{}.old-{}",
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("talk-rs-model"),
+        std::process::id()
+    ));
+    if backup.exists() {
+        cleanup_staging(&staging);
+        return Err(TalkError::Transcription(format!(
+            "model backup path already occupied: {}",
+            backup.display()
+        )));
+    }
+    let had_old = dir.exists();
+    if had_old {
+        if let Err(e) = std::fs::rename(dir, &backup) {
             cleanup_staging(&staging);
             return Err(TalkError::Transcription(format!(
-                "remove pre-existing model dir {}: {}",
-                dir.display(),
-                e
+                "backup model {}: {e}",
+                dir.display()
             )));
         }
     }
 
     if let Err(e) = std::fs::rename(&inner_dir, dir) {
+        let restore = if had_old {
+            std::fs::rename(&backup, dir).err()
+        } else {
+            None
+        };
         cleanup_staging(&staging);
         return Err(TalkError::Transcription(format!(
-            "promote {} -> {}: {}",
+            "promote {} -> {}: {}; rollback error: {:?}",
             inner_dir.display(),
             dir.display(),
-            e
+            e,
+            restore
         )));
+    }
+    if had_old {
+        std::fs::remove_dir_all(&backup).map_err(|e| {
+            TalkError::Transcription(format!("remove old model backup {}: {e}", backup.display()))
+        })?;
     }
 
     // Inner dir is gone (renamed); clean up the now-empty staging
@@ -562,6 +653,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         populate_dir(tmp.path(), &TEST_SPEC);
         assert!(is_present(tmp.path(), &TEST_SPEC));
+        assert!(!tmp.path().join(COMPLETION_MARKER).exists());
+    }
+
+    #[test]
+    fn invalid_completion_marker_never_falls_back_to_legacy_presence() {
+        let tmp = TempDir::new().unwrap();
+        populate_dir(tmp.path(), &TEST_SPEC);
+        std::fs::write(tmp.path().join(COMPLETION_MARKER), b"not valid yaml: [").unwrap();
+        assert!(!is_present(tmp.path(), &TEST_SPEC));
     }
 
     #[test]
@@ -570,6 +670,27 @@ mod tests {
         populate_dir(tmp.path(), &TEST_SPEC);
         std::fs::File::create(tmp.path().join("tokens.txt")).unwrap();
         assert!(!is_present(tmp.path(), &TEST_SPEC));
+    }
+
+    #[test]
+    fn installed_model_rejects_truncated_required_file() {
+        let tmp = TempDir::new().unwrap();
+        let tarball = tmp.path().join("model.tar.bz2");
+        make_synthetic_tarball(
+            &tarball,
+            &[
+                ("a.onnx", b"model data"),
+                ("b.onnx", b"more data"),
+                ("tokens.txt", b"tokens"),
+            ],
+            TEST_SPEC.inner_dir,
+        )
+        .unwrap();
+        let dir = tmp.path().join("model");
+        install_from_tarball(&tarball, &dir, &TEST_SPEC).unwrap();
+        assert!(is_present(&dir, &TEST_SPEC));
+        std::fs::write(dir.join("a.onnx"), b"x").unwrap();
+        assert!(!is_present(&dir, &TEST_SPEC));
     }
 
     #[test]
@@ -626,6 +747,52 @@ mod tests {
     }
 
     #[test]
+    fn promote_failure_preserves_existing_model() {
+        let tmp = TempDir::new().unwrap();
+        let tarball = tmp.path().join("model.tar.bz2");
+        make_synthetic_tarball(
+            &tarball,
+            &[
+                ("a.onnx", b"new"),
+                ("b.onnx", b"new"),
+                ("tokens.txt", b"new"),
+            ],
+            TEST_SPEC.inner_dir,
+        )
+        .unwrap();
+        let dir = tmp.path().join("model");
+        populate_dir(&dir, &TEST_SPEC);
+        let occupied_backup = tmp.path().join(format!("model.old-{}", std::process::id()));
+        std::fs::create_dir(&occupied_backup).unwrap();
+        let err = install_from_tarball(&tarball, &dir, &TEST_SPEC)
+            .expect_err("occupied rollback slot must not replace old model");
+        assert!(err.to_string().contains("backup"));
+        assert_eq!(std::fs::read(dir.join("a.onnx")).unwrap(), b"dummy-bytes");
+        assert!(!tmp.path().join("model.staging.tmp").exists());
+    }
+
+    #[test]
+    fn ambiguous_archive_layout_cleans_staging() {
+        let tmp = TempDir::new().unwrap();
+        let tarball = tmp.path().join("model.tar.bz2");
+        let file = std::fs::File::create(&tarball).unwrap();
+        let encoder = bzip2::write::BzEncoder::new(file, Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for name in ["first/a.onnx", "second/b.onnx"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, &b"x"[..]).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+        let dir = tmp.path().join("model");
+        assert!(install_from_tarball(&tarball, &dir, &TEST_SPEC).is_err());
+        assert!(!dir.exists());
+        assert!(!tmp.path().join("model.staging.tmp").exists());
+    }
+
+    #[test]
     fn install_from_tarball_single_subdir_fallback() {
         // A re-packaged tarball with a different top-level name still
         // works because we fall back to the single non-hidden subdir.
@@ -655,13 +822,116 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("m");
         populate_dir(&dir, &TEST_SPEC);
-        // No network in the test runner; the fast path must
-        // short-circuit before any HTTP call.
-        let start = std::time::Instant::now();
-        download_and_install(&dir, &TEST_SPEC)
+        let server = wiremock::MockServer::start().await;
+        let request = wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let spec = ModelSpec {
+            tarball_url: Box::leak(server.uri().into_boxed_str()),
+            ..TEST_SPEC
+        };
+        download_and_install(&dir, &spec)
             .await
             .expect("fast path must succeed");
-        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+        drop(request);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_download_does_not_block_current_thread_executor() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let tarball = tmp.path().join("fixture.tar.bz2");
+        make_synthetic_tarball(
+            &tarball,
+            &[("a.onnx", b"A"), ("b.onnx", b"B"), ("tokens.txt", b"T")],
+            TEST_SPEC.inner_dir,
+        )
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/model"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(std::fs::read(&tarball).unwrap())
+                    .set_delay(std::time::Duration::from_millis(150)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let url: &'static str = Box::leak(format!("{}/model", server.uri()).into_boxed_str());
+        let spec = ModelSpec {
+            tarball_url: url,
+            ..TEST_SPEC
+        };
+        let dir = tmp.path().join("model");
+        let first = tokio::spawn({
+            let dir = dir.clone();
+            let spec = spec.clone();
+            async move { download_and_install(&dir, &spec).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if !server.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = tokio::spawn({
+            let dir = dir.clone();
+            async move { download_and_install(&dir, &spec).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(is_present(&dir, &TEST_SPEC));
+    }
+
+    #[tokio::test]
+    async fn download_installs_from_local_server_and_cleans_tarball() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let tarball = tmp.path().join("fixture.tar.bz2");
+        make_synthetic_tarball(
+            &tarball,
+            &[
+                ("a.onnx", b"model"),
+                ("b.onnx", b"model"),
+                ("tokens.txt", b"tokens"),
+            ],
+            TEST_SPEC.inner_dir,
+        )
+        .unwrap();
+        let mock = Mock::given(method("GET"))
+            .and(path("/model"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(std::fs::read(&tarball).unwrap()),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let spec = ModelSpec {
+            tarball_url: Box::leak(format!("{}/model", server.uri()).into_boxed_str()),
+            ..TEST_SPEC
+        };
+        let dir = tmp.path().join("model");
+        download_and_install(&dir, &spec).await.unwrap();
+        assert!(is_present(&dir, &spec));
+        assert!(dir.join(COMPLETION_MARKER).is_file());
+        assert!(!tmp.path().join("model.download.tmp").exists());
+        drop(mock);
     }
 
     #[test]

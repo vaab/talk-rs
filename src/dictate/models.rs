@@ -100,9 +100,14 @@ pub(super) fn build_retry_candidates(
     // If the user explicitly specified a model, include it even if it
     // is not in the known list (e.g. a dated snapshot or new model).
     if let (Some(provider), Some(model)) = (cli_provider, cli_model) {
-        let streaming = provider == Provider::OpenAI
-            && crate::transcription::openai::known_model_mode(model)
-                == Some(crate::transcription::openai::OpenAITranscriptionMode::Realtime);
+        let streaming = match provider {
+            Provider::OpenAI => {
+                crate::transcription::openai::known_model_mode(model)
+                    == Some(crate::transcription::openai::OpenAITranscriptionMode::Realtime)
+            }
+            Provider::Mistral => MISTRAL_REALTIME_MODELS.contains(&model),
+            Provider::Parakeet => false,
+        };
         out.push((provider, model.to_string(), streaming));
     }
 
@@ -111,6 +116,11 @@ pub(super) fn build_retry_candidates(
             // Specific provider requested: add all known one-shot + realtime models.
             add_known_models_with_streaming(&mut out, provider);
             add_known_realtime_models(&mut out, provider);
+            out.push((
+                provider,
+                resolve_model(None, config, provider, false),
+                false,
+            ));
         }
         None => {
             // No provider filter: add all known models for every
@@ -299,5 +309,31 @@ mod tests {
             assert!(candidates.contains(&(Provider::OpenAI, (*model).to_string(), false)));
             assert!(!candidates.contains(&(Provider::OpenAI, (*model).to_string(), true)));
         }
+    }
+
+    #[test]
+    fn explicit_mistral_realtime_model_is_only_streaming() {
+        let config = config_with_parakeet(None);
+        let model = "voxtral-mini-transcribe-realtime-2602";
+        let candidates = build_retry_candidates(&config, Some(Provider::Mistral), Some(model));
+        assert!(candidates.contains(&(Provider::Mistral, model.to_string(), true)));
+        assert!(!candidates.contains(&(Provider::Mistral, model.to_string(), false)));
+    }
+
+    #[test]
+    fn explicit_provider_keeps_configured_custom_batch_model() {
+        let mut config = config_with_parakeet(None);
+        config.providers.openai = Some(crate::config::OpenAIConfig {
+            api_key: String::new(),
+            url: None,
+            model: "my-deployment".into(),
+            realtime_model: "gpt-live-transcribe".into(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
+        });
+        let candidates = build_retry_candidates(&config, Some(Provider::OpenAI), None);
+        assert!(candidates.contains(&(Provider::OpenAI, "my-deployment".into(), false)));
     }
 }

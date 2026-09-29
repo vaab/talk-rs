@@ -86,14 +86,11 @@ fn required_files(variant: ParakeetVariant) -> &'static [&'static str] {
 /// True iff every required file for `variant` exists under `dir` AND
 /// is non-empty.
 pub fn is_present(dir: &Path, variant: ParakeetVariant) -> bool {
-    let files = required_files(variant);
-    files.iter().all(|name| {
-        let p = dir.join(name);
-        match std::fs::metadata(&p) {
-            Ok(m) => m.is_file() && m.len() > 0,
-            Err(_) => false,
-        }
-    })
+    let spec = ModelSpec {
+        required_files: required_files(variant),
+        ..INT8_SPEC
+    };
+    crate::model_fetch::is_present(dir, &spec)
 }
 
 /// Check that the model is present under `dir`, WITHOUT downloading.
@@ -136,6 +133,14 @@ pub fn ensure_present(dir: &Path, variant: ParakeetVariant) -> Result<(), TalkEr
 ///   manual-`wget`-fallback message that names the exact URL + target
 ///   dir.
 pub async fn download_model(dir: &Path, variant: ParakeetVariant) -> Result<(), TalkError> {
+    download_model_with_spec(dir, variant, &INT8_SPEC).await
+}
+
+async fn download_model_with_spec(
+    dir: &Path,
+    variant: ParakeetVariant,
+    spec: &ModelSpec,
+) -> Result<(), TalkError> {
     // Fast path: already complete (idempotent).
     if is_present(dir, variant) {
         return Ok(());
@@ -150,7 +155,7 @@ pub async fn download_model(dir: &Path, variant: ParakeetVariant) -> Result<(), 
         )));
     }
 
-    crate::model_fetch::download_and_install(dir, &INT8_SPEC).await
+    crate::model_fetch::download_and_install(dir, spec).await
 }
 
 /// Extract `tarball` (a `.tar.bz2`), verify the 4 expected INT8 files,
@@ -262,17 +267,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("p");
         populate_int8_dir(&dir);
-
-        let start = std::time::Instant::now();
-        download_model(&dir, ParakeetVariant::Int8)
+        let server = wiremock::MockServer::start().await;
+        let request = wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let spec = ModelSpec {
+            tarball_url: Box::leak(server.uri().into_boxed_str()),
+            ..INT8_SPEC
+        };
+        download_model_with_spec(&dir, ParakeetVariant::Int8, &spec)
             .await
             .expect("fast path must succeed");
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "fast path took {:?} — probably hit the network",
-            elapsed
-        );
+        drop(request);
     }
 
     #[test]
@@ -334,6 +342,26 @@ mod tests {
             !staging_tmp.path().join("model.staging.tmp").exists(),
             "staging dir should be cleaned up"
         );
+    }
+
+    #[test]
+    fn installed_parakeet_rejects_truncated_file() {
+        let tmp = TempDir::new().unwrap();
+        let tarball = tmp.path().join("model.tar.bz2");
+        make_synthetic_tarball(
+            &tarball,
+            &[
+                ("encoder.int8.onnx", b"model"),
+                ("decoder.int8.onnx", b"decoder"),
+                ("joiner.int8.onnx", b"joiner"),
+                ("tokens.txt", b"tokens"),
+            ],
+        )
+        .unwrap();
+        let dir = tmp.path().join("model");
+        install_from_tarball(&tarball, &dir).unwrap();
+        std::fs::write(dir.join("encoder.int8.onnx"), b"x").unwrap();
+        assert!(!is_present(&dir, ParakeetVariant::Int8));
     }
 
     #[test]

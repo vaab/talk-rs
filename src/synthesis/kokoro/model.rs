@@ -47,7 +47,11 @@
 
 use crate::error::TalkError;
 use crate::model_fetch::ModelSpec;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static DERIVATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Tarball asset URL for `kokoro-multi-lang-v1_0` (~350 MB).
 const KOKORO_TARBALL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2";
@@ -154,7 +158,11 @@ pub(crate) fn ensure_lang_model(dir: &Path, lang: &str) -> Result<std::path::Pat
     }
 
     let derived = dir.join(model_filename_for_lang(lang));
-    if derived.exists() {
+    let stock_len = std::fs::metadata(dir.join(MODEL_EN))?.len();
+    let expected_len = stock_len.checked_add_signed(lang.len() as i64 - baked.len() as i64);
+    if expected_len.is_some_and(|len| {
+        std::fs::metadata(&derived).is_ok_and(|md| md.is_file() && md.len() > 0 && md.len() == len)
+    }) {
         return Ok(derived);
     }
 
@@ -170,9 +178,28 @@ pub(crate) fn ensure_lang_model(dir: &Path, lang: &str) -> Result<std::path::Pat
 
     // Write to a temp sibling then atomic-rename so a crash mid-write
     // never leaves a truncated derived model.
-    let tmp = dir.join(format!("model-{}.onnx.tmp", lang));
-    std::fs::write(&tmp, &patched)
-        .map_err(|e| TalkError::Config(format!("failed to write {}: {}", tmp.display(), e)))?;
+    let tmp = dir.join(format!(
+        "model-{}.onnx.tmp-{}-{}",
+        lang,
+        std::process::id(),
+        DERIVATION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(&patched)?;
+        file.sync_all()
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(TalkError::Config(format!(
+            "failed to write {}: {}",
+            tmp.display(),
+            e
+        )));
+    }
     std::fs::rename(&tmp, &derived).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         TalkError::Config(format!(
@@ -441,6 +468,47 @@ mod tests {
         // Second call is cached (no re-derivation error).
         let p2 = ensure_lang_model(dir, "fr").expect("cached fr");
         assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn truncated_derived_model_is_regenerated() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join(MODEL_EN), synthetic_model()).unwrap();
+        let derived = dir.join("model-fr.onnx");
+        std::fs::write(&derived, b"x").unwrap();
+        assert_eq!(ensure_lang_model(dir, "fr").unwrap(), derived);
+        assert_eq!(
+            std::fs::read(&derived).unwrap(),
+            patch_voice_metadata(&synthetic_model(), "fr").unwrap()
+        );
+    }
+
+    #[test]
+    fn concurrent_derivations_publish_complete_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join(MODEL_EN), synthetic_model()).unwrap();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| ensure_lang_model(dir, "fr")))
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap().unwrap(), dir.join("model-fr.onnx"));
+            }
+        });
+        assert_eq!(
+            std::fs::read(dir.join("model-fr.onnx")).unwrap(),
+            patch_voice_metadata(&synthetic_model(), "fr").unwrap()
+        );
+        assert_eq!(
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+                .count(),
+            0
+        );
     }
 
     #[test]
