@@ -15,8 +15,10 @@ use crate::transcription::{
 };
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs;
+use std::fs::OpenOptions;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +27,49 @@ const MAX_CACHED_RECORDINGS: usize = 10;
 const LAST_RECORDING_POINTER: &str = "last_recording.ogg";
 const LAST_METADATA_POINTER: &str = "last_metadata.yml";
 const LAST_PASTE_STATE_FILE: &str = "last_paste.yml";
+
+/// Whether a YAML companion is owned by this exact audio stem.
+pub(crate) fn belongs_to_recording(name: &str, stem: &str) -> bool {
+    if stem.is_empty() || !name.ends_with(".yml") {
+        return false;
+    }
+    name == format!("{stem}.pick.yml")
+        || name == format!("{stem}.pick-lock.yml")
+        || ["mistral", "openai", "parakeet"].iter().any(|provider| {
+            name.strip_prefix(&format!("{stem}_{provider}_"))
+                .is_some_and(|rest| !rest.is_empty())
+        })
+}
+
+/// Compare recording paths by the instant encoded in their names.
+/// Legacy/imported names use basename ordering as before.
+pub(crate) fn compare_recording_paths(a: &Path, b: &Path) -> Ordering {
+    fn instant(path: &Path) -> Option<(chrono::DateTime<chrono::FixedOffset>, u64)> {
+        let stem = path.file_stem()?.to_str()?;
+        let prefix = stem.get(..24)?;
+        let suffix = stem.get(24..)?;
+        if !suffix.is_empty()
+            && !(suffix.starts_with('-') && suffix[1..].bytes().all(|b| b.is_ascii_digit()))
+        {
+            return None;
+        }
+        let index = if suffix.is_empty() {
+            0
+        } else {
+            suffix[1..].parse().ok()?
+        };
+        Some((
+            chrono::DateTime::parse_from_str(prefix, "%Y-%m-%dT%H-%M-%S%z").ok()?,
+            index,
+        ))
+    }
+    match (instant(a), instant(b)) {
+        (Some(a_time), Some(b_time)) => a_time
+            .cmp(&b_time)
+            .then_with(|| a.file_name().cmp(&b.file_name())),
+        _ => a.file_name().cmp(&b.file_name()),
+    }
+}
 
 /// Metadata associated with a cached recording.
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,6 +86,12 @@ pub struct RecordingMetadata {
     pub transcript: String,
     /// ISO-8601 timestamp of when the recording was made.
     pub timestamp: String,
+    /// Audio fingerprint at write time. Legacy sidecars without these fields
+    /// remain valid as long as the audio still exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_mtime_ns: Option<u128>,
     /// Optional API metadata captured during transcription.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<CommonMetadata>,
@@ -240,23 +291,30 @@ pub struct TranscriptionCache;
 
 impl TranscriptionCache {
     /// Look up a cached transcription for the given audio file,
-    /// provider, and model.
+    /// provider, and model. Old sidecars without a size/mtime fingerprint
+    /// remain valid for existing audio files (backward compatibility).
     pub fn get(audio_path: &Path, provider: Provider, model: &str) -> Option<TranscriptionResult> {
+        let audio_meta = fs::metadata(audio_path).ok()?;
         let dir = audio_path.parent()?;
         let stem = audio_path.file_stem()?.to_str()?;
         // `oneshot` is the current mode token; `batch` is the legacy
         // alias kept in the read list so pre-rename sidecars written
         // before the batch->one-shot vocabulary change are still found.
         for mode in &["oneshot", "batch", "realtime"] {
-            let safe_model = model.replace(['/', ' '], "-");
-            let filename = format!("{}_{}_{}_{}.yml", stem, provider, safe_model, mode);
-            let path = dir.join(&filename);
-            if path.exists() {
-                match Self::read_sidecar(&path) {
+            let encoded = encode_model(model);
+            let legacy = model.replace(['/', ' '], "-");
+            for safe_model in [encoded.as_str(), legacy.as_str()] {
+                // Legacy filenames can collide; the stored model field
+                // decides ownership, including on the fallback path.
+                let filename = format!("{}_{}_{}_{}.yml", stem, provider, safe_model, mode);
+                let path = dir.join(&filename);
+                if !path.exists() {
+                    continue;
+                }
+                match Self::read_sidecar(&path, &audio_meta, model, provider) {
                     Ok(result) => return Some(result),
                     Err(e) => {
                         log::warn!("failed to read cached sidecar {}: {}", path.display(), e);
-                        continue;
                     }
                 }
             }
@@ -299,13 +357,47 @@ impl TranscriptionCache {
     }
 
     /// Read a YAML sidecar file and convert to TranscriptionResult.
-    fn read_sidecar(path: &Path) -> Result<TranscriptionResult, TalkError> {
+    fn read_sidecar(
+        path: &Path,
+        audio_meta: &fs::Metadata,
+        model: &str,
+        provider: Provider,
+    ) -> Result<TranscriptionResult, TalkError> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| TalkError::Config(format!("failed to read {}: {}", path.display(), e)))?;
         let meta: RecordingMetadata = serde_yaml::from_str(&content)
             .map_err(|e| TalkError::Config(format!("failed to parse {}: {}", path.display(), e)))?;
+        if meta.model != model || meta.provider != provider.to_string() {
+            return Err(TalkError::Config(format!(
+                "sidecar model/provider mismatch {}",
+                path.display()
+            )));
+        }
+        if meta.audio_size.is_some_and(|size| size != audio_meta.len())
+            || meta.audio_mtime_ns.is_some_and(|mtime| {
+                audio_meta.modified().ok().and_then(system_time_ns) != Some(mtime)
+            })
+        {
+            return Err(TalkError::Config(format!(
+                "stale sidecar {}",
+                path.display()
+            )));
+        }
         Ok(meta.into_transcription_result())
     }
+}
+
+fn system_time_ns(time: std::time::SystemTime) -> Option<u128> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+fn encode_model(model: &str) -> String {
+    model
+        .replace('%', "%25")
+        .replace('/', "%2F")
+        .replace(' ', "%20")
 }
 
 fn is_token_usage_empty(v: &TokenUsage) -> bool {
@@ -497,8 +589,31 @@ pub fn generate_recording_path() -> Result<(PathBuf, String), TalkError> {
     let dir = ensure_recordings_dir()?;
     let now = Local::now();
     let ts = now.format("%Y-%m-%dT%H-%M-%S%z").to_string();
-    let ogg_path = dir.join(format!("{}.ogg", ts));
-    Ok((ogg_path, ts))
+    let path = recording_path_in_dir(&dir, &ts)?;
+    let reserved_stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(&ts);
+    Ok((path.clone(), reserved_stem.to_string()))
+}
+
+fn recording_path_in_dir(dir: &Path, ts: &str) -> Result<PathBuf, TalkError> {
+    for index in 0u64.. {
+        let stem = if index == 0 {
+            ts.to_string()
+        } else {
+            format!("{ts}-{index}")
+        };
+        let path = dir.join(format!("{stem}.ogg"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(TalkError::Io(e)),
+        }
+    }
+    Err(TalkError::Config(
+        "recording filename sequence exhausted".into(),
+    ))
 }
 
 /// Build the metadata YAML filename from components.
@@ -507,8 +622,7 @@ pub fn generate_recording_path() -> Result<(PathBuf, String), TalkError> {
 /// where mode is "realtime" or "oneshot".
 fn metadata_filename(timestamp: &str, provider: Provider, model: &str, realtime: bool) -> String {
     let mode = if realtime { "realtime" } else { "oneshot" };
-    // Sanitise model name: replace `/` and spaces with `-`
-    let safe_model = model.replace(['/', ' '], "-");
+    let safe_model = encode_model(model);
     format!("{}_{}_{}_{}.yml", timestamp, provider, safe_model, mode)
 }
 
@@ -517,7 +631,7 @@ fn metadata_filename(timestamp: &str, provider: Provider, model: &str, realtime:
 /// Format: `{stem}_{provider}_{model}_{mode}_lock.yml`.
 fn model_lock_filename(stem: &str, provider: Provider, model: &str, realtime: bool) -> String {
     let mode = if realtime { "realtime" } else { "oneshot" };
-    let safe_model = model.replace(['/', ' '], "-");
+    let safe_model = encode_model(model);
     format!("{}_{}_{}_{}-lock.yml", stem, provider, safe_model, mode)
 }
 
@@ -561,11 +675,19 @@ pub fn acquire_model_lock(
     realtime: bool,
 ) -> Result<(), TalkError> {
     let path = model_lock_path(audio_path, provider, model, realtime)?;
-    if path.exists() {
-        return Err(TalkError::ModelInProgress);
+    acquire_lock_file(&path, TalkError::ModelInProgress)
+}
+
+fn acquire_lock_file(path: &Path, occupied: TalkError) -> Result<(), TalkError> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(occupied),
+        Err(e) => Err(TalkError::Config(format!(
+            "failed to create {}: {}",
+            path.display(),
+            e
+        ))),
     }
-    fs::write(&path, b"")
-        .map_err(|e| TalkError::Config(format!("failed to write {}: {}", path.display(), e)))
 }
 
 /// Release the per-model lock.  Idempotent: missing lock is not an
@@ -626,20 +748,28 @@ fn pick_lock_path(audio_path: &Path) -> Result<PathBuf, TalkError> {
     Ok(dir.join(pick_lock_filename(stem)))
 }
 
-fn recording_sidecar_dirs(audio_path: &Path) -> Vec<PathBuf> {
+fn recording_sidecar_dirs(audio_path: &Path, fallback_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(audio_dir) = audio_path.parent() {
         dirs.push(audio_dir.to_path_buf());
     }
-    if let Ok(cache_dir) = recordings_dir() {
-        if !dirs.iter().any(|dir| dir == &cache_dir) {
-            dirs.push(cache_dir);
+    if let Some(cache_dir) = fallback_dir {
+        if !dirs.iter().any(|dir| dir == cache_dir) {
+            dirs.push(cache_dir.to_path_buf());
         }
     }
     dirs
 }
 
 pub fn list_sidecars_for_audio(audio_path: &Path) -> Vec<(Provider, String, String, bool)> {
+    let cache_dir = recordings_dir().ok();
+    list_sidecars_for_audio_with_fallback(audio_path, cache_dir.as_deref())
+}
+
+fn list_sidecars_for_audio_with_fallback(
+    audio_path: &Path,
+    fallback_dir: Option<&Path>,
+) -> Vec<(Provider, String, String, bool)> {
     let stem = match audio_path.file_stem().and_then(|s| s.to_str()) {
         Some(stem) if !stem.is_empty() => stem,
         _ => return Vec::new(),
@@ -650,7 +780,7 @@ pub fn list_sidecars_for_audio(audio_path: &Path) -> Vec<(Provider, String, Stri
     let mut seen: HashSet<(String, String, bool)> = HashSet::new();
     let mut entries = Vec::new();
 
-    for dir in recording_sidecar_dirs(audio_path) {
+    for dir in recording_sidecar_dirs(audio_path, fallback_dir) {
         let read_dir = match fs::read_dir(&dir) {
             Ok(read_dir) => read_dir,
             Err(err) => {
@@ -826,11 +956,7 @@ pub fn read_pick(audio_path: &Path) -> Option<(Provider, String, bool, String)> 
 /// progress).
 pub fn acquire_pick_lock(audio_path: &Path) -> Result<(), TalkError> {
     let path = pick_lock_path(audio_path)?;
-    if path.exists() {
-        return Err(TalkError::TranscriptInProgress);
-    }
-    fs::write(&path, b"")
-        .map_err(|e| TalkError::Config(format!("failed to write {}: {}", path.display(), e)))
+    acquire_lock_file(&path, TalkError::TranscriptInProgress)
 }
 
 /// Release the pick-level lock for a recording.
@@ -864,6 +990,7 @@ pub fn write_metadata_to_dir(
     segments: Option<&[crate::transcription::TranscriptSegment]>,
     diarization: Option<&[crate::transcription::DiarizationSegment]>,
 ) -> Result<PathBuf, TalkError> {
+    let audio_meta = fs::metadata(dir.join(audio_filename)).ok();
     let meta = RecordingMetadata {
         recording: audio_filename.to_string(),
         provider: provider.to_string(),
@@ -871,6 +998,11 @@ pub fn write_metadata_to_dir(
         realtime,
         transcript: transcript.to_string(),
         timestamp: timestamp.to_string(),
+        audio_size: audio_meta.as_ref().map(|meta| meta.len()),
+        audio_mtime_ns: audio_meta
+            .as_ref()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(system_time_ns),
         metadata: common_metadata_from_transcription(transcription_metadata),
         provider_api: provider_api_metadata_from_transcription(transcription_metadata),
         segments: common_segments_from_result(segments),
@@ -1018,7 +1150,7 @@ pub fn latest_recording_path() -> Result<PathBuf, TalkError> {
         }
     }
 
-    oggs.sort();
+    oggs.sort_by(|a, b| compare_recording_paths(a, b));
     oggs.pop().ok_or_else(|| {
         TalkError::Config(format!("no cached recordings found in {}", dir.display()))
     })
@@ -1046,7 +1178,7 @@ pub fn metadata_path_for_recording(
                 .map_err(|e| TalkError::Config(format!("failed to read directory entry: {}", e)))?;
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with(stem) && path.extension().and_then(|e| e.to_str()) == Some("yml") {
+            if belongs_to_recording(name, stem) {
                 ymls.push(path);
             }
         }
@@ -1157,7 +1289,7 @@ fn rotate_cache_in_dir(dir: &Path, keep: usize) -> Result<(), TalkError> {
         }
     }
 
-    oggs.sort();
+    oggs.sort_by(|a, b| compare_recording_paths(a, b));
 
     // If within limit, nothing to do
     if oggs.len() <= keep {
@@ -1183,9 +1315,7 @@ fn rotate_cache_in_dir(dir: &Path, keep: usize) -> Result<(), TalkError> {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name.starts_with(stem)
-                        && path.extension().and_then(|e| e.to_str()) == Some("yml")
-                    {
+                    if belongs_to_recording(name, stem) {
                         if let Err(e) = fs::remove_file(&path) {
                             log::warn!(
                                 "failed to remove cached metadata {}: {}",
@@ -1217,6 +1347,8 @@ mod tests {
             realtime,
             transcript: transcript.to_string(),
             timestamp: "2026-02-18T12-33-45".to_string(),
+            audio_size: None,
+            audio_mtime_ns: None,
             metadata: None,
             provider_api: None,
             segments: None,
@@ -1273,43 +1405,106 @@ mod tests {
     /// directly in a temp directory and testing rotation logic.
 
     #[test]
-    fn test_metadata_filename_oneshot() {
-        let name = metadata_filename("2026-02-18T12-33-45", Provider::OpenAI, "whisper-1", false);
-        assert_eq!(name, "2026-02-18T12-33-45_openai_whisper-1_oneshot.yml");
-    }
-
-    #[test]
-    fn test_metadata_filename_realtime() {
-        let name = metadata_filename(
-            "2026-02-18T12-33-45",
-            Provider::OpenAI,
-            "gpt-4o-mini-transcribe",
-            true,
-        );
-        assert_eq!(
-            name,
-            "2026-02-18T12-33-45_openai_gpt-4o-mini-transcribe_realtime.yml"
-        );
-    }
-
-    #[test]
-    fn test_metadata_filename_mistral() {
-        let name = metadata_filename(
-            "2026-02-18T12-33-45",
-            Provider::Mistral,
-            "voxtral-mini-latest",
-            false,
-        );
-        assert_eq!(
-            name,
-            "2026-02-18T12-33-45_mistral_voxtral-mini-latest_oneshot.yml"
-        );
+    fn metadata_filename_preserves_common_model_names_in_both_modes() {
+        for (provider, model, realtime, expected) in [
+            (
+                Provider::OpenAI,
+                "whisper-1",
+                false,
+                "2026-02-18T12-33-45_openai_whisper-1_oneshot.yml",
+            ),
+            (
+                Provider::OpenAI,
+                "gpt-4o-mini-transcribe",
+                true,
+                "2026-02-18T12-33-45_openai_gpt-4o-mini-transcribe_realtime.yml",
+            ),
+            (
+                Provider::Mistral,
+                "voxtral-mini-latest",
+                false,
+                "2026-02-18T12-33-45_mistral_voxtral-mini-latest_oneshot.yml",
+            ),
+        ] {
+            assert_eq!(
+                metadata_filename("2026-02-18T12-33-45", provider, model, realtime),
+                expected
+            );
+        }
     }
 
     #[test]
     fn test_metadata_filename_sanitises_slashes() {
         let name = metadata_filename("2026-02-18T12-33-45", Provider::OpenAI, "org/model", false);
-        assert_eq!(name, "2026-02-18T12-33-45_openai_org-model_oneshot.yml");
+        assert_ne!(
+            name,
+            metadata_filename("2026-02-18T12-33-45", Provider::OpenAI, "org-model", false)
+        );
+        assert_ne!(
+            model_lock_filename("sample", Provider::OpenAI, "org/model", false),
+            model_lock_filename("sample", Provider::OpenAI, "org-model", false)
+        );
+        assert_eq!(
+            metadata_filename("sample", Provider::Mistral, "voxtral-mini-2507", false),
+            "sample_mistral_voxtral-mini-2507_oneshot.yml"
+        );
+        assert_eq!(
+            metadata_filename("sample", Provider::OpenAI, "gpt-4o-transcribe", false),
+            "sample_openai_gpt-4o-transcribe_oneshot.yml"
+        );
+    }
+
+    #[test]
+    fn distinct_model_names_have_independent_cache_results() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = dir.path().join("sample.ogg");
+        fs::write(&audio, b"audio").expect("audio");
+        for (model, text) in [("org/model", "slash"), ("org-model", "dash")] {
+            TranscriptionCache::store(
+                &audio,
+                Provider::OpenAI,
+                model,
+                false,
+                &TranscriptionResult {
+                    text: text.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("store");
+        }
+        assert_eq!(
+            TranscriptionCache::get(&audio, Provider::OpenAI, "org/model")
+                .expect("slash")
+                .text,
+            "slash"
+        );
+        assert_eq!(
+            TranscriptionCache::get(&audio, Provider::OpenAI, "org-model")
+                .expect("dash")
+                .text,
+            "dash"
+        );
+    }
+
+    #[test]
+    fn legacy_colliding_name_is_read_only_for_recorded_model() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = dir.path().join("sample.ogg");
+        fs::write(&audio, b"audio").expect("audio");
+        fs::write(
+            dir.path().join("sample_openai_org-model_batch.yml"),
+            sample_metadata("legacy", "openai", "org/model", false),
+        )
+        .expect("legacy sidecar");
+        assert_eq!(
+            TranscriptionCache::get(&audio, Provider::OpenAI, "org/model")
+                .expect("matching legacy model")
+                .text,
+            "legacy"
+        );
+        assert!(TranscriptionCache::get(&audio, Provider::OpenAI, "org-model").is_none());
+        assert_ne!(encode_model("org/model"), encode_model("org%2Fmodel"));
+        assert_ne!(encode_model("org/model"), encode_model("org model"));
     }
 
     #[test]
@@ -1321,6 +1516,8 @@ mod tests {
             realtime: false,
             transcript: "Hello world.".to_string(),
             timestamp: "2026-02-18T12-33-45".to_string(),
+            audio_size: None,
+            audio_mtime_ns: None,
             metadata: None,
             provider_api: None,
             segments: None,
@@ -1344,6 +1541,8 @@ mod tests {
             realtime: false,
             transcript: "Bonjour".to_string(),
             timestamp: "2026-02-18T12-33-45".to_string(),
+            audio_size: None,
+            audio_mtime_ns: None,
             metadata: Some(CommonMetadata {
                 request_latency_ms: Some(123),
                 session_elapsed_ms: None,
@@ -1390,6 +1589,8 @@ mod tests {
             realtime: false,
             transcript: "Hello world.".to_string(),
             timestamp: "2026-02-18T12-33-45".to_string(),
+            audio_size: None,
+            audio_mtime_ns: None,
             metadata: None,
             provider_api: None,
             diarization: None,
@@ -1413,6 +1614,8 @@ mod tests {
             realtime: false,
             transcript: "Hello world.".to_string(),
             timestamp: "2026-02-18T12-33-45".to_string(),
+            audio_size: None,
+            audio_mtime_ns: None,
             metadata: None,
             provider_api: None,
             segments: None,
@@ -1481,6 +1684,64 @@ mod tests {
         let cached = TranscriptionCache::get(&audio_path, Provider::Mistral, "voxtral-mini-latest");
 
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn cache_misses_when_audio_size_changes_but_hits_for_unchanged_audio() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = dir.path().join("sample.ogg");
+        fs::write(&audio, b"original").expect("audio");
+        TranscriptionCache::store(
+            &audio,
+            Provider::OpenAI,
+            "whisper-1",
+            false,
+            &sample_result(),
+        )
+        .expect("store");
+        assert!(TranscriptionCache::get(&audio, Provider::OpenAI, "whisper-1").is_some());
+        fs::write(&audio, b"changed audio").expect("overwrite");
+        assert!(TranscriptionCache::get(&audio, Provider::OpenAI, "whisper-1").is_none());
+    }
+
+    #[test]
+    fn cache_misses_when_audio_is_missing() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = dir.path().join("sample.ogg");
+        fs::write(&audio, b"original").expect("audio");
+        TranscriptionCache::store(
+            &audio,
+            Provider::OpenAI,
+            "whisper-1",
+            false,
+            &sample_result(),
+        )
+        .expect("store");
+        fs::remove_file(&audio).expect("remove audio");
+        assert!(TranscriptionCache::get(&audio, Provider::OpenAI, "whisper-1").is_none());
+    }
+
+    #[test]
+    fn cache_misses_when_only_audio_mtime_changes() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = dir.path().join("sample.ogg");
+        fs::write(&audio, b"original").expect("audio");
+        TranscriptionCache::store(
+            &audio,
+            Provider::OpenAI,
+            "whisper-1",
+            false,
+            &sample_result(),
+        )
+        .expect("store");
+        let changed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .expect("open audio")
+            .set_times(fs::FileTimes::new().set_modified(changed))
+            .expect("change mtime");
+        assert!(TranscriptionCache::get(&audio, Provider::OpenAI, "whisper-1").is_none());
     }
 
     #[test]
@@ -1680,6 +1941,63 @@ mod tests {
     }
 
     #[test]
+    fn rotation_preserves_sidecars_of_similarly_prefixed_recording() {
+        let dir = TempDir::new().expect("tempdir");
+        for name in ["memo", "memo2"] {
+            fs::write(dir.path().join(format!("{name}.ogg")), b"audio").expect("audio");
+            fs::write(dir.path().join(format!("{name}.pick.yml")), b"pick").expect("pick");
+        }
+        rotate_cache_in_dir(dir.path(), 1).expect("rotate");
+        assert!(dir.path().join("memo2.ogg").exists());
+        assert!(dir.path().join("memo2.pick.yml").exists());
+    }
+
+    #[test]
+    fn sidecar_grammar_accepts_existing_cache_names_and_rejects_neighbor() {
+        let stem = "2026-09-04T18-57-41+0200";
+        assert!(belongs_to_recording(
+            "2026-09-04T18-57-41+0200_mistral_voxtral-mini-2602_oneshot.yml",
+            stem
+        ));
+        assert!(belongs_to_recording(
+            "2026-09-04T18-57-41+0200.pick.yml",
+            stem
+        ));
+        assert!(belongs_to_recording(
+            "2026-09-04T18-57-41+0200_mistral_voxtral-mini-2602_batch.yml",
+            stem
+        ));
+        assert!(!belongs_to_recording(
+            "2026-09-04T18-57-41+0200-1.pick.yml",
+            stem
+        ));
+    }
+
+    #[test]
+    fn rotation_keeps_newest_instant_across_dst_fold() {
+        let dir = TempDir::new().expect("tempdir");
+        let earlier = dir.path().join("2026-10-25T02-50-00+0200.ogg");
+        let later = dir.path().join("2026-10-25T02-10-00+0100.ogg");
+        fs::write(&earlier, b"earlier").expect("earlier");
+        fs::write(&later, b"later").expect("later");
+        rotate_cache_in_dir(dir.path(), 1).expect("rotate");
+        assert!(!earlier.exists());
+        assert!(later.exists());
+    }
+
+    #[test]
+    fn two_recordings_in_same_second_get_distinct_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let ts = "2026-10-25T02-50-00+0200";
+        let first = recording_path_in_dir(dir.path(), ts).expect("first path");
+        fs::write(&first, b"first").expect("first audio");
+        let second = recording_path_in_dir(dir.path(), ts).expect("second path");
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&first).expect("first remains"), b"first");
+        assert_eq!(compare_recording_paths(&first, &second), Ordering::Less);
+    }
+
+    #[test]
     fn test_rotate_cache_under_limit_is_noop() {
         let dir = TempDir::new().expect("create temp dir");
         let rec_dir = dir.path();
@@ -1806,7 +2124,7 @@ mod tests {
     #[test]
     fn test_list_sidecars_for_audio_uses_recordings_dir_as_fallback() {
         let dir = TempDir::new().expect("create temp dir");
-        let recordings = recordings_dir().expect("recordings dir");
+        let recordings = dir.path().join("recordings");
         fs::create_dir_all(&recordings).expect("create recordings dir");
         let audio_path = dir.path().join("fallback.ogg");
         fs::write(&audio_path, b"fake ogg").expect("write audio");
@@ -1817,7 +2135,7 @@ mod tests {
         )
         .expect("write fallback sidecar");
 
-        let sidecars = list_sidecars_for_audio(&audio_path);
+        let sidecars = list_sidecars_for_audio_with_fallback(&audio_path, Some(&recordings));
 
         assert_eq!(sidecars.len(), 1);
         assert_eq!(
@@ -1829,8 +2147,6 @@ mod tests {
                 false
             )
         );
-
-        let _ = fs::remove_file(fallback_sidecar);
     }
 
     #[test]
@@ -1964,6 +2280,36 @@ mod tests {
 
         let result = acquire_pick_lock(&audio_path);
         assert!(matches!(result, Err(TalkError::TranscriptInProgress)));
+    }
+
+    #[test]
+    fn concurrent_lock_acquisition_has_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+        for model_lock in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let audio = dir.path().join("recording.ogg");
+            fs::write(&audio, b"audio").expect("audio");
+            let barrier = Arc::new(Barrier::new(32));
+            let handles: Vec<_> = (0..32)
+                .map(|_| {
+                    let audio = audio.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if model_lock {
+                            acquire_model_lock(&audio, Provider::OpenAI, "whisper-1", false).is_ok()
+                        } else {
+                            acquire_pick_lock(&audio).is_ok()
+                        }
+                    })
+                })
+                .collect();
+            let winners = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread") as usize)
+                .sum::<usize>();
+            assert_eq!(winners, 1, "model_lock={model_lock}");
+        }
     }
 
     #[test]

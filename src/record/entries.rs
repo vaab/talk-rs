@@ -103,10 +103,17 @@ fn transcript_variants(raw: &str) -> (String, String) {
 ///
 /// Expected format: `2026-02-18T12-33-45` → `"2026-02-18 12:33:45"`.
 fn date_label_from_stem(stem: &str) -> String {
-    if stem.len() >= 19 {
-        let date_part = &stem[..10];
-        let time_part = stem[11..19].replace('-', ":");
-        format!("{} {}", date_part, time_part)
+    let bytes = stem.as_bytes();
+    if bytes.len() >= 19
+        && bytes[..19].is_ascii()
+        && [4, 7, 13, 16].iter().all(|&i| bytes[i] == b'-')
+        && bytes[10] == b'T'
+        && bytes[..19]
+            .iter()
+            .enumerate()
+            .all(|(i, b)| matches!(i, 4 | 7 | 10 | 13 | 16) || b.is_ascii_digit())
+    {
+        format!("{} {}", &stem[..10], stem[11..19].replace('-', ":"))
     } else {
         stem.to_string()
     }
@@ -204,7 +211,7 @@ fn collect_audio_flat(dir: &Path) -> Result<Vec<PathBuf>, TalkError> {
 
 /// Sort timestamp-bearing recording basenames newest-first.
 fn sort_recording_paths_newest_first(audio: &mut [PathBuf]) {
-    audio.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    audio.sort_by(|a, b| recording_cache::compare_recording_paths(b, a));
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -472,9 +479,7 @@ fn delete_recording_in_dir(file_path: &Path, dir: Option<&Path>) -> Result<(), T
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name.starts_with(stem)
-                        && path.extension().and_then(|e| e.to_str()) == Some("yml")
-                    {
+                    if recording_cache::belongs_to_recording(name, stem) {
                         if let Err(e) = std::fs::remove_file(&path) {
                             log::warn!("failed to remove metadata {}: {}", path.display(), e);
                         }
@@ -653,7 +658,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BUG: deletion matches YAML sidecars by raw stem prefix and removes another recording's metadata"]
     fn deletion_preserves_similarly_prefixed_recording() {
         let temp = tempfile::tempdir().expect("tempdir");
         let audio = temp.path().join("memo.ogg");
@@ -665,6 +669,21 @@ mod tests {
         delete_recording_in_dir(&audio, Some(temp.path())).expect("delete");
         assert!(other.exists());
         assert!(other_pick.exists(), "another recording's pick must survive");
+    }
+
+    #[test]
+    fn imported_unicode_stem_is_displayed_without_panicking() {
+        assert_eq!(date_label_from_stem("éééééééééé"), "éééééééééé");
+    }
+
+    #[test]
+    fn recording_sort_uses_instant_across_dst_fold() {
+        let mut paths = vec![
+            PathBuf::from("2026-10-25T02-50-00+0200.ogg"),
+            PathBuf::from("2026-10-25T02-10-00+0100.ogg"),
+        ];
+        sort_recording_paths_newest_first(&mut paths);
+        assert_eq!(paths[0], PathBuf::from("2026-10-25T02-10-00+0100.ogg"));
     }
 
     #[test]
@@ -852,18 +871,15 @@ mod tests {
 
         assert_eq!(out.len(), 2, "should find both flat and nested files");
 
-        // Sort by file name (same rule list_ogg_recordings uses) and
-        // verify chronological order.  Path-based sorting would produce
-        // the wrong order here because `-` < `/` in ASCII.
-        out.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        sort_recording_paths_newest_first(&mut out);
         let names: Vec<_> = out.iter().map(|p| basename(p).to_string()).collect();
         assert_eq!(
             names,
             vec![
-                "2026-04-05T10-00-00+0200.ogg".to_string(),
                 "2026-04-10T10-00-00+0200.ogg".to_string(),
+                "2026-04-05T10-00-00+0200.ogg".to_string(),
             ],
-            "file-name-based sort must place the Apr-5 flat file before the Apr-10 nested file"
+            "production sort must place the Apr-10 nested file before the Apr-5 flat file"
         );
     }
 
@@ -974,8 +990,26 @@ mod tests {
 
     #[test]
     fn audio_duration_secs_dispatches_correctly() {
-        // Unknown extension → None (not an error).
+        use crate::audio::{AudioWriter, OggOpusWriter};
         let tmp = TempDir::new().expect("tempdir");
+        let mut writer = OggOpusWriter::new(crate::config::AudioConfig::new()).expect("ogg writer");
+        let ogg = [
+            writer.header().expect("ogg header"),
+            writer.write_pcm(&vec![0; 16_000]).expect("ogg samples"),
+            writer.finalize().expect("ogg final"),
+        ]
+        .concat();
+        let ogg_path = tmp.path().join("clip.ogg");
+        std::fs::write(&ogg_path, ogg).expect("ogg fixture");
+        let ogg_duration = audio_duration_secs(&ogg_path).expect("ogg duration");
+        assert!((ogg_duration - 1.0).abs() < 0.1, "{ogg_duration}");
+
+        let m4a =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sine_440_0.5s_mono.m4a");
+        let m4a_duration = audio_duration_secs(&m4a).expect("m4a duration");
+        assert!((m4a_duration - 0.5).abs() < 0.1, "{m4a_duration}");
+
+        // Unknown extension → None (not an error).
         let unknown = tmp.path().join("clip.flac");
         std::fs::write(&unknown, b"x").unwrap();
         assert_eq!(audio_duration_secs(&unknown), None);
