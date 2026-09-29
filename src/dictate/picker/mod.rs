@@ -90,6 +90,7 @@ struct PreparedRecord {
 
 /// Parameters for the pick-mode path.
 pub(crate) struct PickParams {
+    pub chain: Option<String>,
     pub input_audio_file: Option<PathBuf>,
     pub cached_brief: Option<recording_cache::RecordingMetadataBrief>,
     pub replace_char_count: Option<usize>,
@@ -318,6 +319,31 @@ where
     }
 
     let mut outcome = present(PickerUiInput {
+        chain_order: config
+            .resolve_chain(
+                params.chain.as_deref(),
+                params.provider,
+                params.model.as_deref(),
+            )?
+            .map(|chain| {
+                chain
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.provider,
+                            entry.model.clone(),
+                            transcription::catalog::supports(
+                                entry.provider,
+                                &entry.model,
+                                "realtime",
+                                &entry.supports,
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         transcribers: oneshot_filtered,
         audio_path,
         cached_entries,
@@ -368,7 +394,35 @@ async fn prepare_record_input(
         all_entries.push((*p, m.clone(), t.clone(), *s));
     }
 
-    let candidates = build_retry_candidates(config, params.provider, params.model.as_deref());
+    let mut candidates = build_retry_candidates(config, params.provider, params.model.as_deref());
+    if let Ok(Some(chain)) = config.resolve_chain(
+        params.chain.as_deref(),
+        params.provider,
+        params.model.as_deref(),
+    ) {
+        let mut ordered: Vec<_> = chain
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.provider,
+                    entry.model.clone(),
+                    transcription::catalog::supports(
+                        entry.provider,
+                        &entry.model,
+                        "realtime",
+                        &entry.supports,
+                    ),
+                )
+            })
+            .collect();
+        for candidate in candidates {
+            if !ordered.contains(&candidate) {
+                ordered.push(candidate);
+            }
+        }
+        candidates = ordered;
+    }
     log::debug!("picker candidates: {} total", candidates.len());
     for (p, m, s) in &candidates {
         log::debug!("  candidate: {}:{} (streaming={})", p, m, s);
@@ -409,6 +463,8 @@ async fn prepare_record_input(
                 policy: transcription::RequestTimeoutPolicy::Proportional,
                 cancel_token: None,
                 skip_legacy_lock: false,
+                retry_schedule: None,
+                language: None,
             },
             &sink,
         )
@@ -461,8 +517,23 @@ async fn prepare_record_input(
     // Resolve the default model so only it is transcribed immediately.
     // All other candidates are deferred — shown in the UI with a
     // "transcribe" button that the user can click on demand.
-    let default_provider = resolve_provider(params.provider, config);
-    let default_model = resolve_model(params.model.as_deref(), config, default_provider, false);
+    let selected_chain = config
+        .resolve_chain(
+            params.chain.as_deref(),
+            params.provider,
+            params.model.as_deref(),
+        )
+        .ok()
+        .flatten();
+    let chain_first = selected_chain
+        .as_ref()
+        .and_then(|chain| chain.first_available(transcription::chain::outage_path().ok()?));
+    let default_provider = chain_first
+        .map(|entry| entry.provider)
+        .unwrap_or_else(|| resolve_provider(params.provider, config));
+    let default_model = chain_first
+        .map(|entry| entry.model.clone())
+        .unwrap_or_else(|| resolve_model(params.model.as_deref(), config, default_provider, false));
     log::debug!(
         "picker default model: {}:{} (one-shot)",
         default_provider,
@@ -893,6 +964,7 @@ mod tests {
 
     fn openai_picker_params(audio_path: PathBuf) -> PickParams {
         PickParams {
+            chain: None,
             input_audio_file: Some(audio_path),
             cached_brief: None,
             replace_char_count: None,
@@ -1608,6 +1680,7 @@ mod tests {
             config,
             PickParams {
                 input_audio_file: Some(middle.clone()),
+                chain: None,
                 cached_brief: None,
                 replace_char_count: None,
                 replace_last_paste: false,
@@ -1726,6 +1799,7 @@ mod tests {
             config,
             PickParams {
                 input_audio_file: Some(recordings[0].clone()),
+                chain: None,
                 cached_brief: None,
                 replace_char_count: None,
                 replace_last_paste: false,

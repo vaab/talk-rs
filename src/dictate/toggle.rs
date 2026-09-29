@@ -22,6 +22,13 @@ fn build_daemon_args(opts: &DictateOpts, target_window: Option<String>) -> Vec<S
     args.push("dictate".to_string());
     args.push("--daemon".to_string());
 
+    if let Some(chain) = &opts.chain {
+        args.extend(["--chain".to_string(), chain.clone()]);
+    }
+    if let Some(lang) = &opts.lang {
+        args.extend(["--lang".to_string(), lang.clone()]);
+    }
+
     if let Some(p) = opts.provider {
         args.push("--provider".to_string());
         args.push(p.to_string());
@@ -153,6 +160,8 @@ pub(super) mod tests {
 
     pub(in crate::dictate) fn test_opts() -> DictateOpts {
         DictateOpts {
+            chain: None,
+            lang: None,
             save: None,
             output_yaml: None,
             input_audio_file: None,
@@ -180,6 +189,17 @@ pub(super) mod tests {
             target_window: None,
             verbose: 0,
         }
+    }
+
+    #[test]
+    fn toggle_forwards_chain_and_language() {
+        let mut opts = test_opts();
+        opts.chain = Some("french".into());
+        opts.lang = Some("fr".into());
+        assert_eq!(
+            build_daemon_args(&opts, None),
+            ["dictate", "--daemon", "--chain", "french", "--lang", "fr"]
+        );
     }
 
     #[test]

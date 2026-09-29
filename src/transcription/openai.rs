@@ -68,13 +68,7 @@ impl OpenAIResponse {
     }
 }
 
-pub(crate) const OPENAI_BATCH_MODELS: &[&str] = &[
-    "gpt-transcribe",
-    "gpt-4o-mini-transcribe",
-    "gpt-4o-transcribe",
-    "whisper-1",
-];
-pub(crate) const OPENAI_REALTIME_MODELS: &[&str] = &["gpt-live-transcribe", "gpt-realtime-whisper"];
+pub(crate) use super::catalog::{OPENAI_BATCH_MODELS, OPENAI_REALTIME_MODELS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenAITranscriptionMode {
@@ -275,8 +269,9 @@ pub(crate) async fn validate_openai_model(
     api_base: &str,
     sink: &Arc<dyn TelemetrySink>,
     cancel: CancellationToken,
+    schedule: transport::RetrySchedule,
 ) -> Result<(), TalkError> {
-    super::transport::http::validate_model(
+    super::transport::http::validate_model_with_schedule(
         crate::config::Provider::OpenAI,
         "OpenAI",
         api_key,
@@ -285,6 +280,7 @@ pub(crate) async fn validate_openai_model(
         is_transcription_model,
         sink,
         cancel,
+        schedule,
     )
     .await
 }
@@ -310,6 +306,7 @@ pub struct OpenAIOneShotTranscriber {
     /// See [`super::mistral::MistralOneShotTranscriber::cancel_token`]
     /// for the wiring rationale.
     cancel_token: CancellationToken,
+    retry_schedule: transport::RetrySchedule,
 }
 
 impl OpenAIOneShotTranscriber {
@@ -345,6 +342,7 @@ impl OpenAIOneShotTranscriber {
             policy,
             sink: Arc::new(NoOpSink),
             cancel_token: CancellationToken::new(),
+            retry_schedule: transport::RetrySchedule::default(),
         })
     }
 
@@ -357,6 +355,7 @@ impl OpenAIOneShotTranscriber {
             policy: RequestTimeoutPolicy::Proportional,
             sink: Arc::new(NoOpSink),
             cancel_token: CancellationToken::new(),
+            retry_schedule: transport::RetrySchedule::default(),
         })
     }
 
@@ -458,7 +457,7 @@ impl OpenAIOneShotTranscriber {
         );
 
         let req = Request {
-            retry_schedule: Default::default(),
+            retry_schedule: self.retry_schedule.clone(),
             method: Method::Post,
             url: self.endpoint.clone(),
             headers: vec![(
@@ -523,6 +522,7 @@ impl OpenAIOneShotTranscriber {
         Ok(TranscriptionResult {
             text,
             metadata: TranscriptionMetadata {
+                attempts: Vec::new(),
                 request_latency_ms: Some(request_latency_ms),
                 session_elapsed_ms: None,
                 request_id,
@@ -548,6 +548,9 @@ impl OpenAIOneShotTranscriber {
 
 #[async_trait]
 impl OneShotTranscriber for OpenAIOneShotTranscriber {
+    fn set_retry_schedule(&mut self, schedule: transport::RetrySchedule) {
+        self.retry_schedule = schedule;
+    }
     fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
         self.sink = sink;
     }
@@ -579,6 +582,7 @@ impl OneShotTranscriber for OpenAIOneShotTranscriber {
             api_base,
             &self.sink,
             self.cancel_token.clone(),
+            self.retry_schedule.clone(),
         )
         .await
     }

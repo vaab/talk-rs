@@ -112,6 +112,8 @@ async fn parakeet_transcribes_real_french_speech() {
             policy: RequestTimeoutPolicy::Proportional,
             cancel_token: None,
             skip_legacy_lock: false,
+            retry_schedule: None,
+            language: None,
         },
         &sink,
     )

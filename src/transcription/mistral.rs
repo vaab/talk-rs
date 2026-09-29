@@ -130,35 +130,6 @@ pub(crate) async fn enrich_model_error(
     .await
 }
 
-// ── Model validation (delegates to shared http helper) ──────────────
-
-/// Validate that `model` is available in the Mistral account reachable
-/// at `api_base`.
-///
-/// Thin wrapper around [`super::transport::http::validate_model`] that
-/// fixes provider-specific bits (provider enum, display name,
-/// transcription-model filter) so callers only carry the variable
-/// inputs (api key, model, api_base, telemetry sink).
-pub(crate) async fn validate_mistral_model(
-    api_key: &str,
-    model: &str,
-    api_base: &str,
-    sink: &Arc<dyn TelemetrySink>,
-    cancel: CancellationToken,
-) -> Result<(), TalkError> {
-    super::transport::http::validate_model(
-        crate::config::Provider::Mistral,
-        "Mistral",
-        api_key,
-        model,
-        api_base,
-        is_transcription_model,
-        sink,
-        cancel,
-    )
-    .await
-}
-
 /// Transcriber implementation using the Mistral API.
 ///
 /// This implementation sends audio files to the Mistral API for transcription
@@ -186,6 +157,7 @@ pub struct MistralOneShotTranscriber {
     /// [`OneShotTranscriber::set_cancel_token`] so Stop buttons and
     /// SIGUSR1 from another process abort the in-flight request.
     cancel_token: CancellationToken,
+    retry_schedule: transport::RetrySchedule,
 }
 
 impl MistralOneShotTranscriber {
@@ -229,6 +201,7 @@ impl MistralOneShotTranscriber {
             policy,
             sink: Arc::new(NoOpSink),
             cancel_token: CancellationToken::new(),
+            retry_schedule: transport::RetrySchedule::default(),
         })
     }
 
@@ -252,6 +225,7 @@ impl MistralOneShotTranscriber {
             policy: RequestTimeoutPolicy::Proportional,
             sink: Arc::new(NoOpSink),
             cancel_token: CancellationToken::new(),
+            retry_schedule: transport::RetrySchedule::default(),
         })
     }
 
@@ -329,7 +303,7 @@ impl MistralOneShotTranscriber {
         );
 
         let req = Request {
-            retry_schedule: Default::default(),
+            retry_schedule: self.retry_schedule.clone(),
             method: Method::Post,
             url: self.endpoint.clone(),
             headers: vec![(
@@ -390,6 +364,7 @@ impl MistralOneShotTranscriber {
         Ok(TranscriptionResult {
             text,
             metadata: TranscriptionMetadata {
+                attempts: Vec::new(),
                 request_latency_ms: Some(request_latency_ms),
                 session_elapsed_ms: None,
                 request_id,
@@ -415,6 +390,9 @@ impl MistralOneShotTranscriber {
 
 #[async_trait]
 impl OneShotTranscriber for MistralOneShotTranscriber {
+    fn set_retry_schedule(&mut self, schedule: transport::RetrySchedule) {
+        self.retry_schedule = schedule;
+    }
     fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
         self.sink = sink;
     }
@@ -429,12 +407,16 @@ impl OneShotTranscriber for MistralOneShotTranscriber {
             .find("/v1/")
             .map(|pos| &self.endpoint[..pos])
             .unwrap_or(&self.endpoint);
-        validate_mistral_model(
+        super::transport::http::validate_model_with_schedule(
+            crate::config::Provider::Mistral,
+            "Mistral",
             &self.config.api_key,
             &self.config.model,
             api_base,
+            is_transcription_model,
             &self.sink,
             self.cancel_token.clone(),
+            self.retry_schedule.clone(),
         )
         .await
     }

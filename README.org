@@ -240,6 +240,8 @@ sections, fail configuration loading with an error naming the key.
 | ~providers.kokoro.num_threads~     | ~4~                       | Kokoro inference threads           |
 | ~providers.kokoro.lang~            | ~en~ (model-baked)        | Default Kokoro phonemization language |
 | ~transcription.default_provider~   | ~mistral~                 | Default transcription provider when unspecified |
+| ~transcription.default_chain~      | /none/                    | Named chain used unless ~--chain~, ~--provider~ or ~--model~ is given |
+| ~transcription.outage_memory~      | ~3m~                      | Duration to remember a busy provider across invocations |
 | ~speak.default_provider~           | /kokoro-if-configured/    | Default ~speak~ provider (~kokoro~ or ~mistral~) |
 | ~indicators.boop_interval_ms~      | ~5000~                    | Periodic boop interval in ms (~0~ disables boops; also ~--no-boop~) |
 | ~indicators.visual_overlay~        | ~true~                    | Show X11 overlay badge             |
@@ -256,6 +258,63 @@ for a *human* to listen to or share.  They are independent of
 transcription: audio sent to the providers is always downsampled to
 16 kHz mono internally (both Voxtral and Whisper operate at 16 kHz),
 so these knobs do not affect transcription accuracy or upload size.
+
+*** Named transcription fallback chains
+
+Add named chains under ~transcription.chains~; ~default_chain~ selects one
+when neither ~--chain~ nor an explicit ~--provider~ / ~--model~ is used.
+Both ~dictate~ (including ~--toggle~) and ~transcribe~ accept ~--chain
+NAME~ and ~--lang CODE~.  ~--chain~ conflicts with ~--provider~ and
+~--model~.  Explicit single-model calls keep their existing behavior.
+
+#+begin_src yaml
+transcription:
+  default_chain: dictate
+  outage_memory: 3m
+  chains:
+    dictate:
+      - mistral/voxtral-mini-2602
+      - model: openai/gpt-transcribe
+        retries: 2
+      - model: mistral/voxtral-mini-2507
+        wait: 45s
+      - parakeet
+    french:
+      - model: openai/gpt-transcribe
+        languages: [fr]
+      - mistral/voxtral-mini-2602
+    experimental:
+      - model: mistral/some-future-model
+        supports: [diarize, realtime]
+#+end_src
+
+An entry is either ~provider/model~, a bare provider (its configured
+batch model), or a map with ~model~ and optional ~retries~, ~wait~,
+~languages~ and ~supports~.  Durations use ~s~ or ~m~ (e.g. ~30s~,
+~2m~).  Without patience, the first busy failure moves immediately to
+the next model, including at the final entry.  When both bounds are
+set, the earlier bound wins.  The transport continues to honor
+~Retry-After~.  Only HTTP 429/5xx and connection/timeouts advance;
+bad credentials, unknown models and other permanent errors stop the
+chain.  Successful entries determine the sidecar/pick model and the
+recording metadata includes an ~attempts~ list.
+
+Chains are checked at config load: unknown/missing providers, missing
+API keys, empty/duplicate entries, invalid durations and local
+Parakeet before another entry are errors.  Before recording, ~--diarize~
+and ~--realtime~ filter unsupported models.  A ~languages~ list is a
+hard filter: without ~--lang~ that entry is skipped; with ~--lang fr~
+only entries accepting French remain (unrestricted entries accept any
+language).  ~supports~ can declare capabilities of future models;
+known models retain their catalog facts.  If none remain, dictation
+refuses before capture.  A chain in ~--pick~ lists its models first.
+
+On a busy response, provider-wide outage memory is written atomically
+to ~$XDG_CACHE_HOME/talk-rs/outages.yml~ (typically
+=~/.cache/talk-rs/outages.yml=).  Subsequent runs skip that provider
+until the ~Retry-After~ duration or ~outage_memory~ expires; if every
+eligible provider is marked busy, they are still attempted in order.
+Success clears its marker.  A corrupt file is ignored with a warning.
 
 *** Foreground application paste routing
 
@@ -367,6 +426,8 @@ Options:
 | ~--toggle~                  | Daemon toggle mode                              |
 | ~--provider~                | Choose ~mistral~, ~openai~, or ~parakeet~       |
 | ~--model~                   | Override model for this invocation               |
+| ~--chain <NAME>~            | Use a named fallback chain (conflicts with ~--provider~ and ~--model~) |
+| ~--lang <CODE>~             | Request a language code and filter chain entries |
 | ~--diarize~                 | Enable speaker diarization (batch mode only)    |
 | ~--timestamp~               | Include timestamps in output (~HH:MM:SS~ prefix) |
 | ~--realtime~                | Stream audio via WebSocket (incremental text)   |
@@ -463,6 +524,8 @@ Options:
 |---------------+---------------------------------------------------|
 | ~--provider~  | Choose ~mistral~, ~openai~, or ~parakeet~         |
 | ~--model~     | Override model for this invocation                 |
+| ~--chain <NAME>~ | Use a named fallback chain (conflicts with ~--provider~ and ~--model~) |
+| ~--lang <CODE>~ | Request a language code and filter chain entries |
 | ~--diarize~   | Enable speaker diarization (tag by speaker)       |
 | ~--timestamp~ | Include timestamps in output (~HH:MM:SS~ prefix)  |
 
@@ -476,8 +539,8 @@ ordinary model names keep their existing filenames.
 
 Cloud providers periodically answer =503 high load= or
 =429 backend_out_of_capacity=, especially on long recordings.
-~talk-rs~ treats every 5xx and 429 as "busy, try again later" and
-waits between attempts: 5 s, 15 s, 30 s, 60 s, 120 s, 120 s (about
+For a single-model call, ~talk-rs~ treats every 5xx and 429 as "busy,
+try again later" and waits between attempts: 5 s, 15 s, 30 s, 60 s, 120 s, 120 s (about
 5.5 minutes in total, seven attempts).  A =Retry-After= header from
 the provider (seconds or HTTP date) overrides the schedule slot (capped at 120 s).  Each wait
 is logged at ~-v~ as =server retry N/6=.  Other 4xx answers are
@@ -492,7 +555,7 @@ In the interactive picker, a connected request has no per-request
 wall-clock cap: slow server processing does not cause the same paid
 transcription POST to be sent again.
 
-If all seven attempts fail the recording is kept in the cache;
+If all seven single-model attempts fail the recording is kept in the cache;
 re-run ~transcribe~ on the ~.ogg~ (or ~dictate --retry-last~) once
 the provider has recovered.
 

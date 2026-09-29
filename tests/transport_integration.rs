@@ -436,6 +436,216 @@ async fn transport_retries_429_honouring_retry_after() {
     );
 }
 
+#[tokio::test]
+async fn chain_wait_bound_stops_before_retry_after_exceeds_remaining_patience() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
+        .mount(&server)
+        .await;
+    let mut request = make_request(
+        format!("{}/v1/models", server.uri()),
+        PipelinePhase::Validate,
+    );
+    request.retry_schedule.connection_budgets = vec![Duration::from_secs(2)];
+    request.retry_schedule.data_backoffs = vec![Duration::from_secs(5)];
+    request.retry_schedule.max_data_wait = Some(Duration::from_secs(1));
+    let sink: Arc<dyn TelemetrySink> = Arc::new(NoOpSink);
+    // Well under the 30 s Retry-After and the 5 s backoff slot: only an
+    // immediate give-up fits, yet loaded CI runs have room to schedule.
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        http_request(request, &sink, CancellationToken::new()),
+    )
+    .await;
+    let failure = result
+        .expect("wait must not reach deadline")
+        .expect_err("429 must be returned");
+    assert!(matches!(
+        failure.kind,
+        PipelineFailureKind::HttpStatus { status: 429, .. }
+    ));
+    assert_eq!(failure.retry_after, Some(Duration::from_secs(30)));
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+#[tokio::test]
+async fn chain_wait_starts_with_first_request_not_schedule_construction() {
+    use talk_rs::config::ChainEntry;
+
+    let server = wiremock::MockServer::start().await;
+    mount_fail_then_succeed(&server, 429, Some(0), 1).await;
+    let entry = ChainEntry {
+        provider: Provider::Mistral,
+        model: "voxtral-mini-2602".into(),
+        realtime_model: None,
+        retries: Some(1),
+        // Long enough that the first 429 round-trip fits even on a loaded
+        // machine; the pre-request sleep below still exceeds it.
+        wait: Some(Duration::from_secs(3)),
+        languages: None,
+        supports: Vec::new(),
+    };
+    let mut request = make_request(
+        format!("{}/v1/models", server.uri()),
+        PipelinePhase::Validate,
+    );
+    request.retry_schedule = entry.retry_schedule();
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    let sink: Arc<dyn TelemetrySink> = Arc::new(NoOpSink);
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        http_request(request, &sink, CancellationToken::new()),
+    )
+    .await
+    .expect("request should not wait for construction-time deadline")
+    .expect("busy response should retry after request begins");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn chain_wait_budget_is_shared_across_preflight_and_upload() {
+    use talk_rs::config::ChainEntry;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/preflight"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/upload"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/upload"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let entry = ChainEntry {
+        provider: Provider::Mistral,
+        model: "voxtral-mini-2602".into(),
+        realtime_model: None,
+        retries: Some(1),
+        wait: Some(Duration::from_millis(80)),
+        languages: None,
+        supports: Vec::new(),
+    };
+    let schedule = entry.retry_schedule();
+    let sink: Arc<dyn TelemetrySink> = Arc::new(NoOpSink);
+    let mut preflight = make_request(
+        format!("{}/preflight", server.uri()),
+        PipelinePhase::Validate,
+    );
+    preflight.retry_schedule = schedule.clone();
+    assert_eq!(
+        http_request(preflight, &sink, CancellationToken::new())
+            .await
+            .expect("preflight")
+            .status,
+        200
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut upload = make_request(format!("{}/upload", server.uri()), PipelinePhase::Request);
+    upload.retry_schedule = schedule;
+    let failure = http_request(upload, &sink, CancellationToken::new())
+        .await
+        .expect_err("shared wait expired");
+    assert!(matches!(
+        failure.kind,
+        PipelineFailureKind::HttpStatus { status: 429, .. }
+    ));
+    assert_eq!(server.received_requests().await.expect("requests").len(), 2);
+}
+
+#[tokio::test]
+async fn websocket_busy_handshake_is_fallback_worthy_but_unauthorized_is_not() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    for (status, fallback) in [(429, true), (401, false)] {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/realtime"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let url = format!("{}/v1/realtime", server.uri()).replacen("http://", "ws://", 1);
+        let mut request = make_request(url, PipelinePhase::Validate);
+        request.retry_schedule.connection_budgets = vec![Duration::from_secs(2)];
+        let sink: Arc<dyn TelemetrySink> = Arc::new(NoOpSink);
+        let failure = ws_upgrade(request, &sink, CancellationToken::new())
+            .await
+            .expect_err("handshake must fail");
+        assert!(
+            matches!(&failure.kind, PipelineFailureKind::HttpStatus { status: code, .. } if *code == status)
+        );
+        assert_eq!(failure.is_fallback_worthy(), fallback);
+        assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn websocket_chain_patience_retries_busy_handshake_on_same_entry() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let url = format!(
+        "ws://{}/v1/realtime",
+        listener.local_addr().expect("address")
+    );
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.expect("first connection");
+        let mut request = [0u8; 4096];
+        let len = first.read(&mut request).await.expect("request");
+        assert!(String::from_utf8_lossy(&request[..len]).starts_with("GET /v1/realtime"));
+        first
+            .write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("429");
+        drop(first);
+        let (second, _) = listener.accept().await.expect("retry connection");
+        tokio_tungstenite::accept_async(second)
+            .await
+            .expect("upgrade retry");
+    });
+    let mut request = make_request(url, PipelinePhase::Validate);
+    request.retry_schedule.connection_budgets = vec![Duration::from_secs(2); 2];
+    request.retry_schedule.data_backoffs = vec![Duration::ZERO];
+    request.retry_schedule.retry_ws_busy = true;
+    let sink: Arc<dyn TelemetrySink> = Arc::new(NoOpSink);
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        ws_upgrade(request, &sink, CancellationToken::new()),
+    )
+    .await
+    .expect("bounded handshake")
+    .expect("second handshake succeeds");
+    drop(stream);
+    server.await.expect("server completed");
+}
+
 /// Spec 2 (schedule): without `Retry-After`, the wait before data
 /// retry `n` is `DATA_BACKOFF_SECS[n-1]` in the default policy.
 #[test]

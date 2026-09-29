@@ -102,6 +102,8 @@ pub struct RecordingMetadata {
     pub segments: Option<Vec<CommonSegment>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diarization: Option<Vec<CommonDiarizationSegment>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<crate::transcription::chain::Attempt>,
 }
 
 /// Minimal metadata used for retry/replacement flows.
@@ -263,7 +265,7 @@ impl RecordingMetadata {
                 .collect()
         });
 
-        let metadata = self
+        let mut metadata = self
             .metadata
             .map(|cm| TranscriptionMetadata {
                 request_latency_ms: cm.request_latency_ms,
@@ -280,8 +282,10 @@ impl RecordingMetadata {
                     total_tokens: tu.total_tokens,
                 }),
                 provider_specific: None,
+                attempts: Vec::new(),
             })
             .unwrap_or_default();
+        metadata.attempts = self.attempts;
 
         TranscriptionResult {
             text: self.transcript,
@@ -1017,6 +1021,7 @@ pub fn write_metadata_to_dir(
         provider_api: provider_api_metadata_from_transcription(transcription_metadata),
         segments: common_segments_from_result(segments),
         diarization: common_diarization_from_result(diarization),
+        attempts: transcription_metadata.attempts.clone(),
     };
 
     let yaml = serde_yaml::to_string(&meta)
@@ -1364,6 +1369,7 @@ mod tests {
 
     fn sample_metadata(transcript: &str, provider: &str, model: &str, realtime: bool) -> String {
         serde_yaml::to_string(&RecordingMetadata {
+            attempts: Vec::new(),
             recording: "sample.ogg".to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
@@ -1384,6 +1390,7 @@ mod tests {
         TranscriptionResult {
             text: "hello world".to_string(),
             metadata: TranscriptionMetadata {
+                attempts: Vec::new(),
                 request_latency_ms: Some(123),
                 session_elapsed_ms: Some(456),
                 request_id: Some("req_123".to_string()),
@@ -1422,6 +1429,41 @@ mod tests {
                 },
             ]),
         }
+    }
+
+    #[test]
+    fn chain_attempts_serialize_with_answering_model_and_legacy_omission(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let audio = dir.path().join("sample.ogg");
+        fs::write(&audio, b"audio")?;
+        let mut result = sample_result();
+        result.metadata.attempts = vec![
+            crate::transcription::chain::Attempt {
+                provider: "mistral".into(),
+                model: "voxtral-mini-2602".into(),
+                outcome: "busy".into(),
+            },
+            crate::transcription::chain::Attempt {
+                provider: "openai".into(),
+                model: "gpt-transcribe".into(),
+                outcome: "success".into(),
+            },
+        ];
+        let path =
+            TranscriptionCache::store(&audio, Provider::OpenAI, "gpt-transcribe", false, &result)?;
+        let saved: RecordingMetadata = serde_yaml::from_str(&fs::read_to_string(&path)?)?;
+        assert_eq!(saved.provider, "openai");
+        assert_eq!(saved.model, "gpt-transcribe");
+        assert_eq!(saved.attempts, result.metadata.attempts);
+        let legacy: RecordingMetadata = serde_yaml::from_str(&sample_metadata(
+            "old",
+            "mistral",
+            "voxtral-mini-2507",
+            false,
+        ))?;
+        assert!(legacy.attempts.is_empty());
+        Ok(())
     }
 
     /// Override the recordings directory for testing by creating files
@@ -1533,6 +1575,7 @@ mod tests {
     #[test]
     fn test_recording_metadata_serialisation() {
         let meta = RecordingMetadata {
+            attempts: Vec::new(),
             recording: "2026-02-18T12-33-45.ogg".to_string(),
             provider: "openai".to_string(),
             model: "whisper-1".to_string(),
@@ -1558,6 +1601,7 @@ mod tests {
     #[test]
     fn test_recording_metadata_serialisation_with_provider_metadata() {
         let meta = RecordingMetadata {
+            attempts: Vec::new(),
             recording: "2026-02-18T12-33-45.ogg".to_string(),
             provider: "openai".to_string(),
             model: "gpt-4o-transcribe".to_string(),
@@ -1606,6 +1650,7 @@ mod tests {
     #[test]
     fn test_recording_metadata_serialize_with_segments() {
         let meta = RecordingMetadata {
+            attempts: Vec::new(),
             recording: "2026-02-18T12-33-45.ogg".to_string(),
             provider: "openai".to_string(),
             model: "whisper-1".to_string(),
@@ -1631,6 +1676,7 @@ mod tests {
     #[test]
     fn test_recording_metadata_serialize_without_segments() {
         let meta = RecordingMetadata {
+            attempts: Vec::new(),
             recording: "2026-02-18T12-33-45.ogg".to_string(),
             provider: "openai".to_string(),
             model: "whisper-1".to_string(),

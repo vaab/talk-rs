@@ -1,6 +1,9 @@
 //! Model catalog: provider/model resolution and known model lists.
 
 use crate::config::{Config, Provider};
+use crate::transcription::catalog::{
+    MISTRAL_REALTIME_MODELS, MISTRAL_TRANSCRIPTION_MODELS, PARAKEET_TRANSCRIPTION_MODELS,
+};
 
 /// Resolve the effective provider from CLI override or config default.
 pub(super) fn resolve_provider(cli_provider: Option<Provider>, config: &Config) -> Provider {
@@ -58,21 +61,6 @@ pub(super) fn resolve_model(
             .unwrap_or_else(|| "parakeet-tdt-0.6b-v3-int8".to_string()),
     }
 }
-
-/// Known Mistral models for the `/v1/audio/transcriptions` endpoint.
-///
-/// `voxtral-mini-latest` aliases to `voxtral-mini-2602` for
-/// transcription; we use explicit version names so the user can
-/// compare results between generations.
-const MISTRAL_TRANSCRIPTION_MODELS: &[&str] = &["voxtral-mini-2507", "voxtral-mini-2602"];
-
-/// Known local Parakeet models.  v1 ships INT8 only; FP32 is a
-/// config-accepted variant whose download is deferred to a later
-/// phase.
-const PARAKEET_TRANSCRIPTION_MODELS: &[&str] = &["parakeet-tdt-0.6b-v3-int8"];
-
-/// Known Mistral models that support realtime (WebSocket) transcription.
-const MISTRAL_REALTIME_MODELS: &[&str] = &["voxtral-mini-transcribe-realtime-2602"];
 
 /// Known OpenAI models that support realtime (WebSocket) transcription.
 ///

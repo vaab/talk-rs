@@ -139,6 +139,28 @@ providers:
 # Valid values: mistral, openai, parakeet.
 # transcription:
 #   default_provider: mistral
+#   default_chain: dictate      # used unless --chain, --provider or --model is given
+#   outage_memory: 3m           # busy provider remembered across runs; default 3m
+#   chains:
+#     dictate:
+#       - mistral/voxtral-mini-2602  # short form, no patience on busy
+#       - model: openai/gpt-transcribe
+#         retries: 2                 # at most two retries before next entry
+#       - model: mistral/voxtral-mini-2507
+#         wait: 45s                  # retry until this elapsed wait bound
+#       - parakeet                   # local provider must be last; configured model
+#     french:
+#       - model: openai/gpt-transcribe
+#         languages: [fr]            # only used with --lang fr
+#       - mistral/voxtral-mini-2602
+#     custom:
+#       - model: mistral/some-future-model
+#         supports: [diarize]        # declare capabilities of unknown models
+#
+# A chain requires each referenced provider section (and remote API key).
+# Only 429, 5xx, connection failures and timeouts advance to the next entry.
+# 400/401/403, bad models and missing keys stop immediately. With neither
+# retries nor wait, even the final entry makes just one attempt.
 
 # Optional: Default text-to-speech provider for the `speak` command,
 # used when --provider is not specified.  Valid values: kokoro, mistral.

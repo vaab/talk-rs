@@ -58,6 +58,8 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             }
         }
         Commands::Transcribe {
+            chain,
+            lang,
             input,
             output,
             provider,
@@ -69,7 +71,7 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             if let Some(output_file) = output {
                 args.push(output_file);
             }
-            transcribe(args, provider, model, diarize, timestamp).await?;
+            transcribe(args, provider, model, chain, lang, diarize, timestamp).await?;
         }
         Commands::Speak {
             text,
@@ -94,6 +96,8 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             .await?;
         }
         Commands::Dictate {
+            chain,
+            lang,
             save,
             output_yaml,
             input_audio_file,
@@ -121,6 +125,8 @@ pub async fn dispatch(command: Commands, verbose: u8) -> Result<(), Box<dyn std:
             target_window,
         } => {
             dictate(DictateOpts {
+                chain,
+                lang,
                 save: save.map(PathBuf::from),
                 output_yaml: output_yaml.map(PathBuf::from),
                 input_audio_file: input_audio_file.map(PathBuf::from),

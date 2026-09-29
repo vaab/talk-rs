@@ -49,6 +49,8 @@ pub async fn transcribe(
     args: Vec<String>,
     cli_provider: Option<Provider>,
     cli_model: Option<String>,
+    cli_chain: Option<String>,
+    lang: Option<String>,
     diarize: bool,
     timestamp: bool,
 ) -> Result<(), TalkError> {
@@ -60,6 +62,10 @@ pub async fn transcribe(
         )));
     }
     let config = Config::load(None)?;
+    let chain = config
+        .resolve_chain(cli_chain.as_deref(), cli_provider, cli_model.as_deref())?
+        .map(|chain| chain.eligible(diarize, false, lang.as_deref()))
+        .transpose()?;
     let provider = cli_provider
         .or_else(|| config.transcription.as_ref().map(|t| t.default_provider))
         .unwrap_or(Provider::Mistral);
@@ -69,15 +75,43 @@ pub async fn transcribe(
     // consent here (TTY prompt, or stderr-log + proceed when piped)
     // before transcription reaches `validate`.  No-op once installed.
     #[cfg(feature = "parakeet")]
-    if provider == Provider::Parakeet {
+    if chain.is_none() && provider == Provider::Parakeet {
         crate::transcription::parakeet::consent::ensure_with_cli_consent(&config).await?;
     }
 
-    let specific_options = cli_provider.is_some() || cli_model.is_some() || diarize;
+    let specific_options =
+        cli_provider.is_some() || cli_model.is_some() || diarize || lang.is_some();
     let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
         std::sync::Arc::new(crate::telemetry::NoOpSink);
 
-    let output_text = if specific_options {
+    let output_text = if let Some(chain) = &chain {
+        let outcome = chain
+            .run_file(
+                &input_path,
+                &config,
+                diarize,
+                lang.as_deref(),
+                &sink,
+                transcription::chain::outage_path()?,
+                0,
+                Vec::new(),
+                None,
+            )
+            .await?;
+        let text = transcription::format_transcription_output(&outcome.result, timestamp);
+        if !specific_options {
+            if let Err(error) = crate::recording_cache::write_pick_if_absent(
+                &input_path,
+                &outcome.provider.to_string(),
+                &outcome.model,
+                false,
+                &text,
+            ) {
+                log::warn!("failed to write pick file: {error}");
+            }
+        }
+        text
+    } else if specific_options {
         // Specific options -> Layer 3 directly, no pick I/O.
         // CLI is an autonomous caller (no human watching a GTK
         // window), so use `Proportional` so a hung server cannot
@@ -93,6 +127,8 @@ pub async fn transcribe(
                 policy: transcription::RequestTimeoutPolicy::Proportional,
                 cancel_token: None,
                 skip_legacy_lock: false,
+                retry_schedule: None,
+                language: lang.clone(),
             },
             &sink,
         )
@@ -185,6 +221,8 @@ mod tests {
         let missing = dir.path().join("missing.ogg");
         let error = transcribe(
             vec![missing.display().to_string()],
+            None,
+            None,
             None,
             None,
             false,

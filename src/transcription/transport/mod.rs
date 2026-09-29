@@ -48,7 +48,7 @@ pub(crate) mod ws;
 use crate::config::Provider;
 use crate::error::{NetworkKind, PipelineFailure, PipelineFailureKind, TimerLabel};
 use crate::telemetry::{TelemetrySink, TranscriptionEvent};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -86,6 +86,11 @@ pub const DATA_BACKOFF_SECS: [u64; 6] = [5, 15, 30, 60, 120, 120];
 pub struct RetrySchedule {
     pub connection_budgets: Vec<Duration>,
     pub data_backoffs: Vec<Duration>,
+    pub max_data_wait: Option<Duration>,
+    /// Set by the first request; clones for preflight and upload share the start.
+    pub wait_started: Option<Arc<OnceLock<Instant>>>,
+    /// Chain entries may wait on a busy WebSocket handshake; legacy callers do not.
+    pub retry_ws_busy: bool,
 }
 
 impl Default for RetrySchedule {
@@ -93,6 +98,9 @@ impl Default for RetrySchedule {
         Self {
             connection_budgets: CONNECTION_BUDGETS_SECS.map(Duration::from_secs).to_vec(),
             data_backoffs: DATA_BACKOFF_SECS.map(Duration::from_secs).to_vec(),
+            max_data_wait: None,
+            wait_started: None,
+            retry_ws_busy: false,
         }
     }
 }
@@ -333,9 +341,26 @@ pub async fn http_request(
     });
 
     let mut data_attempt: u32 = 1;
+    let started = Instant::now();
+    let wait_started = req
+        .retry_schedule
+        .wait_started
+        .as_ref()
+        .map_or(started, |shared| *shared.get_or_init(|| started));
+    let deadline = req
+        .retry_schedule
+        .max_data_wait
+        .map(|limit| wait_started + limit);
     loop {
-        let outcome =
-            run_connection_phase(&req, sink, &cancel, data_attempt, max_data_attempts).await;
+        let outcome = run_connection_phase(
+            &req,
+            sink,
+            &cancel,
+            data_attempt,
+            max_data_attempts,
+            deadline,
+        )
+        .await;
 
         let (pf, retry_after) = match outcome {
             ConnectionPhase::Done(result) => {
@@ -365,6 +390,19 @@ pub async fn http_request(
         let wait = retry_after
             .map(|d| d.min(Duration::from_secs(RETRY_AFTER_CAP_SECS)))
             .unwrap_or(slot);
+        let wait = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if wait >= remaining {
+                sink.emit(TranscriptionEvent::RequestCompleted {
+                    success: false,
+                    t: Instant::now(),
+                });
+                return Err(pf);
+            }
+            wait
+        } else {
+            wait
+        };
         let retry_num = data_attempt;
         let reason = pf.to_string();
         log::info!(
@@ -427,11 +465,17 @@ async fn run_connection_phase(
     cancel: &CancellationToken,
     data_attempt: u32,
     max_data_attempts: u32,
+    deadline: Option<Instant>,
 ) -> ConnectionPhase {
     let max_connection_attempts = req.retry_schedule.connection_budgets.len() as u32;
     let mut last_failure: Option<PipelineFailure> = None;
 
     for (idx, &connect_budget) in req.retry_schedule.connection_budgets.iter().enumerate() {
+        if idx > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return ConnectionPhase::Done(Err(last_failure.unwrap_or_else(|| {
+                build_generic_exhausted_failure(req, max_connection_attempts)
+            })));
+        }
         let attempt_num = (idx as u32) + 1;
 
         // Emit a `RetryScheduled` BEFORE every attempt past the
@@ -658,22 +702,11 @@ async fn run_single_http_attempt(
         })
     };
 
-    // Wall-clock cap on the whole attempt.  Two concerns layered:
-    //
-    //   * `connect_budget` (the per-attempt growing connect window)
-    //     wraps the whole `send_fut` because reqwest's
-    //     `connect_timeout` only fires AFTER TCP is established
-    //     (it's the TLS-handshake window), not for stuck SYNs.
-    //     Without this outer cap a blackhole destination would
-    //     hang for the OS-default ~125s TCP SYN timeout.
-    //
-    //   * The caller's `wall_clock` (if any) is already applied
-    //     via `.timeout(budget)` on the RequestBuilder — that
-    //     governs successful-connect, slow-server cases.
-    //
-    // The outer cap is the larger of the two (see `attempt_cap`):
-    // the growing schedule still grows for small requests, while a
-    // payload-sized `wall_clock` is never undercut by an early slot.
+    // When `wall_clock` is set, the request builder applies that timeout
+    // and the outer timeout caps the whole send at the larger of it and
+    // this attempt's connection budget.  With `wall_clock: None`, there
+    // is no outer cap: reqwest's connect timeout and TCP defences still
+    // apply, while a connected user-attended request may keep waiting.
     let cap = attempt_cap(connect_budget, req.wall_clock);
     let send_with_cap = async {
         match req.wall_clock {
@@ -755,17 +788,20 @@ async fn run_single_http_attempt(
         // exhaust if the server never recovers.
         let retry_after = parse_retry_after_at(&response.headers, std::time::SystemTime::now());
         SingleAttempt::DataRetryable {
-            failure: PipelineFailure::new(
-                req.provider_name.clone(),
-                req.phase,
-                data_attempt,
-                max_data_attempts,
-                req.url.clone(),
-                PipelineFailureKind::HttpStatus {
-                    status: response.status,
-                    body: String::from_utf8_lossy(&response.body).into_owned(),
-                },
-            ),
+            failure: PipelineFailure {
+                retry_after,
+                ..PipelineFailure::new(
+                    req.provider_name.clone(),
+                    req.phase,
+                    data_attempt,
+                    max_data_attempts,
+                    req.url.clone(),
+                    PipelineFailureKind::HttpStatus {
+                        status: response.status,
+                        body: String::from_utf8_lossy(&response.body).into_owned(),
+                    },
+                )
+            },
             retry_after,
         }
     } else {
@@ -895,8 +931,18 @@ pub async fn ws_upgrade(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     PipelineFailure,
 > {
-    let max_connection_attempts = CONNECTION_BUDGETS_SECS.len() as u32;
+    let max_connection_attempts = req.retry_schedule.connection_budgets.len() as u32;
     let mut last_failure: Option<PipelineFailure> = None;
+    let started = Instant::now();
+    let wait_started = req
+        .retry_schedule
+        .wait_started
+        .as_ref()
+        .map_or(started, |shared| *shared.get_or_init(|| started));
+    let deadline = req
+        .retry_schedule
+        .max_data_wait
+        .map(|limit| wait_started + limit);
 
     if !matches!(req.body, RequestBody::Empty) {
         return Err(PipelineFailure::new(
@@ -918,8 +964,10 @@ pub async fn ws_upgrade(
         t: Instant::now(),
     });
 
-    for (idx, &budget_secs) in CONNECTION_BUDGETS_SECS.iter().enumerate() {
-        let connect_budget = Duration::from_secs(budget_secs);
+    for (idx, &connect_budget) in req.retry_schedule.connection_budgets.iter().enumerate() {
+        if idx > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         let attempt_num = (idx as u32) + 1;
 
         // Retry telemetry on attempts past the first.
@@ -974,6 +1022,49 @@ pub async fn ws_upgrade(
             WsAttempt::ConnectionRetryable(pf) => {
                 last_failure = Some(pf);
                 continue;
+            }
+            WsAttempt::Permanent(pf)
+                if req.retry_schedule.retry_ws_busy && pf.is_fallback_worthy() =>
+            {
+                let Some(&slot) = req.retry_schedule.data_backoffs.get(idx) else {
+                    sink.emit(TranscriptionEvent::RequestCompleted {
+                        success: false,
+                        t: Instant::now(),
+                    });
+                    return Err(pf);
+                };
+                let delay = pf
+                    .retry_after
+                    .map(|d| d.min(Duration::from_secs(RETRY_AFTER_CAP_SECS)))
+                    .unwrap_or(slot);
+                if deadline.is_some_and(|deadline| {
+                    delay >= deadline.saturating_duration_since(Instant::now())
+                }) {
+                    sink.emit(TranscriptionEvent::RequestCompleted {
+                        success: false,
+                        t: Instant::now(),
+                    });
+                    return Err(pf);
+                }
+                log::info!(
+                    "{} busy — retrying WebSocket handshake in {}s",
+                    req.provider_name,
+                    delay.as_secs()
+                );
+                sink.emit(TranscriptionEvent::RetryScheduled {
+                    kind: crate::telemetry::RetryKind::Data,
+                    attempt: attempt_num,
+                    max: req.retry_schedule.data_backoffs.len() as u32,
+                    reason: pf.to_string(),
+                    delay,
+                    t: Instant::now(),
+                });
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(build_cancellation_failure(&req, attempt_num, max_connection_attempts)),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                last_failure = Some(pf);
             }
             WsAttempt::Permanent(pf) => {
                 sink.emit(TranscriptionEvent::RequestCompleted {
@@ -1109,6 +1200,34 @@ async fn run_single_ws_attempt(
         )),
         Ok(Ok((stream, _response))) => WsAttempt::Success(stream),
         Ok(Err(err)) => {
+            if let tokio_tungstenite::tungstenite::Error::Http(response) = &err {
+                let status = response.status().as_u16();
+                let headers: Vec<(String, String)> = response
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_string(),
+                            v.to_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect();
+                let retry_after = parse_retry_after_at(&headers, std::time::SystemTime::now());
+                return WsAttempt::Permanent(PipelineFailure {
+                    retry_after,
+                    ..PipelineFailure::new(
+                        req.provider_name.clone(),
+                        req.phase,
+                        attempt_num,
+                        max_attempts,
+                        req.url.clone(),
+                        PipelineFailureKind::HttpStatus {
+                            status,
+                            body: err.to_string(),
+                        },
+                    )
+                });
+            }
             // tungstenite errors: classify into connect-retryable
             // (network / IO / TLS) vs permanent (HTTP 4xx, protocol
             // violation, decode).

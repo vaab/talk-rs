@@ -448,6 +448,8 @@ pub(super) fn spawn_transcription(
                 // `transcribe_audio` must not race us on the same
                 // file path.
                 skip_legacy_lock: local_job.is_some(),
+                retry_schedule: None,
+                language: None,
             },
             &sink,
         )

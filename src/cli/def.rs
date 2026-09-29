@@ -65,6 +65,12 @@ pub enum Commands {
     },
     /// Transcribe an audio file to text
     Transcribe {
+        /// Named transcription fallback chain
+        #[arg(long, conflicts_with_all = ["provider", "model"])]
+        chain: Option<String>,
+        /// Requested language code
+        #[arg(long)]
+        lang: Option<String>,
         /// Input audio file path
         #[arg(value_name = "INPUT")]
         input: String,
@@ -120,6 +126,12 @@ pub enum Commands {
     },
     /// Record, transcribe, and paste text into the focused application
     Dictate {
+        /// Named transcription fallback chain
+        #[arg(long, conflicts_with_all = ["provider", "model"])]
+        chain: Option<String>,
+        /// Requested language code
+        #[arg(long)]
+        lang: Option<String>,
         /// Save audio recording to this file path
         #[arg(long, value_name = "PATH")]
         save: Option<String>,
@@ -203,6 +215,59 @@ pub enum Commands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chain_conflicts_with_explicit_provider_or_model() {
+        for command in ["dictate", "transcribe"] {
+            for override_flag in ["--provider", "--model"] {
+                let value = if override_flag == "--provider" {
+                    "openai"
+                } else {
+                    "gpt-transcribe"
+                };
+                let mut args = vec![
+                    "talk-rs",
+                    command,
+                    "--chain",
+                    "dictate",
+                    override_flag,
+                    value,
+                ];
+                if command == "transcribe" {
+                    args.push("recording.ogg");
+                }
+                assert_eq!(
+                    Cli::try_parse_from(args)
+                        .expect_err("conflicting selection")
+                        .kind(),
+                    clap::error::ErrorKind::ArgumentConflict
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chain_and_language_parse_for_dictate_and_transcribe() {
+        let dictate =
+            Cli::try_parse_from(["talk-rs", "dictate", "--chain", "french", "--lang", "fr"])
+                .expect("dictate flags");
+        assert!(
+            matches!(dictate.command, Commands::Dictate { chain: Some(ref chain), lang: Some(ref lang), .. } if chain == "french" && lang == "fr")
+        );
+        let transcribe = Cli::try_parse_from([
+            "talk-rs",
+            "transcribe",
+            "memo.ogg",
+            "--chain",
+            "french",
+            "--lang",
+            "fr",
+        ])
+        .expect("transcribe flags");
+        assert!(
+            matches!(transcribe.command, Commands::Transcribe { chain: Some(ref chain), lang: Some(ref lang), .. } if chain == "french" && lang == "fr")
+        );
+    }
 
     #[test]
     fn record_toggle_parses_public_options_and_hidden_child_mode() {
@@ -360,6 +425,7 @@ mod tests {
                 model,
                 diarize,
                 timestamp,
+                ..
             } => {
                 assert_eq!(input, "in.m4a");
                 assert_eq!(output.as_deref(), Some("out.txt"));
@@ -512,6 +578,7 @@ mod tests {
                 no_bt_auto_switch,
                 daemon,
                 target_window,
+                ..
             } => {
                 assert_eq!(save.as_deref(), Some("rec.ogg"));
                 assert_eq!(output_yaml.as_deref(), Some("meta.yml"));

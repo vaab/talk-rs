@@ -42,6 +42,8 @@ use tokio_util::sync::CancellationToken;
 
 /// Options for the dictate command.
 pub struct DictateOpts {
+    pub chain: Option<String>,
+    pub lang: Option<String>,
     pub save: Option<PathBuf>,
     pub output_yaml: Option<PathBuf>,
     pub input_audio_file: Option<PathBuf>,
@@ -103,7 +105,8 @@ impl DictatePlan {
         cached: recording_cache::TranscriptStatus,
         replace_chars: usize,
     ) -> Self {
-        let specific = opts.provider.is_some() || opts.model.is_some() || opts.diarize;
+        let specific =
+            opts.chain.is_some() || opts.provider.is_some() || opts.model.is_some() || opts.diarize;
         let mode = if opts.pick {
             DictateMode::Picker
         } else if input_audio.is_some() && !specific {
@@ -492,7 +495,7 @@ pub async fn dictate(opts: DictateOpts) -> Result<(), TalkError> {
 
 async fn dictate_loaded(
     opts: DictateOpts,
-    config: Config,
+    mut config: Config,
     t_start: StartTiming,
 ) -> Result<(), TalkError> {
     // Build the runtime paste-node tree from config (or fall back to
@@ -551,18 +554,38 @@ async fn dictate_loaded(
         recording_cache::TranscriptStatus::NotAvailable,
         recording_cache::get_transcript,
     );
-    let plan = DictatePlan::resolve(
+    let mut plan = DictatePlan::resolve(
         &opts,
         &config,
         input_audio_file.as_deref(),
         cached_status,
         replace_char_count.unwrap_or(0),
     );
+    let chain = config
+        .resolve_chain(opts.chain.as_deref(), opts.provider, opts.model.as_deref())?
+        .map(|chain| chain.eligible(opts.diarize, opts.realtime, opts.lang.as_deref()))
+        .transpose()?;
+    if let (Some(lang), Some(openai)) = (&opts.lang, &mut config.providers.openai) {
+        openai.languages = Some(vec![lang.clone()]);
+    }
+    let outage_path = if chain.is_some() {
+        Some(transcription::chain::outage_path()?)
+    } else {
+        None
+    };
+    if let (Some(chain), Some(path)) = (&chain, &outage_path) {
+        let first = chain.first_available(path.clone()).ok_or_else(|| {
+            TalkError::Config(format!("chain \"{}\" has no eligible entries", chain.name))
+        })?;
+        plan.provider = first.provider;
+        plan.model = first.model.clone();
+    }
     let policy = plan.policy;
     if plan.mode == DictateMode::Picker {
         return run_pick(
             config,
             PickParams {
+                chain: opts.chain.clone(),
                 input_audio_file,
                 cached_brief,
                 replace_char_count,
@@ -709,8 +732,8 @@ async fn dictate_loaded(
     let (cache_path, _cache_timestamp) = recording_cache::generate_recording_path()?;
     log::info!("cache recording: {}", cache_path.display());
 
-    let provider = plan.provider;
-    let effective_model = plan.model;
+    let mut provider = plan.provider;
+    let mut effective_model = plan.model;
 
     // Create audio source: live microphone or audio file input.
     //
@@ -1055,10 +1078,18 @@ async fn dictate_loaded(
             visualizer.as_ref(),
             &shutdown,
             bt_guard,
+            chain.as_ref(),
+            outage_path.as_deref(),
         )
         .await
         {
-            Ok(r) => r,
+            Ok((r, answered_provider, answered_model)) => {
+                provider = answered_provider;
+                if chain.is_some() {
+                    effective_model = answered_model;
+                }
+                r
+            }
             Err(e) => {
                 if let Err(join_error) = paste_task.await {
                     log::warn!("paste task error: {}", join_error);
@@ -1090,11 +1121,19 @@ async fn dictate_loaded(
         let mut transcriber = transcription::create_oneshot_transcriber(
             &config,
             provider,
-            opts.model.as_deref(),
+            Some(&effective_model),
             opts.diarize,
             transcription::RequestTimeoutPolicy::Proportional,
         )?;
         transcriber.set_sink(sink.clone());
+        if let Some(entry) = chain.as_ref().and_then(|chain| {
+            chain
+                .entries
+                .iter()
+                .find(|e| e.provider == provider && e.model == effective_model)
+        }) {
+            transcriber.set_retry_schedule(entry.retry_schedule());
+        }
 
         let (stream_result, t_stop_val) = dictate_oneshot(
             &mut *capture,
@@ -1108,8 +1147,9 @@ async fn dictate_loaded(
             visualizer.as_ref(),
             &config,
             provider,
-            opts.model.as_deref(),
+            Some(&effective_model),
             opts.diarize,
+            chain.is_some(),
             bt_guard,
         )
         .await;
@@ -1120,79 +1160,99 @@ async fn dictate_loaded(
         // file.  Retry lives inside `transcribe_audio` (see
         // `transcription::transport::retry`) — no loop here.
         match stream_result {
-            Ok(r) => r,
+            Ok(mut r) => {
+                if chain.is_some() {
+                    r.metadata.attempts.push(transcription::chain::Attempt {
+                        provider: provider.to_string(),
+                        model: effective_model.clone(),
+                        outcome: "success".into(),
+                    });
+                }
+                r
+            }
             Err(first_err) => {
                 log::warn!("one-shot transcription failed: {}", first_err);
 
-                if !should_fallback_to_file(&cache_path) {
-                    return deliver(
-                        Err(first_err),
-                        Delivery {
-                            policy: &policy,
-                            audio: &cache_path,
-                            provider,
-                            model: &effective_model,
-                            cached: false,
-                            paste_root: paste_root.as_ref(),
-                            target_window: target_window.as_ref(),
-                            paste_timing,
-                            sink: &*sink,
-                            t_stop,
-                            authoritative: false,
-                            paste_alert: None,
-                        },
-                    )
-                    .await
-                    .map(|_| ());
-                }
-
-                // Fall back to file-based transcription.  Retry is
-                // already handled by Layer 3.  Same `Proportional`
-                // policy as the one-shot path above — autonomous
-                // dictate must not hang.
-                let result = transcription::transcribe_audio(
-                    &cache_path,
-                    &config,
-                    provider,
-                    opts.model.as_deref(),
-                    opts.diarize,
-                    transcription::TranscribeOptions {
-                        allow_api: true,
-                        policy: transcription::RequestTimeoutPolicy::Proportional,
-                        cancel_token: None,
-                        skip_legacy_lock: false,
-                    },
-                    &sink,
-                )
-                .await;
-
-                match result {
-                    Ok(r) => r,
-                    Err(final_err) => {
-                        // Model errors get enriched with available
-                        // models (display concern).  Other errors are
-                        // already after-retry permanent failures.
-                        let final_err = if transcription::is_model_error(provider, &final_err) {
-                            transcription::enrich_model_error(
+                if let (Some(chain), Some(path)) = (&chain, &outage_path) {
+                    let continuation = async {
+                        if !first_err.is_fallback_worthy() || !should_fallback_to_file(&cache_path)
+                        {
+                            return Err(first_err);
+                        }
+                        let first_index = chain
+                            .entries
+                            .iter()
+                            .position(|e| e.provider == provider && e.model == effective_model)
+                            .unwrap_or(0);
+                        chain.record_busy(provider, first_err.retry_after(), path.clone());
+                        if first_index + 1 == chain.entries.len() {
+                            return Err(first_err);
+                        }
+                        let prior = vec![transcription::chain::Attempt {
+                            provider: provider.to_string(),
+                            model: effective_model.clone(),
+                            outcome: "busy".into(),
+                        }];
+                        let notify = |message: &str| {
+                            if let Some(viz) = &visualizer {
+                                viz.push_message(message);
+                            }
+                        };
+                        chain
+                            .run_file(
+                                &cache_path,
                                 &config,
-                                provider,
-                                opts.model.as_deref(),
-                                final_err,
+                                opts.diarize,
+                                opts.lang.as_deref(),
+                                &sink,
+                                path.clone(),
+                                first_index + 1,
+                                prior,
+                                Some(&notify),
                             )
                             .await
-                        } else {
-                            final_err
-                        };
-                        let final_msg = format!("{}", final_err);
-                        log::error!("{}", final_msg);
-                        if let Some(ref viz) = visualizer {
-                            viz.push_message(&format!("Error: {}", final_msg));
+                    }
+                    .await;
+                    match continuation {
+                        Ok(outcome) => {
+                            provider = outcome.provider;
+                            effective_model = outcome.model;
+                            outcome.result
                         }
-                        if let Some(o) = feedback.overlay() {
-                            o.hide();
+                        Err(final_err) => {
+                            let final_msg = final_err.to_string();
+                            log::error!("{}", final_msg);
+                            if let Some(ref viz) = visualizer {
+                                viz.push_message(&format!("Error: {}", final_msg));
+                            }
+                            if let Some(o) = feedback.overlay() {
+                                o.hide();
+                            }
+                            return deliver(
+                                Err(final_err),
+                                Delivery {
+                                    policy: &policy,
+                                    audio: &cache_path,
+                                    provider,
+                                    model: &effective_model,
+                                    cached: false,
+                                    paste_root: paste_root.as_ref(),
+                                    target_window: target_window.as_ref(),
+                                    paste_timing,
+                                    sink: &*sink,
+                                    t_stop,
+                                    authoritative: false,
+                                    paste_alert: None,
+                                },
+                            )
+                            .await
+                            .map(|_| ());
                         }
+                    }
+                } else {
+                    if !should_fallback_to_file(&cache_path) {
                         return deliver(
-                            Err(final_err),
+                            Err(first_err),
                             Delivery {
                                 policy: &policy,
                                 audio: &cache_path,
@@ -1210,6 +1270,75 @@ async fn dictate_loaded(
                         )
                         .await
                         .map(|_| ());
+                    }
+
+                    // Fall back to file-based transcription.  Retry is
+                    // already handled by Layer 3.  Same `Proportional`
+                    // policy as the one-shot path above — autonomous
+                    // dictate must not hang.
+                    let result = transcription::transcribe_audio(
+                        &cache_path,
+                        &config,
+                        provider,
+                        opts.model.as_deref(),
+                        opts.diarize,
+                        transcription::TranscribeOptions {
+                            allow_api: true,
+                            policy: transcription::RequestTimeoutPolicy::Proportional,
+                            cancel_token: None,
+                            skip_legacy_lock: false,
+                            retry_schedule: None,
+                            language: None,
+                        },
+                        &sink,
+                    )
+                    .await;
+
+                    match result {
+                        Ok(r) => r,
+                        Err(final_err) => {
+                            // Model errors get enriched with available
+                            // models (display concern).  Other errors are
+                            // already after-retry permanent failures.
+                            let final_err = if transcription::is_model_error(provider, &final_err) {
+                                transcription::enrich_model_error(
+                                    &config,
+                                    provider,
+                                    opts.model.as_deref(),
+                                    final_err,
+                                )
+                                .await
+                            } else {
+                                final_err
+                            };
+                            let final_msg = format!("{}", final_err);
+                            log::error!("{}", final_msg);
+                            if let Some(ref viz) = visualizer {
+                                viz.push_message(&format!("Error: {}", final_msg));
+                            }
+                            if let Some(o) = feedback.overlay() {
+                                o.hide();
+                            }
+                            return deliver(
+                                Err(final_err),
+                                Delivery {
+                                    policy: &policy,
+                                    audio: &cache_path,
+                                    provider,
+                                    model: &effective_model,
+                                    cached: false,
+                                    paste_root: paste_root.as_ref(),
+                                    target_window: target_window.as_ref(),
+                                    paste_timing,
+                                    sink: &*sink,
+                                    t_stop,
+                                    authoritative: false,
+                                    paste_alert: None,
+                                },
+                            )
+                            .await
+                            .map(|_| ());
+                        }
                     }
                 }
             }

@@ -350,6 +350,7 @@ pub struct OpenAIRealtimeTranscriber {
     /// [`super::realtime::MistralRealtimeTranscriber::cancel_token`]
     /// for the wiring rationale.
     cancel_token: CancellationToken,
+    retry_schedule: super::transport::RetrySchedule,
 }
 
 impl OpenAIRealtimeTranscriber {
@@ -367,6 +368,7 @@ impl OpenAIRealtimeTranscriber {
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
             cancel_token: CancellationToken::new(),
+            retry_schedule: Default::default(),
         }
     }
 
@@ -383,6 +385,7 @@ impl OpenAIRealtimeTranscriber {
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
             cancel_token: CancellationToken::new(),
+            retry_schedule: Default::default(),
         }
     }
 
@@ -396,6 +399,7 @@ impl OpenAIRealtimeTranscriber {
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
             cancel_token: CancellationToken::new(),
+            retry_schedule: Default::default(),
         }
     }
 
@@ -413,7 +417,7 @@ impl OpenAIRealtimeTranscriber {
         log::debug!("validation: connecting to {}", ws_url);
 
         let req = super::transport::Request {
-            retry_schedule: Default::default(),
+            retry_schedule: self.retry_schedule.clone(),
             method: super::transport::Method::Get,
             url: ws_url.clone(),
             // OpenAI deprecated the ``OpenAI-Beta: realtime=v1``
@@ -433,7 +437,7 @@ impl OpenAIRealtimeTranscriber {
         };
         let ws_stream = super::transport::ws_upgrade(req, &self.sink, self.cancel_token.clone())
             .await
-            .map_err(|pf| TalkError::Config(pf.to_string()))?;
+            .map_err(TalkError::from)?;
 
         let (mut sink, mut source) = ws_stream.split();
 
@@ -444,10 +448,12 @@ impl OpenAIRealtimeTranscriber {
         )
         .await
         .map_err(|_| {
-            TalkError::Config(format!(
-                "Timed out waiting for session.created after {}s",
-                SESSION_CREATED_TIMEOUT.as_secs()
-            ))
+            crate::error::PipelineFailure::session_timeout(
+                "OpenAI",
+                crate::error::PipelinePhase::Validate,
+                &ws_url,
+                SESSION_CREATED_TIMEOUT,
+            )
         })??;
 
         // Send session.update in the GA shape.  The flat beta
@@ -498,7 +504,14 @@ impl OpenAIRealtimeTranscriber {
             ))
         })
         .await
-        .map_err(|_| TalkError::Config("Timed out waiting for session validation".to_string()))?;
+        .map_err(|_| {
+            crate::error::PipelineFailure::session_timeout(
+                "OpenAI",
+                crate::error::PipelinePhase::Validate,
+                &ws_url,
+                SESSION_CREATED_TIMEOUT,
+            )
+        })?;
 
         // Close the validation connection cleanly.
         let _ = sink.send(Message::Close(None)).await;
@@ -527,7 +540,7 @@ impl OpenAIRealtimeTranscriber {
         log::debug!("connecting to OpenAI Realtime WebSocket: {}", ws_url);
 
         let req = super::transport::Request {
-            retry_schedule: Default::default(),
+            retry_schedule: self.retry_schedule.clone(),
             method: super::transport::Method::Get,
             url: ws_url.clone(),
             // OpenAI deprecated the ``OpenAI-Beta: realtime=v1``
@@ -544,7 +557,7 @@ impl OpenAIRealtimeTranscriber {
         };
         let ws_stream = super::transport::ws_upgrade(req, &self.sink, self.cancel_token.clone())
             .await
-            .map_err(|pf| TalkError::Transcription(pf.to_string()))?;
+            .map_err(TalkError::from)?;
         // No HTTP response wrapper exposed by the transport; the
         // OpenAI realtime path's downstream code paths that
         // previously inspected `response` (mainly for the
@@ -572,10 +585,12 @@ impl OpenAIRealtimeTranscriber {
         )
         .await
         .map_err(|_| {
-            TalkError::Transcription(format!(
-                "Timed out waiting for session.created after {}s",
-                SESSION_CREATED_TIMEOUT.as_secs()
-            ))
+            crate::error::PipelineFailure::session_timeout(
+                "OpenAI",
+                crate::error::PipelinePhase::Request,
+                &ws_url,
+                SESSION_CREATED_TIMEOUT,
+            )
         })??;
         log::info!("OpenAI realtime session established");
         self.sink
@@ -657,6 +672,9 @@ impl OpenAIRealtimeTranscriber {
 
 #[async_trait]
 impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
+    fn set_retry_schedule(&mut self, schedule: super::transport::RetrySchedule) {
+        self.retry_schedule = schedule;
+    }
     async fn validate(&self) -> Result<(), TalkError> {
         super::openai::validate_openai_hints(
             super::openai::OpenAITranscriptionMode::Realtime,
@@ -681,6 +699,7 @@ impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
             &api_base,
             &self.sink,
             self.cancel_token.clone(),
+            self.retry_schedule.clone(),
         )
         .await?;
 

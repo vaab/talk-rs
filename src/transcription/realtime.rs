@@ -476,6 +476,8 @@ pub struct MistralRealtimeTranscriber {
     /// blocking connect / retry loop when the picker's Stop button
     /// or a SIGUSR1 from another talk-rs process fires.
     cancel_token: CancellationToken,
+    model: Option<String>,
+    retry_schedule: super::transport::RetrySchedule,
 }
 
 impl MistralRealtimeTranscriber {
@@ -491,6 +493,8 @@ impl MistralRealtimeTranscriber {
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
             cancel_token: CancellationToken::new(),
+            model: None,
+            retry_schedule: Default::default(),
         }
     }
 
@@ -502,6 +506,8 @@ impl MistralRealtimeTranscriber {
             endpoint,
             sink: std::sync::Arc::new(crate::telemetry::NoOpSink),
             cancel_token: CancellationToken::new(),
+            model: None,
+            retry_schedule: Default::default(),
         }
     }
 
@@ -510,7 +516,11 @@ impl MistralRealtimeTranscriber {
     /// Uses `DEFAULT_REALTIME_MODEL` since the one-shot model name differs
     /// from the realtime model name.
     fn realtime_model(&self) -> &str {
-        DEFAULT_REALTIME_MODEL
+        self.model.as_deref().unwrap_or(DEFAULT_REALTIME_MODEL)
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        self.model = Some(model);
     }
 
     /// Open a throwaway WebSocket connection and wait for
@@ -525,7 +535,7 @@ impl MistralRealtimeTranscriber {
         log::debug!("validation: connecting to {}", ws_url);
 
         let req = super::transport::Request {
-            retry_schedule: Default::default(),
+            retry_schedule: self.retry_schedule.clone(),
             method: super::transport::Method::Get,
             url: ws_url.clone(),
             headers: vec![(
@@ -540,7 +550,7 @@ impl MistralRealtimeTranscriber {
         };
         let ws_stream = super::transport::ws_upgrade(req, &self.sink, self.cancel_token.clone())
             .await
-            .map_err(|pf| TalkError::Config(pf.to_string()))?;
+            .map_err(TalkError::from)?;
 
         let (mut sink_split, mut source) = ws_stream.split();
 
@@ -551,10 +561,12 @@ impl MistralRealtimeTranscriber {
         )
         .await
         .map_err(|_| {
-            TalkError::Config(format!(
-                "Timed out waiting for session.created after {}s",
-                SESSION_CREATED_TIMEOUT.as_secs()
-            ))
+            crate::error::PipelineFailure::session_timeout(
+                "Mistral",
+                crate::error::PipelinePhase::Validate,
+                &ws_url,
+                SESSION_CREATED_TIMEOUT,
+            )
         })?;
 
         // Close the validation connection cleanly.
@@ -581,7 +593,7 @@ impl MistralRealtimeTranscriber {
         log::debug!("connecting to WebSocket: {}", ws_url);
 
         let req = super::transport::Request {
-            retry_schedule: Default::default(),
+            retry_schedule: self.retry_schedule.clone(),
             method: super::transport::Method::Get,
             url: ws_url.clone(),
             headers: vec![(
@@ -596,7 +608,7 @@ impl MistralRealtimeTranscriber {
         };
         let ws_stream = super::transport::ws_upgrade(req, &self.sink, self.cancel_token.clone())
             .await
-            .map_err(|pf| TalkError::Transcription(pf.to_string()))?;
+            .map_err(TalkError::from)?;
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
@@ -617,10 +629,12 @@ impl MistralRealtimeTranscriber {
         )
         .await
         .map_err(|_| {
-            TalkError::Transcription(format!(
-                "Timed out waiting for session.created after {}s",
-                SESSION_CREATED_TIMEOUT.as_secs()
-            ))
+            crate::error::PipelineFailure::session_timeout(
+                "Mistral",
+                crate::error::PipelinePhase::Request,
+                &ws_url,
+                SESSION_CREATED_TIMEOUT,
+            )
         })??;
         log::info!("realtime session established");
         self.sink
@@ -693,6 +707,9 @@ impl MistralRealtimeTranscriber {
 
 #[async_trait]
 impl RealtimeTranscriber for MistralRealtimeTranscriber {
+    fn set_retry_schedule(&mut self, schedule: super::transport::RetrySchedule) {
+        self.retry_schedule = schedule;
+    }
     async fn validate(&self) -> Result<(), TalkError> {
         // Realtime-only models (e.g. voxtral-mini-transcribe-realtime-2602)
         // do not appear in the REST `/v1/models` listing, so we skip the

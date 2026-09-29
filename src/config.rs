@@ -171,6 +171,12 @@ impl std::fmt::Display for Provider {
     }
 }
 
+impl Provider {
+    pub fn is_local(self) -> bool {
+        matches!(self, Self::Parakeet)
+    }
+}
+
 impl std::str::FromStr for Provider {
     type Err = String;
 
@@ -618,6 +624,238 @@ pub struct TranscriptionConfig {
     /// Default transcription provider when `--provider` is not specified.
     #[serde(default = "default_provider")]
     pub default_provider: Provider,
+    #[serde(default)]
+    pub default_chain: Option<String>,
+    #[serde(default)]
+    pub chains: std::collections::BTreeMap<String, Vec<ChainEntryConfig>>,
+    #[serde(default)]
+    pub outage_memory: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ChainEntryConfig {
+    Short(String),
+    Full(ChainEntryDetails),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainEntryDetails {
+    pub model: String,
+    #[serde(default)]
+    pub retries: Option<u32>,
+    #[serde(default)]
+    pub wait: Option<String>,
+    #[serde(default)]
+    pub languages: Option<Vec<String>>,
+    #[serde(default)]
+    pub supports: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainEntry {
+    pub provider: Provider,
+    pub model: String,
+    /// Only a bare provider switches to its configured realtime model.
+    pub realtime_model: Option<String>,
+    pub retries: Option<u32>,
+    pub wait: Option<std::time::Duration>,
+    pub languages: Option<Vec<String>>,
+    pub supports: Vec<String>,
+}
+
+impl ChainEntry {
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.provider, self.model)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedChain {
+    pub name: String,
+    pub entries: Vec<ChainEntry>,
+    pub outage_memory: std::time::Duration,
+}
+
+fn parse_chain_duration(value: &str) -> Result<std::time::Duration, String> {
+    let (number, multiplier) = match value.strip_suffix('s') {
+        Some(number) => (number, 1),
+        None => match value.strip_suffix('m') {
+            Some(number) => (number, 60),
+            None => return Err(format!("invalid duration \"{value}\" (use e.g. 30s or 2m)")),
+        },
+    };
+    let seconds = number
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .and_then(|n| n.checked_mul(multiplier))
+        .ok_or_else(|| format!("invalid duration \"{value}\" (use e.g. 30s or 2m)"))?;
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+impl Config {
+    pub fn resolve_chain(
+        &self,
+        name: Option<&str>,
+        cli_provider: Option<Provider>,
+        cli_model: Option<&str>,
+    ) -> Result<Option<ResolvedChain>, TalkError> {
+        let transcription = match &self.transcription {
+            Some(config) => config,
+            None => {
+                return name.map_or(Ok(None), |name| {
+                    Err(TalkError::Config(format!(
+                        "unknown transcription chain \"{name}\""
+                    )))
+                })
+            }
+        };
+        let selected = name.or_else(|| {
+            if cli_provider.is_none() && cli_model.is_none() {
+                transcription.default_chain.as_deref()
+            } else {
+                None
+            }
+        });
+        let Some(name) = selected else {
+            return Ok(None);
+        };
+        let specs = transcription
+            .chains
+            .get(name)
+            .ok_or_else(|| TalkError::Config(format!("unknown transcription chain \"{name}\"")))?;
+        if specs.is_empty() {
+            return Err(TalkError::Config(format!(
+                "chain \"{name}\" must have at least one entry"
+            )));
+        }
+        let mut entries = Vec::with_capacity(specs.len());
+        let mut seen = std::collections::HashSet::new();
+        for (index, spec) in specs.iter().enumerate() {
+            let (id, retries, wait, languages, supports) = match spec {
+                ChainEntryConfig::Short(id) => (id.as_str(), None, None, None, Vec::new()),
+                ChainEntryConfig::Full(details) => (
+                    details.model.as_str(),
+                    details.retries,
+                    details.wait.as_deref(),
+                    details.languages.clone(),
+                    details.supports.clone(),
+                ),
+            };
+            let contextual = |message| {
+                TalkError::Config(format!(
+                    "chain \"{name}\": entry {} \"{id}\": {message}",
+                    index + 1
+                ))
+            };
+            let (provider_name, model) =
+                id.split_once('/').map_or((id, None), |(p, m)| (p, Some(m)));
+            let provider: Provider = provider_name.parse().map_err(contextual)?;
+            let realtime_model = if model.is_none() {
+                match provider {
+                    Provider::OpenAI => self
+                        .providers
+                        .openai
+                        .as_ref()
+                        .map(|p| p.realtime_model.clone()),
+                    Provider::Mistral => {
+                        Some(crate::transcription::catalog::MISTRAL_REALTIME_MODELS[0].to_string())
+                    }
+                    Provider::Parakeet => None,
+                }
+            } else {
+                None
+            };
+            let model = match model {
+                Some(model) if !model.is_empty() => model.to_string(),
+                Some(_) => return Err(contextual("model name must not be empty".to_string())),
+                None => match provider {
+                    Provider::Mistral => self.providers.mistral.as_ref().map(|p| p.model.clone()),
+                    Provider::OpenAI => self.providers.openai.as_ref().map(|p| p.model.clone()),
+                    Provider::Parakeet => self
+                        .providers
+                        .parakeet
+                        .as_ref()
+                        .map(|p| p.resolved_model_name()),
+                }
+                .unwrap_or_default(),
+            };
+            let configured = match provider {
+                Provider::Mistral => self
+                    .providers
+                    .mistral
+                    .as_ref()
+                    .is_some_and(|p| !p.api_key.trim().is_empty()),
+                Provider::OpenAI => self
+                    .providers
+                    .openai
+                    .as_ref()
+                    .is_some_and(|p| !p.api_key.trim().is_empty()),
+                Provider::Parakeet => self.providers.parakeet.is_some(),
+            };
+            if !configured {
+                return Err(contextual(format!(
+                    "provider {provider} is not configured (add providers.{provider}{} to config)",
+                    if provider.is_local() { "" } else { ".api_key" }
+                )));
+            }
+            let label = format!("{provider}/{model}");
+            if !seen.insert(label.clone()) {
+                return Err(TalkError::Config(format!(
+                    "chain \"{name}\": duplicate entry \"{label}\""
+                )));
+            }
+            if provider.is_local() && index + 1 < specs.len() {
+                let next = match &specs[index + 1] {
+                    ChainEntryConfig::Short(s) => s.as_str(),
+                    ChainEntryConfig::Full(d) => d.model.as_str(),
+                };
+                return Err(TalkError::Config(format!("chain \"{name}\": entry {} \"{id}\" is local and always available, so entries after it ({next}) would never run — move it to the end of the chain", index + 1)));
+            }
+            let wait = wait
+                .map(parse_chain_duration)
+                .transpose()
+                .map_err(contextual)?;
+            if languages.as_ref().is_some_and(|values| {
+                values.is_empty() || values.iter().any(|s| s.trim().is_empty())
+            }) {
+                return Err(contextual(
+                    "languages must be a non-empty list of codes".to_string(),
+                ));
+            }
+            if let Some(capability) = supports
+                .iter()
+                .find(|cap| !matches!(cap.as_str(), "diarize" | "realtime"))
+            {
+                return Err(contextual(format!(
+                    "unknown capability \"{capability}\" (expected diarize or realtime)"
+                )));
+            }
+            entries.push(ChainEntry {
+                provider,
+                model,
+                realtime_model,
+                retries,
+                wait,
+                languages,
+                supports,
+            });
+        }
+        let outage_memory = transcription
+            .outage_memory
+            .as_deref()
+            .map(parse_chain_duration)
+            .transpose()
+            .map_err(TalkError::Config)?
+            .unwrap_or(std::time::Duration::from_secs(180));
+        Ok(Some(ResolvedChain {
+            name: name.to_string(),
+            entries,
+            outage_memory,
+        }))
+    }
 }
 
 fn default_provider() -> Provider {
@@ -1480,6 +1718,20 @@ fn validate_config(config: &Config) -> Result<(), TalkError> {
         }
     }
 
+    if let Some(transcription) = &config.transcription {
+        if transcription.default_chain.is_some() || !transcription.chains.is_empty() {
+            for name in transcription.chains.keys() {
+                config.resolve_chain(Some(name), None, None)?;
+            }
+            if transcription.default_chain.is_some() {
+                config.resolve_chain(None, None, None)?;
+            }
+        }
+        if let Some(duration) = transcription.outage_memory.as_deref() {
+            parse_chain_duration(duration).map_err(TalkError::Config)?;
+        }
+    }
+
     // Provider API keys are validated lazily — only when a provider is
     // actually used via the factory function.  This allows configs that
     // only define one provider to work without filling in keys for the
@@ -1497,6 +1749,149 @@ mod tests {
     use std::io::Write;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn chain_config_accepts_short_and_long_entries() -> Result<(), Box<dyn Error>> {
+        let file = write_config(indoc! {"
+            output_dir: /tmp/test-output
+            providers:
+              mistral: {api_key: test-key}
+              openai: {api_key: test-key}
+              parakeet: {}
+            transcription:
+              default_chain: dictate
+              outage_memory: 3m
+              chains:
+                dictate:
+                  - mistral/voxtral-mini-2602
+                  - model: openai/gpt-transcribe
+                    retries: 2
+                    wait: 30s
+                    languages: [fr]
+                  - model: mistral/voxtral-mini-2507
+                    wait: 45s
+                  - parakeet
+                custom:
+                  - model: mistral/some-future-model
+                    supports: [diarize, realtime]
+                live:
+                  - openai
+        "})?;
+        let config = Config::load(Some(file.path()))?;
+        let chain = config
+            .resolve_chain(Some("dictate"), None, None)?
+            .ok_or("chain missing")?;
+        assert_eq!(chain.name, "dictate");
+        assert_eq!(
+            config
+                .resolve_chain(None, None, None)?
+                .ok_or("default missing")?
+                .name,
+            "dictate"
+        );
+        assert!(config
+            .resolve_chain(None, Some(Provider::OpenAI), None)?
+            .is_none());
+        assert!(config
+            .resolve_chain(None, None, Some("gpt-transcribe"))?
+            .is_none());
+        assert_eq!(
+            chain
+                .entries
+                .iter()
+                .map(|e| format!("{}/{}", e.provider, e.model))
+                .collect::<Vec<_>>(),
+            [
+                "mistral/voxtral-mini-2602",
+                "openai/gpt-transcribe",
+                "mistral/voxtral-mini-2507",
+                "parakeet/parakeet-tdt-0.6b-v3-int8"
+            ]
+        );
+        assert_eq!(chain.entries[1].retries, Some(2));
+        assert_eq!(
+            chain.entries[1].wait,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            chain.entries[1].languages.as_deref(),
+            Some(["fr".to_string()].as_slice())
+        );
+        assert_eq!(
+            chain.entries[2].wait,
+            Some(std::time::Duration::from_secs(45))
+        );
+        assert_eq!(
+            config
+                .resolve_chain(Some("custom"), None, None)?
+                .ok_or("custom missing")?
+                .entries[0]
+                .supports,
+            ["diarize", "realtime"]
+        );
+        assert_eq!(
+            config
+                .resolve_chain(Some("live"), None, None)?
+                .ok_or("live missing")?
+                .eligible(false, true, None)?
+                .entries[0]
+                .model,
+            "gpt-live-transcribe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chain_config_rejects_invalid_entries_with_exact_messages() -> Result<(), Box<dyn Error>> {
+        let cases = [
+            ("- parakeet\n      - openai/gpt-transcribe", "Configuration error: chain \"dictate\": entry 1 \"parakeet\" is local and always available, so entries after it (openai/gpt-transcribe) would never run — move it to the end of the chain"),
+            ("- unknown/model", "Configuration error: chain \"dictate\": entry 1 \"unknown/model\": unknown provider 'unknown' (expected 'mistral', 'openai', or 'parakeet')"),
+            ("[]", "Configuration error: chain \"dictate\" must have at least one entry"),
+            ("- openai/gpt-transcribe\n      - openai/gpt-transcribe", "Configuration error: chain \"dictate\": duplicate entry \"openai/gpt-transcribe\""),
+            ("- model: openai/gpt-transcribe\n        wait: never", "Configuration error: chain \"dictate\": entry 1 \"openai/gpt-transcribe\": invalid duration \"never\" (use e.g. 30s or 2m)"),
+        ];
+        for (entries, expected) in cases {
+            let yaml = format!("output_dir: /tmp/test-output\nproviders:\n  openai: {{api_key: test-key}}\n  parakeet: {{}}\ntranscription:\n  chains:\n    dictate:\n      {entries}\n");
+            let file = write_config(&yaml)?;
+            assert_eq!(
+                Config::load(Some(file.path()))
+                    .expect_err("invalid chain")
+                    .to_string(),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chain_config_rejects_unknown_defaults_and_unconfigured_provider(
+    ) -> Result<(), Box<dyn Error>> {
+        for (yaml, expected) in [
+            (indoc! {"
+                output_dir: /tmp/test-output
+                providers: {}
+                transcription:
+                  default_chain: missing
+            "}, "Configuration error: unknown transcription chain \"missing\""),
+            (indoc! {"
+                output_dir: /tmp/test-output
+                providers: {}
+                transcription:
+                  chains:
+                    dictate: [openai/gpt-transcribe]
+            "}, "Configuration error: chain \"dictate\": entry 1 \"openai/gpt-transcribe\": provider openai is not configured (add providers.openai.api_key to config)"),
+            (indoc! {"
+                output_dir: /tmp/test-output
+                providers: {}
+                transcription:
+                  outage_memory: endless
+            "}, "Configuration error: invalid duration \"endless\" (use e.g. 30s or 2m)"),
+        ] {
+            let file = write_config(yaml)?;
+            assert_eq!(Config::load(Some(file.path())).expect_err("invalid chain").to_string(), expected);
+        }
+        Ok(())
+    }
 
     struct EnvGuard {
         key: String,

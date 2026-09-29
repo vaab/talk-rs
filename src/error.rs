@@ -76,6 +76,19 @@ impl From<PipelineFailure> for TalkError {
     }
 }
 
+impl TalkError {
+    pub fn is_fallback_worthy(&self) -> bool {
+        matches!(self, Self::Pipeline(failure) if failure.is_fallback_worthy())
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Pipeline(failure) => failure.retry_after,
+            _ => None,
+        }
+    }
+}
+
 /// Phase of the HTTP transcription pipeline at which a failure
 /// occurred.
 ///
@@ -253,9 +266,33 @@ pub struct PipelineFailure {
     /// Structured cause.
     #[source]
     pub kind: PipelineFailureKind,
+    pub retry_after: Option<Duration>,
 }
 
 impl PipelineFailure {
+    /// A realtime session handshake timed out after WebSocket upgrade.
+    pub fn session_timeout(
+        provider: &str,
+        phase: PipelinePhase,
+        url: &str,
+        budget: Duration,
+    ) -> Self {
+        Self::new(
+            provider,
+            phase,
+            1,
+            1,
+            url,
+            PipelineFailureKind::Network {
+                kind: NetworkKind::WallClock,
+                timer: Some(TimerLabel::from_duration("session_created_timeout", budget)),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for realtime session confirmation",
+                )),
+            },
+        )
+    }
     /// Build a new structured failure.
     ///
     /// Producers in `transport::http` and provider modules use
@@ -277,6 +314,20 @@ impl PipelineFailure {
             max_attempts,
             url: url.into(),
             kind,
+            retry_after: None,
+        }
+    }
+
+    pub fn is_fallback_worthy(&self) -> bool {
+        match &self.kind {
+            PipelineFailureKind::HttpStatus { status, .. } => {
+                *status == 429 || (500..600).contains(status)
+            }
+            PipelineFailureKind::Network { kind, timer, .. } => {
+                *kind != NetworkKind::Other
+                    && !timer.as_ref().is_some_and(|t| t.name == "cancelled")
+            }
+            _ => false,
         }
     }
 }
@@ -504,6 +555,36 @@ fn is_layer_redundant(lower: &str, timer: Option<&TimerLabel>, url: &str) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realtime_session_timeout_is_fallback_worthy_but_cancellation_is_not() {
+        let timeout: TalkError = PipelineFailure::session_timeout(
+            "OpenAI",
+            PipelinePhase::Validate,
+            "ws://localhost/v1/realtime",
+            Duration::from_secs(5),
+        )
+        .into();
+        assert!(timeout.is_fallback_worthy());
+        assert_eq!(timeout.retry_after(), None);
+        assert!(timeout.to_string().contains("session_created_timeout"));
+        let cancelled = TalkError::Pipeline(Box::new(PipelineFailure::new(
+            "OpenAI",
+            PipelinePhase::Validate,
+            1,
+            1,
+            "ws://localhost/v1/realtime",
+            PipelineFailureKind::Network {
+                kind: NetworkKind::Other,
+                timer: Some(TimerLabel::from_duration("cancelled", Duration::ZERO)),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "cancelled",
+                )),
+            },
+        )));
+        assert!(!cancelled.is_fallback_worthy());
+    }
 
     #[test]
     fn test_config_error_display() {

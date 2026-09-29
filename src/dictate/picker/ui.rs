@@ -140,6 +140,7 @@ pub(super) struct PickerNavigationAvailability {
 }
 
 pub(super) struct PickerUiInput {
+    pub(super) chain_order: Vec<(Provider, String, bool)>,
     pub(super) transcribers: Vec<(Provider, String)>,
     pub(super) audio_path: PathBuf,
     pub(super) cached_entries: Vec<(Provider, String, String, bool, bool)>,
@@ -147,6 +148,31 @@ pub(super) struct PickerUiInput {
     pub(super) realtime_transcribers: Vec<(Provider, String, Box<dyn RealtimeTranscriber>)>,
     pub(super) deferred_candidates: Vec<(Provider, String, bool)>,
     pub(super) navigation: PickerNavigationAvailability,
+}
+
+fn row_rank(
+    order: &[(Provider, String, bool)],
+    provider: Provider,
+    model: &str,
+    streaming: bool,
+    default_provider: Provider,
+) -> (usize, (u8, String), String, bool) {
+    let provider_rank = if provider == default_provider {
+        (0, String::new())
+    } else {
+        (1, provider.to_string())
+    };
+    (
+        order
+            .iter()
+            .position(|(candidate, name, mode)| {
+                *candidate == provider && name == model && *mode == streaming
+            })
+            .unwrap_or(usize::MAX),
+        provider_rank,
+        model.to_string(),
+        streaming,
+    )
 }
 
 #[derive(Clone)]
@@ -1052,6 +1078,7 @@ pub(super) async fn pick_with_streaming_gtk(
     input: PickerUiInput,
 ) -> Result<PickerOutcome, TalkError> {
     let PickerUiInput {
+        chain_order,
         mut transcribers,
         audio_path,
         mut cached_entries,
@@ -1074,38 +1101,41 @@ pub(super) async fn pick_with_streaming_gtk(
     // puts the config default provider first (rank 0) ahead of the
     // others (alphabetical among rank 1).
     let default_provider = resolve_provider(None, config.as_ref());
-    // Rank providers: config default first (rank 0), others alphabetical
-    // (rank 1 + name).  Factored out so the same ordering is applied by
-    // both the per-source sorts below and the unified sort inside the
-    // GTK thread.
-    fn provider_rank(p: Provider, default_provider: Provider) -> (u8, String) {
-        if p == default_provider {
-            (0, String::new())
-        } else {
-            (1, p.to_string())
-        }
-    }
     cached_entries.sort_by(|(pa, ma, _, _, sa), (pb, mb, _, _, sb)| {
-        provider_rank(*pa, default_provider)
-            .cmp(&provider_rank(*pb, default_provider))
-            .then(ma.cmp(mb))
-            .then(sa.cmp(sb))
+        row_rank(&chain_order, *pa, ma, *sa, default_provider).cmp(&row_rank(
+            &chain_order,
+            *pb,
+            mb,
+            *sb,
+            default_provider,
+        ))
     });
     transcribers.sort_by(|(pa, ma), (pb, mb)| {
-        provider_rank(*pa, default_provider)
-            .cmp(&provider_rank(*pb, default_provider))
-            .then(ma.cmp(mb))
+        row_rank(&chain_order, *pa, ma, false, default_provider).cmp(&row_rank(
+            &chain_order,
+            *pb,
+            mb,
+            false,
+            default_provider,
+        ))
     });
     realtime_transcribers.sort_by(|(pa, ma, _), (pb, mb, _)| {
-        provider_rank(*pa, default_provider)
-            .cmp(&provider_rank(*pb, default_provider))
-            .then(ma.cmp(mb))
+        row_rank(&chain_order, *pa, ma, true, default_provider).cmp(&row_rank(
+            &chain_order,
+            *pb,
+            mb,
+            true,
+            default_provider,
+        ))
     });
     deferred_candidates.sort_by(|(pa, ma, sa), (pb, mb, sb)| {
-        provider_rank(*pa, default_provider)
-            .cmp(&provider_rank(*pb, default_provider))
-            .then(ma.cmp(mb))
-            .then(sa.cmp(sb))
+        row_rank(&chain_order, *pa, ma, *sa, default_provider).cmp(&row_rank(
+            &chain_order,
+            *pb,
+            mb,
+            *sb,
+            default_provider,
+        ))
     });
 
     // Extract (provider, model) labels before transcribers are consumed
@@ -1884,10 +1914,13 @@ pub(super) async fn pick_with_streaming_gtk(
         // per-source sorts done above so the order is identical
         // regardless of which bucket a row came from.
         all_rows.sort_by(|(pa, ma, sa, _), (pb, mb, sb, _)| {
-            provider_rank(*pa, default_provider)
-                .cmp(&provider_rank(*pb, default_provider))
-                .then(ma.cmp(mb))
-                .then(sa.cmp(sb))
+            row_rank(&chain_order, *pa, ma, *sa, default_provider).cmp(&row_rank(
+                &chain_order,
+                *pb,
+                mb,
+                *sb,
+                default_provider,
+            ))
         });
 
         // Unified action-button storage — one per row (same order as
@@ -3209,6 +3242,30 @@ pub(super) async fn pick_with_streaming_gtk(
 mod tests {
     use super::*;
     use crate::transcription::TranscriptionEvent;
+
+    #[test]
+    fn picker_chain_rows_precede_other_models_in_configured_order() {
+        let order = vec![
+            (Provider::OpenAI, "gpt-transcribe".into(), false),
+            (Provider::Mistral, "voxtral-mini-2602".into(), false),
+        ];
+        let mut rows = vec![
+            (Provider::Mistral, "voxtral-mini-2507", false),
+            (Provider::Mistral, "voxtral-mini-2602", false),
+            (Provider::OpenAI, "gpt-transcribe", false),
+        ];
+        rows.sort_by_key(|(provider, model, streaming)| {
+            row_rank(&order, *provider, model, *streaming, Provider::Mistral)
+        });
+        assert_eq!(
+            rows,
+            vec![
+                (Provider::OpenAI, "gpt-transcribe", false),
+                (Provider::Mistral, "voxtral-mini-2602", false),
+                (Provider::Mistral, "voxtral-mini-2507", false),
+            ]
+        );
+    }
 
     struct ScriptedRealtime {
         events: Vec<TranscriptionEvent>,

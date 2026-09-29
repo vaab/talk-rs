@@ -420,7 +420,9 @@ pub(crate) async fn dictate_realtime(
     visualizer: Option<&VisualizerHandle>,
     shutdown: &CancellationToken,
     mut bt_guard: bt_profile::HeadsetGuard,
-) -> Result<TranscriptionResult, TalkError> {
+    chain: Option<&crate::config::ResolvedChain>,
+    outage_path: Option<&std::path::Path>,
+) -> Result<(TranscriptionResult, Provider, String), TalkError> {
     // Always record audio to the cache OGG independently of transcription.
     log::info!("caching audio to: {}", cache_ogg_path.display());
     let buffer = Arc::new(AudioBuffer::new());
@@ -431,30 +433,100 @@ pub(crate) async fn dictate_realtime(
         Arc::clone(&buffer),
     ));
 
-    // Create initial transcription pipeline: buffer → feeder → transcriber.
-    let transcriber = match transcription::create_realtime_transcriber(&config, provider, model) {
-        Ok(transcriber) => transcriber,
-        Err(error) => {
-            finish_live_recording(capture, feedback, &mut bt_guard, ogg_task, false).await?;
-            return Err(error);
-        }
+    let outage = outage_path.map(std::path::Path::to_path_buf);
+    let choices: Vec<_> = match (chain, &outage) {
+        (Some(chain), Some(path)) => chain
+            .available_entries(path.clone())
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.provider,
+                    Some(entry.model.clone()),
+                    Some(entry.retry_schedule()),
+                )
+            })
+            .collect(),
+        _ => vec![(provider, model.map(str::to_string), None)],
     };
-    // Pre-flight so a bad key or model fails immediately with an enriched error
-    // instead of surfacing mid-session. Reconnects intentionally skip validation:
-    // the session was already validated, and retries should not add a round-trip.
-    if let Err(error) = transcriber.validate().await {
-        finish_live_recording(capture, feedback, &mut bt_guard, ogg_task, false).await?;
-        return Err(error);
-    }
-    let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
-    let mut feeder_handle = tokio::spawn(buffer_feeder(Arc::clone(&buffer), fwd_tx, 0));
-    let mut event_rx = match transcriber.transcribe_realtime(fwd_rx).await {
-        Ok(events) => events,
-        Err(error) => {
-            feeder_handle.abort();
-            finish_live_recording(capture, feedback, &mut bt_guard, ogg_task, false).await?;
-            return Err(error);
+    let mut attempts = Vec::new();
+    let mut selected = None;
+    let mut last_error = None;
+    for (index, (candidate, candidate_model, schedule)) in choices.iter().enumerate() {
+        let mut transcriber = match transcription::create_realtime_transcriber(
+            &config,
+            *candidate,
+            candidate_model.as_deref(),
+        ) {
+            Ok(transcriber) => transcriber,
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        };
+        if let Some(schedule) = schedule {
+            transcriber.set_retry_schedule(schedule.clone());
         }
+        let connected = match transcriber.validate().await {
+            Ok(()) => {
+                let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
+                let feeder = tokio::spawn(buffer_feeder(Arc::clone(&buffer), fwd_tx, 0));
+                match transcriber.transcribe_realtime(fwd_rx).await {
+                    Ok(events) => Ok((events, feeder)),
+                    Err(error) => {
+                        feeder.abort();
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+        match connected {
+            Ok((events, feeder)) => {
+                if let (Some(chain), Some(path)) = (chain, &outage) {
+                    chain.clear_outage(*candidate, path.clone());
+                    attempts.push(crate::transcription::chain::Attempt {
+                        provider: candidate.to_string(),
+                        model: candidate_model.clone().unwrap_or_default(),
+                        outcome: "success".into(),
+                    });
+                }
+                selected = Some((events, feeder, *candidate, candidate_model.clone()));
+                break;
+            }
+            Err(error) if chain.is_some() && error.is_fallback_worthy() => {
+                if let (Some(chain), Some(path)) = (chain, &outage) {
+                    chain.record_busy(*candidate, error.retry_after(), path.clone());
+                }
+                attempts.push(crate::transcription::chain::Attempt {
+                    provider: candidate.to_string(),
+                    model: candidate_model.clone().unwrap_or_default(),
+                    outcome: "busy".into(),
+                });
+                if let Some((_, Some(next), _)) = choices.get(index + 1) {
+                    let message = format!(
+                        "{} busy → {}",
+                        candidate_model.as_deref().unwrap_or("model"),
+                        next
+                    );
+                    log::info!("{message}");
+                    if let Some(viz) = visualizer {
+                        viz.push_message(&message);
+                    }
+                }
+                last_error = Some(error);
+            }
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        }
+    }
+    let Some((mut event_rx, mut feeder_handle, selected_provider, selected_model)) = selected
+    else {
+        finish_live_recording(capture, feedback, &mut bt_guard, ogg_task, false).await?;
+        return Err(last_error.unwrap_or_else(|| {
+            TalkError::Config("realtime chain has no connection candidate".into())
+        }));
     };
     let started = std::time::Instant::now();
 
@@ -617,7 +689,7 @@ pub(crate) async fn dictate_realtime(
                         // Try to reconnect with a fresh transcriber and
                         // replay all audio from the beginning.
                         feeder_handle.abort();
-                        match transcription::create_realtime_transcriber(&config, provider, model)
+                        match transcription::create_realtime_transcriber(&config, selected_provider, selected_model.as_deref().or(model))
                         {
                             Ok(new_transcriber) => {
                                 let (new_fwd_tx, new_fwd_rx) =
@@ -706,7 +778,7 @@ pub(crate) async fn dictate_realtime(
                         }
 
                         feeder_handle.abort();
-                        match transcription::create_realtime_transcriber(&config, provider, model)
+                        match transcription::create_realtime_transcriber(&config, selected_provider, selected_model.as_deref().or(model))
                         {
                             Ok(new_transcriber) => {
                                 let (new_fwd_tx, new_fwd_rx) =
@@ -766,9 +838,9 @@ pub(crate) async fn dictate_realtime(
 
     finish_live_recording(capture, feedback, &mut bt_guard, ogg_task, capture_stopped).await?;
 
-    let provider_specific = match provider {
+    let provider_specific = match selected_provider {
         Provider::OpenAI => Some(ProviderSpecificMetadata::OpenAI(OpenAIProviderMetadata {
-            model: model.map(str::to_string),
+            model: selected_model.clone().or_else(|| model.map(str::to_string)),
             usage_raw: None,
             rate_limit_headers: std::collections::BTreeMap::new(),
             unknown_event_types,
@@ -781,7 +853,7 @@ pub(crate) async fn dictate_realtime(
             }),
         })),
         Provider::Mistral => Some(ProviderSpecificMetadata::Mistral(MistralProviderMetadata {
-            model: model.map(str::to_string),
+            model: selected_model.clone().or_else(|| model.map(str::to_string)),
             usage_raw: None,
             unknown_event_types,
         })),
@@ -791,33 +863,38 @@ pub(crate) async fn dictate_realtime(
         Provider::Parakeet => None,
     };
 
-    Ok(TranscriptionResult {
-        text: transcript.text(),
-        metadata: TranscriptionMetadata {
-            request_latency_ms: None,
-            session_elapsed_ms: Some(started.elapsed().as_millis() as u64),
-            request_id: ws_upgrade_headers.get("x-request-id").cloned(),
-            provider_processing_ms: ws_upgrade_headers
-                .get("openai-processing-ms")
-                .and_then(|s| s.parse::<u64>().ok()),
-            detected_language,
-            audio_seconds: None,
-            segment_count: Some(if api_segment_count > 0 {
-                api_segment_count
+    Ok((
+        TranscriptionResult {
+            text: transcript.text(),
+            metadata: TranscriptionMetadata {
+                attempts,
+                request_latency_ms: None,
+                session_elapsed_ms: Some(started.elapsed().as_millis() as u64),
+                request_id: ws_upgrade_headers.get("x-request-id").cloned(),
+                provider_processing_ms: ws_upgrade_headers
+                    .get("openai-processing-ms")
+                    .and_then(|s| s.parse::<u64>().ok()),
+                detected_language,
+                audio_seconds: None,
+                segment_count: Some(if api_segment_count > 0 {
+                    api_segment_count
+                } else {
+                    transcript.segment_count()
+                }),
+                word_count: None,
+                token_usage: None,
+                provider_specific,
+            },
+            diarization: None,
+            segments: if timed_segments.is_empty() {
+                None
             } else {
-                transcript.segment_count()
-            }),
-            word_count: None,
-            token_usage: None,
-            provider_specific,
+                Some(timed_segments)
+            },
         },
-        diarization: None,
-        segments: if timed_segments.is_empty() {
-            None
-        } else {
-            Some(timed_segments)
-        },
-    })
+        selected_provider,
+        selected_model.unwrap_or_else(|| model.unwrap_or_default().to_string()),
+    ))
 }
 
 // Old `audio_tee_to_wav` removed — replaced by `ogg_recording_task`
@@ -972,14 +1049,134 @@ mod tests {
                 None,
                 &CancellationToken::new(),
                 bt_profile::HeadsetGuard::new(None),
+                None,
+                None,
             ),
         )
         .await
         .expect("early Done must not hang")
         .expect("dictation result");
-        assert_eq!(result.text, "");
+        assert_eq!(result.0.text, "");
         assert!(capture.stopped);
         server.await.expect("local server completed");
+    }
+
+    #[tokio::test]
+    async fn realtime_chain_switches_on_busy_handshake_before_streaming() {
+        use futures::SinkExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local listener");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut busy, _) = listener.accept().await.expect("busy handshake");
+            let mut request = [0u8; 4096];
+            let mut len = 0;
+            while !request[..len].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                assert!(len < request.len(), "upgrade headers exceed test buffer");
+                let read = busy
+                    .read(&mut request[len..])
+                    .await
+                    .expect("upgrade request");
+                assert!(read > 0, "connection closed mid-upgrade");
+                len += read;
+            }
+            assert!(String::from_utf8_lossy(&request[..len])
+                .contains("model=voxtral-mini-transcribe-realtime-2602"));
+            busy.write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("busy response");
+            drop(busy);
+            for phase in 0..2 {
+                let (stream, _) = listener.accept().await.expect("next model handshake");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("upgrade next model");
+                ws.send(Message::Text(r#"{"type":"session.created"}"#.into()))
+                    .await
+                    .expect("session created");
+                if phase == 1 {
+                    ws.send(Message::Text(r#"{"type":"transcription.done"}"#.into()))
+                        .await
+                        .expect("transcription complete");
+                }
+            }
+        });
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config: Config = serde_yaml::from_str(&format!(
+            "output_dir: {}\nproviders:\n  mistral:\n    api_key: local\n    url: {}\ntranscription:\n  chains:\n    live:\n      - mistral/voxtral-mini-transcribe-realtime-2602\n      - model: mistral/future-rt\n        supports: [realtime]\n",
+            dir.path().display(), endpoint,
+        )).expect("local chain config");
+        let chain = config
+            .resolve_chain(Some("live"), None, None)
+            .expect("resolve")
+            .expect("live chain")
+            .eligible(false, true, None)
+            .expect("realtime eligible");
+        let mut capture = HoldingCapture::default();
+        let audio_rx = capture.start().expect("start capture");
+        let mut feedback =
+            RecordingFeedback::new(crate::audio::recording_feedback::RecordingFeedbackOptions {
+                no_sounds: true,
+                no_boop: true,
+                no_overlay: true,
+                viz: None,
+                mono: false,
+                boop_interval_ms: 0,
+                capture_rate: 16_000,
+                pause_audio: false,
+                suppress_boop: None,
+                overlay: crate::audio::recording_feedback::RecordingOverlayOptions {
+                    silence_tx: None,
+                    auto_pause: false,
+                    telemetry_rx: None,
+                },
+            });
+        let outage_path = dir.path().join("outages.yml");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dictate_realtime(
+                config,
+                Provider::Mistral,
+                Some("voxtral-mini-transcribe-realtime-2602"),
+                &dir.path().join("recording.ogg"),
+                audio_rx,
+                &mut capture,
+                false,
+                &mut feedback,
+                None,
+                None,
+                &CancellationToken::new(),
+                bt_profile::HeadsetGuard::new(None),
+                Some(&chain),
+                Some(&outage_path),
+            ),
+        )
+        .await
+        .expect("connection fallback must finish")
+        .expect("second connection succeeds");
+        assert_eq!(result.1, Provider::Mistral);
+        assert_eq!(result.2, "future-rt");
+        assert_eq!(
+            result
+                .0
+                .metadata
+                .attempts
+                .iter()
+                .map(|attempt| attempt.outcome.as_str())
+                .collect::<Vec<_>>(),
+            ["busy", "success"]
+        );
+        assert!(capture.stopped);
+        server.await.expect("scripted server");
     }
 
     #[tokio::test]

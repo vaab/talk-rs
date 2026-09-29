@@ -202,13 +202,18 @@ pub struct TranscribeOptions {
     /// (which writes the same lock file with a richer YAML
     /// payload) so we don't conflict-on-self.
     pub skip_legacy_lock: bool,
+    pub retry_schedule: Option<transport::RetrySchedule>,
+    pub language: Option<String>,
 }
 
+pub(crate) mod catalog;
+pub mod chain;
 pub mod jobs;
 pub mod mistral;
 pub mod model_suggestions;
 pub mod openai;
 pub mod openai_realtime;
+pub(crate) mod outage;
 #[cfg(feature = "parakeet")]
 pub mod parakeet;
 pub mod realtime;
@@ -380,6 +385,8 @@ fn format_timestamp(seconds: f64) -> String {
 /// Provider-agnostic metadata that can be written to YAML.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptionMetadata {
+    /// Chain attempts in order; empty for legacy single-model calls.
+    pub attempts: Vec<chain::Attempt>,
     /// End-to-end API call latency measured client-side.
     pub request_latency_ms: Option<u64>,
     /// End-to-end realtime session duration measured client-side.
@@ -484,6 +491,7 @@ pub(crate) trait OneShotTranscriber: Send + Sync {
     /// SIGUSR1-routed cross-process cancellation via
     /// [`crate::transcription::jobs::cancel_remote`].
     fn set_cancel_token(&mut self, _token: tokio_util::sync::CancellationToken) {}
+    fn set_retry_schedule(&mut self, _schedule: transport::RetrySchedule) {}
 }
 
 // ── Realtime trait ───────────────────────────────────────────────────
@@ -525,6 +533,7 @@ pub(crate) trait RealtimeTranscriber: Send + Sync {
     /// active session aborts.  See [`OneShotTranscriber::set_cancel_token`]
     /// for the wiring rationale.
     fn set_cancel_token(&mut self, _token: tokio_util::sync::CancellationToken) {}
+    fn set_retry_schedule(&mut self, _schedule: transport::RetrySchedule) {}
 }
 
 // ── Error detection / enrichment dispatchers ────────────────────────
@@ -614,6 +623,17 @@ pub(crate) fn create_oneshot_transcriber(
     diarize: bool,
     policy: RequestTimeoutPolicy,
 ) -> Result<Box<dyn OneShotTranscriber>, TalkError> {
+    create_oneshot_transcriber_with_language(config, provider, model, diarize, policy, None)
+}
+
+fn create_oneshot_transcriber_with_language(
+    config: &Config,
+    provider: Provider,
+    model: Option<&str>,
+    diarize: bool,
+    policy: RequestTimeoutPolicy,
+    language: Option<&str>,
+) -> Result<Box<dyn OneShotTranscriber>, TalkError> {
     match provider {
         Provider::Mistral => {
             let mut cfg = config.providers.mistral.clone().ok_or_else(|| {
@@ -645,6 +665,10 @@ pub(crate) fn create_oneshot_transcriber(
                 ));
             }
             let cfg = override_openai_batch_model(cfg, model);
+            let mut cfg = cfg;
+            if let Some(language) = language {
+                cfg.languages = Some(vec![language.to_string()]);
+            }
             Ok(Box::new(OpenAIOneShotTranscriber::with_policy(
                 cfg, policy,
             )?))
@@ -771,6 +795,8 @@ pub async fn produce_transcript(
             policy: RequestTimeoutPolicy::Proportional,
             cancel_token: None,
             skip_legacy_lock: false,
+            retry_schedule: None,
+            language: None,
         },
         sink,
     )
@@ -828,6 +854,8 @@ pub async fn transcribe_audio(
         policy,
         cancel_token,
         skip_legacy_lock,
+        retry_schedule,
+        language,
     } = options;
     use crate::recording_cache::{self, TranscriptionCache};
 
@@ -871,8 +899,18 @@ pub async fn transcribe_audio(
 
     // Wrap API call in a closure so we can always release the lock.
     let api_result = async {
-        let mut transcriber = create_oneshot_transcriber(config, provider, model, diarize, policy)?;
+        let mut transcriber = create_oneshot_transcriber_with_language(
+            config,
+            provider,
+            model,
+            diarize,
+            policy,
+            language.as_deref(),
+        )?;
         transcriber.set_sink(sink.clone());
+        if let Some(schedule) = retry_schedule {
+            transcriber.set_retry_schedule(schedule);
+        }
         if let Some(token) = cancel_token {
             transcriber.set_cancel_token(token);
         }
@@ -969,7 +1007,11 @@ pub(crate) fn create_realtime_transcriber(
                     "providers.mistral.api_key is required".to_string(),
                 ));
             }
-            Ok(Box::new(MistralRealtimeTranscriber::new(cfg)))
+            let mut transcriber = MistralRealtimeTranscriber::new(cfg);
+            if let Some(model) = model {
+                transcriber.set_model(model.to_string());
+            }
+            Ok(Box::new(transcriber))
         }
         Provider::OpenAI => {
             let mut cfg = config.providers.openai.clone().ok_or_else(|| {

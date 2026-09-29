@@ -421,6 +421,8 @@ pub(crate) struct ModelInfo {
 /// error messages (e.g. `"Mistral"`, `"OpenAI"`).
 /// `is_transcription_model` filters the available models to suggest
 /// transcription-relevant alternatives on a model-not-found error.
+// The legacy tests exercise the production default without an entry-specific policy.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // provider identity, endpoint, sink and cancellation are independent inputs
 pub(crate) async fn validate_model(
     provider: crate::config::Provider,
@@ -431,6 +433,32 @@ pub(crate) async fn validate_model(
     is_transcription_model: fn(&str) -> bool,
     sink: &std::sync::Arc<dyn TelemetrySink>,
     cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), TalkError> {
+    validate_model_with_schedule(
+        provider,
+        provider_name,
+        api_key,
+        model,
+        api_base,
+        is_transcription_model,
+        sink,
+        cancel,
+        super::RetrySchedule::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // same validation inputs plus the caller's transport patience
+pub(crate) async fn validate_model_with_schedule(
+    provider: crate::config::Provider,
+    provider_name: &str,
+    api_key: &str,
+    model: &str,
+    api_base: &str,
+    is_transcription_model: fn(&str) -> bool,
+    sink: &std::sync::Arc<dyn TelemetrySink>,
+    cancel: tokio_util::sync::CancellationToken,
+    schedule: super::RetrySchedule,
 ) -> Result<(), TalkError> {
     // ── Cache check ─────────────────────────────────────────────
     if super::validate_cache::is_fresh(provider, model, api_base, api_key) {
@@ -453,6 +481,7 @@ pub(crate) async fn validate_model(
         is_transcription_model,
         sink,
         cancel,
+        schedule,
     )
     .await;
     sink.emit(TranscriptionEvent::PreflightCompleted {
@@ -475,6 +504,7 @@ pub(crate) async fn validate_model(
 /// Bail-on-model-rejected is implemented here (not in the
 /// transport) because "this specific model isn't listed" is a
 /// validate-only concern that requires parsing the response body.
+#[allow(clippy::too_many_arguments)] // endpoint identity, cancellation, and retry policy remain distinct transport inputs
 async fn validate_model_uncached(
     provider_name: &str,
     api_key: &str,
@@ -483,6 +513,7 @@ async fn validate_model_uncached(
     is_transcription_model: fn(&str) -> bool,
     sink: &Arc<dyn TelemetrySink>,
     cancel: tokio_util::sync::CancellationToken,
+    schedule: super::RetrySchedule,
 ) -> Result<(), TalkError> {
     use super::{Method, Request, RequestBody};
 
@@ -498,7 +529,7 @@ async fn validate_model_uncached(
     };
 
     let req = Request {
-        retry_schedule: Default::default(),
+        retry_schedule: schedule,
         method: Method::Get,
         url: models_url.clone(),
         headers: vec![("Authorization".into(), format!("Bearer {}", api_key))],

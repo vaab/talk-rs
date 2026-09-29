@@ -130,6 +130,7 @@ pub(crate) async fn dictate_oneshot(
     provider: Provider,
     model: Option<&str>,
     diarize: bool,
+    chain_active: bool,
     mut bt_guard: bt_profile::HeadsetGuard,
 ) -> (
     Result<TranscriptionResult, TalkError>,
@@ -213,12 +214,10 @@ pub(crate) async fn dictate_oneshot(
                     );
 
                     live_retries += 1;
-                    if live_retries > MAX_LIVE_RETRIES {
-                        let msg = format!(
-                            "Transcription failed ({} retries exhausted) — \
-                             will retry after recording",
-                            MAX_LIVE_RETRIES
-                        );
+                    if chain_active || live_retries > MAX_LIVE_RETRIES {
+                        let msg = if chain_active {
+                            "Transcription busy — trying next chain entry after recording".to_string()
+                        } else { format!("Transcription failed ({} retries exhausted) — will retry after recording", MAX_LIVE_RETRIES) };
                         log::warn!("{}", msg);
                         if let Some(viz) = visualizer {
                             viz.push_message(&msg);
@@ -533,6 +532,104 @@ mod tests {
         )
     }
 
+    struct BusyTranscriber {
+        started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl OneShotTranscriber for BusyTranscriber {
+        async fn validate(&self) -> Result<(), TalkError> {
+            Ok(())
+        }
+
+        async fn fetch_transcription(
+            &self,
+            _body: TranscriptionBody,
+        ) -> Result<TranscriptionResult, TalkError> {
+            if let Some(started) = self.started.lock().expect("started lock").take() {
+                let _ = started.send(());
+            }
+            Err(crate::error::PipelineFailure::new(
+                "Mistral",
+                crate::error::PipelinePhase::Request,
+                1,
+                1,
+                "http://localhost/v1/audio/transcriptions",
+                crate::error::PipelineFailureKind::HttpStatus {
+                    status: 429,
+                    body: "busy".into(),
+                },
+            )
+            .into())
+        }
+    }
+
+    #[tokio::test]
+    async fn live_chain_preserves_busy_failure_for_file_fallback() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let cache = dir.path().join("busy.ogg");
+        struct StopNotifyingCapture(Option<oneshot::Sender<()>>);
+        impl AudioCapture for StopNotifyingCapture {
+            fn start(&mut self) -> Result<mpsc::Receiver<Vec<i16>>, TalkError> {
+                Err(TalkError::Audio("test capture is already started".into()))
+            }
+
+            fn stop(&mut self) -> Result<(), TalkError> {
+                if let Some(stopped) = self.0.take() {
+                    let _ = stopped.send(());
+                }
+                Ok(())
+            }
+        }
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let mut capture = StopNotifyingCapture(Some(stopped_tx));
+        let (tx, rx) = mpsc::channel(8);
+        let (started_tx, started_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let feeder = tokio::spawn(async move {
+            for _ in 0..5 {
+                tx.send(vec![9000; 320]).await.expect("PCM sent");
+            }
+            started_rx.await.expect("busy request started");
+            stop.cancel();
+            stopped_rx
+                .await
+                .expect("capture stopped before input closes");
+            drop(tx);
+        });
+        let mut feedback = no_device_feedback();
+        let (result, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dictate_oneshot(
+                &mut capture,
+                false,
+                AudioConfig::new(),
+                rx,
+                &cache,
+                Box::new(BusyTranscriber {
+                    started: std::sync::Mutex::new(Some(started_tx)),
+                }),
+                &shutdown,
+                &mut feedback,
+                None,
+                &offline_config(dir.path()),
+                Provider::Mistral,
+                None,
+                false,
+                true,
+                bt_profile::HeadsetGuard::new(None),
+            ),
+        )
+        .await
+        .expect("busy pipeline finishes");
+        feeder.await.expect("PCM feeder finished");
+        let error = result.expect_err("busy error");
+        assert!(matches!(error, TalkError::Pipeline(ref failure)
+            if matches!(failure.kind, crate::error::PipelineFailureKind::HttpStatus { status: 429, .. })));
+        assert!(cache.is_file());
+    }
+
     fn no_device_feedback() -> RecordingFeedback {
         RecordingFeedback::new(RecordingFeedbackOptions {
             no_sounds: true,
@@ -633,6 +730,7 @@ mod tests {
             Provider::Mistral,
             None,
             false,
+            false,
             bt_profile::HeadsetGuard::new(None),
         )
         .await;
@@ -674,6 +772,7 @@ mod tests {
             Provider::Mistral,
             None,
             false,
+            false,
             bt_profile::HeadsetGuard::new(None),
         )
         .await;
@@ -712,6 +811,7 @@ mod tests {
                 &offline_config(dir.path()),
                 Provider::Mistral,
                 None,
+                false,
                 false,
                 bt_profile::HeadsetGuard::new(None),
             ),
