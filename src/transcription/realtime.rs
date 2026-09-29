@@ -487,6 +487,7 @@ impl MistralRealtimeTranscriber {
         log::debug!("validation: connecting to {}", ws_url);
 
         let req = super::transport::Request {
+            retry_schedule: Default::default(),
             method: super::transport::Method::Get,
             url: ws_url.clone(),
             headers: vec![(
@@ -542,6 +543,7 @@ impl MistralRealtimeTranscriber {
         log::debug!("connecting to WebSocket: {}", ws_url);
 
         let req = super::transport::Request {
+            retry_schedule: Default::default(),
             method: super::transport::Method::Get,
             url: ws_url.clone(),
             headers: vec![(

@@ -41,14 +41,15 @@ use crate::recording_cache;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use tokio_util::sync::CancellationToken;
 
 /// On-disk lock payload format version.  Bump when the YAML
 /// schema changes incompatibly.  Observers refuse to attach to a
 /// lock with a newer-major version than they understand.
 const LOCK_PAYLOAD_VERSION: u32 = 1;
+static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(0);
 
 /// YAML payload written into the per-model lock file by
 /// [`register_local`].
@@ -83,6 +84,9 @@ pub struct LockPayload {
     pub model: String,
     /// Streaming flag (realtime vs one-shot).
     pub realtime: bool,
+    /// Unique registration identity; absent on older lock files.
+    #[serde(default)]
+    pub owner_id: String,
 }
 
 impl LockPayload {
@@ -99,6 +103,15 @@ impl LockPayload {
             provider: provider.to_string(),
             model: model.to_string(),
             realtime,
+            owner_id: format!(
+                "{}-{}-{}",
+                process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+            ),
         }
     }
 }
@@ -117,6 +130,7 @@ impl LockPayload {
 static LOCAL_REGISTRY: OnceLock<Mutex<Vec<RegisteredJob>>> = OnceLock::new();
 
 struct RegisteredJob {
+    id: String,
     cancel: CancellationToken,
 }
 
@@ -176,7 +190,7 @@ fn install_sigusr1_handler() {
 pub struct LocalJob {
     cancel: CancellationToken,
     lock_path: PathBuf,
-    registry_index: usize,
+    id: String,
 }
 
 impl LocalJob {
@@ -206,40 +220,18 @@ impl Drop for LocalJob {
     fn drop(&mut self) {
         // Best-effort lock-file removal.  Missing file is fine
         // (the user may have already cancelled).
-        let _ = std::fs::remove_file(&self.lock_path);
+        if observe_remote(&self.lock_path).is_some_and(|remote| remote.payload.owner_id == self.id)
+        {
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
 
-        // Deregister from the local registry.  Use swap-remove on
-        // a clone of the position so we don't accidentally
-        // deregister a different job if indices shifted.
+        // Deregister by stable identity, independent of swap_remove ordering.
         if let Ok(mut g) = local_registry().lock() {
-            // Find by token equality (Arc-internal identity).
-            if let Some(pos) = g.iter().position(|e| {
-                Arc::ptr_eq(&token_inner_arc(&e.cancel), &token_inner_arc(&self.cancel))
-            }) {
+            if let Some(pos) = g.iter().position(|e| e.id == self.id) {
                 g.swap_remove(pos);
-            } else if self.registry_index < g.len() {
-                // Fall back to the index we were given.
-                g.swap_remove(self.registry_index);
             }
         }
     }
-}
-
-/// Tokens are compared via pointer equality on their inner Arc.
-///
-/// `CancellationToken::is_cancelled` doesn't help for identity
-/// comparison; we use the internal Arc pointer instead.  This
-/// works because the registry stores the same `CancellationToken`
-/// instance the `LocalJob` holds.
-fn token_inner_arc(_t: &CancellationToken) -> Arc<()> {
-    // tokio_util doesn't expose the inner Arc; use a fresh empty
-    // marker so the position-by-identity check above degrades to
-    // "always falsy", which is fine: the index fallback handles
-    // the common single-job case.  In multi-job processes the
-    // wrong-job-removal risk is bounded to "removes the wrong
-    // entry from the in-process registry", with no on-disk or
-    // cross-process consequence.
-    Arc::new(())
 }
 
 /// Register an in-flight job for the given (recording, provider,
@@ -264,10 +256,6 @@ pub fn register_local(
     realtime: bool,
 ) -> Result<LocalJob, TalkError> {
     let lock_path = recording_cache::model_lock_path_public(audio_path, provider, model, realtime)?;
-    if lock_path.exists() {
-        return Err(TalkError::ModelInProgress);
-    }
-
     let payload = LockPayload::new(provider, model, realtime);
     let yaml = serde_yaml::to_string(&payload)
         .map_err(|e| TalkError::Config(format!("failed to serialize lock payload: {}", e)))?;
@@ -278,31 +266,39 @@ pub fn register_local(
     let tmp = {
         let mut p = lock_path.clone();
         let new_name = format!(
-            "{}.tmp",
-            p.file_name().and_then(|n| n.to_str()).unwrap_or("lock")
+            "{}.{}.tmp",
+            p.file_name().and_then(|n| n.to_str()).unwrap_or("lock"),
+            payload.owner_id
         );
         p.set_file_name(new_name);
         p
     };
     std::fs::write(&tmp, yaml.as_bytes())
         .map_err(|e| TalkError::Config(format!("failed to write {}: {}", tmp.display(), e)))?;
-    std::fs::rename(&tmp, &lock_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        TalkError::Config(format!(
-            "failed to install lock {}: {}",
-            lock_path.display(),
-            e
-        ))
-    })?;
+    let linked = std::fs::hard_link(&tmp, &lock_path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(TalkError::ModelInProgress)
+        }
+        Err(e) => {
+            return Err(TalkError::Config(format!(
+                "failed to install lock {}: {}",
+                lock_path.display(),
+                e
+            )))
+        }
+    }
 
     let cancel = CancellationToken::new();
-    let registry_index;
     {
-        let mut g = local_registry()
-            .lock()
-            .map_err(|_| TalkError::Config("jobs registry mutex poisoned".into()))?;
-        registry_index = g.len();
+        let mut g = local_registry().lock().map_err(|_| {
+            let _ = std::fs::remove_file(&lock_path);
+            TalkError::Config("jobs registry mutex poisoned".into())
+        })?;
         g.push(RegisteredJob {
+            id: payload.owner_id.clone(),
             cancel: cancel.clone(),
         });
     }
@@ -310,7 +306,7 @@ pub fn register_local(
     Ok(LocalJob {
         cancel,
         lock_path,
-        registry_index,
+        id: payload.owner_id,
     })
 }
 
@@ -441,12 +437,102 @@ pub fn cancel_remote(remote: &RemoteJob) -> Result<(), TalkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn tmp_audio_path(dir: &TempDir, name: &str) -> PathBuf {
         let path = dir.path().join(name);
         std::fs::File::create(&path).expect("create test audio file");
         path
+    }
+
+    #[tokio::test]
+    async fn simultaneous_registration_has_exactly_one_owner() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = tmp_audio_path(&dir, "race.ogg");
+        for _ in 0..30 {
+            let gate = Arc::new(std::sync::Barrier::new(3));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let audio = audio.clone();
+                    let gate = gate.clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    std::thread::spawn(move || {
+                        let _runtime = runtime.enter();
+                        gate.wait();
+                        let result = register_local(&audio, Provider::Mistral, "voxtral", false);
+                        gate.wait();
+                        result
+                    })
+                })
+                .collect();
+            gate.wait();
+            gate.wait();
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect();
+            assert_eq!(
+                results.iter().filter(|r| r.is_ok()).count(),
+                1,
+                "expected exactly one owner, got {:?}",
+                results
+                    .iter()
+                    .map(|r| r
+                        .as_ref()
+                        .map(|job| job.id.as_str())
+                        .map_err(|e| e.to_string()))
+                    .collect::<Vec<_>>()
+            );
+            assert!(results
+                .iter()
+                .any(|r| matches!(r, Err(TalkError::ModelInProgress))));
+            drop(results);
+        }
+    }
+
+    #[tokio::test]
+    async fn old_guard_does_not_remove_replacement_lock() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = tmp_audio_path(&dir, "replace.ogg");
+        let guard = register_local(&audio, Provider::Mistral, "voxtral", false).expect("register");
+        let path = guard.lock_path().to_path_buf();
+        let replacement = LockPayload::new(Provider::OpenAI, "replacement", false);
+        std::fs::write(&path, serde_yaml::to_string(&replacement).expect("yaml"))
+            .expect("replacement");
+        drop(guard);
+        assert_eq!(
+            observe_remote(&path)
+                .expect("replacement preserved")
+                .payload
+                .model,
+            "replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_middle_then_last_keeps_only_first_registered() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = tmp_audio_path(&dir, "registry.ogg");
+        let a = register_local(&audio, Provider::Mistral, "a", false).expect("a");
+        let b = register_local(&audio, Provider::Mistral, "b", false).expect("b");
+        let c = register_local(&audio, Provider::Mistral, "c", false).expect("c");
+        let ids = [a.id.clone(), b.id.clone(), c.id.clone()];
+        drop(b);
+        drop(c);
+        let g = local_registry().lock().expect("registry");
+        let remaining: Vec<_> = g
+            .iter()
+            .filter(|e| ids.contains(&e.id))
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![a.id.as_str()],
+            "only A should be registered"
+        );
+        drop(g);
+        drop(a);
     }
 
     #[tokio::test]
@@ -493,6 +579,33 @@ mod tests {
         assert_eq!(in_flight.len(), 1);
         assert_eq!(in_flight[0].payload.owner_pid, std::process::id());
         assert!(in_flight[0].owner_alive());
+    }
+
+    #[tokio::test]
+    async fn listing_ignores_other_recordings_and_unobservable_locks() {
+        let dir = TempDir::new().expect("tempdir");
+        let audio = tmp_audio_path(&dir, "target.ogg");
+        let other_audio = tmp_audio_path(&dir, "other.ogg");
+        let valid =
+            register_local(&audio, Provider::OpenAI, "whisper-1", false).expect("valid lock");
+        let _other = register_local(&other_audio, Provider::Mistral, "voxtral", false)
+            .expect("other recording lock");
+        std::fs::write(dir.path().join("target_bad-lock.yml"), "not: [yaml")
+            .expect("malformed lock");
+        std::fs::write(dir.path().join("target_legacy-lock.yml"), "").expect("legacy lock");
+        let mut future = LockPayload::new(Provider::OpenAI, "future", false);
+        future.version = LOCK_PAYLOAD_VERSION + 1;
+        std::fs::write(
+            dir.path().join("target_future-lock.yml"),
+            serde_yaml::to_string(&future).expect("future yaml"),
+        )
+        .expect("future lock");
+
+        let observed = list_in_flight_for(&audio);
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].lock_path, valid.lock_path());
+        assert_eq!(observed[0].payload.model, "whisper-1");
+        assert_eq!(observed[0].payload.provider, "openai");
     }
 
     #[tokio::test]

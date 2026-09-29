@@ -1,6 +1,6 @@
 //! Disk-backed cache for `/v1/models` validation results.
 //!
-//! Validating a `(provider, model, api_base)` triple costs one
+//! Validating a `(provider, model, api_base, credential)` tuple costs one
 //! HTTP round-trip to the provider's `/v1/models` endpoint — see
 //! [`super::http::validate_model`].  On a flaky VPN that round-trip
 //! fails frequently, and historically every transcription paid the
@@ -21,7 +21,7 @@
 //! 1. Acquire the exclusive lock.
 //! 2. Re-read the cache file from disk and merge with our
 //!    in-process map (newer timestamp wins per `(provider, model,
-//!    api_base)` key).
+//!    api_base, credential fingerprint)` key).
 //! 3. Write the merged set to a tempfile + atomic rename onto the
 //!    final path.
 //! 4. Release the lock.
@@ -81,7 +81,7 @@ const CACHE_FILE_NAME: &str = "validate-cache.yaml";
 
 /// In-memory + on-disk key for a single validation entry.
 ///
-/// The triple `(provider, model, api_base)` is deliberately exact:
+/// The tuple `(provider, model, api_base, credential fingerprint)` is exact:
 /// the same model name on different `api_base` URLs (e.g. a
 /// staging proxy vs. production) is a different cache entry —
 /// one's freshness says nothing about the other.
@@ -96,6 +96,7 @@ struct Key {
     provider: String,
     model: String,
     api_base: String,
+    credential_fingerprint: String,
 }
 
 /// Single on-disk cache row.
@@ -108,7 +109,17 @@ struct Entry {
     provider: String,
     model: String,
     api_base: String,
+    #[serde(default)]
+    credential_fingerprint: String,
     validated_at: DateTime<Utc>,
+}
+
+fn fingerprint(api_key: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, api_key.as_bytes());
+    digest.as_ref()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Top-level YAML structure: a flat list of entries.  Chosen over
@@ -190,28 +201,28 @@ fn read_disk_unconditional() -> Option<Vec<Entry>> {
 /// data into the in-process map every lookup).  Used by the read
 /// path ([`is_fresh`]); the write path uses
 /// [`read_disk_unconditional`] under flock for correctness.
-fn read_disk_if_changed() -> Option<Vec<Entry>> {
-    let path = cache_path().ok()?;
-    let metadata = std::fs::metadata(&path).ok()?;
-    let current_mtime = metadata.modified().ok()?;
+fn read_disk_if_changed() -> Result<Option<Vec<Entry>>, ()> {
+    let path = cache_path().map_err(|_| ())?;
+    let metadata = std::fs::metadata(&path).map_err(|_| ())?;
+    let current_mtime = metadata.modified().map_err(|_| ())?;
 
     let mtime_changed = {
-        let last = last_disk_mtime().lock().ok()?;
+        let last = last_disk_mtime().lock().map_err(|_| ())?;
         last.map(|m| m != current_mtime).unwrap_or(true)
     };
 
     if !mtime_changed {
-        return None; // Disk hasn't changed since last read
+        return Ok(None); // Disk hasn't changed since last read
     }
 
-    let bytes = std::fs::read(&path).ok()?;
-    let file: CacheFile = serde_yaml::from_slice(&bytes).ok()?;
+    let bytes = std::fs::read(&path).map_err(|_| ())?;
+    let file: CacheFile = serde_yaml::from_slice(&bytes).map_err(|_| ())?;
 
     if let Ok(mut last) = last_disk_mtime().lock() {
         *last = Some(current_mtime);
     }
 
-    Some(file.entries)
+    Ok(Some(file.entries))
 }
 
 /// Merge any newer-on-disk entries into the in-process map.
@@ -219,17 +230,29 @@ fn read_disk_if_changed() -> Option<Vec<Entry>> {
 /// Called at the top of every cache lookup so a sibling process's
 /// successful validation becomes visible without restarting us.
 fn refresh_in_process_from_disk() {
-    let Some(entries) = read_disk_if_changed() else {
-        return;
+    let entries = match read_disk_if_changed() {
+        Ok(Some(entries)) => entries,
+        Ok(None) => return,
+        Err(()) => {
+            if let Ok(mut map) = in_process().lock() {
+                map.clear();
+            }
+            if let Ok(mut last) = last_disk_mtime().lock() {
+                *last = None;
+            }
+            return;
+        }
     };
     let Ok(mut map) = in_process().lock() else {
         return;
     };
+    map.clear();
     for e in entries {
         let key = Key {
             provider: e.provider,
             model: e.model,
             api_base: e.api_base,
+            credential_fingerprint: e.credential_fingerprint,
         };
         // Always overwrite: the disk version is authoritative for
         // entries we haven't validated ourselves this run.
@@ -243,12 +266,13 @@ fn refresh_in_process_from_disk() {
 /// Returns `true` only when a fresh entry exists.  Errors,
 /// missing entries, and stale entries all return `false` so the
 /// caller falls through to the network.
-pub(crate) fn is_fresh(provider: Provider, model: &str, api_base: &str) -> bool {
+pub(crate) fn is_fresh(provider: Provider, model: &str, api_base: &str, api_key: &str) -> bool {
     refresh_in_process_from_disk();
     let key = Key {
         provider: provider.to_string(),
         model: model.to_string(),
         api_base: api_base.to_string(),
+        credential_fingerprint: fingerprint(api_key),
     };
     let Ok(map) = in_process().lock() else {
         return false;
@@ -266,11 +290,12 @@ pub(crate) fn is_fresh(provider: Provider, model: &str, api_base: &str) -> bool 
 /// errors are logged at `warn` and swallowed — a cache miss next
 /// call is strictly preferable to failing a transcription that
 /// already validated on the wire.
-pub(crate) fn record(provider: Provider, model: &str, api_base: &str) {
+pub(crate) fn record(provider: Provider, model: &str, api_base: &str, api_key: &str) {
     let key = Key {
         provider: provider.to_string(),
         model: model.to_string(),
         api_base: api_base.to_string(),
+        credential_fingerprint: fingerprint(api_key),
     };
     let now = Utc::now();
 
@@ -359,6 +384,7 @@ fn persist_to_disk() -> Result<(), TalkError> {
                     provider: e.provider,
                     model: e.model,
                     api_base: e.api_base,
+                    credential_fingerprint: e.credential_fingerprint,
                 };
                 match map.get(&key).copied() {
                     None => {
@@ -381,6 +407,7 @@ fn persist_to_disk() -> Result<(), TalkError> {
                 provider: k.provider.clone(),
                 model: k.model.clone(),
                 api_base: k.api_base.clone(),
+                credential_fingerprint: k.credential_fingerprint.clone(),
                 validated_at: t,
             })
             .collect(),
@@ -526,12 +553,12 @@ mod tests {
     fn record_then_is_fresh_returns_true() {
         with_temp_home(|| {
             assert!(
-                !is_fresh(Provider::Mistral, "voxtral", "https://x"),
+                !is_fresh(Provider::Mistral, "voxtral", "https://x", "key"),
                 "missing entry must not be fresh"
             );
-            record(Provider::Mistral, "voxtral", "https://x");
+            record(Provider::Mistral, "voxtral", "https://x", "key");
             assert!(
-                is_fresh(Provider::Mistral, "voxtral", "https://x"),
+                is_fresh(Provider::Mistral, "voxtral", "https://x", "key"),
                 "just-recorded entry must be fresh"
             );
         });
@@ -542,14 +569,25 @@ mod tests {
     #[test]
     fn cache_distinguishes_api_base() {
         with_temp_home(|| {
-            record(Provider::Mistral, "voxtral", "https://api.mistral.ai");
+            record(
+                Provider::Mistral,
+                "voxtral",
+                "https://api.mistral.ai",
+                "key",
+            );
             assert!(is_fresh(
                 Provider::Mistral,
                 "voxtral",
-                "https://api.mistral.ai"
+                "https://api.mistral.ai",
+                "key"
             ));
             assert!(
-                !is_fresh(Provider::Mistral, "voxtral", "https://staging.mistral.ai"),
+                !is_fresh(
+                    Provider::Mistral,
+                    "voxtral",
+                    "https://staging.mistral.ai",
+                    "key"
+                ),
                 "different api_base must be a separate entry"
             );
         });
@@ -560,16 +598,18 @@ mod tests {
     #[test]
     fn cache_distinguishes_model() {
         with_temp_home(|| {
-            record(Provider::Mistral, "voxtral-mini-2602", "https://x");
+            record(Provider::Mistral, "voxtral-mini-2602", "https://x", "key");
             assert!(is_fresh(
                 Provider::Mistral,
                 "voxtral-mini-2602",
-                "https://x"
+                "https://x",
+                "key"
             ));
             assert!(!is_fresh(
                 Provider::Mistral,
                 "voxtral-mini-2507",
-                "https://x"
+                "https://x",
+                "key"
             ));
         });
     }
@@ -586,13 +626,14 @@ mod tests {
                 provider: Provider::Mistral.to_string(),
                 model: "voxtral".into(),
                 api_base: "https://x".into(),
+                credential_fingerprint: fingerprint("key"),
             };
             in_process()
                 .lock()
                 .expect("test: lock")
                 .insert(key, stale_time);
             assert!(
-                !is_fresh(Provider::Mistral, "voxtral", "https://x"),
+                !is_fresh(Provider::Mistral, "voxtral", "https://x", "key"),
                 "entry older than 24h must not be fresh"
             );
         });
@@ -604,7 +645,7 @@ mod tests {
     #[test]
     fn disk_persistence_survives_in_process_clear() {
         with_temp_home(|| {
-            record(Provider::Mistral, "voxtral", "https://x");
+            record(Provider::Mistral, "voxtral", "https://x", "key");
             // Simulate a fresh process: clear the in-process map.
             // The next `is_fresh` should re-read from disk.
             if let Ok(mut map) = in_process().lock() {
@@ -614,7 +655,7 @@ mod tests {
                 *t = None; // Force a re-read regardless of mtime.
             }
             assert!(
-                is_fresh(Provider::Mistral, "voxtral", "https://x"),
+                is_fresh(Provider::Mistral, "voxtral", "https://x", "key"),
                 "entry must be readable from disk after in-process clear"
             );
         });
@@ -626,13 +667,31 @@ mod tests {
     #[test]
     fn disk_format_is_valid_yaml() {
         with_temp_home(|| {
-            record(Provider::Mistral, "voxtral", "https://x");
-            record(Provider::OpenAI, "whisper-1", "https://api.openai.com");
+            record(Provider::Mistral, "voxtral", "https://x", "key");
+            record(
+                Provider::OpenAI,
+                "whisper-1",
+                "https://api.openai.com",
+                "key",
+            );
 
             let path = cache_path().expect("test: path");
             let bytes = std::fs::read(&path).expect("test: read cache");
             let file: CacheFile = serde_yaml::from_slice(&bytes).expect("test: parse cache");
             assert_eq!(file.entries.len(), 2);
+            assert!(!String::from_utf8_lossy(&bytes).contains("key"));
+        });
+    }
+
+    #[test]
+    fn legacy_entry_without_fingerprint_is_read_but_never_authorizes() {
+        with_temp_home(|| {
+            let path = cache_path().expect("path");
+            let yaml = format!("entries:\n- provider: mistral\n  model: voxtral\n  api_base: https://x\n  validated_at: {}\n", Utc::now().to_rfc3339());
+            std::fs::write(&path, yaml).expect("old cache");
+            assert!(!is_fresh(Provider::Mistral, "voxtral", "https://x", "key"));
+            record(Provider::Mistral, "voxtral", "https://x", "key");
+            assert!(is_fresh(Provider::Mistral, "voxtral", "https://x", "key"));
         });
     }
 
@@ -658,7 +717,20 @@ mod tests {
             }
 
             // Lookup must not panic; missing-or-corrupt = not-fresh.
-            assert!(!is_fresh(Provider::Mistral, "voxtral", "https://x"));
+            assert!(!is_fresh(Provider::Mistral, "voxtral", "https://x", "key"));
+        });
+    }
+
+    #[test]
+    fn corruption_after_success_invalidates_in_process_hit() {
+        with_temp_home(|| {
+            record(Provider::Mistral, "voxtral", "https://x", "key");
+            assert!(is_fresh(Provider::Mistral, "voxtral", "https://x", "key"));
+            let path = cache_path().expect("cache path");
+            std::fs::write(&path, b"entries: [broken").expect("corrupt disk");
+            // Force the changed-file check even on coarse-mtime filesystems.
+            *last_disk_mtime().lock().expect("mtime lock") = None;
+            assert!(!is_fresh(Provider::Mistral, "voxtral", "https://x", "key"));
         });
     }
 
@@ -711,6 +783,7 @@ entries:
                 Provider::Mistral,
                 "voxtral-mini-2602",
                 "https://api.mistral.ai",
+                "key",
             );
 
             // 4. Read the disk file directly and assert both
@@ -752,6 +825,7 @@ entries:
                 provider: Provider::Mistral.to_string(),
                 model: "voxtral".into(),
                 api_base: "https://x".into(),
+                credential_fingerprint: fingerprint("key"),
             };
             in_process()
                 .lock()
@@ -759,7 +833,7 @@ entries:
                 .insert(key.clone(), stale);
 
             // Re-record with the public API.
-            record(Provider::Mistral, "voxtral", "https://x");
+            record(Provider::Mistral, "voxtral", "https://x", "key");
 
             // The entry must now be safely fresh — the timestamp
             // moved to (approximately) Utc::now().

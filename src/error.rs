@@ -336,7 +336,11 @@ impl std::fmt::Display for PipelineFailure {
             PipelineFailureKind::HttpStatus { status, body } => {
                 let body_trimmed = body.trim();
                 let body_short = if body_trimmed.len() > 200 {
-                    format!("{}…", &body_trimmed[..200])
+                    let boundary = (0..=200)
+                        .rev()
+                        .find(|&index| body_trimmed.is_char_boundary(index))
+                        .unwrap_or(0);
+                    format!("{}…", &body_trimmed[..boundary])
                 } else {
                     body_trimmed.to_string()
                 };
@@ -739,6 +743,26 @@ mod tests {
         assert!(s.contains("Unauthorized"), "got: {}", s);
         assert!(s.contains("(after 1/5 attempts"), "got: {}", s);
         assert!(s.contains("4xx permanent, no retry"), "got: {}", s);
+    }
+
+    #[test]
+    fn multibyte_http_body_truncates_without_panicking() {
+        let pf = PipelineFailure::new(
+            "Mistral",
+            PipelinePhase::Request,
+            1,
+            1,
+            "https://x",
+            PipelineFailureKind::HttpStatus {
+                status: 400,
+                body: format!("{}émore", "a".repeat(199)),
+            },
+        );
+        let rendered = pf.to_string();
+        assert!(
+            rendered.ends_with(&format!("{}…", "a".repeat(199))),
+            "{rendered}"
+        );
     }
 
     /// Spec: a 5xx with exhausted retries shows the

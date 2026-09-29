@@ -80,6 +80,23 @@ pub const CONNECTION_BUDGETS_SECS: [u64; 7] = [2, 5, 8, 11, 15, 30, 120];
 /// the provider ~5.5 minutes to recover before giving up.
 pub const DATA_BACKOFF_SECS: [u64; 6] = [5, 15, 30, 60, 120, 120];
 
+/// Retry budgets for one HTTP request. The default is the production
+/// schedule; callers may supply shorter budgets for local endpoints.
+#[derive(Debug, Clone)]
+pub struct RetrySchedule {
+    pub connection_budgets: Vec<Duration>,
+    pub data_backoffs: Vec<Duration>,
+}
+
+impl Default for RetrySchedule {
+    fn default() -> Self {
+        Self {
+            connection_budgets: CONNECTION_BUDGETS_SECS.map(Duration::from_secs).to_vec(),
+            data_backoffs: DATA_BACKOFF_SECS.map(Duration::from_secs).to_vec(),
+        }
+    }
+}
+
 /// Upper bound applied to a server-supplied `Retry-After` so a
 /// misbehaving header cannot park an unattended pipeline for hours.
 /// Equal to the largest schedule slot.
@@ -159,6 +176,8 @@ pub struct Request {
     /// take as long as it takes, bounded only by the connect
     /// timeout and TCP-level defences).
     pub wall_clock: Option<Duration>,
+    /// Connection and data retry budgets for this request.
+    pub retry_schedule: RetrySchedule,
 }
 
 /// A response from the transport.
@@ -306,7 +325,7 @@ pub async fn http_request(
     sink: &Arc<dyn TelemetrySink>,
     cancel: CancellationToken,
 ) -> Result<Response, PipelineFailure> {
-    let max_data_attempts = DATA_BACKOFF_SECS.len() as u32 + 1;
+    let max_data_attempts = req.retry_schedule.data_backoffs.len() as u32 + 1;
 
     sink.emit(TranscriptionEvent::RequestStarted {
         endpoint: req.url.clone(),
@@ -336,7 +355,7 @@ pub async fn http_request(
         // that just failed; retry `n` (1-based) waits
         // `DATA_BACKOFF_SECS[n-1]` unless the server said otherwise.
         let retry_index = data_attempt as usize - 1;
-        let Some(&slot_secs) = DATA_BACKOFF_SECS.get(retry_index) else {
+        let Some(&slot) = req.retry_schedule.data_backoffs.get(retry_index) else {
             sink.emit(TranscriptionEvent::RequestCompleted {
                 success: false,
                 t: Instant::now(),
@@ -345,7 +364,7 @@ pub async fn http_request(
         };
         let wait = retry_after
             .map(|d| d.min(Duration::from_secs(RETRY_AFTER_CAP_SECS)))
-            .unwrap_or_else(|| Duration::from_secs(slot_secs));
+            .unwrap_or(slot);
         let retry_num = data_attempt;
         let reason = pf.to_string();
         log::info!(
@@ -353,13 +372,13 @@ pub async fn http_request(
             req.provider_name,
             wait.as_secs(),
             retry_num,
-            DATA_BACKOFF_SECS.len(),
+            req.retry_schedule.data_backoffs.len(),
             reason,
         );
         sink.emit(TranscriptionEvent::RetryScheduled {
             kind: crate::telemetry::RetryKind::Data,
             attempt: retry_num,
-            max: DATA_BACKOFF_SECS.len() as u32,
+            max: req.retry_schedule.data_backoffs.len() as u32,
             reason,
             delay: wait,
             t: Instant::now(),
@@ -409,11 +428,10 @@ async fn run_connection_phase(
     data_attempt: u32,
     max_data_attempts: u32,
 ) -> ConnectionPhase {
-    let max_connection_attempts = CONNECTION_BUDGETS_SECS.len() as u32;
+    let max_connection_attempts = req.retry_schedule.connection_budgets.len() as u32;
     let mut last_failure: Option<PipelineFailure> = None;
 
-    for (idx, &budget_secs) in CONNECTION_BUDGETS_SECS.iter().enumerate() {
-        let connect_budget = Duration::from_secs(budget_secs);
+    for (idx, &connect_budget) in req.retry_schedule.connection_budgets.iter().enumerate() {
         let attempt_num = (idx as u32) + 1;
 
         // Emit a `RetryScheduled` BEFORE every attempt past the
@@ -506,15 +524,26 @@ fn is_data_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
-/// Parse a `Retry-After` header value as delay-seconds.  The
-/// HTTP-date form is not supported (no provider we talk to uses
-/// it); an unparsable value yields `None` so the schedule applies.
-fn parse_retry_after_secs(headers: &[(String, String)]) -> Option<Duration> {
+/// Parse either Retry-After form at a supplied instant; past dates mean no wait.
+fn parse_retry_after_at(
+    headers: &[(String, String)],
+    now: std::time::SystemTime,
+) -> Option<Duration> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
-        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
+        .and_then(|(_, value)| {
+            let value = value.trim();
+            value
+                .parse::<u64>()
+                .ok()
+                .map(Duration::from_secs)
+                .or_else(|| {
+                    httpdate::parse_http_date(value)
+                        .ok()
+                        .map(|date| date.duration_since(now).unwrap_or_default())
+                })
+        })
 }
 
 /// Outcome of a single HTTP attempt inside [`http_request`].
@@ -646,7 +675,12 @@ async fn run_single_http_attempt(
     // the growing schedule still grows for small requests, while a
     // payload-sized `wall_clock` is never undercut by an early slot.
     let cap = attempt_cap(connect_budget, req.wall_clock);
-    let send_with_cap = tokio::time::timeout(cap, send_fut);
+    let send_with_cap = async {
+        match req.wall_clock {
+            Some(_) => tokio::time::timeout(cap, send_fut).await,
+            None => Ok(send_fut.await),
+        }
+    };
 
     let outcome = tokio::select! {
         biased;
@@ -719,7 +753,7 @@ async fn run_single_http_attempt(
         // 5xx / 429: data-phase retryable.  The counters describe
         // the *data* budget, which is the one this failure will
         // exhaust if the server never recovers.
-        let retry_after = parse_retry_after_secs(&response.headers);
+        let retry_after = parse_retry_after_at(&response.headers, std::time::SystemTime::now());
         SingleAttempt::DataRetryable {
             failure: PipelineFailure::new(
                 req.provider_name.clone(),
@@ -1107,5 +1141,61 @@ async fn run_single_ws_attempt(
                 WsAttempt::Permanent(pf)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn websocket_upgrade_rejects_audio_body_before_connecting() {
+        let sink: Arc<dyn TelemetrySink> = Arc::new(crate::telemetry::NoOpSink);
+        let error = ws_upgrade(
+            Request {
+                method: Method::Get,
+                url: "ws://127.0.0.1:1/v1/realtime".into(),
+                headers: Vec::new(),
+                body: RequestBody::Bytes(Arc::new(vec![1, 2, 3])),
+                provider: Provider::OpenAI,
+                provider_name: "OpenAI".into(),
+                phase: crate::error::PipelinePhase::Request,
+                wall_clock: None,
+                retry_schedule: RetrySchedule::default(),
+            },
+            &sink,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a WebSocket upgrade cannot send audio in the handshake");
+        assert_eq!((error.attempts, error.max_attempts), (1, 1));
+        assert!(
+            matches!(error.kind, PipelineFailureKind::Decode(ref message) if message == "transport::ws_upgrade: only RequestBody::Empty is supported (a WebSocket upgrade handshake carries no body)")
+        );
+    }
+
+    #[test]
+    fn http_date_retry_after_is_a_delay() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(30));
+        let headers = vec![("Retry-After".into(), date)];
+        assert_eq!(
+            parse_retry_after_at(&headers, now),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after_at(&[("retry-after".into(), "7".into())], now),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            parse_retry_after_at(
+                &[(
+                    "Retry-After".into(),
+                    httpdate::fmt_http_date(now - Duration::from_secs(1))
+                )],
+                now
+            ),
+            Some(Duration::ZERO)
+        );
     }
 }

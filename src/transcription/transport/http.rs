@@ -421,6 +421,7 @@ pub(crate) struct ModelInfo {
 /// error messages (e.g. `"Mistral"`, `"OpenAI"`).
 /// `is_transcription_model` filters the available models to suggest
 /// transcription-relevant alternatives on a model-not-found error.
+#[allow(clippy::too_many_arguments)] // provider identity, endpoint, sink and cancellation are independent inputs
 pub(crate) async fn validate_model(
     provider: crate::config::Provider,
     provider_name: &str,
@@ -429,9 +430,10 @@ pub(crate) async fn validate_model(
     api_base: &str,
     is_transcription_model: fn(&str) -> bool,
     sink: &std::sync::Arc<dyn TelemetrySink>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), TalkError> {
     // ── Cache check ─────────────────────────────────────────────
-    if super::validate_cache::is_fresh(provider, model, api_base) {
+    if super::validate_cache::is_fresh(provider, model, api_base, api_key) {
         log::debug!(
             "validate_model: cache hit for {}:{} on {}",
             provider_name,
@@ -450,6 +452,7 @@ pub(crate) async fn validate_model(
         api_base,
         is_transcription_model,
         sink,
+        cancel,
     )
     .await;
     sink.emit(TranscriptionEvent::PreflightCompleted {
@@ -458,7 +461,7 @@ pub(crate) async fn validate_model(
     });
 
     if result.is_ok() {
-        super::validate_cache::record(provider, model, api_base);
+        super::validate_cache::record(provider, model, api_base, api_key);
     }
 
     result
@@ -479,6 +482,7 @@ async fn validate_model_uncached(
     api_base: &str,
     is_transcription_model: fn(&str) -> bool,
     sink: &Arc<dyn TelemetrySink>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), TalkError> {
     use super::{Method, Request, RequestBody};
 
@@ -494,6 +498,7 @@ async fn validate_model_uncached(
     };
 
     let req = Request {
+        retry_schedule: Default::default(),
         method: Method::Get,
         url: models_url.clone(),
         headers: vec![("Authorization".into(), format!("Bearer {}", api_key))],
@@ -508,11 +513,10 @@ async fn validate_model_uncached(
         wall_clock: Some(Duration::from_secs(15)),
     };
 
-    let response =
-        match super::http_request(req, sink, tokio_util::sync::CancellationToken::new()).await {
-            Ok(r) => r,
-            Err(pf) => return Err(pf.into()),
-        };
+    let response = match super::http_request(req, sink, cancel).await {
+        Ok(r) => r,
+        Err(pf) => return Err(pf.into()),
+    };
 
     // Parse models list — permanent decode errors surface as a
     // structured failure tagged Validate.
@@ -908,7 +912,7 @@ mod tests {
             .expect("test: build client");
         let err = client
             .get(&url)
-            .timeout(Duration::from_millis(50))
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .expect_err("test: send must fail when peer never replies");
@@ -920,7 +924,7 @@ mod tests {
             },
             TimerSpec {
                 name: "request_wall_clock",
-                budget: Duration::from_millis(50),
+                budget: Duration::from_secs(5),
             },
         ];
         let (kind, timer) = classify_reqwest_error(&err, &timers);
@@ -954,7 +958,7 @@ mod tests {
             .expect("test: build client");
         let err = client
             .get(&url)
-            .timeout(Duration::from_millis(50))
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .expect_err("test: send must fail when peer never replies");
@@ -1085,25 +1089,19 @@ mod tests {
     /// matter: the user explicitly specified them, so a future refactor
     /// that "rounds" or "tweaks" them must fail this test loudly.
     ///
-    /// Indirect check: the schedule lives in `transport::mod.rs` and
-    /// is private; we observe it through the public effect (number
-    /// of `RetryScheduled` events) in the
-    /// `validate_model_emits_one_retry_event_per_retry` test below.
-    /// The literal-value pin is kept by counting attempts to be 5.
+    /// Read the schedule actually selected by the transport rather
+    /// than repeating arithmetic on literals in the test.
     #[test]
     fn validate_budget_schedule_is_2_5_8_11_15_30_120() {
-        // The schedule is now an implementation detail of
-        // `transport::http_request`; this test asserts the contract
-        // it preserves: 7 total connection attempts.  The literal
-        // budgets are pinned by the timing-sensitive test
-        // `transport_connection_phase_retries_with_growing_budget`
-        // in `tests/transport_integration.rs`.
-        const EXPECTED_ATTEMPTS: usize = 7;
-        // Spec re-statement so log greppers find it: the schedule
-        // is [2, 5, 8, 11, 15, 30, 120] seconds.  Seven entries.
-        let expected_total_secs: u64 = 2 + 5 + 8 + 11 + 15 + 30 + 120;
-        assert_eq!(expected_total_secs, 191);
-        assert_eq!(EXPECTED_ATTEMPTS, 7);
+        let schedule = super::super::RetrySchedule::default();
+        assert_eq!(
+            schedule.connection_budgets,
+            [2, 5, 8, 11, 15, 30, 120].map(Duration::from_secs)
+        );
+        assert_eq!(
+            schedule.connection_budgets.iter().sum::<Duration>(),
+            Duration::from_secs(191)
+        );
     }
 
     /// Redirect the validate-cache file at a fresh tempfile via
@@ -1201,6 +1199,7 @@ mod tests {
             &api_base,
             |id| id.contains("voxtral"),
             &dyn_sink,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(
@@ -1262,6 +1261,7 @@ mod tests {
             &api_base,
             |id| id.contains("voxtral"),
             &sink,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         // Structural assertion: the failure is a Pipeline error
@@ -1323,6 +1323,7 @@ mod tests {
             &api_base,
             |id| id.contains("voxtral"),
             &sink,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(result.is_err());
@@ -1374,6 +1375,7 @@ mod tests {
             &api_base,
             |id| id.contains("voxtral"),
             &sink,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(r1.is_ok());
@@ -1387,6 +1389,7 @@ mod tests {
             &api_base,
             |id| id.contains("voxtral"),
             &sink,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(r2.is_ok());
@@ -1410,6 +1413,151 @@ mod tests {
             "exactly one Preflight pair (start+complete) across both calls; got {} events",
             events
         );
+    }
+
+    #[tokio::test]
+    async fn validation_cache_does_not_authorize_a_different_credential() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _cache_guard = cache_test_guard();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("Authorization", "Bearer key-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "voxtral"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("Authorization", "Bearer key-b"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let sink: Arc<dyn TelemetrySink> = Arc::new(RecordingSink::new());
+        let base = server.uri();
+        assert!(validate_model(
+            crate::config::Provider::Mistral,
+            "Mistral",
+            "key-a",
+            "voxtral",
+            &base,
+            |_| true,
+            &sink,
+            tokio_util::sync::CancellationToken::new()
+        )
+        .await
+        .is_ok());
+        let error = validate_model(
+            crate::config::Provider::Mistral,
+            "Mistral",
+            "key-b",
+            "voxtral",
+            &base,
+            |_| true,
+            &sink,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("key B must be rejected by its own preflight");
+        assert!(
+            matches!(error, TalkError::Pipeline(ref pf) if matches!(pf.kind, PipelineFailureKind::HttpStatus { status: 401, .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_preflight_prevents_transcription_post() {
+        use crate::transcription::{MistralOneShotTranscriber, OneShotTranscriber};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _cache_guard = cache_test_guard();
+        let server = MockServer::start().await;
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let notify = arrived.clone();
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(move |_: &wiremock::Request| {
+                notify.notify_one();
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(60))
+                    .set_body_json(serde_json::json!({"data": [{"id": "voxtral"}]}))
+            })
+            .mount(&server)
+            .await;
+        let config = crate::config::MistralConfig {
+            api_key: "key".into(),
+            url: Some(server.uri()),
+            model: "voxtral".into(),
+            context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".into(),
+            tts_voice: None,
+            tts_voices: None,
+        };
+        let mut transcriber = MistralOneShotTranscriber::new(config, false).expect("transcriber");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        transcriber.set_cancel_token(cancel.clone());
+        let mut validation = Box::pin(transcriber.validate());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                biased;
+                _ = arrived.notified() => {}
+                result = &mut validation => panic!("preflight finished before GET: {result:?}"),
+            }
+        })
+        .await
+        .expect("preflight GET did not reach wiremock");
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(30), validation).await;
+        assert!(
+            matches!(result, Ok(Err(ref error)) if error.to_string().contains("cancelled")),
+            "expected cancellation before the delayed response, got {result:?}"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .iter()
+                .filter(|r| r.method.as_str() == "POST")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_preflight_get_returns_without_waiting_for_arrival() {
+        use crate::transcription::{MistralOneShotTranscriber, OneShotTranscriber};
+        use wiremock::MockServer;
+
+        let _cache_guard = cache_test_guard();
+        let server = MockServer::start().await;
+        let config = crate::config::MistralConfig {
+            api_key: "key".into(),
+            url: Some(server.uri()),
+            model: "voxtral".into(),
+            context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".into(),
+            tts_voice: None,
+            tts_voices: None,
+        };
+        let mut transcriber = MistralOneShotTranscriber::new(config, false).expect("transcriber");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        transcriber.set_cancel_token(cancel);
+        let result = tokio::time::timeout(Duration::from_secs(30), transcriber.validate())
+            .await
+            .expect("pre-cancelled validation must not park the cache guard");
+        assert!(matches!(result, Err(ref e) if e.to_string().contains("cancelled")));
+        assert!(server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty());
     }
 
     /// Spec (post Step 3 of transport-consolidation): a 200 OK
@@ -1463,6 +1611,7 @@ mod tests {
             &api_base,
             |id| id.contains("voxtral"),
             &sink,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         let err = result.expect_err("malformed body must surface as Err");

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::transport::http::{parse_u64_field, proportional_timeout, ProgressBody};
+use super::transport::http::{parse_u64_field, ProgressBody};
 use super::transport::{self, Method, Request, RequestBody};
 use super::OneShotTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink};
@@ -144,6 +144,7 @@ pub(crate) async fn validate_mistral_model(
     model: &str,
     api_base: &str,
     sink: &Arc<dyn TelemetrySink>,
+    cancel: CancellationToken,
 ) -> Result<(), TalkError> {
     super::transport::http::validate_model(
         crate::config::Provider::Mistral,
@@ -153,6 +154,7 @@ pub(crate) async fn validate_mistral_model(
         api_base,
         is_transcription_model,
         sink,
+        cancel,
     )
     .await
 }
@@ -315,10 +317,7 @@ impl MistralOneShotTranscriber {
             })
         };
 
-        let wall_clock = match self.policy {
-            RequestTimeoutPolicy::Proportional => Some(proportional_timeout(file_len)),
-            RequestTimeoutPolicy::UserAttended => None,
-        };
+        let wall_clock = self.policy.wall_clock(file_len);
 
         log::debug!(
             "mistral send_request: policy={:?}, wall_clock={}, audio={} KB",
@@ -330,6 +329,7 @@ impl MistralOneShotTranscriber {
         );
 
         let req = Request {
+            retry_schedule: Default::default(),
             method: Method::Post,
             url: self.endpoint.clone(),
             headers: vec![(
@@ -434,6 +434,7 @@ impl OneShotTranscriber for MistralOneShotTranscriber {
             &self.config.model,
             api_base,
             &self.sink,
+            self.cancel_token.clone(),
         )
         .await
     }
@@ -456,8 +457,17 @@ impl OneShotTranscriber for MistralOneShotTranscriber {
                 log::warn!("[DBG] mistral stream: awaiting audio chunks from encoder");
                 let collect_start = Instant::now();
                 let mut bytes = Vec::new();
-                while let Some(chunk) = chunks.recv().await {
-                    bytes.extend_from_slice(&chunk);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel_token.cancelled() => {
+                            return Err(TalkError::Transcription("cancelled by caller".into()));
+                        }
+                        chunk = chunks.recv() => match chunk {
+                            Some(chunk) => bytes.extend_from_slice(&chunk),
+                            None => break,
+                        }
+                    }
                 }
                 let audio_len = bytes.len() as u64;
                 log::info!(
@@ -484,6 +494,33 @@ mod tests {
     use tempfile::NamedTempFile;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn pipe_collection_stops_on_cancellation() {
+        let config = MistralConfig {
+            api_key: "key".into(),
+            url: Some("http://127.0.0.1:1".into()),
+            model: "voxtral".into(),
+            context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".into(),
+            tts_voice: None,
+            tts_voices: None,
+        };
+        let mut transcriber = MistralOneShotTranscriber::new(config, false).expect("transcriber");
+        let cancel = CancellationToken::new();
+        transcriber.set_cancel_token(cancel.clone());
+        let (_sender, chunks) = tokio::sync::mpsc::channel(1);
+        let future = transcriber.fetch_transcription(TranscriptionBody::Pipe {
+            chunks,
+            file_name: "audio.ogg".into(),
+        });
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), future).await;
+        assert!(
+            matches!(result, Ok(Err(ref e)) if e.to_string().contains("cancelled")),
+            "pipe must terminate on cancel: {result:?}"
+        );
+    }
 
     #[test]
     fn test_new_uses_default_endpoint_when_url_is_none() {
@@ -958,129 +995,19 @@ mod tests {
         assert!(result.diarization.is_none());
     }
 
-    /// Spec for `with_policy(UserAttended)`:
-    ///
-    /// When a Mistral one-shot request fails because the server accepts
-    /// the connection but never replies, the error message must NOT
-    /// be attributed to `request_wall_clock` (because the
-    /// `UserAttended` policy intentionally omits the wall-clock
-    /// timer).  Attribution should fall through to `connect_timeout`
-    /// (Rule 1) or `kernel_tcp_unspecified` (Rule 3) — never
-    /// `request_wall_clock`.
-    ///
-    /// This is the regression-detection test for the picker path:
-    /// if a future refactor accidentally re-introduces a
-    /// `.timeout()` for `UserAttended`, this fails.
-    #[tokio::test]
-    async fn user_attended_policy_omits_request_wall_clock_attribution() {
-        // Bind a TCP listener that accepts but never replies, so the
-        // request will (eventually) fail with TCP-level timing only.
-        // We don't actually wait for it to fail — we just assert
-        // that *if* it fails before the test framework times out,
-        // attribution is correct.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test: bind ephemeral port");
-        let addr = listener.local_addr().expect("test: local_addr");
-        tokio::spawn(async move {
-            loop {
-                if listener.accept().await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        let config = MistralConfig {
-            api_key: "test-api-key".to_string(),
-            url: None,
-            model: "voxtral-mini-latest".to_string(),
-            context_bias: None,
-            tts_model: "voxtral-mini-tts-latest".to_string(),
-            tts_voice: None,
-            tts_voices: None,
-        };
-        let transcriber = MistralOneShotTranscriber::with_policy(
-            config,
-            false,
-            crate::transcription::RequestTimeoutPolicy::UserAttended,
-        )
-        .expect("build client");
-
-        // Override endpoint to point at the silent listener.  Use a
-        // wiremock-shaped path so the post URL is plausible.
-        let mut transcriber = transcriber;
-        transcriber.endpoint = format!("http://{}/v1/audio/transcriptions", addr);
-
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(b"fake audio data").unwrap();
-        temp_file.flush().unwrap();
-
-        // Race the request against a short test deadline.  We don't
-        // care whether the underlying request returns within the
-        // window — the test framework's per-test timeout will kill
-        // it eventually if needed.  The contract being asserted is:
-        // *whatever* error we get, it cannot be attributed to
-        // `request_wall_clock`.
-        let race = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            transcriber
-                .fetch_transcription(TranscriptionBody::File(temp_file.path().to_path_buf())),
-        )
-        .await;
-
-        match race {
-            Ok(Ok(_)) => {
-                // Listener never replies — success is impossible
-                // here.  If this branch fires, the test setup is
-                // broken; fail loudly.
-                panic!("test: silent listener should never produce a Mistral success");
-            }
-            Ok(Err(e)) => {
-                // Structural assertion: the failure must be a
-                // `Pipeline` error in the `Request` phase, and its
-                // `Network` cause MUST NOT have a
-                // `request_wall_clock` timer attached (because
-                // `UserAttended` policy intentionally omits it).
-                use crate::error::{NetworkKind, PipelineFailureKind, PipelinePhase};
-                let pf = match &e {
-                    crate::error::TalkError::Pipeline(pf) => pf,
-                    other => panic!(
-                        "expected TalkError::Pipeline under UserAttended, got: {}",
-                        other
-                    ),
-                };
-                assert_eq!(pf.phase, PipelinePhase::Request);
-                if let PipelineFailureKind::Network { kind: _, timer, .. } = &pf.kind {
-                    assert!(
-                        !matches!(timer, Some(t) if t.name == "request_wall_clock"),
-                        "UserAttended must not attribute to request_wall_clock; got timer={:?}",
-                        timer
-                    );
-                }
-                // Decode/HttpStatus from a never-replying listener
-                // is also acceptable — the structured shape is what
-                // matters, not the specific sub-variant.
-                let _ = NetworkKind::Connect; // suppress unused-import warning if Network branch never hits
-                                              // Sanity: not a flat string-stuffed legacy error
-                                              // — the `Display` should NOT carry a leading
-                                              // "Configuration error:" or "Transcription error:"
-                                              // prefix.
-                let s = e.to_string();
-                assert!(
-                    !s.starts_with("Configuration error:"),
-                    "structured Pipeline error must not produce Config prefix: {}",
-                    s
-                );
-            }
-            Err(_) => {
-                // The test deadline (15s) elapsed before reqwest
-                // returned.  That's the user-attended-policy
-                // contract working as intended: no wall-clock cap
-                // means the request just keeps waiting.  Not a
-                // failure of the spec under test — `with_retry`
-                // wrapping is the only finite-time guarantee and
-                // it lives at a different layer.
-            }
-        }
+    /// The same policy method used by the request builder must omit
+    /// the wall clock regardless of payload size. The transport's
+    /// delayed-POST integration test checks the established connection.
+    #[test]
+    fn user_attended_policy_omits_request_wall_clock_attribution() {
+        assert_eq!(RequestTimeoutPolicy::UserAttended.wall_clock(1), None);
+        assert_eq!(
+            RequestTimeoutPolicy::UserAttended.wall_clock(1024 * 1024),
+            None
+        );
+        assert_eq!(
+            RequestTimeoutPolicy::Proportional.wall_clock(1),
+            Some(std::time::Duration::from_secs(3))
+        );
     }
 }

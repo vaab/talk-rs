@@ -68,13 +68,14 @@ pub(crate) async fn fetch_transcription_models(
     if let Ok(guard) = cache().lock() {
         if let Some(cached) = guard.get(&cache_key) {
             if cached.fetched_at.elapsed() < CACHE_TTL {
-                return Ok(cached.models.clone());
+                return Ok(filtered_models(&cached.models, filter));
             }
         }
     }
 
     let models_url = format!("{}/v1/models", api_base);
     let req = Request {
+        retry_schedule: Default::default(),
         method: Method::Get,
         url: models_url,
         headers: vec![("Authorization".into(), format!("Bearer {}", api_key))],
@@ -95,52 +96,54 @@ pub(crate) async fn fetch_transcription_models(
                 let body = String::from_utf8_lossy(&response.body).to_string();
                 let err =
                     TalkError::Config(format!("models API error ({}): {}", response.status, body));
-                return fallback_to_stale_cache(&cache_key, err);
+                return fallback_to_stale_cache(&cache_key, filter, err);
             }
 
             let parsed: ModelsResponse = match serde_json::from_slice(&response.body) {
                 Ok(p) => p,
                 Err(e) => {
                     let err = TalkError::Config(format!("failed to parse models response: {}", e));
-                    return fallback_to_stale_cache(&cache_key, err);
+                    return fallback_to_stale_cache(&cache_key, filter, err);
                 }
             };
 
-            let mut result: Vec<String> = parsed
-                .data
-                .iter()
-                .map(|m| m.id.as_str())
-                .filter(|id| filter(id))
-                .map(String::from)
-                .collect();
-            result.sort();
+            let mut raw: Vec<String> = parsed.data.iter().map(|m| m.id.clone()).collect();
+            raw.sort();
 
             // Update cache.
             if let Ok(mut guard) = cache().lock() {
                 guard.insert(
                     cache_key,
                     CachedModels {
-                        models: result.clone(),
+                        models: raw.clone(),
                         fetched_at: Instant::now(),
                     },
                 );
             }
-            Ok(result)
+            Ok(filtered_models(&raw, filter))
         }
         Err(pf) => {
             let err: TalkError = pf.into();
-            fallback_to_stale_cache(&cache_key, err)
+            fallback_to_stale_cache(&cache_key, filter, err)
         }
     }
 }
 
 /// Return a stale cached entry if one exists, otherwise propagate
 /// the supplied error.
-fn fallback_to_stale_cache(cache_key: &CacheKey, err: TalkError) -> Result<Vec<String>, TalkError> {
+fn filtered_models(models: &[String], filter: fn(&str) -> bool) -> Vec<String> {
+    models.iter().filter(|m| filter(m)).cloned().collect()
+}
+
+fn fallback_to_stale_cache(
+    cache_key: &CacheKey,
+    filter: fn(&str) -> bool,
+    err: TalkError,
+) -> Result<Vec<String>, TalkError> {
     if let Ok(guard) = cache().lock() {
         if let Some(cached) = guard.get(cache_key) {
             log::warn!("model-list fetch failed ({}); using stale cache", err);
-            return Ok(cached.models.clone());
+            return Ok(filtered_models(&cached.models, filter));
         }
     }
     Err(err)
@@ -227,6 +230,35 @@ mod tests {
         assert_eq!(r1.unwrap(), r2.unwrap());
 
         // Drop the scoped mock to verify expectations.
+        drop(mock);
+    }
+
+    #[tokio::test]
+    async fn cached_raw_models_are_filtered_for_each_caller() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mock = Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "batch-model"}, {"id": "stream-model"}]
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let batch = fetch_transcription_models("distinct-filter-key", &server.uri(), |id| {
+            id.starts_with("batch")
+        })
+        .await
+        .unwrap();
+        let stream = fetch_transcription_models("distinct-filter-key", &server.uri(), |id| {
+            id.starts_with("stream")
+        })
+        .await
+        .unwrap();
+        assert_eq!(batch, vec!["batch-model"]);
+        assert_eq!(stream, vec!["stream-model"]);
         drop(mock);
     }
 }

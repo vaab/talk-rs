@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::transport::http::{parse_u64_field, proportional_timeout, ProgressBody};
+use super::transport::http::{parse_u64_field, ProgressBody};
 use super::transport::{self, Method, Request, RequestBody};
 use super::OneShotTranscriber;
 use crate::telemetry::{NoOpSink, TelemetrySink};
@@ -274,6 +274,7 @@ pub(crate) async fn validate_openai_model(
     model: &str,
     api_base: &str,
     sink: &Arc<dyn TelemetrySink>,
+    cancel: CancellationToken,
 ) -> Result<(), TalkError> {
     super::transport::http::validate_model(
         crate::config::Provider::OpenAI,
@@ -283,6 +284,7 @@ pub(crate) async fn validate_openai_model(
         api_base,
         is_transcription_model,
         sink,
+        cancel,
     )
     .await
 }
@@ -444,10 +446,7 @@ impl OpenAIOneShotTranscriber {
             })
         };
 
-        let wall_clock = match self.policy {
-            RequestTimeoutPolicy::Proportional => Some(proportional_timeout(file_len)),
-            RequestTimeoutPolicy::UserAttended => None,
-        };
+        let wall_clock = self.policy.wall_clock(file_len);
 
         log::debug!(
             "openai send_request: policy={:?}, wall_clock={}, audio={} KB",
@@ -459,6 +458,7 @@ impl OpenAIOneShotTranscriber {
         );
 
         let req = Request {
+            retry_schedule: Default::default(),
             method: Method::Post,
             url: self.endpoint.clone(),
             headers: vec![(
@@ -578,6 +578,7 @@ impl OneShotTranscriber for OpenAIOneShotTranscriber {
             &self.config.model,
             api_base,
             &self.sink,
+            self.cancel_token.clone(),
         )
         .await
     }
@@ -598,8 +599,17 @@ impl OneShotTranscriber for OpenAIOneShotTranscriber {
                 file_name,
             } => {
                 let mut bytes = Vec::new();
-                while let Some(chunk) = chunks.recv().await {
-                    bytes.extend_from_slice(&chunk);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel_token.cancelled() => {
+                            return Err(TalkError::Transcription("cancelled by caller".into()));
+                        }
+                        chunk = chunks.recv() => match chunk {
+                            Some(chunk) => bytes.extend_from_slice(&chunk),
+                            None => break,
+                        }
+                    }
                 }
                 (bytes, file_name)
             }
@@ -617,6 +627,25 @@ mod tests {
     use tempfile::NamedTempFile;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Match, Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
+
+    #[tokio::test]
+    async fn pipe_collection_stops_on_cancellation() {
+        let mut transcriber =
+            OpenAIOneShotTranscriber::new(openai_config("whisper-1")).expect("transcriber");
+        let cancel = CancellationToken::new();
+        transcriber.set_cancel_token(cancel.clone());
+        let (_sender, chunks) = tokio::sync::mpsc::channel(1);
+        let future = transcriber.fetch_transcription(TranscriptionBody::Pipe {
+            chunks,
+            file_name: "audio.ogg".into(),
+        });
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), future).await;
+        assert!(
+            matches!(result, Ok(Err(ref e)) if e.to_string().contains("cancelled")),
+            "pipe must terminate on cancel: {result:?}"
+        );
+    }
 
     fn openai_config(model: &str) -> OpenAIConfig {
         OpenAIConfig {

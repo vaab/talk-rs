@@ -157,6 +157,15 @@ pub enum RequestTimeoutPolicy {
     UserAttended,
 }
 
+impl RequestTimeoutPolicy {
+    pub(crate) fn wall_clock(self, audio_bytes: u64) -> Option<std::time::Duration> {
+        match self {
+            Self::Proportional => Some(transport::http::proportional_timeout(audio_bytes)),
+            Self::UserAttended => None,
+        }
+    }
+}
+
 /// Caller-controlled options for [`transcribe_audio`].
 ///
 /// Bundles the orthogonal axes that affect a single transcription
@@ -1631,8 +1640,7 @@ providers:
         let _: Box<dyn OneShotTranscriber> = t;
     }
 
-    /// End-to-end guard on the pre-upload normalization step for a
-    /// *long* recording.
+    /// End-to-end guard on the pre-upload normalization step.
     ///
     /// `encode_16k_mono_ogg` is the one call site that hands a whole
     /// decoded file to `OggOpusWriter::write_pcm` in a single call, so
@@ -1641,18 +1649,15 @@ providers:
     /// buffer before contacting the API at all (see the comment on the
     /// cursor loop in `src/audio/writer.rs`).
     ///
-    /// This test writes a real 20-minute OGG/Opus file to a temp dir,
-    /// then normalizes it through the production path and asserts the
-    /// whole step stays well under a minute.  The threshold is
-    /// deliberately loose — the point is to catch a return to
-    /// minutes-per-recording, not to benchmark the encoder.  The
-    /// deterministic guard on the underlying cause lives in
+    /// A short real OGG/Opus file exercises the same whole-buffer path
+    /// without encoding twenty minutes of audio twice. The deterministic
+    /// guard on the underlying quadratic cause lives in
     /// `audio::writer::tests::test_write_pcm_bulk_call_does_not_memmove_quadratically`.
     #[test]
-    fn encode_16k_mono_ogg_normalizes_a_long_recording_quickly() {
+    fn encode_16k_mono_ogg_normalizes_a_recording_quickly() {
         use crate::audio::{AudioWriter, OggOpusWriter};
 
-        const SECONDS: usize = 20 * 60;
+        const SECONDS: usize = 2;
         const RATE: usize = 16_000;
 
         let dir = tempfile::TempDir::new().expect("tmp dir");
@@ -1690,9 +1695,8 @@ providers:
             elapsed
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(60),
-            "normalizing a {SECONDS}s recording took {elapsed:?}; the pre-upload step has \
-             regressed to the quadratic-buffer regime"
+            elapsed < std::time::Duration::from_secs(5),
+            "normalizing a {SECONDS}s recording took {elapsed:?}; the pre-upload step is too slow"
         );
     }
 }

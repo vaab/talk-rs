@@ -411,6 +411,7 @@ impl OpenAIRealtimeTranscriber {
         log::debug!("validation: connecting to {}", ws_url);
 
         let req = super::transport::Request {
+            retry_schedule: Default::default(),
             method: super::transport::Method::Get,
             url: ws_url.clone(),
             // OpenAI deprecated the ``OpenAI-Beta: realtime=v1``
@@ -524,6 +525,7 @@ impl OpenAIRealtimeTranscriber {
         log::debug!("connecting to OpenAI Realtime WebSocket: {}", ws_url);
 
         let req = super::transport::Request {
+            retry_schedule: Default::default(),
             method: super::transport::Method::Get,
             url: ws_url.clone(),
             // OpenAI deprecated the ``OpenAI-Beta: realtime=v1``
@@ -672,6 +674,7 @@ impl RealtimeTranscriber for OpenAIRealtimeTranscriber {
             &self.model,
             &api_base,
             &self.sink,
+            self.cancel_token.clone(),
         )
         .await?;
 
