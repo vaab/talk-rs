@@ -562,7 +562,12 @@ async fn dictate_loaded(
         replace_char_count.unwrap_or(0),
     );
     let chain = config
-        .resolve_chain(opts.chain.as_deref(), opts.provider, opts.model.as_deref())?
+        .resolve_chain(
+            crate::config::ChainCommand::Dictate,
+            opts.chain.as_deref(),
+            opts.provider,
+            opts.model.as_deref(),
+        )?
         .map(|chain| chain.eligible(opts.diarize, opts.realtime, opts.lang.as_deref()))
         .transpose()?;
     if let (Some(lang), Some(openai)) = (&opts.lang, &mut config.providers.openai) {

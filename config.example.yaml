@@ -139,7 +139,8 @@ providers:
 # Valid values: mistral, openai, parakeet.
 # transcription:
 #   default_provider: mistral
-#   default_chain: dictate      # used unless --chain, --provider or --model is given
+#   default_chain: dictate      # used unless --chain, --provider or --model is given;
+#                               # or per command: {dictate: dictate, transcribe: french}
 #   outage_memory: 3m           # busy provider remembered across runs; default 3m
 #   chains:
 #     dictate:

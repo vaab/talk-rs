@@ -63,7 +63,12 @@ pub async fn transcribe(
     }
     let config = Config::load(None)?;
     let chain = config
-        .resolve_chain(cli_chain.as_deref(), cli_provider, cli_model.as_deref())?
+        .resolve_chain(
+            crate::config::ChainCommand::Transcribe,
+            cli_chain.as_deref(),
+            cli_provider,
+            cli_model.as_deref(),
+        )?
         .map(|chain| chain.eligible(diarize, false, lang.as_deref()))
         .transpose()?;
     let provider = cli_provider

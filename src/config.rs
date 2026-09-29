@@ -624,12 +624,65 @@ pub struct TranscriptionConfig {
     /// Default transcription provider when `--provider` is not specified.
     #[serde(default = "default_provider")]
     pub default_provider: Provider,
+    /// Chain used when no `--chain`, `--provider` or `--model` is given:
+    /// one name for every command, or a per-command map.
     #[serde(default)]
-    pub default_chain: Option<String>,
+    pub default_chain: Option<DefaultChain>,
     #[serde(default)]
     pub chains: std::collections::BTreeMap<String, Vec<ChainEntryConfig>>,
     #[serde(default)]
     pub outage_memory: Option<String>,
+}
+
+/// Command whose default chain is being resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChainCommand {
+    Dictate,
+    Transcribe,
+}
+
+/// `transcription.default_chain`: a single chain name shared by every
+/// command, or a map from command to chain name.  Commands absent from
+/// the map have no default chain.
+#[derive(Debug, Clone)]
+pub enum DefaultChain {
+    All(String),
+    PerCommand(std::collections::BTreeMap<ChainCommand, String>),
+}
+
+// Dispatch on the YAML shape instead of `#[serde(untagged)]`, so a
+// misspelled command key reports serde's own "unknown variant" error
+// rather than an opaque "did not match any variant".
+impl<'de> Deserialize<'de> for DefaultChain {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_yaml::Value::deserialize(deserializer)? {
+            serde_yaml::Value::String(name) => Ok(Self::All(name)),
+            map @ serde_yaml::Value::Mapping(_) => serde_yaml::from_value(map)
+                .map(Self::PerCommand)
+                .map_err(|e| D::Error::custom(format!("default_chain: {e}"))),
+            other => Err(D::Error::custom(format!(
+                "default_chain: expected a chain name or a map of command to chain name, got {other:?}"
+            ))),
+        }
+    }
+}
+
+impl DefaultChain {
+    pub fn for_command(&self, command: ChainCommand) -> Option<&str> {
+        match self {
+            Self::All(name) => Some(name),
+            Self::PerCommand(map) => map.get(&command).map(String::as_str),
+        }
+    }
+
+    fn names(&self) -> Vec<&str> {
+        match self {
+            Self::All(name) => vec![name.as_str()],
+            Self::PerCommand(map) => map.values().map(String::as_str).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -698,6 +751,7 @@ fn parse_chain_duration(value: &str) -> Result<std::time::Duration, String> {
 impl Config {
     pub fn resolve_chain(
         &self,
+        command: ChainCommand,
         name: Option<&str>,
         cli_provider: Option<Provider>,
         cli_model: Option<&str>,
@@ -714,7 +768,10 @@ impl Config {
         };
         let selected = name.or_else(|| {
             if cli_provider.is_none() && cli_model.is_none() {
-                transcription.default_chain.as_deref()
+                transcription
+                    .default_chain
+                    .as_ref()
+                    .and_then(|default| default.for_command(command))
             } else {
                 None
             }
@@ -1721,10 +1778,12 @@ fn validate_config(config: &Config) -> Result<(), TalkError> {
     if let Some(transcription) = &config.transcription {
         if transcription.default_chain.is_some() || !transcription.chains.is_empty() {
             for name in transcription.chains.keys() {
-                config.resolve_chain(Some(name), None, None)?;
+                config.resolve_chain(ChainCommand::Dictate, Some(name), None, None)?;
             }
-            if transcription.default_chain.is_some() {
-                config.resolve_chain(None, None, None)?;
+            if let Some(default) = &transcription.default_chain {
+                for name in default.names() {
+                    config.resolve_chain(ChainCommand::Dictate, Some(name), None, None)?;
+                }
             }
         }
         if let Some(duration) = transcription.outage_memory.as_deref() {
@@ -1779,21 +1838,21 @@ mod tests {
         "})?;
         let config = Config::load(Some(file.path()))?;
         let chain = config
-            .resolve_chain(Some("dictate"), None, None)?
+            .resolve_chain(ChainCommand::Dictate, Some("dictate"), None, None)?
             .ok_or("chain missing")?;
         assert_eq!(chain.name, "dictate");
         assert_eq!(
             config
-                .resolve_chain(None, None, None)?
+                .resolve_chain(ChainCommand::Dictate, None, None, None)?
                 .ok_or("default missing")?
                 .name,
             "dictate"
         );
         assert!(config
-            .resolve_chain(None, Some(Provider::OpenAI), None)?
+            .resolve_chain(ChainCommand::Dictate, None, Some(Provider::OpenAI), None)?
             .is_none());
         assert!(config
-            .resolve_chain(None, None, Some("gpt-transcribe"))?
+            .resolve_chain(ChainCommand::Dictate, None, None, Some("gpt-transcribe"))?
             .is_none());
         assert_eq!(
             chain
@@ -1823,7 +1882,7 @@ mod tests {
         );
         assert_eq!(
             config
-                .resolve_chain(Some("custom"), None, None)?
+                .resolve_chain(ChainCommand::Dictate, Some("custom"), None, None)?
                 .ok_or("custom missing")?
                 .entries[0]
                 .supports,
@@ -1831,7 +1890,7 @@ mod tests {
         );
         assert_eq!(
             config
-                .resolve_chain(Some("live"), None, None)?
+                .resolve_chain(ChainCommand::Dictate, Some("live"), None, None)?
                 .ok_or("live missing")?
                 .eligible(false, true, None)?
                 .entries[0]
@@ -1890,6 +1949,56 @@ mod tests {
             let file = write_config(yaml)?;
             assert_eq!(Config::load(Some(file.path())).expect_err("invalid chain").to_string(), expected);
         }
+        Ok(())
+    }
+
+    /// Resolve the default chain name each command gets for a
+    /// `default_chain` value, with `a` and `b` as defined chains.
+    fn default_chain_names(
+        default_chain: &str,
+    ) -> Result<(Option<String>, Option<String>), Box<dyn Error>> {
+        let file = write_config(&format!(
+            "output_dir: /tmp/test-output\nproviders:\n  mistral: {{api_key: k}}\ntranscription:\n  default_chain: {default_chain}\n  chains:\n    a: [mistral/voxtral-mini-2602]\n    b: [mistral/voxtral-mini-2507]\n"
+        ))?;
+        let config = Config::load(Some(file.path()))?;
+        let name = |command| -> Result<Option<String>, TalkError> {
+            Ok(config
+                .resolve_chain(command, None, None, None)?
+                .map(|chain| chain.name))
+        };
+        Ok((
+            name(ChainCommand::Dictate)?,
+            name(ChainCommand::Transcribe)?,
+        ))
+    }
+
+    #[test]
+    fn default_chain_is_selected_per_command() -> Result<(), Box<dyn Error>> {
+        let some = |name: &str| Some(name.to_string());
+        assert_eq!(default_chain_names("a")?, (some("a"), some("a")));
+        assert_eq!(
+            default_chain_names("{dictate: a, transcribe: b}")?,
+            (some("a"), some("b"))
+        );
+        assert_eq!(default_chain_names("{transcribe: b}")?, (None, some("b")));
+        Ok(())
+    }
+
+    #[test]
+    fn default_chain_map_rejects_unknown_chain_and_command() -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            default_chain_names("{dictate: a, transcribe: missing}")
+                .expect_err("unknown chain")
+                .to_string(),
+            "Configuration error: unknown transcription chain \"missing\""
+        );
+        let error = default_chain_names("{dictat: a}")
+            .expect_err("unknown command")
+            .to_string();
+        assert!(
+            error.contains("default_chain"),
+            "error must name the offending key, got: {error}"
+        );
         Ok(())
     }
 

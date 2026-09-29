@@ -240,7 +240,7 @@ sections, fail configuration loading with an error naming the key.
 | ~providers.kokoro.num_threads~     | ~4~                       | Kokoro inference threads           |
 | ~providers.kokoro.lang~            | ~en~ (model-baked)        | Default Kokoro phonemization language |
 | ~transcription.default_provider~   | ~mistral~                 | Default transcription provider when unspecified |
-| ~transcription.default_chain~      | /none/                    | Named chain used unless ~--chain~, ~--provider~ or ~--model~ is given |
+| ~transcription.default_chain~      | /none/                    | Chain used unless ~--chain~, ~--provider~ or ~--model~ is given: one name for all commands, or a map per command (~dictate~, ~transcribe~) |
 | ~transcription.outage_memory~      | ~3m~                      | Duration to remember a busy provider across invocations |
 | ~speak.default_provider~           | /kokoro-if-configured/    | Default ~speak~ provider (~kokoro~ or ~mistral~) |
 | ~indicators.boop_interval_ms~      | ~5000~                    | Periodic boop interval in ms (~0~ disables boops; also ~--no-boop~) |
@@ -263,6 +263,10 @@ so these knobs do not affect transcription accuracy or upload size.
 
 Add named chains under ~transcription.chains~; ~default_chain~ selects one
 when neither ~--chain~ nor an explicit ~--provider~ / ~--model~ is used.
+It is either a single chain name used by every command, or a map from
+command (~dictate~, ~transcribe~) to chain name, e.g.
+~default_chain: {dictate: dictate, transcribe: transcribe}~; a command
+missing from the map has no default chain.
 Both ~dictate~ (including ~--toggle~) and ~transcribe~ accept ~--chain
 NAME~ and ~--lang CODE~.  ~--chain~ conflicts with ~--provider~ and
 ~--model~.  Explicit single-model calls keep their existing behavior.

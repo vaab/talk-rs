@@ -409,7 +409,12 @@ mod tests {
         std::fs::write(&config_path, format!("output_dir: {}\nproviders:\n  openai: {{api_key: test, url: {}}}\n  mistral: {{api_key: test, url: {}}}\ntranscription:\n  chains:\n    fallback:\n      - openai/gpt-transcribe\n      - mistral/voxtral-mini-2602\n", dir.path().display(), first.uri(), second.uri()))?;
         let config = Config::load(Some(&config_path))?;
         let chain = config
-            .resolve_chain(Some("fallback"), None, None)?
+            .resolve_chain(
+                crate::config::ChainCommand::Transcribe,
+                Some("fallback"),
+                None,
+                None,
+            )?
             .ok_or("chain missing")?;
         Ok((dir, config, chain, first, second))
     }

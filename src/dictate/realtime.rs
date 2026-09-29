@@ -1116,7 +1116,12 @@ mod tests {
             dir.path().display(), endpoint,
         )).expect("local chain config");
         let chain = config
-            .resolve_chain(Some("live"), None, None)
+            .resolve_chain(
+                crate::config::ChainCommand::Dictate,
+                Some("live"),
+                None,
+                None,
+            )
             .expect("resolve")
             .expect("live chain")
             .eligible(false, true, None)

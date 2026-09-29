@@ -321,6 +321,7 @@ where
     let mut outcome = present(PickerUiInput {
         chain_order: config
             .resolve_chain(
+                crate::config::ChainCommand::Dictate,
                 params.chain.as_deref(),
                 params.provider,
                 params.model.as_deref(),
@@ -396,6 +397,7 @@ async fn prepare_record_input(
 
     let mut candidates = build_retry_candidates(config, params.provider, params.model.as_deref());
     if let Ok(Some(chain)) = config.resolve_chain(
+        crate::config::ChainCommand::Dictate,
         params.chain.as_deref(),
         params.provider,
         params.model.as_deref(),
@@ -519,6 +521,7 @@ async fn prepare_record_input(
     // "transcribe" button that the user can click on demand.
     let selected_chain = config
         .resolve_chain(
+            crate::config::ChainCommand::Dictate,
             params.chain.as_deref(),
             params.provider,
             params.model.as_deref(),
