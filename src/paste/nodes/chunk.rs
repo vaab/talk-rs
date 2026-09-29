@@ -1,6 +1,6 @@
 //! Chunk paste-node: split into word-bounded sub-chunks and forward
 //! each to a child node.  Emits cumulative `PasteProgress` telemetry,
-//! matching legacy behaviour byte-for-byte.
+//! measured in Unicode characters.
 
 use crate::error::TalkError;
 use crate::paste::node::{PasteCtx, PasteNode};
@@ -16,7 +16,7 @@ pub(crate) struct ChunkNode {
 #[async_trait]
 impl PasteNode for ChunkNode {
     async fn paste(&self, text: &str, ctx: &PasteCtx<'_>) -> Result<(), TalkError> {
-        let total_chars = text.len() as u64;
+        let total_chars = text.chars().count() as u64;
 
         if self.chunk_chars == 0 {
             // `chunk_chars: 0` ⇒ single-shot (legacy semantics).
@@ -42,7 +42,7 @@ impl PasteNode for ChunkNode {
                 chunk.len(),
             );
             self.child.paste(chunk, ctx).await?;
-            chars_pasted += chunk.len() as u64;
+            chars_pasted += chunk.chars().count() as u64;
             ctx.sink.emit(TranscriptionEvent::PasteProgress {
                 chars_pasted,
                 total_chars,

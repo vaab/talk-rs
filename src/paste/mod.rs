@@ -124,43 +124,65 @@ pub async fn ensure_focus(window_id: &str) -> Result<(), TalkError> {
 /// Split `text` into chunks of at most `max_chars` characters each,
 /// breaking on word boundaries so words are never cut in half.
 ///
-/// Every chunk after the first is prefixed with a single space so that
-/// concatenating all chunks reproduces the original word sequence.
-/// If the text is empty (or whitespace-only) a single element containing
-/// the original string is returned so that the caller always has at
-/// least one chunk to paste.  A single word longer than `max_chars` is
-/// emitted as-is (never split mid-word).
+/// Concatenating the chunks reproduces `text` exactly, including all
+/// whitespace. Boundary whitespace stays with the following word when it
+/// fits; otherwise it is emitted in its own chunk(s). A single word longer
+/// than `max_chars` is emitted as-is (never split mid-word).
 pub fn split_into_char_chunks(text: &str, max_chars: usize) -> Vec<String> {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.is_empty() {
+    if text.is_empty() || max_chars == 0 {
         return vec![text.to_string()];
     }
-
     let mut chunks = Vec::new();
     let mut current = String::new();
-
-    for word in &words {
-        let candidate_len = if current.is_empty() {
-            word.len()
+    let mut chars = text.char_indices().peekable();
+    while let Some(&(start, _)) = chars.peek() {
+        let whitespace = chars.peek().is_some_and(|(_, c)| c.is_whitespace());
+        while chars
+            .peek()
+            .is_some_and(|(_, c)| c.is_whitespace() == whitespace)
+        {
+            chars.next();
+        }
+        let end = chars.peek().map_or(text.len(), |(index, _)| *index);
+        let token = &text[start..end];
+        let token_chars = token.chars().count();
+        if whitespace {
+            // Attach boundary whitespace to the next word when the pair
+            // fits, rather than leaving a dangling space in the old chunk.
+            let next_word_chars = text[end..]
+                .chars()
+                .take_while(|c| !c.is_whitespace())
+                .count();
+            if !current.is_empty()
+                && next_word_chars > 0
+                && current.chars().count() + token_chars + next_word_chars > max_chars
+            {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let mut rest = token;
+            while !rest.is_empty() {
+                let available = max_chars.saturating_sub(current.chars().count());
+                if available == 0 {
+                    chunks.push(std::mem::take(&mut current));
+                    continue;
+                }
+                let take = rest.chars().count().min(available);
+                let byte_end = rest.char_indices().nth(take).map_or(rest.len(), |(i, _)| i);
+                current.push_str(&rest[..byte_end]);
+                rest = &rest[byte_end..];
+            }
+        } else if current.chars().count() + token_chars <= max_chars {
+            current.push_str(token);
         } else {
-            current.len() + 1 + word.len() // +1 for the space
-        };
-
-        if !current.is_empty() && candidate_len > max_chars {
-            chunks.push(current);
-            current = format!(" {word}");
-        } else if current.is_empty() {
-            current = (*word).to_string();
-        } else {
-            current.push(' ');
-            current.push_str(word);
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            current.push_str(token);
         }
     }
-
     if !current.is_empty() {
         chunks.push(current);
     }
-
     chunks
 }
 
@@ -239,7 +261,7 @@ pub async fn paste_with_root(
     alert: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<(), TalkError> {
     let clipboard = X11Clipboard::new();
-    let total_chars = text.len() as u64;
+    let total_chars = text.chars().count() as u64;
 
     // Wrapper-level timing knobs are no longer consumed here (the
     // per-chunk gate carries its own).  Kept on the API surface so
@@ -559,6 +581,23 @@ mod tests {
         let chunks = split_into_char_chunks(text, 30);
         let reassembled: String = chunks.concat();
         assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn chunking_preserves_every_whitespace_character() {
+        let text = "  hello  world\n\tgoodbye \r\n";
+        let chunks = split_into_char_chunks(text, 9);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn chunk_limit_counts_unicode_characters() {
+        assert_eq!(split_into_char_chunks("é é", 3), vec!["é é"]);
+    }
+
+    #[test]
+    fn boundary_whitespace_does_not_make_a_chunk_oversize() {
+        assert_eq!(split_into_char_chunks("a bb", 2), vec!["a", " ", "bb"]);
     }
 
     #[test]
@@ -1092,10 +1131,10 @@ providers: {}
     }
 
     #[tokio::test]
-    async fn chunk_node_forwards_same_chunks_as_split_into_char_chunks() {
-        let text = "aaa bbb ccc ddd eee fff";
-        let chunk_chars = 10;
-        let expected = super::split_into_char_chunks(text, chunk_chars);
+    async fn chunk_node_forwards_literal_chunks_and_character_progress() {
+        let text = "éé bb cc";
+        let chunk_chars = 5;
+        let expected = vec!["éé bb", " cc"];
 
         let received = Arc::new(Mutex::new(Vec::<String>::new()));
         let progress = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
@@ -1123,16 +1162,8 @@ providers: {}
         let got = received.lock().expect("lock received").clone();
         assert_eq!(got, expected);
 
-        // Cumulative chars_pasted progresses to total_chars=text.len().
-        let total = text.len() as u64;
         let progress = progress.lock().expect("lock progress").clone();
-        assert_eq!(progress.len(), expected.len());
-        let mut cum: u64 = 0;
-        for ((cp, tc), chunk) in progress.iter().zip(expected.iter()) {
-            cum += chunk.len() as u64;
-            assert_eq!(*tc, total);
-            assert_eq!(*cp, cum);
-        }
+        assert_eq!(progress, vec![(5, 8), (8, 8)]);
     }
 
     #[tokio::test]

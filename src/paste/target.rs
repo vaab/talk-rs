@@ -340,6 +340,22 @@ struct ProcessInfo {
 
 fn read_process(pid: u32) -> io::Result<ProcessInfo> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let stat = parse_stat(&stat)?;
+    let executable = fs::read_link(format!("/proc/{pid}/exe"))?;
+    let argv = fs::read(format!("/proc/{pid}/cmdline"))?
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    Ok(ProcessInfo {
+        pid,
+        stat,
+        executable,
+        argv,
+    })
+}
+
+fn parse_stat(stat: &str) -> io::Result<ProcStat> {
     let close = stat
         .rfind(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed proc stat"))?;
@@ -356,26 +372,12 @@ fn read_process(pid: u32) -> io::Result<ProcessInfo> {
         .get(5)
         .and_then(|value| value.parse::<i32>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing foreground group"))?;
-    let start_time = fields
-        .get(19)
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process start time"))?;
-    let executable = fs::read_link(format!("/proc/{pid}/exe"))?;
-    let argv = fs::read(format!("/proc/{pid}/cmdline"))?
-        .split(|byte| *byte == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect();
-    Ok(ProcessInfo {
-        pid,
-        stat: ProcStat {
-            pgrp,
-            tty_nr,
-            tpgid,
-            start_time,
-        },
-        executable,
-        argv,
+    let start_time = crate::proc_stat::start_time(stat)?;
+    Ok(ProcStat {
+        pgrp,
+        tty_nr,
+        tpgid,
+        start_time,
     })
 }
 
@@ -425,7 +427,8 @@ fn classify_process(executable: &str, argv: &[String]) -> ForegroundApp {
             if argv
                 .iter()
                 .skip(1)
-                .any(|arg| arg.split('/').any(|part| part == "pi"))
+                .find(|arg| !arg.starts_with('-'))
+                .is_some_and(|script| script.split('/').any(|part| part == "pi"))
             {
                 ForegroundApp::PiTui
             } else {
@@ -579,7 +582,8 @@ fn select_tmux_client(output: &str, expected_pid: u32, expected_tty: &Path) -> O
             (pid == expected_pid
                 && tty == expected_tty
                 && control_mode == "0"
-                && client_active_pane.is_empty())
+                && client_active_pane.is_empty()
+                && fields.next().is_none())
             .then_some(TmuxClient { pid, tty, session })
         })
         .collect();
@@ -855,6 +859,17 @@ mod tests {
     }
 
     #[test]
+    fn node_pi_label_uses_executed_script_not_later_arguments() {
+        assert_eq!(
+            classify_process(
+                "/usr/bin/node",
+                &args(&["node", "/opt/other/cli.js", "--project", "/work/pi"])
+            ),
+            ForegroundApp::Unknown
+        );
+    }
+
+    #[test]
     fn terminal_pty_must_be_unique() {
         assert_eq!(
             select_unique_pty(vec![PathBuf::from("/dev/pts/41")]),
@@ -868,6 +883,57 @@ mod tests {
             None
         );
         assert_eq!(select_unique_pty(Vec::new()), None);
+        assert_eq!(
+            select_unique_pty(vec![
+                PathBuf::from("/dev/pts/41"),
+                PathBuf::from("/dev/pts/41")
+            ]),
+            Some(PathBuf::from("/dev/pts/41"))
+        );
+    }
+
+    #[test]
+    fn proc_stat_parses_comm_with_spaces_and_closing_parenthesis() {
+        let stat =
+            parse_stat("123 (odd ) process) S 1 123 123 34816 123 0 0 0 0 0 0 0 0 0 0 0 0 0 9876");
+        assert_eq!(
+            stat.expect("valid proc stat"),
+            ProcStat {
+                pgrp: 123,
+                tty_nr: 34816,
+                tpgid: 123,
+                start_time: 9876,
+            }
+        );
+    }
+
+    #[test]
+    fn only_numeric_direct_pts_children_are_pty_paths() {
+        assert!(is_pts_path(Path::new("/dev/pts/42")));
+        for invalid in [
+            "/dev/pts/ptmx",
+            "/dev/pts/42/child",
+            "/tmp/pts/42",
+            "/dev/pts/4a",
+        ] {
+            assert!(!is_pts_path(Path::new(invalid)), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn controlling_device_encoding_handles_split_minor_bits() {
+        let device = nix::sys::stat::makedev(136, 0x12345);
+        let stat = ProcStat {
+            pgrp: 123,
+            tty_nr: encode_proc_tty_nr(136, 0x12345),
+            tpgid: 123,
+            start_time: 1,
+        };
+        assert!(process_controls_device(&stat, device));
+        assert!(!process_controls_device(
+            &ProcStat { tty_nr: 0, ..stat },
+            device
+        ));
     }
 
     #[test]
@@ -902,6 +968,18 @@ mod tests {
             select_tmux_client(active_pane, 411, Path::new("/dev/pts/21")),
             None,
             "unsupported client-specific active-pane flag must fail closed"
+        );
+    }
+
+    #[test]
+    fn tmux_client_rejects_extra_tab_fields() {
+        assert_eq!(
+            select_tmux_client(
+                "411\t/dev/pts/21\t0\ttwo\t\textra\n",
+                411,
+                Path::new("/dev/pts/21")
+            ),
+            None
         );
     }
 

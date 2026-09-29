@@ -17,8 +17,9 @@
 //! target's per-paste fetch count via a quiescence window (modern
 //! GTK / Qt apps issue two UTF8_STRING requests per paste); chunks
 //! 2..N CONFIRM the same count is reached before the gate releases.
-//! On timeout the paste ABORTS LOUDLY rather than silently advancing
-//! — there is no "best effort" path here.
+//! On timeout with no target fetch, the shortcut may be retried. If
+//! any target fetch was served, retry could duplicate inserted text,
+//! so the paste ABORTS LOUDLY rather than re-injecting or advancing.
 //!
 //! When the target client-base cannot be resolved (blind paste, or
 //! the XID could not be parsed / masked), the node falls back to
@@ -101,6 +102,29 @@ where
     inject().await
 }
 
+/// Owns the retry boundary shared by X11 delivery and scripted observers.
+/// Once the target fetched even once, a second shortcut might duplicate text.
+async fn run_target_attempts<F, Fut>(
+    retries: u32,
+    mut attempt_fn: F,
+) -> Result<GateDecision, TalkError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<GateDecision, TalkError>>,
+{
+    for attempt in 0..=retries {
+        let decision = attempt_fn(attempt).await?;
+        match decision {
+            GateDecision::Learned { .. } | GateDecision::Confirmed { .. } => return Ok(decision),
+            GateDecision::AbortedTimeout { observed: 0, .. } if attempt < retries => continue,
+            GateDecision::AbortedTimeout { .. } => return Ok(decision),
+        }
+    }
+    Err(TalkError::Clipboard(
+        "paste retry loop exhausted".to_string(),
+    ))
+}
+
 #[async_trait]
 impl PasteNode for ClipboardNode {
     async fn paste(&self, text: &str, ctx: &PasteCtx<'_>) -> Result<(), TalkError> {
@@ -120,22 +144,17 @@ impl PasteNode for ClipboardNode {
             }
         };
 
-        // Deterministic target-confirmation path WITH automatic retry.
+        // Deterministic target-confirmation path with zero-fetch retry.
         //
-        // Each attempt re-serves the chunk (fresh serve handle = fresh
-        // per-chunk fetch counter), re-focuses the target window before
-        // re-sending the paste keystroke, and re-runs the gate.  On
+        // Each zero-fetch retry re-serves the chunk (fresh serve handle =
+        // fresh per-chunk fetch counter) and re-focuses before re-sending.
+        // Once any target fetch occurred, no second shortcut is safe. On
         // chunk 1 (LEARN) each retry resets
         // `expected_target_fetches` to 0 so the gate re-LEARNS instead
         // of wrongly entering CONFIRM.
         //
-        // This async loop mirrors the pure [`run_retry_plan`] state
-        // machine 1:1 (attempt range, chunk-1 reset, signal-once on
-        // exhaustion); keep the two in lock-step — the unit tests
-        // exercise `run_retry_plan`.
         let learn_phase = ctx.expected_target_fetches.load(Ordering::Relaxed) == 0;
-
-        for attempt in 0..=self.target_fetch_retries {
+        let result = run_target_attempts(self.target_fetch_retries, |attempt| async move {
             if attempt > 0 {
                 // On a chunk-1 retry the previous failed attempt must
                 // not leave a partially-learned expected count behind:
@@ -165,53 +184,32 @@ impl PasteNode for ClipboardNode {
                     attempt,
                     error,
                 );
-                self.signal_final_abort(ctx, &error);
                 return Err(error);
             }
-
-            match self.run_target_gate(clipboard, target_base, ctx).await {
-                Ok(()) => {
-                    if attempt > 0 {
-                        log::info!(
-                            "paste(clipboard-node): chunk confirmed on retry {} \
-                             (target client-base {:#x})",
-                            attempt,
-                            target_base,
-                        );
-                    }
-                    let _ = ctx.t_stop;
-                    return Ok(());
-                }
-                Err(e) => {
-                    if attempt < self.target_fetch_retries {
-                        log::warn!(
-                            "paste(clipboard-node): target client-base {:#x} did not \
-                             fetch chunk within {} ms (attempt {}/{}) — re-focusing \
-                             and retrying: {}",
-                            target_base,
-                            self.chunk_fetch_timeout_ms,
-                            attempt + 1,
-                            self.target_fetch_retries + 1,
-                            e,
-                        );
-                        continue;
-                    }
-                    // Retries exhausted: emit the VISIBLE abort signal
-                    // exactly once (red overlay + alert sound), then
-                    // propagate the error.  The wrapper still restores
-                    // the original clipboard regardless.
-                    self.signal_final_abort(ctx, &e);
-                    return Err(e);
-                }
+            Ok(self.run_target_gate(clipboard, target_base, ctx).await)
+        })
+        .await;
+        let result = match result {
+            Ok(GateDecision::Learned { .. } | GateDecision::Confirmed { .. }) => Ok(()),
+            Ok(GateDecision::AbortedTimeout { observed, required }) => {
+                let reason = if observed == 0 {
+                    "no target fetch after all shortcut attempts"
+                } else {
+                    "not retrying after a target fetch: the chunk may already be inserted"
+                };
+                Err(TalkError::Clipboard(format!(
+                    "paste aborted: target X11 client-base {target_base:#x} fetched clipboard \
+                     {observed}/{required} times within {} ms; {reason}",
+                    self.chunk_fetch_timeout_ms
+                )))
             }
+            Err(error) => Err(error),
+        };
+        if let Err(ref error) = result {
+            self.signal_final_abort(ctx, error);
         }
-
-        // Unreachable: the `for` loop always returns from within (the
-        // last iteration either returns Ok or the exhausted Err).
-        // Kept as a defensive fallback that never fires.
-        Err(TalkError::Clipboard(
-            "paste aborted: retry loop exited without a decision".to_string(),
-        ))
+        let _ = ctx.t_stop;
+        result
     }
 }
 
@@ -261,12 +259,11 @@ impl ClipboardNode {
         simulate_paste(self.shortcut).await
     }
 
-    /// Emit the VISIBLE abort signal on a FINAL paste abort (target
-    /// retries exhausted): a `Failed` telemetry event that drives the
+    /// Emit the VISIBLE abort signal on a final paste abort: a `Failed`
+    /// telemetry event that drives the
     /// overlay to its red `Phase::Error`, plus the triple-pulse alert
     /// tone (when an alert hook is wired).  Fired exactly ONCE, here,
-    /// because the retry loop only reaches this site after the last
-    /// attempt failed.
+    /// because the caller reaches this site only on failure.
     fn signal_final_abort(&self, ctx: &PasteCtx<'_>, err: &TalkError) {
         ctx.sink.emit(crate::telemetry::TranscriptionEvent::Failed {
             reason: err.to_string(),
@@ -282,23 +279,34 @@ impl ClipboardNode {
     /// Chunk 1 learns the target's per-paste fetch count via a
     /// quiescence window; subsequent chunks confirm the same count
     /// is reached.  On hard timeout returns a clear
-    /// [`TalkError::Clipboard`] — the caller never silently advances.
+    /// [`GateDecision::AbortedTimeout`] — the caller never silently advances.
     async fn run_target_gate(
         &self,
         clipboard: &crate::clipboard::X11Clipboard,
         target_base: u32,
         ctx: &PasteCtx<'_>,
-    ) -> Result<(), TalkError> {
+    ) -> GateDecision {
         let expected_prev = ctx.expected_target_fetches.load(Ordering::Relaxed);
         let timeout = Duration::from_millis(self.chunk_fetch_timeout_ms);
         let quiescence = Duration::from_millis(self.target_quiescence_ms);
 
         let decision = if expected_prev == 0 {
             // CHUNK 1 = LEARN
-            wait_and_learn(clipboard, target_base, timeout, quiescence).await
+            wait_and_learn(
+                || clipboard.target_fetch_count(target_base),
+                timeout,
+                quiescence,
+            )
+            .await
         } else {
             // CHUNK N = CONFIRM
-            wait_and_confirm(clipboard, target_base, expected_prev, timeout, quiescence).await
+            wait_and_confirm(
+                || clipboard.target_fetch_count(target_base),
+                expected_prev,
+                timeout,
+                quiescence,
+            )
+            .await
         };
 
         match decision {
@@ -312,7 +320,7 @@ impl ClipboardNode {
                     expected,
                     self.target_quiescence_ms,
                 );
-                Ok(())
+                decision
             }
             GateDecision::Confirmed { observed } => {
                 log::trace!(
@@ -322,27 +330,9 @@ impl ClipboardNode {
                     observed,
                     expected_prev,
                 );
-                Ok(())
+                decision
             }
-            GateDecision::AbortedTimeout { observed, required } => {
-                let msg = if expected_prev == 0 {
-                    format!(
-                        "paste aborted: target X11 client-base {:#x} never fetched \
-                         the clipboard for chunk 1 within {} ms (observed={}) — \
-                         wrong focus, unsupported app, or shortcut mismatch",
-                        target_base, self.chunk_fetch_timeout_ms, observed,
-                    )
-                } else {
-                    format!(
-                        "paste aborted: target X11 client-base {:#x} only fetched \
-                         clipboard {}/{} times within {} ms (this chunk would be \
-                         dropped — refusing to overwrite silently)",
-                        target_base, observed, required, self.chunk_fetch_timeout_ms,
-                    )
-                };
-                log::error!("{}", msg);
-                Err(TalkError::Clipboard(msg))
-            }
+            GateDecision::AbortedTimeout { .. } => decision,
         }
     }
 
@@ -384,8 +374,7 @@ impl ClipboardNode {
 /// [`GateDecision::AbortedTimeout`] when no target fetch arrives
 /// before the deadline.
 async fn wait_and_learn(
-    clipboard: &crate::clipboard::X11Clipboard,
-    target_base: u32,
+    fetch_count: impl Fn() -> u32,
     timeout: Duration,
     quiescence: Duration,
 ) -> GateDecision {
@@ -394,7 +383,7 @@ async fn wait_and_learn(
 
     // Phase A: wait for the FIRST target fetch.
     loop {
-        let count = clipboard.target_fetch_count(target_base);
+        let count = fetch_count();
         if count > 0 {
             break;
         }
@@ -410,7 +399,7 @@ async fn wait_and_learn(
     // Phase B: keep waiting through `quiescence` of no NEW fetch.
     // Update `last_change` whenever the count grows; freeze when
     // `quiescence` elapses since the last growth.
-    let mut last_count = clipboard.target_fetch_count(target_base);
+    let mut last_count = fetch_count();
     let mut last_change = Instant::now();
     loop {
         if last_change.elapsed() >= quiescence {
@@ -428,7 +417,7 @@ async fn wait_and_learn(
             };
         }
         tokio::time::sleep(poll).await;
-        let now = clipboard.target_fetch_count(target_base);
+        let now = fetch_count();
         if now != last_count {
             last_count = now;
             last_change = Instant::now();
@@ -445,8 +434,7 @@ async fn wait_and_learn(
 /// Returns [`GateDecision::Confirmed`] on success, or
 /// [`GateDecision::AbortedTimeout`] when `expected` is not reached.
 async fn wait_and_confirm(
-    clipboard: &crate::clipboard::X11Clipboard,
-    target_base: u32,
+    fetch_count: impl Fn() -> u32,
     expected: u32,
     timeout: Duration,
     quiescence: Duration,
@@ -457,7 +445,7 @@ async fn wait_and_confirm(
     // Phase A: wait until count >= expected.
     let mut observed;
     loop {
-        observed = clipboard.target_fetch_count(target_base);
+        observed = fetch_count();
         if observed >= expected {
             break;
         }
@@ -486,7 +474,7 @@ async fn wait_and_confirm(
             };
         }
         tokio::time::sleep(poll).await;
-        let now = clipboard.target_fetch_count(target_base);
+        let now = fetch_count();
         if now != last_count {
             last_count = now;
             last_change = Instant::now();
@@ -577,16 +565,8 @@ mod tests {
 
     // ── Learn / confirm / quiescence state-machine tests ────────
     //
-    // We test the LOGIC of wait_and_learn / wait_and_confirm against
-    // a controllable fetch-count source.  Driving real X11 in a unit
-    // test would require a Xephyr server; instead we feed the
-    // X11Clipboard from a fake serve handle.  Since X11Clipboard's
-    // serve_handle is a private Mutex<Option<ClipboardServeHandle>>,
-    // we factor the test cases through a tiny helper that drives
-    // wait_and_learn / wait_and_confirm against a SIMULATED count
-    // source.  The helpers below mirror the production loop shape
-    // 1:1 — any divergence would be caught when this module's tests
-    // start passing against the real X11 path.
+    // Production wait loops accept a fetch-count observer, so these
+    // tests drive the same logic as X11 with a deterministic source.
 
     /// Spec: ABORT immediately when the target never fetches.  The
     /// pure decision computation falls through to AbortedTimeout.
@@ -595,7 +575,7 @@ mod tests {
         // Use a custom helper that simulates "always 0".
         let timeout = Duration::from_millis(20);
         let quiescence = Duration::from_millis(50);
-        let decision = simulate_learn_with(|_| 0, timeout, quiescence).await;
+        let decision = wait_and_learn(|| 0, timeout, quiescence).await;
         match decision {
             GateDecision::AbortedTimeout { observed, required } => {
                 assert_eq!(observed, 0);
@@ -611,8 +591,8 @@ mod tests {
     async fn learn_freezes_at_one_when_only_one_fetch_arrives() {
         // After 0ms count jumps from 0 → 1 and never grows.
         let started = Instant::now();
-        let decision = simulate_learn_with(
-            move |_| {
+        let decision = wait_and_learn(
+            move || {
                 if started.elapsed() > Duration::from_millis(2) {
                     1
                 } else {
@@ -635,8 +615,8 @@ mod tests {
     #[tokio::test]
     async fn learn_freezes_at_two_when_target_fetches_twice() {
         let started = Instant::now();
-        let decision = simulate_learn_with(
-            move |_| {
+        let decision = wait_and_learn(
+            move || {
                 let e = started.elapsed();
                 if e > Duration::from_millis(15) {
                     2
@@ -661,8 +641,8 @@ mod tests {
     #[tokio::test]
     async fn confirm_succeeds_when_expected_count_reached() {
         let started = Instant::now();
-        let decision = simulate_confirm_with(
-            move |_| {
+        let decision = wait_and_confirm(
+            move || {
                 let e = started.elapsed();
                 if e > Duration::from_millis(15) {
                     2
@@ -690,8 +670,8 @@ mod tests {
     async fn confirm_aborts_when_expected_count_not_reached() {
         // Stays at 1 forever; expected=2 → abort.
         let started = Instant::now();
-        let decision = simulate_confirm_with(
-            move |_| {
+        let decision = wait_and_confirm(
+            move || {
                 if started.elapsed() > Duration::from_millis(2) {
                     1
                 } else {
@@ -712,256 +692,81 @@ mod tests {
         }
     }
 
-    // ── Retry-loop state-machine tests ──────────────────────────
-    //
-    // These drive the pure `run_retry_plan` mirror of the async
-    // retry loop in `ClipboardNode::paste`, verifying the reset /
-    // relearn / signal-once behaviour without an X11 server.  The
-    // mirror is test-only: production drives real async side effects
-    // but keeps the SAME loop shape (attempt range, chunk-1 reset,
-    // signal-once on exhaustion) — keep them in lock-step.
+    // Retry assertions below exercise the production attempt loop directly.
 
-    /// Outcome of one attempt: `Ok` = gate confirmed; `Err` = the
-    /// abort message the real gate would have produced.
-    type AttemptResult = Result<(), String>;
-
-    /// Observability into the retry loop: final result, how many
-    /// chunk-1 relearn resets happened, whether the final abort
-    /// signal fired (exactly once on exhaustion), and attempt count.
-    struct RetryTrace {
-        result: AttemptResult,
-        resets: u32,
-        signalled: bool,
-        attempts: u32,
+    #[tokio::test]
+    async fn partial_target_fetch_never_injects_the_same_chunk_twice() {
+        let learned =
+            run_target_attempts(2, |_| async { Ok(GateDecision::Learned { expected: 2 }) })
+                .await
+                .expect("first chunk learns fetch count");
+        assert_eq!(learned, GateDecision::Learned { expected: 2 });
+        let mut injections = Vec::new();
+        let result = run_target_attempts(2, |_| {
+            injections.push("chunk");
+            async {
+                Ok(GateDecision::AbortedTimeout {
+                    observed: 1,
+                    required: 2,
+                })
+            }
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Ok(GateDecision::AbortedTimeout {
+                observed: 1,
+                required: 2
+            })
+        ));
+        assert_eq!(injections, vec!["chunk"]);
     }
 
-    /// Pure retry state machine mirroring the loop in
-    /// [`super::ClipboardNode::paste`] 1:1.  `retries` = extra
-    /// attempts beyond the first; `learn_phase` = chunk 1 (each retry
-    /// resets to re-learn); `gate` = per-attempt outcome.
-    fn run_retry_plan<F>(retries: u32, learn_phase: bool, mut gate: F) -> RetryTrace
-    where
-        F: FnMut(u32) -> AttemptResult,
-    {
-        let mut resets = 0u32;
-        let mut attempts = 0u32;
-        for attempt in 0..=retries {
-            if attempt > 0 && learn_phase {
-                // Chunk-1 retry: reset expected count so the gate
-                // re-LEARNS instead of wrongly entering CONFIRM.
-                resets += 1;
-            }
-            attempts += 1;
-            match gate(attempt) {
-                Ok(()) => {
-                    return RetryTrace {
-                        result: Ok(()),
-                        resets,
-                        signalled: false,
-                        attempts,
-                    };
-                }
-                Err(e) => {
-                    if attempt < retries {
-                        continue;
-                    }
-                    // Retries exhausted: the final abort signal fires
-                    // exactly once here.
-                    return RetryTrace {
-                        result: Err(e),
-                        resets,
-                        signalled: true,
-                        attempts,
-                    };
+    #[tokio::test]
+    async fn zero_fetch_attempt_can_retry_and_confirm() {
+        let mut injections = 0;
+        let result = run_target_attempts(2, |_| {
+            injections += 1;
+            let observed = injections;
+            async move {
+                if observed == 1 {
+                    Ok(GateDecision::AbortedTimeout {
+                        observed: 0,
+                        required: 2,
+                    })
+                } else {
+                    Ok(GateDecision::Confirmed { observed: 2 })
                 }
             }
-        }
-        // Unreachable in practice (loop always returns).
-        RetryTrace {
-            result: Err("retry loop exited without a decision".to_string()),
-            resets,
-            signalled: false,
-            attempts,
-        }
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Ok(GateDecision::Confirmed { observed: 2 })
+        ));
+        assert_eq!(injections, 2);
     }
 
-    /// Spec (A): the chunk fails the first attempt then succeeds on
-    /// the retry — the loop returns Ok, does NOT fire the abort
-    /// signal, and used exactly two attempts.
-    #[test]
-    fn retry_succeeds_after_one_failed_attempt() {
-        let trace = run_retry_plan(2, /* learn_phase */ true, |attempt| {
-            if attempt == 0 {
-                Err("first attempt: target never fetched".to_string())
-            } else {
-                Ok(())
-            }
-        });
-        assert!(trace.result.is_ok(), "second attempt should confirm");
-        assert!(!trace.signalled, "no abort signal on eventual success");
-        assert_eq!(trace.attempts, 2, "one failure + one success");
-        // Chunk-1 retry re-learns exactly once (for attempt 1).
-        assert_eq!(trace.resets, 1);
-    }
-
-    /// Spec (B): every attempt fails — after retries are exhausted
-    /// the loop returns Err AND fires the abort signal exactly once.
-    #[test]
-    fn retry_aborts_and_signals_once_after_exhaustion() {
-        let mut fail_count = 0u32;
-        let trace = run_retry_plan(2, /* learn_phase */ false, |_attempt| {
-            fail_count += 1;
-            Err("target never fetched".to_string())
-        });
-        assert!(trace.result.is_err(), "exhausted retries must abort");
-        assert!(
-            trace.signalled,
-            "abort signal fires exactly once on final abort"
-        );
-        assert_eq!(trace.attempts, 3, "1 initial + 2 retries = 3 attempts");
-        assert_eq!(fail_count, 3, "gate invoked once per attempt");
-        // CONFIRM phase (chunk N) never resets the learned count.
-        assert_eq!(trace.resets, 0);
-    }
-
-    /// Spec (C): on chunk 1 (LEARN phase) each RETRY resets the
-    /// expected count so the gate re-LEARNS; on chunk N (CONFIRM)
-    /// no reset happens.  Two retries ⇒ two resets in LEARN, zero
-    /// in CONFIRM.
-    #[test]
-    fn chunk_one_retries_relearn_but_chunk_n_does_not() {
-        let learn = run_retry_plan(2, true, |_| Err("nope".to_string()));
-        assert_eq!(learn.resets, 2, "chunk-1 relearns on each of 2 retries");
-
-        let confirm = run_retry_plan(2, false, |_| Err("nope".to_string()));
-        assert_eq!(confirm.resets, 0, "chunk-N never resets learned count");
-    }
-
-    /// Spec: with zero retries a single failing attempt aborts +
-    /// signals immediately (no extra attempts).  This is the shape
-    /// the config knob `target_fetch_retries: 0` produces.
-    #[test]
-    fn zero_retries_aborts_on_first_failure() {
-        let trace = run_retry_plan(0, true, |_| Err("nope".to_string()));
-        assert!(trace.result.is_err());
-        assert!(trace.signalled);
-        assert_eq!(trace.attempts, 1);
-    }
-
-    /// Spec: the first attempt succeeding needs no retries and never
-    /// signals — the common happy path.
-    #[test]
-    fn first_attempt_success_no_retry_no_signal() {
-        let trace = run_retry_plan(2, true, |attempt| {
-            assert_eq!(attempt, 0, "must not run a second attempt");
-            Ok(())
-        });
-        assert!(trace.result.is_ok());
-        assert!(!trace.signalled);
-        assert_eq!(trace.attempts, 1);
-        assert_eq!(trace.resets, 0);
-    }
-
-    // ── Test helpers (mirror prod loop shape 1:1) ───────────────
-    //
-    // The helpers below replicate `wait_and_learn` / `wait_and_confirm`
-    // against an injectable "count source" so we can drive the state
-    // machine without an X11 server.  Any change to the production
-    // loop shape MUST mirror here, and vice-versa — keep them lock-step.
-
-    async fn simulate_learn_with<F>(
-        count: F,
-        timeout: Duration,
-        quiescence: Duration,
-    ) -> GateDecision
-    where
-        F: Fn(Instant) -> u32,
-    {
-        let deadline = Instant::now() + timeout;
-        let poll = Duration::from_millis(GATE_POLL_INTERVAL_MS);
-
-        loop {
-            let c = count(Instant::now());
-            if c > 0 {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return GateDecision::AbortedTimeout {
+    #[tokio::test]
+    async fn zero_fetch_exhausts_only_after_configured_attempts() {
+        let mut injections = 0;
+        let result = run_target_attempts(2, |_| {
+            injections += 1;
+            async {
+                Ok(GateDecision::AbortedTimeout {
                     observed: 0,
                     required: 1,
-                };
+                })
             }
-            tokio::time::sleep(poll).await;
-        }
-
-        let mut last_count = count(Instant::now());
-        let mut last_change = Instant::now();
-        loop {
-            if last_change.elapsed() >= quiescence {
-                return GateDecision::Learned {
-                    expected: last_count,
-                };
-            }
-            if Instant::now() >= deadline {
-                return GateDecision::Learned {
-                    expected: last_count,
-                };
-            }
-            tokio::time::sleep(poll).await;
-            let now = count(Instant::now());
-            if now != last_count {
-                last_count = now;
-                last_change = Instant::now();
-            }
-        }
-    }
-
-    async fn simulate_confirm_with<F>(
-        count: F,
-        expected: u32,
-        timeout: Duration,
-        quiescence: Duration,
-    ) -> GateDecision
-    where
-        F: Fn(Instant) -> u32,
-    {
-        let deadline = Instant::now() + timeout;
-        let poll = Duration::from_millis(GATE_POLL_INTERVAL_MS);
-
-        let mut observed;
-        loop {
-            observed = count(Instant::now());
-            if observed >= expected {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return GateDecision::AbortedTimeout {
-                    observed,
-                    required: expected,
-                };
-            }
-            tokio::time::sleep(poll).await;
-        }
-
-        let mut last_count = observed;
-        let mut last_change = Instant::now();
-        loop {
-            if last_change.elapsed() >= quiescence {
-                return GateDecision::Confirmed {
-                    observed: last_count,
-                };
-            }
-            if Instant::now() >= deadline {
-                return GateDecision::Confirmed {
-                    observed: last_count,
-                };
-            }
-            tokio::time::sleep(poll).await;
-            let now = count(Instant::now());
-            if now != last_count {
-                last_count = now;
-                last_change = Instant::now();
-            }
-        }
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Ok(GateDecision::AbortedTimeout {
+                observed: 0,
+                required: 1
+            })
+        ));
+        assert_eq!(injections, 3);
     }
 }
