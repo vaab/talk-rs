@@ -5,10 +5,13 @@
 
 use crate::error::TalkError;
 #[cfg(feature = "ui")]
-use crate::x11::clipboard::{x11_clipboard_get, x11_clipboard_set, ClipboardServeHandle};
+use crate::x11::clipboard::{
+    x11_clipboard_get, x11_clipboard_set, x11_clipboard_set_snapshot, x11_clipboard_snapshot,
+    ClipboardServeHandle,
+};
 use async_trait::async_trait;
 #[cfg(feature = "ui")]
-use std::io::{Read, Write};
+use std::io::Read;
 #[cfg(feature = "ui")]
 use std::os::unix::{net::UnixStream, process::CommandExt};
 #[cfg(feature = "ui")]
@@ -18,15 +21,47 @@ use std::time::Duration;
 
 /// Trait for clipboard operations.
 ///
-/// Implementations should handle reading and writing text to the system clipboard.
+/// Implementations handle text operations and selection snapshots.
 /// All implementations must be `Send + Sync` for use in async contexts.
 #[async_trait]
 pub trait Clipboard: Send + Sync {
+    /// Capture every supported content target, or None if there is no owner.
+    async fn snapshot(&self) -> Result<Option<ClipboardSnapshot>, TalkError>;
+
+    /// Restore a captured selection; None leaves the current selection alone.
+    async fn restore_snapshot(&self, saved: Option<ClipboardSnapshot>) -> Result<(), TalkError>;
+
     /// Get the current clipboard text content.
     async fn get_text(&self) -> Result<String, TalkError>;
 
     /// Set the clipboard text content.
     async fn set_text(&self, text: &str) -> Result<(), TalkError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClipboardTarget {
+    pub name: String,
+    pub property_type: String,
+    pub format: u8,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClipboardSnapshot {
+    pub targets: Vec<ClipboardTarget>,
+}
+
+impl ClipboardSnapshot {
+    fn text(text: &str) -> Self {
+        Self {
+            targets: vec![ClipboardTarget {
+                name: "UTF8_STRING".into(),
+                property_type: "UTF8_STRING".into(),
+                format: 8,
+                bytes: text.as_bytes().to_vec(),
+            }],
+        }
+    }
 }
 
 /// X11 clipboard implementation using native `x11rb` calls.
@@ -181,45 +216,40 @@ const SERVED_POLL_INTERVAL_MS: u64 = 5;
 /// acknowledges ownership on stdout; it then serves until SelectionClear.
 #[cfg(feature = "ui")]
 pub fn run_holder() -> Result<(), TalkError> {
-    let mut text = String::new();
-    std::io::stdin().read_to_string(&mut text)?;
-    crate::x11::clipboard::x11_clipboard_hold(&text).map_err(TalkError::Clipboard)
+    let snapshot: ClipboardSnapshot = serde_json::from_reader(std::io::stdin())
+        .map_err(|e| TalkError::Clipboard(format!("holder snapshot: {e}")))?;
+    crate::x11::clipboard::x11_clipboard_hold_snapshot(&snapshot).map_err(TalkError::Clipboard)
 }
 
-/// Restore only meaningful saved text. Never claim an empty selection
-/// when the original owner offered no UTF8_STRING or the read failed.
+/// Restore readable content targets, without claiming an empty selection
+/// when the original owner was absent or no target could be fetched.
 #[cfg(feature = "ui")]
-pub async fn restore_saved(clipboard: &X11Clipboard, saved: Option<&str>) {
-    let Some(text) = restorable_text(saved) else {
-        log::debug!("clipboard restore skipped: original text was empty or could not be read");
+pub async fn restore_saved(clipboard: &X11Clipboard, saved: Option<ClipboardSnapshot>) {
+    let Some(snapshot) = saved.filter(|s| !s.targets.is_empty()) else {
+        log::debug!("clipboard restore skipped: no original owner or readable targets");
         return;
     };
     log::trace!(
-        "clipboard: restoring original clipboard via detached holder = {}",
-        crate::paste::log_preview(text),
+        "clipboard: restoring {} original targets via detached holder",
+        snapshot.targets.len()
     );
     if let Err(error) = tokio::task::spawn_blocking({
-        let text = text.to_owned();
-        move || spawn_holder(&text)
+        let snapshot = snapshot.clone();
+        move || spawn_holder(&snapshot)
     })
     .await
     .map_err(|e| e.to_string())
     .and_then(|r| r)
     {
         log::warn!("detached clipboard restore failed ({error}); using in-process fallback");
-        if let Err(error) = clipboard.set_text(text).await {
+        if let Err(error) = clipboard.restore_snapshot(Some(snapshot)).await {
             log::warn!("in-process clipboard restore failed: {error}");
         }
     }
 }
 
 #[cfg(feature = "ui")]
-fn restorable_text(saved: Option<&str>) -> Option<&str> {
-    saved.filter(|text| !text.is_empty())
-}
-
-#[cfg(feature = "ui")]
-fn spawn_holder(text: &str) -> Result<(), String> {
+fn spawn_holder(snapshot: &ClipboardSnapshot) -> Result<(), String> {
     let (mut parent, child_io) = UnixStream::pair().map_err(|e| e.to_string())?;
     parent
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -247,9 +277,7 @@ fn spawn_holder(text: &str) -> Result<(), String> {
     }
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let result = (|| {
-        parent
-            .write_all(text.as_bytes())
-            .map_err(|e| e.to_string())?;
+        serde_json::to_writer(&mut parent, snapshot).map_err(|e| e.to_string())?;
         parent
             .shutdown(std::net::Shutdown::Write)
             .map_err(|e| e.to_string())?;
@@ -274,6 +302,29 @@ fn spawn_holder(text: &str) -> Result<(), String> {
 #[cfg(feature = "ui")]
 #[async_trait]
 impl Clipboard for X11Clipboard {
+    async fn snapshot(&self) -> Result<Option<ClipboardSnapshot>, TalkError> {
+        tokio::task::spawn_blocking(x11_clipboard_snapshot)
+            .await
+            .map_err(|e| TalkError::Clipboard(format!("clipboard task panicked: {e}")))?
+            .map_err(TalkError::Clipboard)
+    }
+
+    async fn restore_snapshot(&self, saved: Option<ClipboardSnapshot>) -> Result<(), TalkError> {
+        let Some(snapshot) = saved.filter(|s| !s.targets.is_empty()) else {
+            return Ok(());
+        };
+        let handle = tokio::task::spawn_blocking(move || x11_clipboard_set_snapshot(snapshot))
+            .await
+            .map_err(|e| TalkError::Clipboard(format!("clipboard task panicked: {e}")))?
+            .ok_or_else(|| TalkError::Clipboard("failed to claim clipboard ownership".into()))?;
+        *self
+            .serve_handle
+            .lock()
+            .map_err(|e| TalkError::Clipboard(format!("clipboard lock poisoned: {e}")))? =
+            Some(handle);
+        Ok(())
+    }
+
     async fn get_text(&self) -> Result<String, TalkError> {
         let result = tokio::task::spawn_blocking(x11_clipboard_get)
             .await
@@ -315,13 +366,13 @@ impl Clipboard for X11Clipboard {
 ///
 /// Stores clipboard content in memory using thread-safe interior mutability.
 pub struct MockClipboard {
-    content: std::sync::Arc<tokio::sync::Mutex<String>>,
+    content: std::sync::Arc<tokio::sync::Mutex<Option<ClipboardSnapshot>>>,
 }
 
 impl Default for MockClipboard {
     fn default() -> Self {
         Self {
-            content: std::sync::Arc::new(tokio::sync::Mutex::new(String::new())),
+            content: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -335,19 +386,49 @@ impl MockClipboard {
     /// Create a new mock clipboard with initial content.
     pub fn with_content(text: impl Into<String>) -> Self {
         Self {
-            content: std::sync::Arc::new(tokio::sync::Mutex::new(text.into())),
+            content: std::sync::Arc::new(tokio::sync::Mutex::new(Some(ClipboardSnapshot::text(
+                &text.into(),
+            )))),
+        }
+    }
+
+    pub fn with_snapshot(snapshot: ClipboardSnapshot) -> Self {
+        Self {
+            content: std::sync::Arc::new(tokio::sync::Mutex::new(Some(snapshot))),
         }
     }
 }
 
 #[async_trait]
 impl Clipboard for MockClipboard {
-    async fn get_text(&self) -> Result<String, TalkError> {
+    async fn snapshot(&self) -> Result<Option<ClipboardSnapshot>, TalkError> {
         Ok(self.content.lock().await.clone())
     }
 
+    async fn restore_snapshot(&self, saved: Option<ClipboardSnapshot>) -> Result<(), TalkError> {
+        if let Some(saved) = saved {
+            *self.content.lock().await = Some(saved);
+        }
+        Ok(())
+    }
+
+    async fn get_text(&self) -> Result<String, TalkError> {
+        Ok(self
+            .content
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|s| {
+                s.targets
+                    .iter()
+                    .find(|t| t.name == "UTF8_STRING")
+                    .and_then(|t| String::from_utf8(t.bytes.clone()).ok())
+            })
+            .unwrap_or_default())
+    }
+
     async fn set_text(&self, text: &str) -> Result<(), TalkError> {
-        *self.content.lock().await = text.to_string();
+        *self.content.lock().await = Some(ClipboardSnapshot::text(text));
         Ok(())
     }
 }
@@ -355,14 +436,6 @@ impl Clipboard for MockClipboard {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "ui")]
-    #[test]
-    fn empty_or_failed_save_does_not_restore() {
-        assert_eq!(restorable_text(None), None);
-        assert_eq!(restorable_text(Some("")), None);
-        assert_eq!(restorable_text(Some("ORIGINAL")), Some("ORIGINAL"));
-    }
 
     #[tokio::test]
     async fn test_mock_clipboard_starts_empty() {
@@ -393,5 +466,48 @@ mod tests {
         let clipboard = MockClipboard::with_content("initial");
         let text = clipboard.get_text().await.unwrap();
         assert_eq!(text, "initial");
+    }
+
+    #[tokio::test]
+    async fn mock_restores_image_and_multiple_targets() {
+        let original = ClipboardSnapshot {
+            targets: vec![
+                ClipboardTarget {
+                    name: "image/png".into(),
+                    property_type: "image/png".into(),
+                    format: 8,
+                    bytes: vec![0, 137, 80, 78, 71],
+                },
+                ClipboardTarget {
+                    name: "text/html".into(),
+                    property_type: "text/html".into(),
+                    format: 8,
+                    bytes: b"<b>hi</b>".to_vec(),
+                },
+            ],
+        };
+        let clipboard = MockClipboard::with_snapshot(original.clone());
+        let saved = clipboard.snapshot().await.unwrap();
+        clipboard.set_text("DICTATED").await.unwrap();
+        clipboard.restore_snapshot(saved).await.unwrap();
+        assert_eq!(clipboard.snapshot().await.unwrap(), Some(original));
+    }
+
+    #[tokio::test]
+    async fn mock_restores_text_unchanged() {
+        let clipboard = MockClipboard::with_content("original");
+        let saved = clipboard.snapshot().await.unwrap();
+        clipboard.set_text("DICTATED").await.unwrap();
+        clipboard.restore_snapshot(saved).await.unwrap();
+        assert_eq!(clipboard.get_text().await.unwrap(), "original");
+    }
+
+    #[tokio::test]
+    async fn mock_no_original_owner_leaves_pasted_text() {
+        let clipboard = MockClipboard::new();
+        let saved = clipboard.snapshot().await.unwrap();
+        clipboard.set_text("DICTATED").await.unwrap();
+        clipboard.restore_snapshot(saved).await.unwrap();
+        assert_eq!(clipboard.get_text().await.unwrap(), "DICTATED");
     }
 }

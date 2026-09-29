@@ -290,13 +290,15 @@ pub async fn paste_with_root(
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     }
 
-    let saved_clipboard = clipboard.get_text().await.ok();
+    let saved_clipboard = clipboard.snapshot().await.unwrap_or_else(|error| {
+        log::warn!("could not snapshot original clipboard: {error}");
+        None
+    });
     log::trace!(
-        "paste: saved original clipboard = {}",
+        "paste: saved original clipboard targets = {}",
         saved_clipboard
-            .as_deref()
-            .map(log_preview)
-            .unwrap_or_else(|| "<none>".to_string()),
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.targets.len()),
     );
 
     // Legacy "timing: stop +Nms first_paste" log — emitted once,
@@ -330,7 +332,7 @@ pub async fn paste_with_root(
     // Restore the original clipboard regardless of whether paste
     // succeeded: a half-finished paste should not leave clipboard
     // contents from the failed operation in the user's clipboard.
-    crate::clipboard::restore_saved(&clipboard, saved_clipboard.as_deref()).await;
+    crate::clipboard::restore_saved(&clipboard, saved_clipboard).await;
 
     paste_result?;
 
@@ -404,7 +406,7 @@ async fn resolve_target_client_base(target_window: Option<&String>) -> Option<u3
 /// behaviour with a warning — backward compatible.
 pub struct RealtimeClipboardGuard {
     clipboard: X11Clipboard,
-    saved: Option<String>,
+    saved: Option<crate::clipboard::ClipboardSnapshot>,
 }
 
 impl RealtimeClipboardGuard {
@@ -419,13 +421,13 @@ impl RealtimeClipboardGuard {
     pub async fn begin(timing: PasteTiming) -> Self {
         let _ = timing;
         let clipboard = X11Clipboard::new();
-        let saved = clipboard.get_text().await.ok();
+        let saved = clipboard.snapshot().await.unwrap_or_else(|error| {
+            log::warn!("could not snapshot original clipboard: {error}");
+            None
+        });
         log::trace!(
-            "paste(realtime): saved original clipboard = {}",
-            saved
-                .as_deref()
-                .map(log_preview)
-                .unwrap_or_else(|| "<none>".to_string()),
+            "paste(realtime): saved original clipboard targets = {}",
+            saved.as_ref().map_or(0, |snapshot| snapshot.targets.len()),
         );
         Self { clipboard, saved }
     }
@@ -473,7 +475,7 @@ impl RealtimeClipboardGuard {
     /// `paste_segment` call already confirmed the target consumed
     /// the last segment before returning.
     pub async fn finish(self) {
-        crate::clipboard::restore_saved(&self.clipboard, self.saved.as_deref()).await;
+        crate::clipboard::restore_saved(&self.clipboard, self.saved).await;
     }
 }
 

@@ -11,11 +11,154 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::clipboard::{ClipboardSnapshot, ClipboardTarget};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
+
+const SNAPSHOT_LIMIT: usize = 32 * 1024 * 1024;
+const META_TARGETS: &[&[u8]] = &[
+    b"TARGETS",
+    b"MULTIPLE",
+    b"TIMESTAMP",
+    b"SAVE_TARGETS",
+    b"DELETE",
+];
+
+fn atom_name(conn: &RustConnection, atom: Atom) -> Option<String> {
+    let reply = conn.get_atom_name(atom).ok()?.reply().ok()?;
+    String::from_utf8(reply.name).ok()
+}
+
+fn request_target(
+    conn: &RustConnection,
+    window: Window,
+    clipboard: Atom,
+    target: Atom,
+    property: Atom,
+    limit: usize,
+) -> Option<GetPropertyReply> {
+    conn.delete_property(window, property).ok()?;
+    conn.convert_selection(window, clipboard, target, property, 0u32)
+        .ok()?;
+    conn.flush().ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match conn.poll_for_event().ok()? {
+            Some(Event::SelectionNotify(n))
+                if n.requestor == window && n.selection == clipboard && n.target == target =>
+            {
+                if n.property == 0 {
+                    return None;
+                }
+                return conn
+                    .get_property(
+                        true,
+                        window,
+                        property,
+                        AtomEnum::ANY,
+                        0,
+                        (limit / 4 + 1) as u32,
+                    )
+                    .ok()?
+                    .reply()
+                    .ok();
+            }
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    None
+}
+
+/// Snapshot the current owner's content targets without altering ownership.
+/// Oversized, incremental, or failed conversions are omitted with a warning.
+pub fn x11_clipboard_snapshot() -> Result<Option<ClipboardSnapshot>, String> {
+    let (conn, screen) = x11rb::connect(None).map_err(|e| e.to_string())?;
+    let clipboard = intern(&conn, b"CLIPBOARD").ok_or("could not intern CLIPBOARD")?;
+    let owner = conn
+        .get_selection_owner(clipboard)
+        .map_err(|e| e.to_string())?
+        .reply()
+        .map_err(|e| e.to_string())?
+        .owner;
+    if owner == 0 {
+        return Ok(None);
+    }
+    let root = conn.setup().roots[screen].root;
+    let window = conn.generate_id().map_err(|e| e.to_string())?;
+    conn.create_window(
+        0,
+        window,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        0,
+        &CreateWindowAux::new(),
+    )
+    .map_err(|e| e.to_string())?;
+    let targets_atom = intern(&conn, b"TARGETS").ok_or("could not intern TARGETS")?;
+    let property = intern(&conn, b"TALK_RS_SEL").ok_or("could not intern property")?;
+    let incr = intern(&conn, b"INCR").ok_or("could not intern INCR")?;
+    let list = request_target(
+        &conn,
+        window,
+        clipboard,
+        targets_atom,
+        property,
+        SNAPSHOT_LIMIT,
+    )
+    .ok_or("could not fetch clipboard TARGETS")?;
+    if list.format != 32 || list.bytes_after != 0 {
+        return Err("invalid clipboard TARGETS".into());
+    }
+    let mut targets = Vec::new();
+    let mut total = 0usize;
+    for atom in list.value32().into_iter().flatten() {
+        let Some(name) = atom_name(&conn, atom) else {
+            continue;
+        };
+        if META_TARGETS.contains(&name.as_bytes()) {
+            continue;
+        }
+        let remaining = SNAPSHOT_LIMIT.saturating_sub(total);
+        if remaining == 0 {
+            log::warn!("clipboard snapshot reached 32 MiB cap");
+            break;
+        }
+        let Some(value) = request_target(&conn, window, clipboard, atom, property, remaining)
+        else {
+            log::warn!("clipboard snapshot: could not fetch target {name}");
+            continue;
+        };
+        if value.type_ == incr || value.bytes_after != 0 || value.value.len() > remaining {
+            log::warn!("clipboard snapshot: skipping incremental/oversized target {name}");
+            continue;
+        }
+        if !matches!(value.format, 8 | 16 | 32) {
+            continue;
+        }
+        let Some(property_type) = atom_name(&conn, value.type_) else {
+            continue;
+        };
+        total += value.value.len();
+        targets.push(ClipboardTarget {
+            name,
+            property_type,
+            format: value.format,
+            bytes: value.value,
+        });
+    }
+    let _ = conn.destroy_window(window);
+    let _ = conn.flush();
+    Ok(Some(ClipboardSnapshot { targets }))
+}
 
 /// Compute the X11 client-base of a window XID for a given server
 /// `resource_id_mask`.
@@ -231,6 +374,17 @@ pub fn x11_clipboard_get() -> Option<String> {
 ///
 /// Returns `None` if the X11 connection or ownership claim fails.
 pub fn x11_clipboard_set(text: &str) -> Option<ClipboardServeHandle> {
+    x11_clipboard_set_snapshot(ClipboardSnapshot {
+        targets: vec![ClipboardTarget {
+            name: "UTF8_STRING".into(),
+            property_type: "UTF8_STRING".into(),
+            format: 8,
+            bytes: text.as_bytes().to_vec(),
+        }],
+    })
+}
+
+pub fn x11_clipboard_set_snapshot(snapshot: ClipboardSnapshot) -> Option<ClipboardServeHandle> {
     let (conn, screen_num) = x11rb::connect(None).ok()?;
     let setup = conn.setup();
     let root = setup.roots[screen_num].root;
@@ -280,7 +434,6 @@ pub fn x11_clipboard_set(text: &str) -> Option<ClipboardServeHandle> {
     let stop2 = Arc::clone(&stop);
     let skip2 = Arc::clone(&skip_grace);
     let fetches2 = Arc::clone(&fetches);
-    let text = text.to_string();
 
     let atoms = Atoms {
         clipboard,
@@ -292,7 +445,7 @@ pub fn x11_clipboard_set(text: &str) -> Option<ClipboardServeHandle> {
         serve_loop(
             &conn,
             &atoms,
-            &text,
+            &snapshot,
             &stop2,
             &skip2,
             &fetches2,
@@ -316,6 +469,17 @@ pub fn x11_clipboard_set(text: &str) -> Option<ClipboardServeHandle> {
 /// Hold the restored selection until another client takes ownership.
 /// Runs only in the hidden, detached clipboard-hold subprocess.
 pub fn x11_clipboard_hold(text: &str) -> Result<(), String> {
+    x11_clipboard_hold_snapshot(&ClipboardSnapshot {
+        targets: vec![ClipboardTarget {
+            name: "UTF8_STRING".into(),
+            property_type: "UTF8_STRING".into(),
+            format: 8,
+            bytes: text.as_bytes().to_vec(),
+        }],
+    })
+}
+
+pub fn x11_clipboard_hold_snapshot(snapshot: &ClipboardSnapshot) -> Result<(), String> {
     let (conn, screen_num) = x11rb::connect(None).map_err(|e| e.to_string())?;
     let root = conn.setup().roots[screen_num].root;
     let window = conn.generate_id().map_err(|e| e.to_string())?;
@@ -364,7 +528,7 @@ pub fn x11_clipboard_hold(text: &str) -> Result<(), String> {
     loop {
         match conn.wait_for_event() {
             Ok(Event::SelectionRequest(req)) if req.selection == atoms.clipboard => {
-                serve_request(&conn, &req, text, &atoms, &fetches, mask, own_base);
+                serve_request(&conn, &req, snapshot, &atoms, &fetches, mask, own_base);
             }
             Ok(Event::SelectionClear(ev)) if ev.selection == atoms.clipboard => break,
             Ok(_) => {}
@@ -397,7 +561,7 @@ fn intern(conn: &RustConnection, name: &[u8]) -> Option<Atom> {
 fn serve_loop(
     conn: &RustConnection,
     atoms: &Atoms,
-    text: &str,
+    snapshot: &ClipboardSnapshot,
     stop: &AtomicBool,
     skip_grace: &AtomicBool,
     fetches: &FetchMap,
@@ -416,7 +580,7 @@ fn serve_loop(
                     poll_and_serve(
                         conn,
                         atoms,
-                        text,
+                        snapshot,
                         fetches,
                         resource_id_mask,
                         own_client_base,
@@ -432,7 +596,7 @@ fn serve_loop(
                 serve_request(
                     conn,
                     &req,
-                    text,
+                    snapshot,
                     atoms,
                     fetches,
                     resource_id_mask,
@@ -455,7 +619,7 @@ fn serve_loop(
 fn poll_and_serve(
     conn: &RustConnection,
     atoms: &Atoms,
-    text: &str,
+    snapshot: &ClipboardSnapshot,
     fetches: &FetchMap,
     resource_id_mask: u32,
     own_client_base: u32,
@@ -465,7 +629,7 @@ fn poll_and_serve(
             serve_request(
                 conn,
                 &req,
-                text,
+                snapshot,
                 atoms,
                 fetches,
                 resource_id_mask,
@@ -483,7 +647,7 @@ fn poll_and_serve(
 fn serve_request(
     conn: &RustConnection,
     req: &SelectionRequestEvent,
-    text: &str,
+    snapshot: &ClipboardSnapshot,
     atoms: &Atoms,
     fetches: &FetchMap,
     resource_id_mask: u32,
@@ -498,7 +662,14 @@ fn serve_request(
 
     let ok = if req.target == atoms.targets {
         // Advertise supported targets.
-        let supported = [atoms.targets, atoms.utf8_string];
+        let supported: Vec<_> = std::iter::once(atoms.targets)
+            .chain(
+                snapshot
+                    .targets
+                    .iter()
+                    .filter_map(|t| intern(conn, t.name.as_bytes())),
+            )
+            .collect();
         conn.change_property32(
             PropMode::REPLACE,
             req.requestor,
@@ -507,18 +678,45 @@ fn serve_request(
             &supported,
         )
         .is_ok()
-    } else if req.target == atoms.utf8_string {
-        // Provide the text.
-        let wrote = conn
-            .change_property8(
-                PropMode::REPLACE,
-                req.requestor,
-                prop,
-                atoms.utf8_string,
-                text.as_bytes(),
-            )
-            .is_ok();
-        if wrote {
+    } else if let Some(target) = snapshot
+        .targets
+        .iter()
+        .find(|t| intern(conn, t.name.as_bytes()) == Some(req.target))
+    {
+        let kind = intern(conn, target.property_type.as_bytes()).unwrap_or(req.target);
+        let wrote = match target.format {
+            8 => conn
+                .change_property8(PropMode::REPLACE, req.requestor, prop, kind, &target.bytes)
+                .is_ok(),
+            16 => conn
+                .change_property16(
+                    PropMode::REPLACE,
+                    req.requestor,
+                    prop,
+                    kind,
+                    &target
+                        .bytes
+                        .chunks_exact(2)
+                        .map(|v| u16::from_ne_bytes([v[0], v[1]]))
+                        .collect::<Vec<_>>(),
+                )
+                .is_ok(),
+            32 => conn
+                .change_property32(
+                    PropMode::REPLACE,
+                    req.requestor,
+                    prop,
+                    kind,
+                    &target
+                        .bytes
+                        .chunks_exact(4)
+                        .map(|v| u32::from_ne_bytes([v[0], v[1], v[2], v[3]]))
+                        .collect::<Vec<_>>(),
+                )
+                .is_ok(),
+            _ => false,
+        };
+        if wrote && req.target == atoms.utf8_string {
             // Record that a paste target actually fetched our text,
             // bucketed by the requestor's X11 client-base.  This is
             // the key paste-diagnostic signal: see
@@ -541,7 +739,7 @@ fn serve_request(
                          (client-base {:#x}, {} bytes, this-client count={}, total={})",
                         req.requestor,
                         requestor_base,
-                        text.len(),
+                        target.bytes.len(),
                         this_count,
                         total,
                     );
