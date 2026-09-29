@@ -256,6 +256,13 @@ impl<S: DaemonNamespace> DaemonLock<S> {
     /// # }
     /// ```
     pub fn signal(&self, process: DaemonProcess<S>) -> Result<(), TalkError> {
+        if !matches!(self.status()?, SlotStatus::Running(current) if current.pid == process.pid) {
+            return Err(TalkError::Config(format!(
+                "daemon PID {} no longer owns {}",
+                process.pid,
+                self.slot.pid_path().display()
+            )));
+        }
         send_sigint(process.pid, &self.slot.log_path())?;
         if S::RELEASE_POLICY == ReleasePolicy::Immediate {
             self.cleanup_if_owner(process.pid)?;
@@ -420,6 +427,10 @@ fn cleanup_unpublished_child(child: &mut Child) -> Result<(), TalkError> {
 fn send_sigint(pid: u32, log_path: &Path) -> Result<(), TalkError> {
     use std::io::Write as _;
 
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return Err(TalkError::Config(format!("invalid daemon PID {pid}")));
+    }
+
     let trace = |message: &str| match fs::OpenOptions::new().append(true).open(log_path) {
         Ok(mut file) => {
             if let Err(error) = writeln!(file, "{message}") {
@@ -458,26 +469,64 @@ pub fn cache_dir() -> Result<PathBuf, TalkError> {
 
 /// Check if a process is alive using `kill(pid, 0)`.
 fn is_process_alive(pid: u32) -> bool {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return false;
+    }
     let nix_pid = Pid::from_raw(pid as i32);
     kill(nix_pid, None).is_ok()
 }
 
-/// Read the PID from the PID file, returning `None` if the file doesn't exist.
-fn read_pid_file(path: &Path) -> Result<Option<u32>, TalkError> {
+fn process_start_time(pid: u32) -> std::io::Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    crate::proc_stat::start_time(&stat)
+}
+
+fn process_matches(pid: u32, expected_start: Option<u64>) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+    match expected_start {
+        Some(start) => process_start_time(pid).is_ok_and(|actual| actual == start),
+        None => {
+            let executable = std::env::current_exe();
+            let process_executable = fs::read_link(format!("/proc/{pid}/exe"));
+            matches!((executable, process_executable), (Ok(ours), Ok(theirs)) if ours == theirs)
+        }
+    }
+}
+
+fn read_pid_identity(path: &Path) -> Result<Option<(u32, Option<u64>)>, TalkError> {
     match fs::read_to_string(path) {
         Ok(content) => {
-            let pid = content.trim().parse::<u32>().map_err(|e| {
-                TalkError::Config(format!("invalid PID in {}: {}", path.display(), e))
-            })?;
-            Ok(Some(pid))
+            let mut parts = content.split_whitespace();
+            let Some(pid) = parts.next().and_then(|value| value.parse::<i64>().ok()) else {
+                return Ok(Some((0, None)));
+            };
+            let start = match parts.next().map(|value| value.parse::<u64>()).transpose() {
+                Ok(start) => start,
+                Err(_) => return Ok(Some((0, None))),
+            };
+            if parts.next().is_some() {
+                return Ok(Some((0, None)));
+            }
+            let pid = if pid <= 1 || pid > i32::MAX as i64 {
+                0
+            } else {
+                pid as u32
+            };
+            Ok(Some((pid, start)))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(TalkError::Config(format!(
-            "failed to read PID file {}: {}",
-            path.display(),
-            e
+            "failed to read PID file {}: {e}",
+            path.display()
         ))),
     }
+}
+
+/// Read the PID from the PID file, returning `None` if the file doesn't exist.
+fn read_pid_file(path: &Path) -> Result<Option<u32>, TalkError> {
+    Ok(read_pid_identity(path)?.map(|(pid, _)| pid))
 }
 
 /// Check daemon status from the PID file.
@@ -485,10 +534,10 @@ fn read_pid_file(path: &Path) -> Result<Option<u32>, TalkError> {
 /// If the PID file exists but the process is dead, removes the stale file.
 /// Caller MUST hold the lock before calling this.
 fn check_status(pid_file: &Path) -> Result<DaemonStatus, TalkError> {
-    match read_pid_file(pid_file)? {
+    match read_pid_identity(pid_file)? {
         None => Ok(DaemonStatus::NotRunning),
-        Some(pid) => {
-            if is_process_alive(pid) {
+        Some((pid, start)) => {
+            if process_matches(pid, start) {
                 Ok(DaemonStatus::Running { pid })
             } else {
                 // Stale PID file — process is dead, clean up
@@ -513,7 +562,12 @@ fn write_pid_file(pid_file: &Path, pid: u32) -> Result<(), TalkError> {
         })?;
     }
 
-    fs::write(pid_file, format!("{}\n", pid)).map_err(|e| {
+    let start = process_start_time(pid).map_err(|e| {
+        TalkError::Config(format!(
+            "failed to read start time of daemon PID {pid}: {e}"
+        ))
+    })?;
+    fs::write(pid_file, format!("{pid} {start}\n")).map_err(|e| {
         TalkError::Config(format!(
             "failed to write PID file {}: {}",
             pid_file.display(),
@@ -571,14 +625,101 @@ mod tests {
     }
 
     #[test]
+    fn invalid_pids_are_stale_and_never_signal_a_process_group() {
+        for invalid in ["0", "1", "-1"] {
+            let dir = TempDir::new().expect("create temp dir");
+            let slot = DaemonSlot::<DictateDaemon>::in_dir(dir.path());
+            fs::write(slot.pid_path(), format!("{invalid}\n")).expect("write invalid PID");
+
+            let lock = slot.acquire_lock().expect("acquire slot lock");
+            assert_eq!(
+                lock.status().expect("check invalid PID"),
+                SlotStatus::NotRunning
+            );
+            assert!(
+                !slot.pid_path().exists(),
+                "stale PID {invalid} must be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_live_pid_and_reused_pid_are_not_daemons() {
+        for stale_identity in [false, true] {
+            let dir = TempDir::new().expect("create temp dir");
+            let slot = DaemonSlot::<DictateDaemon>::in_dir(dir.path());
+            let mut command = Command::new("sleep");
+            command.arg("30").process_group(0);
+            let mut child = TestChild(command.spawn().expect("spawn isolated harmless child"));
+            let pid = child.0.id();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while fs::read_link(format!("/proc/{pid}/exe"))
+                .is_ok_and(|path| path == std::env::current_exe().expect("test executable"))
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let content = if stale_identity {
+                let stat =
+                    fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
+                let start = stat
+                    .rsplit_once(')')
+                    .expect("stat command")
+                    .1
+                    .split_whitespace()
+                    .nth(19)
+                    .expect("stat start time")
+                    .parse::<u64>()
+                    .expect("numeric start time");
+                format!("{pid} {}\n", start + 1)
+            } else {
+                format!("{pid}\n")
+            };
+            fs::write(slot.pid_path(), content).expect("write stale PID identity");
+
+            let lock = slot.acquire_lock().expect("lock slot");
+            assert_eq!(lock.status().expect("status"), SlotStatus::NotRunning);
+            assert!(!slot.pid_path().exists());
+            assert!(child.0.try_wait().expect("check child").is_none());
+        }
+    }
+
+    #[test]
+    fn signal_refuses_changed_pid_identity_after_status() {
+        let dir = TempDir::new().expect("temp dir");
+        let slot = DaemonSlot::<DictateDaemon>::in_dir(dir.path());
+        let mut command = Command::new("sleep");
+        command.arg("30").process_group(0);
+        let mut child = TestChild(command.spawn().expect("spawn isolated child"));
+        let pid = child.0.id();
+        write_pid_file(&slot.pid_path(), pid).expect("publish child identity");
+        let lock = slot.acquire_lock().expect("lock slot");
+        let SlotStatus::Running(process) = lock.status().expect("initial status") else {
+            panic!("child must initially match its recorded start time");
+        };
+        let start = process_start_time(pid).expect("child start time");
+        fs::write(slot.pid_path(), format!("{pid} {}\n", start + 1)).expect("simulate reused PID");
+
+        assert!(
+            lock.signal(process).is_err(),
+            "reused PID must not be signaled"
+        );
+        assert!(child.0.try_wait().expect("check child").is_none());
+    }
+
+    #[test]
     fn test_write_and_read_pid_file() {
         let dir = TempDir::new().expect("create temp dir");
         let path = test_pid_path(&dir);
 
-        write_pid_file(&path, 12345).expect("write pid");
+        let pid = std::process::id();
+        write_pid_file(&path, pid).expect("write pid");
 
         let content = fs::read_to_string(&path).expect("read file");
-        assert_eq!(content.trim(), "12345");
+        assert_eq!(
+            content.trim(),
+            format!("{pid} {}", process_start_time(pid).expect("start time"))
+        );
     }
 
     #[test]
@@ -586,7 +727,7 @@ mod tests {
         let dir = TempDir::new().expect("create temp dir");
         let path = test_pid_path(&dir);
 
-        write_pid_file(&path, reaped_child_pid()).expect("write pid");
+        fs::write(&path, format!("{}\n", reaped_child_pid())).expect("write pid");
 
         let status = check_status(&path).expect("check status");
         assert_eq!(status, DaemonStatus::NotRunning);
@@ -622,7 +763,7 @@ mod tests {
         let dir = TempDir::new().expect("create temp dir");
         let path = test_pid_path(&dir);
 
-        write_pid_file(&path, 12345).expect("write pid");
+        fs::write(&path, "12345\n").expect("write pid");
         assert!(path.exists());
 
         remove_pid_file(&path).expect("remove");
@@ -635,8 +776,44 @@ mod tests {
         let path = test_pid_path(&dir);
 
         fs::write(&path, "not-a-number\n").expect("write");
-        let result = read_pid_file(&path);
-        assert!(result.is_err());
+        assert_eq!(
+            check_status(&path).expect("corrupt status"),
+            DaemonStatus::NotRunning
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn corrupt_pid_file_is_stale_and_can_be_replaced() {
+        let dir = TempDir::new().expect("temp dir");
+        let slot = DaemonSlot::<DictateDaemon>::in_dir(dir.path());
+        fs::write(slot.pid_path(), "garbage\n").expect("write corrupt PID");
+
+        let lock = slot.acquire_lock().expect("lock slot");
+        assert_eq!(lock.status().expect("status"), SlotStatus::NotRunning);
+        assert!(!slot.pid_path().exists());
+        write_pid_file(&slot.pid_path(), std::process::id()).expect("replace stale file");
+        assert!(matches!(
+            lock.status().expect("new status"),
+            SlotStatus::Running(_)
+        ));
+    }
+
+    #[test]
+    fn unreadable_pid_path_is_reported_without_deletion() {
+        let dir = TempDir::new().expect("temp dir");
+        let slot = DaemonSlot::<DictateDaemon>::in_dir(dir.path());
+        fs::create_dir(slot.pid_path()).expect("make unreadable PID path");
+
+        let error = slot
+            .acquire_lock()
+            .expect("lock slot")
+            .status()
+            .expect_err("read must fail");
+        assert!(error
+            .to_string()
+            .contains(&slot.pid_path().display().to_string()));
+        assert!(slot.pid_path().is_dir());
     }
 
     #[test]
@@ -668,7 +845,8 @@ mod tests {
         let dir = TempDir::new().expect("create temp dir");
         let dictate = DaemonSlot::<DictateDaemon>::in_dir(dir.path());
         let record = DaemonSlot::<RecordDaemon>::in_dir(dir.path());
-        write_pid_file(&dictate.pid_path(), reaped_child_pid()).expect("write dictate pid");
+        fs::write(dictate.pid_path(), format!("{}\n", reaped_child_pid()))
+            .expect("write dictate pid");
         fs::write(record.pid_path(), format!("{}\n", std::process::id()))
             .expect("write record pid");
 
@@ -812,7 +990,7 @@ mod tests {
         write_pid_file(&slot.pid_path(), std::process::id()).expect("original owner");
         let guard = slot.owner_guard();
         let replacement = reaped_child_pid();
-        write_pid_file(&slot.pid_path(), replacement).expect("replacement owner");
+        fs::write(slot.pid_path(), format!("{replacement}\n")).expect("replacement owner");
         drop(guard);
         assert_eq!(
             read_pid_file(&slot.pid_path()).expect("replacement remains"),

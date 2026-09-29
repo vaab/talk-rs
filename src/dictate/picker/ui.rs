@@ -1043,7 +1043,7 @@ fn diff_markup(reference: &str, candidate: &str, del_color: &str, ins_color: &st
 /// `cached_entries` contains pre-populated results that are shown
 /// immediately (no spinner, no API call).  Each tuple is
 /// `(provider, model, text, is_primary, streaming)` where `is_primary`
-/// marks the entry that was already pasted in a previous run
+/// marks the saved selection for pre-selection (not proof of paste)
 /// (selecting it again skips re-pasting).
 ///
 /// Returns a selection, navigation request, or cancellation.
@@ -2185,8 +2185,7 @@ pub(super) async fn pick_with_streaming_gtk(
         };
 
         // Cached entries: rows with transcript already filled.
-        // The `is_primary` flag marks the entry that was already
-        // pasted in a previous run — it gets pre-selected.
+        // The `is_primary` flag marks the saved selection for pre-selection.
         let mut selected_row = false;
         // Track which row to select, deferring the actual selection
         // until AFTER `connect_row_selected` is wired below.  Wiring
@@ -3209,6 +3208,129 @@ pub(super) async fn pick_with_streaming_gtk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcription::TranscriptionEvent;
+
+    struct ScriptedRealtime {
+        events: Vec<TranscriptionEvent>,
+        connect_error: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transcription::RealtimeTranscriber for ScriptedRealtime {
+        async fn validate(&self) -> Result<(), TalkError> {
+            Ok(())
+        }
+
+        async fn transcribe_realtime(
+            &self,
+            _audio_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
+        ) -> Result<tokio::sync::mpsc::Receiver<TranscriptionEvent>, TalkError> {
+            if self.connect_error {
+                return Err(TalkError::Transcription("upgrade rejected".into()));
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            for event in &self.events {
+                tx.try_send(event.clone()).expect("scripted event fits");
+            }
+            Ok(rx)
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_adapter_preserves_final_text_and_timed_segments() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::dictate::picker::backend::run_realtime_transcription(
+            Box::new(ScriptedRealtime {
+                events: vec![
+                    TranscriptionEvent::TextDelta {
+                        text: "provisional".into(),
+                    },
+                    TranscriptionEvent::SegmentDelta {
+                        text: "corrected words".into(),
+                        start: Some(0.25),
+                        end: Some(1.5),
+                    },
+                    TranscriptionEvent::Done,
+                ],
+                connect_error: false,
+            }),
+            std::sync::Arc::new(vec![100; 480]),
+            tx,
+            Provider::OpenAI,
+            "live-model".into(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        match rx.recv().expect("provisional update") {
+            PickerMessage::StreamUpdate {
+                provider,
+                model,
+                accumulated_text,
+            } => {
+                assert_eq!(
+                    (provider, model.as_str(), accumulated_text.as_str()),
+                    (Provider::OpenAI, "live-model", "provisional")
+                );
+            }
+            _ => panic!("expected provisional update"),
+        }
+        match rx.recv().expect("corrected update") {
+            PickerMessage::StreamUpdate {
+                accumulated_text, ..
+            } => {
+                assert_eq!(accumulated_text, "corrected words");
+            }
+            _ => panic!("expected corrected update"),
+        }
+        match rx.recv().expect("final candidate") {
+            PickerMessage::Candidate(candidate) => {
+                assert_eq!(candidate.provider, Provider::OpenAI);
+                assert_eq!(candidate.model, "live-model");
+                assert_eq!(candidate.text, "corrected words");
+                assert!(candidate.streaming);
+                assert_eq!(candidate.error, None);
+                assert_eq!(
+                    candidate.segments.map(|segments| segments
+                        .into_iter()
+                        .map(|segment| (segment.start, segment.end, segment.text))
+                        .collect::<Vec<_>>()),
+                    Some(vec![(0.25, 1.5, "corrected words".to_string())])
+                );
+            }
+            _ => panic!("expected final candidate"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn realtime_adapter_reports_upgrade_failure_as_error_candidate() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::dictate::picker::backend::run_realtime_transcription(
+            Box::new(ScriptedRealtime {
+                events: Vec::new(),
+                connect_error: true,
+            }),
+            std::sync::Arc::new(vec![]),
+            tx,
+            Provider::OpenAI,
+            "live-model".into(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        match rx.recv().expect("error candidate") {
+            PickerMessage::Candidate(candidate) => {
+                assert_eq!(candidate.text, "");
+                assert_eq!(
+                    candidate.error.as_deref(),
+                    Some("Transcription error: upgrade rejected")
+                );
+                assert!(candidate.streaming);
+            }
+            _ => panic!("expected error candidate"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn concurrent_realtime_sample_consumers_share_one_decode() {

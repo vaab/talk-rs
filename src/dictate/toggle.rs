@@ -147,11 +147,11 @@ pub async fn toggle_dispatch(opts: &DictateOpts) -> Result<(), TalkError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn test_opts() -> DictateOpts {
+    pub(in crate::dictate) fn test_opts() -> DictateOpts {
         DictateOpts {
             save: None,
             output_yaml: None,
@@ -183,119 +183,87 @@ mod tests {
     }
 
     #[test]
-    fn test_build_daemon_args_includes_timestamp() {
-        let mut opts = test_opts();
-        opts.timestamp = true;
-        let args = build_daemon_args(&opts, None);
-        assert!(
-            args.contains(&"--timestamp".to_string()),
-            "--timestamp should be forwarded to daemon"
+    fn each_forwarded_flag_has_exact_daemon_arguments() {
+        type FlagCase = (&'static str, fn(&mut DictateOpts), &'static [&'static str]);
+        let cases: &[FlagCase] = &[
+            ("timestamp", |o| o.timestamp = true, &["--timestamp"]),
+            ("no_paste", |o| o.no_paste = true, &["--no-paste"]),
+            ("pick", |o| o.pick = true, &["--pick"]),
+            ("retry_last", |o| o.retry_last = true, &["--retry-last"]),
+            (
+                "replace",
+                |o| o.replace_last_paste = true,
+                &["--replace-last-paste"],
+            ),
+            (
+                "input",
+                |o| o.input_audio_file = Some("/tmp/test.ogg".into()),
+                &["--input-audio-file", "/tmp/test.ogg"],
+            ),
+            (
+                "yaml",
+                |o| o.output_yaml = Some("/tmp/out.yaml".into()),
+                &["--output-yaml", "/tmp/out.yaml"],
+            ),
+            (
+                "provider",
+                |o| o.provider = Some(crate::config::Provider::OpenAI),
+                &["--provider", "openai"],
+            ),
+            (
+                "model",
+                |o| o.model = Some("test".into()),
+                &["--model", "test"],
+            ),
+            ("diarize", |o| o.diarize = true, &["--diarize"]),
+            ("realtime", |o| o.realtime = true, &["--realtime"]),
+            ("no_sounds", |o| o.no_sounds = true, &["--no-sounds"]),
+            ("no_boop", |o| o.no_boop = true, &["--no-boop"]),
+            (
+                "no_chunk",
+                |o| o.no_chunk_paste = true,
+                &["--no-chunk-paste"],
+            ),
+            ("monitor", |o| o.monitor = true, &["--monitor"]),
+            ("no_overlay", |o| o.no_overlay = true, &["--no-overlay"]),
+            (
+                "no_auto_pause",
+                |o| o.no_auto_pause = true,
+                &["--no-auto-pause"],
+            ),
+            (
+                "viz",
+                |o| o.viz = Some(crate::config::VizMode::Waterfall),
+                &["--viz", "waterfall"],
+            ),
+            ("mono", |o| o.mono = true, &["--mono"]),
+            (
+                "upload",
+                |o| o.upload_format = crate::transcription::UploadFormat::Ogg,
+                &["--upload-format", "ogg"],
+            ),
+            (
+                "bt",
+                |o| o.no_bt_auto_switch = true,
+                &["--no-bt-auto-switch"],
+            ),
+            (
+                "save",
+                |o| o.save = Some("/tmp/save.ogg".into()),
+                &["--save", "/tmp/save.ogg"],
+            ),
+        ];
+        for (name, change, extra) in cases {
+            let mut opts = test_opts();
+            change(&mut opts);
+            let mut expected = vec!["dictate", "--daemon"];
+            expected.extend_from_slice(extra);
+            assert_eq!(build_daemon_args(&opts, None), expected, "{name}");
+        }
+        assert_eq!(
+            build_daemon_args(&test_opts(), Some("0x1234".into())),
+            ["dictate", "--daemon", "--target-window", "0x1234"]
         );
-    }
-
-    #[test]
-    fn test_build_daemon_args_includes_no_paste() {
-        let mut opts = test_opts();
-        opts.no_paste = true;
-        let args = build_daemon_args(&opts, None);
-        assert!(
-            args.contains(&"--no-paste".to_string()),
-            "--no-paste should be forwarded to daemon"
-        );
-    }
-
-    #[test]
-    fn test_build_daemon_args_includes_pick() {
-        let mut opts = test_opts();
-        opts.pick = true;
-        let args = build_daemon_args(&opts, None);
-        assert!(
-            args.contains(&"--pick".to_string()),
-            "--pick should be forwarded to daemon"
-        );
-    }
-
-    #[test]
-    fn test_build_daemon_args_includes_retry_last() {
-        let mut opts = test_opts();
-        opts.retry_last = true;
-        let args = build_daemon_args(&opts, None);
-        assert!(
-            args.contains(&"--retry-last".to_string()),
-            "--retry-last should be forwarded to daemon"
-        );
-    }
-
-    #[test]
-    fn test_build_daemon_args_includes_replace_last_paste() {
-        let mut opts = test_opts();
-        opts.replace_last_paste = true;
-        let args = build_daemon_args(&opts, None);
-        assert!(
-            args.contains(&"--replace-last-paste".to_string()),
-            "--replace-last-paste should be forwarded to daemon"
-        );
-    }
-
-    #[test]
-    fn test_build_daemon_args_includes_input_audio_file() {
-        let mut opts = test_opts();
-        opts.input_audio_file = Some(PathBuf::from("/tmp/test.ogg"));
-        let args = build_daemon_args(&opts, None);
-        let idx = args
-            .iter()
-            .position(|a| a == "--input-audio-file")
-            .expect("--input-audio-file should be present");
-        assert_eq!(args[idx + 1], "/tmp/test.ogg");
-    }
-
-    #[test]
-    fn test_build_daemon_args_includes_output_yaml() {
-        let mut opts = test_opts();
-        opts.output_yaml = Some(PathBuf::from("/tmp/out.yaml"));
-        let args = build_daemon_args(&opts, None);
-        let idx = args
-            .iter()
-            .position(|a| a == "--output-yaml")
-            .expect("--output-yaml should be present");
-        assert_eq!(args[idx + 1], "/tmp/out.yaml");
-    }
-
-    #[test]
-    fn test_build_daemon_args_does_not_include_toggle() {
-        let mut opts = test_opts();
-        opts.toggle = true;
-        opts.daemon = true;
-        let args = build_daemon_args(&opts, None);
-        assert!(
-            !args.contains(&"--toggle".to_string()),
-            "--toggle should NOT be forwarded (already handled)"
-        );
-        // Verify --daemon appears exactly once
-        let daemon_count = args.iter().filter(|a| *a == "--daemon").count();
-        assert_eq!(daemon_count, 1, "--daemon should appear exactly once");
-    }
-
-    #[test]
-    fn test_build_daemon_args_includes_target_window() {
-        let opts = test_opts();
-        let args = build_daemon_args(&opts, Some("0x12345678".to_string()));
-        let idx = args
-            .iter()
-            .position(|a| a == "--target-window")
-            .expect("--target-window should be present");
-        assert_eq!(args[idx + 1], "0x12345678");
-    }
-
-    #[test]
-    fn test_build_daemon_args_omits_unset_flags() {
-        let opts = test_opts();
-        let args = build_daemon_args(&opts, None);
-        assert!(!args.contains(&"--timestamp".to_string()));
-        assert!(!args.contains(&"--no-paste".to_string()));
-        assert!(!args.contains(&"--diarize".to_string()));
-        assert!(!args.contains(&"--realtime".to_string()));
-        assert!(!args.contains(&"--no-sounds".to_string()));
     }
 
     #[test]
@@ -321,7 +289,6 @@ mod tests {
         opts.save = Some(PathBuf::from("/tmp/save.ogg"));
         opts.output_yaml = Some(PathBuf::from("/tmp/output.yaml"));
         opts.input_audio_file = Some(PathBuf::from("/tmp/input.ogg"));
-        opts.retry_last = true;
         opts.pick = true;
         opts.replace_last_paste = true;
         opts.toggle = true;
@@ -361,7 +328,6 @@ mod tests {
                 "/tmp/output.yaml",
                 "--input-audio-file",
                 "/tmp/input.ogg",
-                "--retry-last",
                 "--pick",
                 "--replace-last-paste",
                 "--target-window",

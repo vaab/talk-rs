@@ -165,6 +165,7 @@ const REALTIME_FEED_CHUNK: usize = 480;
 #[derive(Default)]
 struct PickerTranscriptAccumulator {
     generic_text: String,
+    current_line: String,
     item_text: OrderedItemTranscript,
     timed_segments: Vec<TranscriptSegment>,
 }
@@ -173,14 +174,15 @@ impl PickerTranscriptAccumulator {
     fn apply(&mut self, event: &TranscriptionEvent) -> Option<String> {
         match event {
             TranscriptionEvent::TextDelta { text } => {
-                self.generic_text.push_str(text);
+                self.current_line.push_str(text);
                 Some(self.final_text())
             }
             TranscriptionEvent::SegmentDelta { text, start, end } => {
-                if text.is_empty() {
+                if text.trim().is_empty() {
                     return None;
                 }
                 let trimmed = text.trim().to_string();
+                self.current_line.clear();
                 if let (Some(start), Some(end)) = (start, end) {
                     self.timed_segments.push(TranscriptSegment {
                         start: *start,
@@ -188,10 +190,11 @@ impl PickerTranscriptAccumulator {
                         text: trimmed.clone(),
                     });
                 }
-                if !self.generic_text.is_empty() {
-                    self.generic_text.push(' ');
-                }
-                self.generic_text.push_str(&trimmed);
+                self.generic_text
+                    .push_str(&crate::transcription::realtime::join_segment(
+                        self.generic_text.chars().last(),
+                        text,
+                    ));
                 Some(self.final_text())
             }
             TranscriptionEvent::ItemCreated {
@@ -224,7 +227,14 @@ impl PickerTranscriptAccumulator {
 
     fn final_text(&self) -> String {
         if self.item_text.is_empty() {
-            self.generic_text.trim().to_string()
+            let mut text = self.generic_text.clone();
+            if !self.current_line.is_empty() {
+                text.push_str(&crate::transcription::realtime::join_segment(
+                    text.chars().last(),
+                    &self.current_line,
+                ));
+            }
+            text.trim().to_string()
         } else {
             self.item_text.snapshot().trim().to_string()
         }
@@ -525,7 +535,34 @@ mod tests {
             end: None,
         });
 
-        assert_eq!(transcript.final_text(), "prefix first second");
+        assert_eq!(transcript.final_text(), "first second");
+    }
+
+    #[test]
+    fn picker_segment_replaces_its_incremental_delta() {
+        let mut transcript = PickerTranscriptAccumulator::default();
+        transcript.apply(&TranscriptionEvent::TextDelta {
+            text: "Hello".into(),
+        });
+        transcript.apply(&TranscriptionEvent::SegmentDelta {
+            text: "Hello".into(),
+            start: None,
+            end: None,
+        });
+        assert_eq!(transcript.final_text(), "Hello");
+    }
+
+    #[test]
+    fn picker_segments_preserve_newline_at_boundary() {
+        let mut transcript = PickerTranscriptAccumulator::default();
+        for text in ["Hello\n", "world"] {
+            transcript.apply(&TranscriptionEvent::SegmentDelta {
+                text: text.into(),
+                start: None,
+                end: None,
+            });
+        }
+        assert_eq!(transcript.final_text(), "Hello\nworld");
     }
 
     /// Drain every queued message and return the

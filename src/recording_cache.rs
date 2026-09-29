@@ -124,6 +124,16 @@ pub struct LastPasteState {
     pub text: String,
 }
 
+impl LastPasteState {
+    /// Never delete text when the stored paste cannot be tied to this window.
+    pub fn replacement_count_for(&self, target_window: Option<&str>) -> usize {
+        match (self.window_id.as_deref(), target_window) {
+            (Some(saved), Some(target)) if saved == target => self.char_count,
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PickerSelectionMetadata {
     provider: String,
@@ -1338,6 +1348,19 @@ fn rotate_cache_in_dir(dir: &Path, keep: usize) -> Result<(), TalkError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn replacement_count_is_zero_for_a_different_or_unknown_window() {
+        let state = LastPasteState {
+            timestamp: String::new(),
+            char_count: 7,
+            window_id: Some("42".into()),
+            text: "example".into(),
+        };
+        assert_eq!(state.replacement_count_for(Some("42")), 7);
+        assert_eq!(state.replacement_count_for(Some("43")), 0);
+        assert_eq!(state.replacement_count_for(None), 0);
+    }
 
     fn sample_metadata(transcript: &str, provider: &str, model: &str, realtime: bool) -> String {
         serde_yaml::to_string(&RecordingMetadata {

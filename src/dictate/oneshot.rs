@@ -337,9 +337,22 @@ pub(crate) async fn dictate_oneshot(
     // (trailing bytes + fsync — very fast).  Never abandon it.
     match cache_ogg_task.await {
         Ok(Ok(())) => log::debug!("cache OGG task completed"),
-        Ok(Err(err)) => log::warn!("cache OGG write error: {}", err),
-        Err(err) => log::warn!("cache OGG task panicked: {}", err),
-    }
+        Ok(Err(err)) => {
+            feeder_handle.abort();
+            encode_handle.abort();
+            transcribe_handle.abort();
+            return (Err(err), t_stop);
+        }
+        Err(err) => {
+            feeder_handle.abort();
+            encode_handle.abort();
+            transcribe_handle.abort();
+            return (
+                Err(TalkError::Audio(format!("cache OGG task failed: {err}"))),
+                t_stop,
+            );
+        }
+    };
     if let Some(t) = t_stop {
         log::info!("timing: stop +{}ms ogg_flushed", t.elapsed().as_millis());
         log::warn!(
@@ -671,5 +684,43 @@ mod tests {
         let cached = decoded_samples(&tokio::fs::read(&cache).await.expect("cached OGG")).await;
         assert!(cached.len().abs_diff(4 * 320) <= 320);
         assert!(cached.iter().any(|&sample| sample.abs() > 1000));
+    }
+
+    #[tokio::test]
+    async fn cache_creation_failure_closes_audio_and_returns_error() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let cache = dir.path().join("missing-parent/capture.ogg");
+        let mut capture = MockAudioCapture::new(16_000, 1, 440.0);
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(vec![9000; 320]).await.expect("send finite PCM");
+        drop(tx);
+        let mut feedback = no_device_feedback();
+        let (transcriber, payload) = inspecting_transcriber();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dictate_oneshot(
+                &mut capture,
+                true,
+                AudioConfig::new(),
+                rx,
+                &cache,
+                transcriber,
+                &CancellationToken::new(),
+                &mut feedback,
+                None,
+                &offline_config(dir.path()),
+                Provider::Mistral,
+                None,
+                false,
+                bt_profile::HeadsetGuard::new(None),
+            ),
+        )
+        .await
+        .expect("dictation must not hang after cache failure")
+        .0
+        .expect_err("cache failure must be returned");
+        assert!(result.to_string().contains("missing-parent"), "{result}");
+        drop(payload);
     }
 }

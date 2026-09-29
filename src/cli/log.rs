@@ -138,6 +138,34 @@ fn open_log_file(path: &Path) -> Result<std::fs::File, String> {
 mod tests {
     use super::*;
     use log::LevelFilter;
+    use std::io::Write;
+
+    #[test]
+    fn log_file_creates_parent_and_appends_to_existing_content() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("nested").join("diagnostics.log");
+        open_log_file(&path)
+            .expect("create nested log")
+            .write_all(b"first\n")
+            .expect("write first event");
+        open_log_file(&path)
+            .expect("reopen existing log")
+            .write_all(b"second\n")
+            .expect("write second event");
+        assert_eq!(std::fs::read(path).expect("read log"), b"first\nsecond\n");
+    }
+
+    #[test]
+    fn oversized_log_is_rotated_before_new_content_is_appended() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("diagnostics.log");
+        std::fs::write(&path, vec![b'x'; MAX_LOG_SIZE as usize + 1]).expect("oversized prior log");
+        open_log_file(&path)
+            .expect("rotate oversized log")
+            .write_all(b"fresh\n")
+            .expect("write fresh event");
+        assert_eq!(std::fs::read(path).expect("read rotated log"), b"fresh\n");
+    }
 
     #[test]
     fn test_base_level_for_verbosity() {

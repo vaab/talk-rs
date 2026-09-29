@@ -130,7 +130,7 @@ pub enum Commands {
         #[arg(long, value_name = "FILE")]
         input_audio_file: Option<String>,
         /// Reuse the last cached recording as input audio
-        #[arg(long)]
+        #[arg(long, conflicts_with = "input_audio_file")]
         retry_last: bool,
         /// Offer multiple candidate transcriptions in a GTK picker window
         #[arg(long)]
@@ -265,6 +265,37 @@ mod tests {
     fn record_toggle_conflicts_with_ui() {
         let error = Cli::try_parse_from(["talk-rs", "record", "--toggle", "--ui"])
             .expect_err("record toggle and UI must conflict");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn dictate_retry_last_parses_alone() {
+        let cli = Cli::try_parse_from(["talk-rs", "dictate", "--retry-last"])
+            .expect("--retry-last alone should parse");
+        match cli.command {
+            Commands::Dictate {
+                retry_last,
+                input_audio_file,
+                ..
+            } => {
+                assert!(retry_last);
+                assert!(input_audio_file.is_none());
+            }
+            other => panic!("expected dictate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dictate_retry_last_conflicts_with_input_audio_file() {
+        let error = Cli::try_parse_from([
+            "talk-rs",
+            "dictate",
+            "--retry-last",
+            "--input-audio-file",
+            "in.ogg",
+        ])
+        .expect_err("--retry-last and --input-audio-file name two different inputs");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
@@ -428,7 +459,6 @@ mod tests {
             "meta.yml",
             "--input-audio-file",
             "in.wav",
-            "--retry-last",
             "--pick",
             "--replace-last-paste",
             "--provider",
@@ -486,7 +516,7 @@ mod tests {
                 assert_eq!(save.as_deref(), Some("rec.ogg"));
                 assert_eq!(output_yaml.as_deref(), Some("meta.yml"));
                 assert_eq!(input_audio_file.as_deref(), Some("in.wav"));
-                assert!(retry_last);
+                assert!(!retry_last);
                 assert!(pick);
                 assert!(replace_last_paste);
                 assert_eq!(provider, Some(Provider::OpenAI));

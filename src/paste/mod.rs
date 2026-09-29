@@ -437,11 +437,19 @@ impl RealtimeClipboardGuard {
         &self,
         root: &dyn PasteNode,
         segment: &str,
+        delete_chars_before_paste: usize,
+        target_window: Option<&str>,
         sink: &dyn crate::telemetry::TelemetrySink,
     ) -> Result<(), TalkError> {
+        if delete_chars_before_paste > 0 {
+            if let Some(window) = target_window {
+                ensure_focus(window).await?;
+                simulate_backspace(delete_chars_before_paste).await?;
+            }
+        }
         let ctx = PasteCtx {
-            target_window: None,
-            delete_chars_before_paste: 0,
+            target_window,
+            delete_chars_before_paste,
             t_stop: None,
             sink,
             clipboard: &self.clipboard,
