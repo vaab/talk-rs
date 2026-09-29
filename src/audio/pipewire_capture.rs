@@ -261,13 +261,20 @@ mod tests {
         info.set_rate(48_000);
         info.set_channels(1);
 
-        let bytes = serialize_audio_info(info);
-        assert!(bytes.is_ok());
-        let bytes = bytes.unwrap();
-        assert!(!bytes.is_empty());
-
-        // Should be a valid Pod
-        let pod = Pod::from_bytes(&bytes);
-        assert!(pod.is_some());
+        let expected = Value::Object(pod::Object {
+            type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+            id: spa::param::ParamType::EnumFormat.as_raw(),
+            properties: info.into(),
+        });
+        let mut input = AudioInfoRaw::new();
+        input.set_format(AudioFormat::S16LE);
+        input.set_rate(48_000);
+        input.set_channels(1);
+        let bytes = serialize_audio_info(input).expect("serialize audio format");
+        let (remaining, actual) =
+            spa::pod::deserialize::PodDeserializer::deserialize_any_from(&bytes)
+                .expect("decode SPA Pod");
+        assert_eq!(remaining, &[] as &[u8]);
+        assert_eq!(actual, expected);
     }
 }

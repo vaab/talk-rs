@@ -97,6 +97,24 @@ impl AudioResampler {
         self.resample_inner(input, Some(input.len()))
     }
 
+    /// Drain the sinc filter after the last real input, returning only the
+    /// delayed frames needed to reach the real stream's output duration.
+    fn finish(&mut self, mut remaining: usize) -> Result<Vec<i16>, TalkError> {
+        let mut tail = Vec::with_capacity(remaining);
+        while remaining > 0 {
+            let chunk = self.resample_inner(&[], Some(0))?;
+            if chunk.is_empty() {
+                return Err(TalkError::Audio(
+                    "resampler produced no frames while draining".into(),
+                ));
+            }
+            let take = chunk.len().min(remaining);
+            tail.extend_from_slice(&chunk[..take]);
+            remaining -= take;
+        }
+        Ok(tail)
+    }
+
     /// Expected number of input frames per `process_chunk` call.
     pub fn chunk_frames(&self) -> usize {
         self.chunk_frames
@@ -180,30 +198,56 @@ pub fn spawn_resample_task(
 
     tokio::spawn(async move {
         let mut input_rx = input_rx;
+        let mut input_frames = 0u64;
+        let mut output_frames = 0usize;
+        let mut pending = Vec::new();
         while let Some(chunk) = input_rx.recv().await {
-            let result = if chunk.len() == expected {
-                resampler.process_chunk(&chunk)
-            } else {
-                // Final partial chunk from capture stop
-                log::debug!(
-                    "resample: partial chunk ({}/{} frames), flushing",
-                    chunk.len(),
-                    expected
-                );
-                resampler.flush(&chunk)
-            };
-
-            match result {
-                Ok(resampled) => {
+            input_frames += chunk.len() as u64;
+            pending.extend(chunk);
+            let mut consumed = 0;
+            while pending.len() - consumed >= expected {
+                match resampler.process_chunk(&pending[consumed..consumed + expected]) {
+                    Ok(resampled) => {
+                        output_frames += resampled.len();
+                        if !resampled.is_empty() && tx.send(resampled).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("resample error: {}", e);
+                        return;
+                    }
+                }
+                consumed += expected;
+            }
+            if consumed > 0 {
+                pending.drain(..consumed);
+            }
+        }
+        let target = (input_frames * to_rate as u64).div_ceil(from_rate as u64) as usize;
+        if !pending.is_empty() {
+            match resampler.flush(&pending) {
+                Ok(mut resampled) => {
+                    resampled.truncate(target.saturating_sub(output_frames));
+                    output_frames += resampled.len();
                     if !resampled.is_empty() && tx.send(resampled).await.is_err() {
-                        log::debug!("resample output channel closed");
-                        break;
+                        return;
                     }
                 }
                 Err(e) => {
                     log::error!("resample error: {}", e);
-                    break;
+                    return;
                 }
+            }
+        }
+        if input_frames > 0 && output_frames < target {
+            match resampler.finish(target - output_frames) {
+                Ok(tail) => {
+                    if !tail.is_empty() && tx.send(tail).await.is_err() {
+                        log::debug!("resample output channel closed during drain");
+                    }
+                }
+                Err(e) => log::error!("resample drain error: {}", e),
             }
         }
         log::debug!("resample task finished");
@@ -215,19 +259,6 @@ pub fn spawn_resample_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_resampler_creation() {
-        let r = AudioResampler::new(48_000, 16_000, 960);
-        assert!(r.is_ok());
-        assert_eq!(r.unwrap().chunk_frames(), 960);
-    }
-
-    #[test]
-    fn test_resampler_same_rate() {
-        let r = AudioResampler::new(16_000, 16_000, 320);
-        assert!(r.is_ok());
-    }
 
     #[test]
     fn test_process_chunk_output_length() {
@@ -283,18 +314,60 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    #[test]
-    fn test_flush_partial() {
-        let mut r = AudioResampler::new(48_000, 16_000, 960).unwrap();
-        // Feed a few full chunks first
-        let full = vec![0i16; 960];
-        for _ in 0..5 {
-            let _ = r.process_chunk(&full);
+    async fn resampled_length(from_rate: u32, to_rate: u32, lengths: &[usize]) -> usize {
+        let frames = from_rate as usize / 50;
+        let (tx, rx) = mpsc::channel(25);
+        let mut output = spawn_resample_task(from_rate, to_rate, rx, frames).unwrap();
+        for &length in lengths {
+            tx.send(vec![100; length]).await.unwrap();
         }
-        // Then flush with a partial chunk
-        let partial = vec![0i16; 480];
-        let out = r.flush(&partial);
-        assert!(out.is_ok());
+        drop(tx);
+        let mut total = 0;
+        while let Some(chunk) = output.recv().await {
+            total += chunk.len();
+        }
+        total
+    }
+
+    async fn resample_samples(chunks: &[Vec<i16>]) -> Vec<i16> {
+        let (tx, rx) = mpsc::channel(10);
+        let mut output = spawn_resample_task(48_000, 16_000, rx, 960).unwrap();
+        for chunk in chunks {
+            tx.send(chunk.clone()).await.unwrap();
+        }
+        drop(tx);
+        let mut samples = Vec::new();
+        while let Some(chunk) = output.recv().await {
+            samples.extend(chunk);
+        }
+        samples
+    }
+
+    #[tokio::test]
+    async fn oversized_resampler_input_matches_equivalent_split_stream() {
+        let pcm: Vec<i16> = (0..(3 * 960 + 157))
+            .map(|i| ((i as f32 * 0.13).sin() * 14000.0) as i16)
+            .collect();
+        let split: Vec<_> = pcm.chunks(960).map(<[i16]>::to_vec).collect();
+        let expected = resample_samples(&split).await;
+        let actual = resample_samples(&[pcm]).await;
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn resampler_drains_exact_and_partial_stream_ends() {
+        for (from, to) in [(48_000, 16_000), (44_100, 16_000), (16_000, 48_000)] {
+            let frame = from as usize / 50;
+            for lengths in [vec![frame; 5], vec![frame, frame, frame / 2]] {
+                let input: usize = lengths.iter().sum();
+                let expected = (input as u64 * to as u64).div_ceil(from as u64) as usize;
+                let actual = resampled_length(from, to, &lengths).await;
+                assert!(
+                    actual.abs_diff(expected) <= 1,
+                    "{from}->{to}: {actual} != {expected}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -314,20 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_resample_task_downsamples() {
-        let (tx, rx) = mpsc::channel(10);
-        let mut out_rx = spawn_resample_task(48_000, 16_000, rx, 960).unwrap();
-
-        // Send several chunks of silence
-        for _ in 0..10 {
-            tx.send(vec![0i16; 960]).await.unwrap();
-        }
-        drop(tx);
-
-        // Should receive some output chunks
-        let mut count = 0;
-        while out_rx.recv().await.is_some() {
-            count += 1;
-        }
-        assert!(count > 0, "should produce output chunks");
+        let actual = resampled_length(48_000, 16_000, &[960; 10]).await;
+        assert!(actual.abs_diff(3200) <= 1, "{actual} != 3200");
     }
 }

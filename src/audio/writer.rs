@@ -62,6 +62,8 @@ pub struct OggOpusWriter {
     serial: u32,
     /// Total granule position (in 48kHz samples, per RFC 7845).
     granule_position: u64,
+    pre_skip: u16,
+    input_frames: u64,
     /// Sample rate ratio for granule calculation (48000 / sample_rate).
     granule_rate_ratio: f64,
     /// Whether header has been written.
@@ -125,6 +127,11 @@ impl OggOpusWriter {
         encoder
             .set_bitrate(opus::Bitrate::Bits(config.bitrate as i32))
             .map_err(|e| TalkError::Audio(format!("Failed to set Opus bitrate: {e}")))?;
+        let lookahead = encoder
+            .get_lookahead()
+            .map_err(|e| TalkError::Audio(format!("Failed to get Opus lookahead: {e}")))?;
+        let pre_skip = u16::try_from(lookahead as u64 * 48_000 / config.sample_rate as u64)
+            .map_err(|_| TalkError::Audio("Opus lookahead exceeds pre-skip range".into()))?;
 
         let frame_size = (config.sample_rate as usize * 20) / 1000; // 20ms frames
         let serial = rand_serial();
@@ -137,6 +144,8 @@ impl OggOpusWriter {
             channels: config.channels,
             serial,
             granule_position: 0,
+            pre_skip,
+            input_frames: 0,
             granule_rate_ratio: 48000.0 / config.sample_rate as f64,
             header_written: false,
             #[cfg(test)]
@@ -153,7 +162,7 @@ impl AudioWriter for OggOpusWriter {
         head.push(1); // version
         head.push(self.channels); // channel count
                                   // Pre-skip: standard value for Opus
-        head.extend_from_slice(&3840u16.to_le_bytes()); // pre-skip
+        head.extend_from_slice(&self.pre_skip.to_le_bytes());
         head.extend_from_slice(&48000u32.to_le_bytes()); // input sample rate (always 48kHz for Opus)
         head.extend_from_slice(&0i16.to_le_bytes()); // output gain
         head.push(0); // mapping family 0
@@ -183,6 +192,7 @@ impl AudioWriter for OggOpusWriter {
     }
 
     fn write_pcm(&mut self, pcm: &[i16]) -> Result<Vec<u8>, TalkError> {
+        self.input_frames += (pcm.len() / self.channels as usize) as u64;
         self.pcm_buffer.extend_from_slice(pcm);
 
         let samples_per_frame = self.frame_size * self.channels as usize;
@@ -257,36 +267,45 @@ impl AudioWriter for OggOpusWriter {
 
     fn finalize(&mut self) -> Result<Vec<u8>, TalkError> {
         let mut output = Vec::new();
+        let final_granule =
+            self.pre_skip as u64 + (self.input_frames as f64 * self.granule_rate_ratio) as u64;
 
-        // Pad remaining buffer and encode final frame
-        if !self.pcm_buffer.is_empty() {
-            let samples_per_frame = self.frame_size * self.channels as usize;
-            while self.pcm_buffer.len() < samples_per_frame {
-                self.pcm_buffer.push(0i16);
-            }
-
-            let frame = self.pcm_buffer.drain(..).collect::<Vec<i16>>();
+        // Opus already introduces its own lookahead. Pad the terminal
+        // packet(s), not the start of the PCM, and trim only the last page.
+        loop {
+            self.pcm_buffer
+                .resize(self.frame_size * self.channels as usize, 0);
             let mut opus_output = vec![0u8; 4000];
             let len = self
                 .encoder
-                .encode(&frame, &mut opus_output)
+                .encode(&self.pcm_buffer, &mut opus_output)
                 .map_err(|e| TalkError::Audio(format!("Opus flush failed: {e}")))?;
             opus_output.truncate(len);
-
+            self.pcm_buffer.clear();
             self.granule_position += (self.frame_size as f64 * self.granule_rate_ratio) as u64;
-
-            // Write as final OGG packet with EndStream flag
+            let is_last = self.granule_position >= final_granule;
             self.packet_writer
                 .write_packet(
                     opus_output,
                     self.serial,
-                    PacketWriteEndInfo::EndStream,
-                    self.granule_position,
+                    if is_last {
+                        PacketWriteEndInfo::EndStream
+                    } else {
+                        PacketWriteEndInfo::EndPage
+                    },
+                    if is_last {
+                        final_granule
+                    } else {
+                        self.granule_position
+                    },
                 )
                 .map_err(|e| TalkError::Audio(format!("failed to write final OGG page: {e}")))?;
 
             output.extend_from_slice(self.packet_writer.inner_mut());
             self.packet_writer.inner_mut().clear();
+            if is_last {
+                break;
+            }
         }
 
         Ok(output)
@@ -362,17 +381,27 @@ impl AudioWriter for WavWriter {
     }
 
     fn write_pcm(&mut self, pcm: &[i16]) -> Result<Vec<u8>, TalkError> {
+        let added = pcm.len().checked_mul(2).and_then(|n| u32::try_from(n).ok());
+        let next_size = added.and_then(|n| self.data_size.checked_add(n));
+        let next_size = next_size
+            .filter(|&n| n <= u32::MAX - 36)
+            .ok_or_else(|| TalkError::Audio("WAV data exceeds the RIFF 4 GiB limit".into()))?;
         let mut bytes = Vec::with_capacity(pcm.len() * 2);
         for &sample in pcm {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
-        self.data_size += bytes.len() as u32;
+        self.data_size = next_size;
         Ok(bytes)
     }
 
     fn finalize(&mut self) -> Result<Vec<u8>, TalkError> {
         // Return a corrected 44-byte header with the actual sizes.
         // The caller is responsible for seeking to offset 0 and writing this.
+        if self.data_size > u32::MAX - 36 {
+            return Err(TalkError::Audio(
+                "WAV data exceeds the RIFF 4 GiB limit".into(),
+            ));
+        }
         self.build_header(self.data_size)
     }
 
@@ -416,6 +445,7 @@ mod tests {
     /// behaviour it replaced, and so the quadratic blow-up can be
     /// measured side by side.
     fn legacy_write_pcm(w: &mut OggOpusWriter, pcm: &[i16]) -> Result<Vec<u8>, TalkError> {
+        w.input_frames += (pcm.len() / w.channels as usize) as u64;
         w.pcm_buffer.extend_from_slice(pcm);
 
         let samples_per_frame = w.frame_size * w.channels as usize;
@@ -499,6 +529,93 @@ mod tests {
     }
 
     #[test]
+    fn ogg_granule_accounts_for_preskip_and_exact_input_duration() {
+        for (rate, samples) in [(16_000, 320), (48_000, 960), (16_000, 417)] {
+            let mut writer = OggOpusWriter::new(AudioConfig {
+                sample_rate: rate,
+                channels: 1,
+                bitrate: 32_000,
+            })
+            .unwrap();
+            let bytes = [
+                writer.header().unwrap(),
+                writer.write_pcm(&vec![1000; samples]).unwrap(),
+                writer.finalize().unwrap(),
+            ]
+            .concat();
+            let preskip = u16::from_le_bytes([bytes[38], bytes[39]]) as u64;
+            assert_eq!(
+                preskip,
+                writer.encoder.get_lookahead().unwrap() as u64 * 48_000 / rate as u64
+            );
+            let mut reader = ogg::PacketReader::new(std::io::Cursor::new(bytes));
+            let mut last = 0;
+            while let Some(packet) = reader.read_packet().unwrap() {
+                if &packet.data[..packet.data.len().min(8)] != b"OpusHead"
+                    && &packet.data[..packet.data.len().min(8)] != b"OpusTags"
+                {
+                    last = packet.absgp_page();
+                }
+            }
+            assert_eq!(last, preskip + samples as u64 * 48_000 / rate as u64);
+        }
+    }
+
+    #[test]
+    fn ogg_final_page_marks_end_of_stream_for_exact_and_empty_input() {
+        for samples in [0, 320] {
+            let mut writer = OggOpusWriter::new(test_config()).unwrap();
+            let bytes = [
+                writer.header().unwrap(),
+                writer.write_pcm(&vec![0; samples]).unwrap(),
+                writer.finalize().unwrap(),
+            ]
+            .concat();
+            let mut offset = 0;
+            let mut last_flags = 0;
+            while offset < bytes.len() {
+                assert_eq!(&bytes[offset..offset + 4], b"OggS");
+                last_flags = bytes[offset + 5];
+                let segments = bytes[offset + 26] as usize;
+                offset += 27
+                    + segments
+                    + bytes[offset + 27..offset + 27 + segments]
+                        .iter()
+                        .map(|&n| n as usize)
+                        .sum::<usize>();
+            }
+            assert_eq!(offset, bytes.len());
+            assert_ne!(last_flags & 0x04, 0, "missing EOS for {samples} samples");
+        }
+    }
+
+    #[test]
+    fn ogg_external_decoder_reports_real_duration() {
+        let mut writer = OggOpusWriter::new(test_config()).unwrap();
+        let samples = 3 * 320 + 77;
+        let bytes = [
+            writer.header().unwrap(),
+            writer.write_pcm(&sine_pcm(samples)).unwrap(),
+            writer.finalize().unwrap(),
+        ]
+        .concat();
+        let file = tempfile::Builder::new().suffix(".ogg").tempfile().unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(file.path())
+            .args(["-f", "s16le", "-ac", "1", "-ar", "16000", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout.len() / 2, samples);
+    }
+
+    #[test]
     fn test_wav_writer_produces_valid_wav() {
         let mut writer = WavWriter::new(test_config());
         let header = writer.header().unwrap();
@@ -520,6 +637,16 @@ mod tests {
     }
 
     #[test]
+    fn wav_rejects_data_exceeding_riff_size_without_wrapping() {
+        let mut writer = WavWriter::new(test_config());
+        writer.data_size = u32::MAX - 36 - 1;
+        assert!(writer.write_pcm(&[1]).is_err());
+
+        writer.data_size = u32::MAX - 35;
+        assert!(writer.finalize().is_err());
+    }
+
+    #[test]
     fn test_ogg_opus_writer_mime_type() {
         let writer = OggOpusWriter::new(test_config()).unwrap();
         assert_eq!(writer.mime_type(), "audio/ogg");
@@ -538,10 +665,10 @@ mod tests {
     /// signal arrives in ONE call — the `encode_16k_mono_ogg` shape.
     #[test]
     fn test_write_pcm_bulk_call_is_byte_identical_to_legacy() {
-        // 5000 frames (100 s of 16 kHz mono audio) plus a deliberate
+        // 128 frames plus a deliberate
         // partial tail of 137 samples, so `finalize()` padding is
         // exercised too.
-        let pcm = sine_pcm(5000 * 320 + 137);
+        let pcm = sine_pcm(128 * 320 + 137);
 
         let mut fixed = writer_with_fixed_serial();
         let fixed_bytes = [
@@ -626,9 +753,9 @@ mod tests {
     /// magnitude, deterministically, in a fraction of a second.
     #[test]
     fn test_write_pcm_bulk_call_does_not_memmove_quadratically() {
-        // 4000 frames = 80 s of 16 kHz mono audio, delivered in ONE call
+        // 128 frames delivered in ONE call
         // (the `encode_16k_mono_ogg` shape).
-        const FRAMES: usize = 4000;
+        const FRAMES: usize = 128;
         const SAMPLES_PER_FRAME: usize = 320;
         let pcm = sine_pcm(FRAMES * SAMPLES_PER_FRAME);
 

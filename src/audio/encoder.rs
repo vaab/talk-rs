@@ -18,14 +18,12 @@ pub trait AudioEncoder: Send {
 }
 
 /// Mock encoder for testing that passes through PCM data.
-pub struct MockEncoder {
-    buffer: Vec<u8>,
-}
+pub struct MockEncoder;
 
 impl MockEncoder {
     /// Create a new mock encoder with the given configuration.
     pub fn new(_config: AudioConfig) -> Self {
-        Self { buffer: Vec::new() }
+        Self
     }
 }
 
@@ -36,14 +34,11 @@ impl AudioEncoder for MockEncoder {
         for &sample in pcm {
             encoded.extend_from_slice(&sample.to_le_bytes());
         }
-        self.buffer.extend_from_slice(&encoded);
         Ok(encoded)
     }
 
     fn flush(&mut self) -> Result<Vec<u8>, TalkError> {
-        let result = self.buffer.clone();
-        self.buffer.clear();
-        Ok(result)
+        Ok(Vec::new())
     }
 }
 
@@ -178,35 +173,18 @@ mod tests {
         let mut encoder = MockEncoder::new(config);
 
         let pcm = vec![100i16, 200i16];
-        encoder.encode(&pcm).expect("encode should succeed");
+        let encoded = encoder.encode(&pcm).expect("encode should succeed");
+        assert_eq!(
+            encoded,
+            [100i16.to_le_bytes(), 200i16.to_le_bytes()].concat()
+        );
 
         let flushed = encoder.flush().expect("flush should succeed");
-        assert_eq!(flushed.len(), 4);
+        assert_eq!(flushed, Vec::<u8>::new());
 
         // After flush, buffer should be empty
         let flushed_again = encoder.flush().expect("flush should succeed");
         assert_eq!(flushed_again.len(), 0);
-    }
-
-    #[test]
-    fn test_opus_encoder_creation() {
-        let config = test_config();
-        let encoder = OpusEncoder::new(config).expect("creation should succeed");
-        assert_eq!(encoder.config.sample_rate, 16_000);
-        assert_eq!(encoder.config.channels, 1);
-    }
-
-    #[test]
-    fn test_opus_encoder_mono_encode() {
-        let config = test_config();
-        let mut encoder = OpusEncoder::new(config).expect("creation should succeed");
-
-        // Create a 20ms chunk of samples (320 samples at 16kHz)
-        let pcm: Vec<i16> = (0..320).map(|i| (i as i16).wrapping_mul(100)).collect();
-        let encoded = encoder.encode(&pcm).expect("encode should succeed");
-
-        // Opus should produce some output
-        assert!(!encoded.is_empty());
     }
 
     #[test]

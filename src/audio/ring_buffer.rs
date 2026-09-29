@@ -13,7 +13,9 @@ pub struct RingBuffer {
 }
 
 impl RingBuffer {
+    /// A zero request is clamped to one sample so push/read remain safe.
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             data: vec![0.0; capacity],
             write_pos: 0,
@@ -67,5 +69,12 @@ mod tests {
         let out = rb.read_last(10);
         // Clamped to capacity
         assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn ring_buffer_zero_capacity_still_accepts_one_sample() {
+        let mut rb = RingBuffer::new(0);
+        rb.push(&[1.0, 2.0]);
+        assert_eq!(rb.read_last(1), vec![2.0]);
     }
 }

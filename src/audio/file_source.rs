@@ -212,6 +212,11 @@ fn parse_wav_header<R: Read + Seek>(reader: &mut R, path: &Path) -> Result<WavHe
                         .seek(SeekFrom::Current((chunk_size - read_so_far) as i64))
                         .map_err(|_| err("failed to skip extra fmt bytes"))?;
                 }
+                if chunk_size % 2 != 0 {
+                    reader
+                        .seek(SeekFrom::Current(1))
+                        .map_err(|_| err("failed to skip fmt padding"))?;
+                }
             }
             b"data" => {
                 data_offset = reader
@@ -224,7 +229,9 @@ fn parse_wav_header<R: Read + Seek>(reader: &mut R, path: &Path) -> Result<WavHe
             _ => {
                 // Skip unknown chunk
                 reader
-                    .seek(SeekFrom::Current(chunk_size as i64))
+                    .seek(SeekFrom::Current(
+                        chunk_size as i64 + i64::from(chunk_size % 2),
+                    ))
                     .map_err(|_| err("failed to skip unknown chunk"))?;
             }
         }
@@ -714,11 +721,23 @@ mod tests {
         assert_eq!(delivered, expected[..expected.len() - 10]);
     }
 
-    #[test]
-    fn test_validate_wav_header_valid() {
-        let file = create_test_wav(16000); // 1 second
-        let config = AudioConfig::new();
-        assert!(validate_wav_header(file.path(), &config).is_ok());
+    #[tokio::test]
+    async fn wav_source_skips_padding_after_odd_sized_junk_chunk() {
+        let valid = create_test_wav(3);
+        let bytes = std::fs::read(valid.path()).unwrap();
+        let mut padded = bytes[..36].to_vec();
+        padded.extend_from_slice(b"JUNK");
+        padded.extend_from_slice(&1u32.to_le_bytes());
+        padded.extend_from_slice(&[42, 0]);
+        padded.extend_from_slice(&bytes[36..]);
+        let riff_size = (padded.len() - 8) as u32;
+        padded[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, &padded).unwrap();
+        let mut source = WavFileSource::new(file.path(), &AudioConfig::new()).unwrap();
+        let mut rx = source.start().unwrap();
+        assert_eq!(rx.recv().await, Some(sine_samples(3)));
+        assert_eq!(rx.recv().await, None);
     }
 
     #[test]
@@ -758,13 +777,6 @@ mod tests {
         assert!(msg.contains("16000 Hz"));
         assert!(msg.contains("44100 Hz"));
         assert!(msg.contains("ffmpeg"));
-    }
-
-    #[test]
-    fn test_wav_file_source_new_valid() {
-        let file = create_test_wav(16000);
-        let config = AudioConfig::new();
-        assert!(WavFileSource::new(file.path(), &config).is_ok());
     }
 
     #[test]
