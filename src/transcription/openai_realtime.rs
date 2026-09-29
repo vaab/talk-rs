@@ -44,9 +44,6 @@ const SESSION_CREATED_TIMEOUT: Duration = Duration::from_secs(15);
 /// Interval between WebSocket ping frames for keepalive.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Time to wait for final transcription events after audio ends.
-const POST_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Sample rate expected by the OpenAI Realtime API for PCM16.
 const OPENAI_SAMPLE_RATE: u32 = 24000;
 
@@ -60,30 +57,35 @@ const SOURCE_SAMPLE_RATE: u32 = 16000;
 ///
 /// The ratio 24000/16000 = 3/2, so for every 2 input samples we
 /// produce 3 output samples.  This is good enough for speech audio.
+#[derive(Default)]
+struct Resampler16To24 {
+    previous: Option<i16>,
+    input_count: usize,
+}
+
+impl Resampler16To24 {
+    fn process(&mut self, input: &[i16]) -> Vec<i16> {
+        let mut output = Vec::with_capacity(
+            (input.len() * OPENAI_SAMPLE_RATE as usize).div_ceil(SOURCE_SAMPLE_RATE as usize),
+        );
+        for &sample in input {
+            if self.input_count % 2 == 1 {
+                if let Some(previous) = self.previous {
+                    output.push(
+                        (previous as f64 + (sample as f64 - previous as f64) * 2.0 / 3.0) as i16,
+                    );
+                }
+            }
+            output.push(sample);
+            self.previous = Some(sample);
+            self.input_count += 1;
+        }
+        output
+    }
+}
+
 pub fn resample_16k_to_24k(input: &[i16]) -> Vec<i16> {
-    if input.is_empty() {
-        return Vec::new();
-    }
-    let in_len = input.len();
-    let out_len = (in_len as u64 * OPENAI_SAMPLE_RATE as u64 / SOURCE_SAMPLE_RATE as u64) as usize;
-    let mut output = Vec::with_capacity(out_len);
-
-    for i in 0..out_len {
-        // Position in the input signal (fixed-point via f64).
-        let src_pos = i as f64 * SOURCE_SAMPLE_RATE as f64 / OPENAI_SAMPLE_RATE as f64;
-        let idx = src_pos as usize;
-        let frac = src_pos - idx as f64;
-
-        let sample = if idx + 1 < in_len {
-            let a = input[idx] as f64;
-            let b = input[idx + 1] as f64;
-            (a + (b - a) * frac) as i16
-        } else {
-            input[in_len - 1]
-        };
-        output.push(sample);
-    }
-    output
+    Resampler16To24::default().process(input)
 }
 
 // ── Encoding helpers ────────────────────────────────────────────────
@@ -618,6 +620,7 @@ impl OpenAIRealtimeTranscriber {
 
         let cancel = CancellationToken::new();
         let audio_done = Arc::new(AtomicBool::new(false));
+        let (audio_end_tx, audio_end_rx) = tokio::sync::watch::channel(None);
 
         // Spawn sender task.
         let sender_task = tokio::spawn(sender_loop(
@@ -625,6 +628,7 @@ impl OpenAIRealtimeTranscriber {
             ws_sink,
             cancel.clone(),
             audio_done.clone(),
+            audio_end_tx,
         ));
 
         // Spawn receiver task.
@@ -633,6 +637,8 @@ impl OpenAIRealtimeTranscriber {
             event_tx,
             cancel.clone(),
             audio_done,
+            audio_end_rx,
+            super::realtime::FINAL_TRANSCRIPT_DEADLINE,
         ));
 
         // Cleanup task that logs panics.
@@ -753,11 +759,13 @@ async fn sender_loop<S>(
     mut ws_sink: SplitSink<S, Message>,
     cancel: CancellationToken,
     audio_done: Arc<AtomicBool>,
+    audio_end_tx: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
 ) where
     S: futures::Sink<Message> + Unpin,
     <S as futures::Sink<Message>>::Error: std::fmt::Display,
 {
     let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
+    let mut resampler = Resampler16To24::default();
     // Skip the first immediate tick.
     ping_interval.tick().await;
 
@@ -767,7 +775,7 @@ async fn sender_loop<S>(
                 match chunk {
                     Some(pcm_chunk) => {
                         // Resample 16 kHz → 24 kHz.
-                        let resampled = resample_16k_to_24k(&pcm_chunk);
+                        let resampled = resampler.process(&pcm_chunk);
                         let bytes = pcm_to_bytes(&resampled);
                         log::trace!(
                             "sending audio chunk: {} in → {} out samples, {} bytes",
@@ -817,6 +825,7 @@ async fn sender_loop<S>(
     // Signal that no more audio will be sent.  The receiver uses
     // this to start a timeout for final transcription events.
     audio_done.store(true, Ordering::Release);
+    audio_end_tx.send_replace(Some(tokio::time::Instant::now()));
 
     // Do NOT close the WebSocket — the server still needs to send
     // remaining transcription events.  Just drop the sink.
@@ -825,33 +834,45 @@ async fn sender_loop<S>(
 /// Receiver loop: reads WebSocket messages, parses events, forwards
 /// to the event channel.
 ///
-/// Once `audio_done` is set and no transcription events arrive for
-/// [`POST_COMMIT_TIMEOUT`], sends [`TranscriptionEvent::Done`] and
-/// exits.
+/// Once audio ends, accepts late events for a fixed final deadline.
 async fn receiver_loop<S>(
     mut ws_source: S,
     event_tx: mpsc::Sender<TranscriptionEvent>,
     cancel: CancellationToken,
     audio_done: Arc<AtomicBool>,
+    mut audio_end: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
+    final_deadline: Duration,
 ) where
     S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
+    let mut saw_final = false;
     loop {
-        // Choose timeout based on whether audio is done.
-        let timeout_dur = if audio_done.load(Ordering::Acquire) {
-            POST_COMMIT_TIMEOUT
-        } else {
-            // Effectively infinite while audio is still streaming.
-            Duration::from_secs(3600)
-        };
-
+        let end = *audio_end.borrow();
         tokio::select! {
+            changed = audio_end.changed(), if end.is_none() => {
+                if changed.is_err() { return; }
+            }
+            _ = async {
+                if let Some(end) = end {
+                    tokio::time::sleep_until(end + final_deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                log::warn!("OpenAI final transcription deadline reached after {}s; keeping accumulated text", final_deadline.as_secs());
+                let _ = event_tx.send(TranscriptionEvent::Done).await;
+                return;
+            }
             msg_opt = ws_source.next() => {
                 let msg_result = match msg_opt {
                     Some(r) => r,
                     None => {
                         log::warn!("OpenAI WebSocket stream ended unexpectedly");
-                        let _ = event_tx.send(TranscriptionEvent::Done).await;
+                        let _ = event_tx.send(if audio_done.load(Ordering::Acquire) && saw_final {
+                            TranscriptionEvent::Done
+                        } else {
+                            TranscriptionEvent::Error { message: "WebSocket closed before final transcription".to_string() }
+                        }).await;
                         cancel.cancel();
                         return;
                     }
@@ -885,6 +906,7 @@ async fn receiver_loop<S>(
                         }
 
                         let is_error = matches!(event, TranscriptionEvent::Error { .. });
+                        saw_final |= matches!(event, TranscriptionEvent::ItemTextCompleted { .. });
                         if event_tx.send(event).await.is_err() {
                             cancel.cancel();
                             return;
@@ -895,7 +917,11 @@ async fn receiver_loop<S>(
                     }
                     Message::Close(frame) => {
                         log::debug!("received OpenAI WS Close frame: {:?}", frame);
-                        let _ = event_tx.send(TranscriptionEvent::Done).await;
+                        let _ = event_tx.send(if audio_done.load(Ordering::Acquire) && saw_final {
+                            TranscriptionEvent::Done
+                        } else {
+                            TranscriptionEvent::Error { message: "WebSocket closed before final transcription".to_string() }
+                        }).await;
                         return;
                     }
                     Message::Pong(_) => {
@@ -905,16 +931,6 @@ async fn receiver_loop<S>(
                         // Ignore binary frames.
                     }
                 }
-            }
-            _ = tokio::time::sleep(timeout_dur) => {
-                // Post-commit timeout expired with no events — we are
-                // done collecting transcription results.
-                log::debug!(
-                    "no events for {}s after commit, finalising",
-                    POST_COMMIT_TIMEOUT.as_secs(),
-                );
-                let _ = event_tx.send(TranscriptionEvent::Done).await;
-                return;
             }
             _ = cancel.cancelled() => {
                 return;
@@ -928,6 +944,361 @@ async fn receiver_loop<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn setup_ignores_non_text_then_returns_created_session_identifiers() {
+        let mut source = futures::stream::iter([
+            Ok(Message::Ping(Vec::new())),
+            Ok(Message::Text(r#"{"type":"rate_limits.updated"}"#.into())),
+            Ok(Message::Text(
+                r#"{"type":"session.created","session":{"id":"session-7"},"conversation":{"id":"conversation-8"}}"#.into(),
+            )),
+        ]);
+        let event = wait_for_session_created(&mut source)
+            .await
+            .expect("session creation follows unrelated frames");
+        match event {
+            TranscriptionEvent::SessionInfo {
+                session_id,
+                conversation_id,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-7"));
+                assert_eq!(conversation_id.as_deref(), Some("conversation-8"));
+            }
+            other => panic!("expected session creation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_eof_without_session_creation_is_an_error() {
+        let mut source = futures::stream::iter(vec![Ok(Message::Text(
+            r#"{"type":"rate_limits.updated"}"#.into(),
+        ))]);
+        let error = wait_for_session_created(&mut source)
+            .await
+            .expect_err("unrelated event cannot complete setup");
+        assert_eq!(
+            error.to_string(),
+            "Transcription error: WebSocket closed before session.created received"
+        );
+    }
+
+    #[tokio::test]
+    async fn receiver_forwards_server_error_once_after_irrelevant_binary_frame() {
+        let (tx, mut rx) = mpsc::channel(4);
+        receiver_loop(
+            futures::stream::iter(vec![
+                Ok(Message::Binary(vec![0, 1, 2])),
+                Ok(Message::Text(
+                    r#"{"type":"error","error":{"message":"model unavailable"}}"#.into(),
+                )),
+            ]),
+            tx,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+            tokio::sync::watch::channel(None).1,
+            Duration::from_secs(15),
+        )
+        .await;
+        match rx.recv().await {
+            Some(TranscriptionEvent::Error { message }) => {
+                assert_eq!(message, "model unavailable");
+            }
+            other => panic!("expected server error, got {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receiver_reports_transport_error_without_successful_completion() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        receiver_loop(
+            futures::stream::iter(vec![Err(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "fixture reset"),
+            ))]),
+            tx,
+            cancel.clone(),
+            Arc::new(AtomicBool::new(true)),
+            tokio::sync::watch::channel(None).1,
+            Duration::from_secs(15),
+        )
+        .await;
+        match rx.recv().await {
+            Some(TranscriptionEvent::Error { message }) => {
+                assert_eq!(message, "WebSocket error: IO error: fixture reset");
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn upgrade_diagnostics_omit_unapproved_headers() {
+        let mut headers = tokio_tungstenite::tungstenite::http::HeaderMap::new();
+        headers.insert("x-request-id", "request-7".parse().expect("header"));
+        headers.insert("openai-processing-ms", "31".parse().expect("header"));
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            "4".parse().expect("header"),
+        );
+        headers.insert("authorization", "Bearer private".parse().expect("header"));
+        headers.insert("set-cookie", "session=private".parse().expect("header"));
+        assert_eq!(
+            extract_ws_upgrade_headers(&headers),
+            BTreeMap::from([
+                ("openai-processing-ms".to_string(), "31".to_string()),
+                (
+                    "x-ratelimit-remaining-requests".to_string(),
+                    "4".to_string()
+                ),
+                ("x-request-id".to_string(), "request-7".to_string()),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_resamples_across_chunks_then_commits_and_marks_audio_end() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let mut server_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let (sink, _source) = client_ws.split();
+        let (audio_tx, audio_rx) = mpsc::channel(2);
+        audio_tx.send(vec![0]).await.expect("first PCM chunk");
+        audio_tx
+            .send(vec![1200, 2400])
+            .await
+            .expect("second PCM chunk");
+        drop(audio_tx);
+        let audio_done = Arc::new(AtomicBool::new(false));
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+
+        sender_loop(
+            audio_rx,
+            sink,
+            CancellationToken::new(),
+            Arc::clone(&audio_done),
+            end_tx,
+        )
+        .await;
+
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            let message = server_ws
+                .next()
+                .await
+                .expect("frame arrived")
+                .expect("valid frame");
+            let Message::Text(json) = message else {
+                panic!("expected JSON text frame");
+            };
+            frames.push(serde_json::from_str::<serde_json::Value>(&json).expect("valid JSON"));
+        }
+        let first = BASE64_STANDARD
+            .decode(frames[0]["audio"].as_str().expect("first audio"))
+            .expect("base64");
+        let second = BASE64_STANDARD
+            .decode(frames[1]["audio"].as_str().expect("second audio"))
+            .expect("base64");
+        assert_eq!(frames[0]["type"], "input_audio_buffer.append");
+        assert_eq!(first, pcm_to_bytes(&[0]));
+        assert_eq!(frames[1]["type"], "input_audio_buffer.append");
+        assert_eq!(second, pcm_to_bytes(&[800, 1200, 2400]));
+        assert_eq!(
+            frames[2],
+            serde_json::json!({"type": "input_audio_buffer.commit"})
+        );
+        assert!(audio_done.load(Ordering::Acquire));
+        assert!(end_rx.borrow().is_some());
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_server_error_after_unrelated_event() {
+        let mut source = futures::stream::iter([
+            Ok(Message::Text(r#"{"type":"rate_limits.updated"}"#.into())),
+            Ok(Message::Text(
+                r#"{"type":"error","error":{"message":"invalid model"}}"#.into(),
+            )),
+        ]);
+        let error = wait_for_session_created(&mut source)
+            .await
+            .expect_err("setup must not accept a server error");
+        assert_eq!(
+            error.to_string(),
+            "Transcription error: Server error during session setup: invalid model"
+        );
+    }
+
+    #[tokio::test]
+    async fn receiver_requires_final_event_before_eof_after_audio_ends() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        receiver_loop(
+            futures::stream::iter(vec![Ok(Message::Text(
+                r#"{"type":"conversation.item.input_audio_transcription.delta","item_id":"one","content_index":0,"delta":"unfinished"}"#.into(),
+            ))]),
+            tx,
+            cancel.clone(),
+            Arc::new(AtomicBool::new(true)),
+            tokio::sync::watch::channel(None).1,
+            Duration::from_secs(15),
+        )
+        .await;
+        match rx.recv().await {
+            Some(TranscriptionEvent::ItemTextDelta {
+                item_id,
+                content_index,
+                text,
+            }) => {
+                assert_eq!(
+                    (item_id.as_str(), content_index, text.as_str()),
+                    ("one", 0, "unfinished")
+                );
+            }
+            other => panic!("expected provisional text, got {other:?}"),
+        }
+        match rx.recv().await {
+            Some(TranscriptionEvent::Error { message }) => {
+                assert_eq!(message, "WebSocket closed before final transcription");
+            }
+            other => panic!("expected incomplete-stream error, got {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn receiver_completes_after_final_event_and_eof() {
+        let (tx, mut rx) = mpsc::channel(4);
+        receiver_loop(
+            futures::stream::iter(vec![Ok(Message::Text(
+                r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"one","content_index":0,"transcript":"final text"}"#.into(),
+            ))]),
+            tx,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(true)),
+            tokio::sync::watch::channel(None).1,
+            Duration::from_secs(15),
+        )
+        .await;
+        match rx.recv().await {
+            Some(TranscriptionEvent::ItemTextCompleted {
+                item_id,
+                content_index,
+                transcript,
+            }) => {
+                assert_eq!(
+                    (item_id.as_str(), content_index, transcript.as_str()),
+                    ("one", 0, "final text")
+                );
+            }
+            other => panic!("expected final text, got {other:?}"),
+        }
+        assert!(matches!(rx.recv().await, Some(TranscriptionEvent::Done)));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn session_info_keeps_identifiers() {
+        let event = parse_openai_event(
+            r#"{"type":"transcription_session.created","session":{"id":"sess-12"},"conversation":{"id":"conv-34"}}"#,
+        );
+        match event {
+            TranscriptionEvent::SessionInfo {
+                session_id,
+                conversation_id,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-12"));
+                assert_eq!(conversation_id.as_deref(), Some("conv-34"));
+            }
+            other => panic!("expected session identifiers, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn openai_unknown_events_do_not_extend_fifteen_second_final_deadline() {
+        let (audio_end_tx, audio_end_rx) = tokio::sync::watch::channel(None);
+        let (msg_tx, msg_rx) =
+            mpsc::channel::<Result<Message, tokio_tungstenite::tungstenite::Error>>(4);
+        let (tx, mut rx) = mpsc::channel(4);
+        let receiver = tokio::spawn(receiver_loop(
+            tokio_stream::wrappers::ReceiverStream::new(msg_rx),
+            tx,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(true)),
+            audio_end_rx,
+            super::super::realtime::FINAL_TRANSCRIPT_DEADLINE,
+        ));
+        audio_end_tx.send_replace(Some(tokio::time::Instant::now()));
+        tokio::time::advance(Duration::from_secs(9)).await;
+        msg_tx
+            .send(Ok(Message::Text(r#"{"type":"unrecognized"}"#.into())))
+            .await
+            .expect("unknown event");
+        assert!(matches!(
+            rx.recv().await,
+            Some(TranscriptionEvent::Unknown { .. })
+        ));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(rx.recv().await, Some(TranscriptionEvent::Done)));
+        receiver.await.expect("receiver finished");
+    }
+
+    #[tokio::test]
+    async fn premature_openai_close_and_eof_reconnect_instead_of_finishing() {
+        for messages in [vec![Ok(Message::Close(None))], vec![]] {
+            let (tx, mut rx) = mpsc::channel(4);
+            receiver_loop(
+                futures::stream::iter(messages),
+                tx,
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+                tokio::sync::watch::channel(None).1,
+                super::super::realtime::FINAL_TRANSCRIPT_DEADLINE,
+            )
+            .await;
+            assert!(matches!(
+                rx.recv().await,
+                Some(TranscriptionEvent::Error { .. })
+            ));
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_close_after_audio_end_finishes() {
+        let (tx, mut rx) = mpsc::channel(4);
+        receiver_loop(
+            futures::stream::iter(vec![
+                Ok(Message::Text(r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-1","content_index":0,"transcript":"hello"}"#.to_string())),
+                Ok(Message::Close(None)),
+            ]),
+            tx,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(true)),
+            tokio::sync::watch::channel(None).1,
+            super::super::realtime::FINAL_TRANSCRIPT_DEADLINE,
+        )
+        .await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(TranscriptionEvent::ItemTextCompleted { .. })
+        ));
+        assert!(matches!(rx.recv().await, Some(TranscriptionEvent::Done)));
+    }
 
     fn openai_config(model: &str) -> OpenAIConfig {
         OpenAIConfig {
@@ -953,52 +1324,24 @@ mod tests {
     }
 
     #[test]
-    fn test_new_uses_custom_url() {
-        let config = OpenAIConfig {
-            api_key: "key".to_string(),
-            url: Some("https://custom.example.com".to_string()),
-            model: "whisper-1".to_string(),
-            realtime_model: "gpt-live-transcribe".to_string(),
-            prompt: None,
-            keywords: None,
-            languages: None,
-            realtime_delay: None,
-        };
-        let transcriber = OpenAIRealtimeTranscriber::new(config);
-        assert_eq!(transcriber.endpoint, "wss://custom.example.com");
-    }
-
-    #[test]
-    fn test_new_default_endpoint() {
-        let config = OpenAIConfig {
-            api_key: "key".to_string(),
-            url: None,
-            model: "whisper-1".to_string(),
-            realtime_model: "gpt-live-transcribe".to_string(),
-            prompt: None,
-            keywords: None,
-            languages: None,
-            realtime_delay: None,
-        };
-        let transcriber = OpenAIRealtimeTranscriber::new(config);
-        assert_eq!(transcriber.endpoint, "wss://api.openai.com");
-    }
-
-    #[test]
-    fn test_with_model_uses_custom_url() {
-        let config = OpenAIConfig {
-            api_key: "key".to_string(),
-            url: Some("https://custom.example.com".to_string()),
-            model: "whisper-1".to_string(),
-            realtime_model: "gpt-live-transcribe".to_string(),
-            prompt: None,
-            keywords: None,
-            languages: None,
-            realtime_delay: None,
-        };
-        let transcriber =
-            OpenAIRealtimeTranscriber::with_model(config, "gpt-realtime-whisper".to_string());
-        assert_eq!(transcriber.endpoint, "wss://custom.example.com");
+    fn constructor_resolves_endpoint_and_model_variants() {
+        for (url, expected) in [
+            (None, "wss://api.openai.com"),
+            (
+                Some("https://custom.example.com"),
+                "wss://custom.example.com",
+            ),
+        ] {
+            let mut config = openai_config("gpt-live-transcribe");
+            config.url = url.map(str::to_string);
+            let transcriber = OpenAIRealtimeTranscriber::new(config.clone());
+            assert_eq!(transcriber.endpoint, expected);
+            assert_eq!(transcriber.model, "gpt-live-transcribe");
+            let overridden =
+                OpenAIRealtimeTranscriber::with_model(config, "gpt-realtime-whisper".into());
+            assert_eq!(overridden.endpoint, expected);
+            assert_eq!(overridden.model, "gpt-realtime-whisper");
+        }
     }
 
     #[test]
@@ -1025,11 +1368,17 @@ mod tests {
     }
 
     #[test]
-    fn test_resample_single_sample() {
-        let output = resample_16k_to_24k(&[42]);
-        // A single sample resamples to ceil(1 * 24000/16000) = 1 or 2.
-        assert!(!output.is_empty());
-        assert_eq!(output[0], 42);
+    fn resampling_is_identical_across_chunk_boundaries() {
+        let samples: Vec<i16> = vec![42, 1000, -500, 3000, -2000, 700, 800];
+        let whole = resample_16k_to_24k(&samples);
+        assert_eq!(whole.len(), samples.len() * 3 / 2);
+        for split in 1..samples.len() {
+            let mut resampler = Resampler16To24::default();
+            let mut chunks = resampler.process(&samples[..split]);
+            chunks.extend(resampler.process(&samples[split..]));
+            assert_eq!(chunks, whole, "split at {split}");
+        }
+        assert_eq!(resample_16k_to_24k(&[42]), [42]);
     }
 
     #[test]
@@ -1164,18 +1513,19 @@ mod tests {
     }
 
     #[test]
-    fn test_build_ws_url() {
-        let url = build_ws_url("wss://api.openai.com");
-        assert_eq!(url, "wss://api.openai.com/v1/realtime?intent=transcription");
-    }
-
-    #[test]
-    fn test_build_ws_url_custom_endpoint() {
-        let url = build_ws_url("wss://custom.example.com");
-        assert_eq!(
-            url,
-            "wss://custom.example.com/v1/realtime?intent=transcription"
-        );
+    fn ws_url_builder_handles_default_and_custom_endpoints() {
+        for (endpoint, expected) in [
+            (
+                "wss://api.openai.com",
+                "wss://api.openai.com/v1/realtime?intent=transcription",
+            ),
+            (
+                "wss://custom.example.com",
+                "wss://custom.example.com/v1/realtime?intent=transcription",
+            ),
+        ] {
+            assert_eq!(build_ws_url(endpoint), expected);
+        }
     }
 
     #[test]

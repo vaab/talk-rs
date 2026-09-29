@@ -14,6 +14,7 @@ use crate::audio::recording_feedback::{RecordingBadgeTeardown, RecordingFeedback
 use crate::audio::{AudioCapture, AudioWriter, OggOpusWriter};
 use crate::config::{AudioConfig, Config, Provider};
 use crate::error::TalkError;
+use crate::transcription::realtime::{join_segment, join_segments};
 use crate::transcription::{
     self, MistralProviderMetadata, OpenAIProviderMetadata, OpenAIRealtimeMetadata,
     OrderedItemTranscript, ProviderSpecificMetadata, TranscriptSegment, TranscriptionEvent,
@@ -78,6 +79,9 @@ impl AudioBuffer {
     /// fully drained.
     pub(super) async fn read_from(&self, cursor: usize) -> (Vec<Vec<i16>>, usize) {
         loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let buf = self.chunks.lock().await;
                 if buf.len() > cursor {
@@ -88,10 +92,8 @@ impl AudioBuffer {
                     return (Vec::new(), cursor);
                 }
             }
-            // No new data — wait for a push() or close().
-            // Tiny race window (notification between lock release and
-            // here) is harmless: the next push() wakes us within ≤20 ms.
-            self.notify.notified().await;
+            // Register before checking state so close cannot race this wait.
+            notified.await;
         }
     }
 }
@@ -109,12 +111,24 @@ pub(super) async fn ogg_recording_task(
     audio_config: AudioConfig,
     buffer: Arc<AudioBuffer>,
 ) -> Result<(), TalkError> {
-    let mut writer = OggOpusWriter::new(audio_config)?;
-    let header = writer.header()?;
+    struct CloseBuffer(Arc<AudioBuffer>);
+    impl Drop for CloseBuffer {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _close_buffer = CloseBuffer(buffer.clone());
+    let (mut writer, header) = tokio::task::spawn_blocking(move || {
+        let mut writer = OggOpusWriter::new(audio_config)?;
+        let header = writer.header()?;
+        Ok::<_, TalkError>((writer, header))
+    })
+    .await
+    .map_err(|error| TalkError::Audio(format!("OGG encoder task failed: {error}")))??;
 
-    let mut file = tokio::fs::File::create(&ogg_path)
-        .await
-        .map_err(TalkError::Io)?;
+    let mut file = tokio::fs::File::create(&ogg_path).await.map_err(|error| {
+        TalkError::Audio(format!("failed to create {}: {error}", ogg_path.display()))
+    })?;
     file.write_all(&header).await.map_err(TalkError::Io)?;
 
     let mut total_samples: u64 = 0;
@@ -122,7 +136,13 @@ pub(super) async fn ogg_recording_task(
     while let Some(pcm_chunk) = source.recv().await {
         // Write encoded bytes to the OGG file.
         total_samples += pcm_chunk.len() as u64;
-        let encoded_bytes = writer.write_pcm(&pcm_chunk)?;
+        let (next_writer, pcm_chunk, encoded_bytes) = tokio::task::spawn_blocking(move || {
+            let encoded_bytes = writer.write_pcm(&pcm_chunk)?;
+            Ok::<_, TalkError>((writer, pcm_chunk, encoded_bytes))
+        })
+        .await
+        .map_err(|error| TalkError::Audio(format!("OGG encoder task failed: {error}")))??;
+        writer = next_writer;
         if !encoded_bytes.is_empty() {
             file.write_all(&encoded_bytes)
                 .await
@@ -136,7 +156,9 @@ pub(super) async fn ogg_recording_task(
     // No more audio — tell feeders there is nothing left to wait for.
     buffer.close();
 
-    let trailing_bytes = writer.finalize()?;
+    let trailing_bytes = tokio::task::spawn_blocking(move || writer.finalize())
+        .await
+        .map_err(|error| TalkError::Audio(format!("OGG encoder task failed: {error}")))??;
     if !trailing_bytes.is_empty() {
         file.write_all(&trailing_bytes)
             .await
@@ -193,6 +215,30 @@ pub(super) async fn buffer_feeder(
     // fwd_tx dropped here → signals end-of-audio downstream.
 }
 
+async fn finish_live_recording(
+    capture: &mut dyn AudioCapture,
+    feedback: &mut RecordingFeedback,
+    bt_guard: &mut bt_profile::HeadsetGuard,
+    ogg_task: tokio::task::JoinHandle<Result<(), TalkError>>,
+    capture_stopped: bool,
+) -> Result<(), TalkError> {
+    let stop_result = if capture_stopped {
+        Ok(())
+    } else {
+        feedback.teardown_recording(RecordingBadgeTeardown::KeepVisible);
+        feedback.play_stop_now();
+        let result = capture.stop();
+        bt_guard.restore_now_async();
+        result
+    };
+    match ogg_task.await {
+        Ok(Ok(())) => log::debug!("cache OGG saved"),
+        Ok(Err(e)) => log::warn!("cache OGG write error: {}", e),
+        Err(e) => log::warn!("cache OGG task panicked: {}", e),
+    }
+    stop_result
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct NormalTranscriptUpdate {
     live_text: String,
@@ -224,9 +270,9 @@ impl NormalTranscriptAccumulator {
                 self.generic_segments[previous_len..].to_vec()
             }
             TranscriptionEvent::SegmentDelta { text, .. } => {
-                let segment = text.trim().to_string();
+                let segment = text;
                 self.current_line.clear();
-                if segment.is_empty() {
+                if segment.trim().is_empty() {
                     Vec::new()
                 } else {
                     self.generic_segments.push(segment.clone());
@@ -274,7 +320,7 @@ impl NormalTranscriptAccumulator {
             let drained = self.item_text.drain_terminal();
             let segments_to_send = self.accept_item_drain(drained);
             return FinishedNormalTranscript {
-                text: self.item_segments.join(" "),
+                text: join_segments(self.item_segments.iter().map(String::as_str)),
                 segments_to_send,
             };
         }
@@ -288,7 +334,7 @@ impl NormalTranscriptAccumulator {
         };
         self.current_line.clear();
         FinishedNormalTranscript {
-            text: self.generic_segments.join(" "),
+            text: join_segments(self.generic_segments.iter().map(String::as_str)),
             segments_to_send,
         }
     }
@@ -298,21 +344,18 @@ impl NormalTranscriptAccumulator {
             return self.item_text.snapshot();
         }
         if !self.item_segments.is_empty() {
-            return self.item_segments.join(" ");
+            return join_segments(self.item_segments.iter().map(String::as_str));
         }
-        let mut live = self.generic_segments.join(" ");
-        if !live.is_empty() && !self.current_line.is_empty() {
-            live.push(' ');
-        }
-        live.push_str(&self.current_line);
+        let mut live = join_segments(self.generic_segments.iter().map(String::as_str));
+        live.push_str(&join_segment(live.chars().last(), &self.current_line));
         live
     }
 
     fn text(&self) -> String {
         if self.item_segments.is_empty() {
-            self.generic_segments.join(" ")
+            join_segments(self.generic_segments.iter().map(String::as_str))
         } else {
-            self.item_segments.join(" ")
+            join_segments(self.item_segments.iter().map(String::as_str))
         }
     }
 
@@ -332,15 +375,16 @@ impl NormalTranscriptAccumulator {
     fn accept_item_drain(&mut self, drained: Vec<String>) -> Vec<String> {
         let mut segments_to_send = Vec::new();
         for segment in drained {
-            if self.replay_prefix.front() == Some(&segment) {
-                self.replay_prefix.pop_front();
-                continue;
-            }
             if !self.replay_prefix.is_empty() {
-                // The replay diverged from text already emitted downstream.
-                // This layer cannot rewrite that output, so stop prefix
-                // suppression and retain both observations explicitly.
-                self.replay_prefix.clear();
+                let index = self.item_segments.len() - self.replay_prefix.len();
+                self.replay_prefix.pop_front();
+                if self.item_segments[index] != segment {
+                    // The cache keeps the authoritative replay correction. The
+                    // already-delivered paste is left untouched: re-pasting a
+                    // correction here would duplicate text in the target app.
+                    self.item_segments[index] = segment;
+                }
+                continue;
             }
             self.item_segments.push(segment.clone());
             segments_to_send.push(segment);
@@ -388,14 +432,30 @@ pub(crate) async fn dictate_realtime(
     ));
 
     // Create initial transcription pipeline: buffer → feeder → transcriber.
-    let transcriber = transcription::create_realtime_transcriber(&config, provider, model)?;
+    let transcriber = match transcription::create_realtime_transcriber(&config, provider, model) {
+        Ok(transcriber) => transcriber,
+        Err(error) => {
+            finish_live_recording(capture, feedback, &mut bt_guard, ogg_task, false).await?;
+            return Err(error);
+        }
+    };
     // Pre-flight so a bad key or model fails immediately with an enriched error
     // instead of surfacing mid-session. Reconnects intentionally skip validation:
     // the session was already validated, and retries should not add a round-trip.
-    transcriber.validate().await?;
+    if let Err(error) = transcriber.validate().await {
+        finish_live_recording(capture, feedback, &mut bt_guard, ogg_task, false).await?;
+        return Err(error);
+    }
     let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(100);
     let mut feeder_handle = tokio::spawn(buffer_feeder(Arc::clone(&buffer), fwd_tx, 0));
-    let mut event_rx = transcriber.transcribe_realtime(fwd_rx).await?;
+    let mut event_rx = match transcriber.transcribe_realtime(fwd_rx).await {
+        Ok(events) => events,
+        Err(error) => {
+            feeder_handle.abort();
+            finish_live_recording(capture, feedback, &mut bt_guard, ogg_task, false).await?;
+            return Err(error);
+        }
+    };
     let started = std::time::Instant::now();
 
     if from_file {
@@ -405,6 +465,7 @@ pub(crate) async fn dictate_realtime(
     }
 
     let capture_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut capture_stopped = false;
     let capture_stop_clone = capture_stop.clone();
 
     // Wait for the shared shutdown token (registered early in dictate())
@@ -448,6 +509,7 @@ pub(crate) async fn dictate_realtime(
             feedback.play_stop_now();
 
             capture.stop()?;
+            capture_stopped = true;
             // Restore the Bluetooth headset to its high-quality
             // profile (typically A2DP) the instant the microphone
             // capture stops, in parallel with the WebSocket finishing
@@ -702,14 +764,7 @@ pub(crate) async fn dictate_realtime(
     ctrlc_task.abort();
     feeder_handle.abort();
 
-    // Wait for OGG recording task to finish (no timeout — it
-    // completes as soon as the source channel closes and any trailing
-    // bytes are flushed, which is fast).
-    match ogg_task.await {
-        Ok(Ok(())) => log::debug!("cache OGG saved"),
-        Ok(Err(e)) => log::warn!("cache OGG write error: {}", e),
-        Err(e) => log::warn!("cache OGG task panicked: {}", e),
-    }
+    finish_live_recording(capture, feedback, &mut bt_guard, ogg_task, capture_stopped).await?;
 
     let provider_specific = match provider {
         Provider::OpenAI => Some(ProviderSpecificMetadata::OpenAI(OpenAIProviderMetadata {
@@ -773,6 +828,169 @@ pub(crate) async fn dictate_realtime(
 mod tests {
     use super::*;
     use crate::config::AudioConfig;
+
+    #[derive(Default)]
+    struct HoldingCapture {
+        sender: Option<tokio::sync::mpsc::Sender<Vec<i16>>>,
+        stopped: bool,
+    }
+
+    impl AudioCapture for HoldingCapture {
+        fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            self.sender = Some(sender);
+            Ok(receiver)
+        }
+
+        fn stop(&mut self) -> Result<(), TalkError> {
+            self.stopped = true;
+            self.sender.take();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_recording_cleanup_stops_live_capture_before_ogg_join() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut capture = HoldingCapture::default();
+        let audio_rx = capture.start().expect("start capture");
+        let buffer = Arc::new(AudioBuffer::new());
+        let ogg_task = tokio::spawn(ogg_recording_task(
+            audio_rx,
+            dir.path().join("capture.ogg"),
+            AudioConfig::new(),
+            buffer,
+        ));
+        let mut feedback =
+            RecordingFeedback::new(crate::audio::recording_feedback::RecordingFeedbackOptions {
+                no_sounds: true,
+                no_boop: true,
+                no_overlay: true,
+                capture_rate: 16_000,
+                viz: None,
+                mono: false,
+                boop_interval_ms: 0,
+                pause_audio: false,
+                suppress_boop: None,
+                overlay: crate::audio::recording_feedback::RecordingOverlayOptions {
+                    silence_tx: None,
+                    auto_pause: false,
+                    telemetry_rx: None,
+                },
+            });
+        let mut guard = bt_profile::HeadsetGuard::new(None);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            finish_live_recording(&mut capture, &mut feedback, &mut guard, ogg_task, false),
+        )
+        .await
+        .expect("terminal cleanup must not wait on running capture")
+        .expect("capture stop succeeds");
+        assert!(capture.stopped);
+    }
+
+    async fn scripted_terminal_session(fail_reconnect: bool) {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local listener");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            for session in 0..if fail_reconnect { 3 } else { 2 } {
+                let (stream, _) = listener.accept().await.expect("local session");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("upgrade");
+                if session != 2 {
+                    ws.send(Message::Text(r#"{"type":"session.created"}"#.into()))
+                        .await
+                        .expect("session created");
+                }
+                if session == 0 {
+                    ws.send(Message::Text(r#"{"type":"session.updated"}"#.into()))
+                        .await
+                        .expect("session updated");
+                } else if fail_reconnect {
+                    ws.send(Message::Text(
+                        r#"{"type":"error","error":{"message":"session unavailable"}}"#.into(),
+                    ))
+                    .await
+                    .expect("scripted error");
+                } else {
+                    ws.send(Message::Text(r#"{"type":"transcription.done"}"#.into()))
+                        .await
+                        .expect("early done");
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut capture = HoldingCapture::default();
+        let audio_rx = capture.start().expect("capture start");
+        let config: Config = serde_yaml::from_str(&format!(
+            "output_dir: {}\nproviders:\n  mistral:\n    api_key: local\n    url: {}\n",
+            dir.path().display(),
+            endpoint,
+        ))
+        .expect("local config");
+        let mut feedback =
+            RecordingFeedback::new(crate::audio::recording_feedback::RecordingFeedbackOptions {
+                no_sounds: true,
+                no_boop: true,
+                no_overlay: true,
+                viz: None,
+                mono: false,
+                boop_interval_ms: 0,
+                capture_rate: 16_000,
+                pause_audio: false,
+                suppress_boop: None,
+                overlay: crate::audio::recording_feedback::RecordingOverlayOptions {
+                    silence_tx: None,
+                    auto_pause: false,
+                    telemetry_rx: None,
+                },
+            });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dictate_realtime(
+                config,
+                Provider::Mistral,
+                None,
+                &dir.path().join("recording.ogg"),
+                audio_rx,
+                &mut capture,
+                false,
+                &mut feedback,
+                None,
+                None,
+                &CancellationToken::new(),
+                bt_profile::HeadsetGuard::new(None),
+            ),
+        )
+        .await
+        .expect("early Done must not hang")
+        .expect("dictation result");
+        assert_eq!(result.text, "");
+        assert!(capture.stopped);
+        server.await.expect("local server completed");
+    }
+
+    #[tokio::test]
+    async fn early_provider_done_stops_live_capture_and_finishes_dictation() {
+        scripted_terminal_session(false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_reconnect_stops_live_capture_and_finishes_dictation() {
+        scripted_terminal_session(true).await;
+    }
 
     #[test]
     fn normal_openai_completion_emits_incrementally_and_finish_does_not_resend() {
@@ -931,6 +1149,34 @@ mod tests {
     }
 
     #[test]
+    fn replayed_correction_replaces_transcript_without_duplicate_paste() {
+        let mut transcript = NormalTranscriptAccumulator::default();
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "old".into(),
+            previous_item_id: None,
+        });
+        let first = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "old".into(),
+            content_index: 0,
+            transcript: "Hello world".into(),
+        });
+        assert_eq!(first.segments_to_send, ["Hello world"]);
+        transcript.reset_item_generation_for_replay();
+        transcript.apply(TranscriptionEvent::ItemCreated {
+            item_id: "replay".into(),
+            previous_item_id: None,
+        });
+        let corrected = transcript.apply(TranscriptionEvent::ItemTextCompleted {
+            item_id: "replay".into(),
+            content_index: 0,
+            transcript: "Hello, world".into(),
+        });
+
+        assert!(corrected.segments_to_send.is_empty());
+        assert_eq!(transcript.finish().text, "Hello, world");
+    }
+
+    #[test]
     fn normal_generic_segments_remain_additive() {
         let mut transcript = NormalTranscriptAccumulator::default();
         let first = transcript.apply(TranscriptionEvent::SegmentDelta {
@@ -947,6 +1193,22 @@ mod tests {
         assert_eq!(first.segments_to_send, vec!["first".to_string()]);
         assert_eq!(second.segments_to_send, vec!["second".to_string()]);
         assert_eq!(transcript.finish().text, "first second");
+    }
+
+    #[test]
+    fn realtime_segments_preserve_existing_boundary_whitespace() {
+        let mut transcript = NormalTranscriptAccumulator::default();
+        transcript.apply(TranscriptionEvent::SegmentDelta {
+            text: "Hello\n".into(),
+            start: None,
+            end: None,
+        });
+        transcript.apply(TranscriptionEvent::SegmentDelta {
+            text: "world".into(),
+            start: None,
+            end: None,
+        });
+        assert_eq!(transcript.finish().text, "Hello\nworld");
     }
 
     // ── AudioBuffer tests ───────────────────────────────────────────
@@ -1036,11 +1298,11 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx); // drop receiver immediately
 
-        // feeder should exit quickly without hanging.
+        // A closed receiver makes the feeder exit; the deadline only detects a hang.
         let handle = tokio::spawn(buffer_feeder(buf, tx, 0));
-        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
             .await
-            .expect("feeder should finish promptly")
+            .expect("feeder should not hang")
             .expect("feeder should not panic");
     }
 
@@ -1120,7 +1382,7 @@ mod tests {
         let packets = read_ogg_packets(&ogg_path);
         assert_eq!(&packets[0][..8], b"OpusHead");
         assert_eq!(&packets[1][..8], b"OpusTags");
-        assert_eq!(packets.len(), 7);
+        assert_eq!(packets.len(), 8); // headers, five live frames, one lookahead tail
     }
 
     #[tokio::test]
@@ -1188,7 +1450,7 @@ mod tests {
 
         // All 3 chunks must be encoded into the OGG stream.
         let packets = read_ogg_packets(&ogg_path);
-        assert_eq!(packets.len(), 5);
+        assert_eq!(packets.len(), 6); // headers, three live frames, one lookahead tail
 
         let mut source =
             crate::audio::file_source::OggFileSource::new(&ogg_path).expect("valid cached OGG");

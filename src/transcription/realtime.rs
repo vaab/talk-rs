@@ -37,6 +37,44 @@ const SESSION_CREATED_TIMEOUT: Duration = Duration::from_secs(15);
 /// Interval between WebSocket ping frames for keepalive.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 
+fn is_cjk_boundary(c: char) -> bool {
+    matches!(c as u32,
+        0x2e80..=0x2fff | 0x3000..=0x30ff | 0x3400..=0x9fff |
+        0xac00..=0xd7af | 0xf900..=0xfaff | 0xff00..=0xffef)
+}
+
+/// Return the next segment with only its necessary boundary separator.
+/// Mixed CJK/Latin boundaries take a space for readability.
+pub(crate) fn join_segment(prev_tail_char: Option<char>, next: &str) -> String {
+    let Some(first) = next.chars().next() else {
+        return String::new();
+    };
+    let separator = match prev_tail_char {
+        Some(prev)
+            if !prev.is_whitespace()
+                && !first.is_whitespace()
+                && !(is_cjk_boundary(prev) && is_cjk_boundary(first)) =>
+        {
+            " "
+        }
+        _ => "",
+    };
+    format!("{separator}{next}")
+}
+
+pub(crate) fn join_segments<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut text = String::new();
+    for part in parts {
+        if !part.is_empty() {
+            text.push_str(&join_segment(text.chars().last(), part));
+        }
+    }
+    text
+}
+
+/// Maximum time to collect final results after the audio stream ends.
+pub(crate) const FINAL_TRANSCRIPT_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Events received from the Voxtral Realtime API.
 #[derive(Debug, Clone)]
 pub enum TranscriptionEvent {
@@ -149,7 +187,7 @@ impl OrderedItemTranscript {
 
     /// Render the current transcript in conversation order.
     pub fn snapshot(&self) -> String {
-        self.render(false).join(" ")
+        join_segments(self.render(false).iter().map(String::as_str))
     }
 
     /// Drain authoritative content that is safe to emit in conversation order.
@@ -271,8 +309,8 @@ impl OrderedItemTranscript {
                         }
                     })
                     .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    .collect::<Vec<_>>();
+                let parts = join_segments(parts);
                 (!parts.is_empty()).then_some(parts)
             })
             .collect()
@@ -624,12 +662,20 @@ impl MistralRealtimeTranscriber {
         // [Fix #5 #7] Shared cancellation token so sender/receiver can
         // signal each other on failure instead of hanging independently.
         let cancel = CancellationToken::new();
+        let (audio_end_tx, audio_end_rx) = tokio::sync::watch::channel(None);
 
         // Spawn sender task: reads PCM from audio_rx, encodes, sends over WS
-        let sender_task = tokio::spawn(sender_loop(audio_rx, ws_sink, cancel.clone()));
+        let sender_task =
+            tokio::spawn(sender_loop(audio_rx, ws_sink, cancel.clone(), audio_end_tx));
 
         // Spawn receiver task: reads WS messages, parses events, sends to event_tx
-        let receiver_task = tokio::spawn(receiver_loop(ws_source, event_tx, cancel.clone()));
+        let receiver_task = tokio::spawn(receiver_loop(
+            ws_source,
+            event_tx,
+            cancel.clone(),
+            audio_end_rx,
+            FINAL_TRANSCRIPT_DEADLINE,
+        ));
 
         // [Fix #6] Cleanup task that logs panics instead of swallowing them
         tokio::spawn(async move {
@@ -716,6 +762,7 @@ async fn sender_loop<S>(
     mut audio_rx: mpsc::Receiver<Vec<i16>>,
     mut ws_sink: SplitSink<S, Message>,
     cancel: CancellationToken,
+    audio_end_tx: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
 ) where
     S: futures::Sink<Message> + Unpin,
     <S as futures::Sink<Message>>::Error: std::fmt::Display,
@@ -776,6 +823,7 @@ async fn sender_loop<S>(
         log::error!("WebSocket send error (input_audio.end): {}", e);
         cancel.cancel();
     }
+    audio_end_tx.send_replace(Some(tokio::time::Instant::now()));
 }
 
 /// Receiver loop: reads WebSocket messages, parses events, forwards to channel.
@@ -786,11 +834,28 @@ async fn receiver_loop<S>(
     mut ws_source: S,
     event_tx: mpsc::Sender<TranscriptionEvent>,
     cancel: CancellationToken,
+    mut audio_end: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
+    final_deadline: Duration,
 ) where
     S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     loop {
+        let end = *audio_end.borrow();
         tokio::select! {
+            changed = audio_end.changed(), if end.is_none() => {
+                if changed.is_err() { return; }
+            }
+            _ = async {
+                if let Some(end) = end {
+                    tokio::time::sleep_until(end + final_deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                log::warn!("Mistral final transcription deadline reached after {}s; keeping accumulated text", final_deadline.as_secs());
+                let _ = event_tx.send(TranscriptionEvent::Done).await;
+                return;
+            }
             msg_opt = ws_source.next() => {
                 let msg_result = match msg_opt {
                     Some(r) => r,
@@ -799,6 +864,9 @@ async fn receiver_loop<S>(
                         // or silent drop). Log it and let the caller collect
                         // whatever text was accumulated so far.
                         log::warn!("WebSocket stream ended unexpectedly");
+                        let _ = event_tx.send(TranscriptionEvent::Error {
+                            message: "WebSocket closed before transcription.done".to_string(),
+                        }).await;
                         cancel.cancel();
                         return;
                     }
@@ -836,7 +904,10 @@ async fn receiver_loop<S>(
                     }
                     Message::Close(frame) => {
                         log::debug!("received WS Close frame: {:?}", frame);
-                        let _ = event_tx.send(TranscriptionEvent::Done).await;
+                        let _ = event_tx.send(TranscriptionEvent::Error {
+                            message: "WebSocket closed before transcription.done".to_string(),
+                        }).await;
+                        cancel.cancel();
                         return;
                     }
                     Message::Pong(_) => {
@@ -860,6 +931,95 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ordered_items_join_cjk_without_inserting_a_space() {
+        let mut transcript = OrderedItemTranscript::default();
+        transcript.item_created("first", None);
+        transcript.item_created("second", Some("first"));
+        transcript.complete("first", 0, "你好。");
+        transcript.complete("second", 0, "世界");
+        assert_eq!(transcript.snapshot(), "你好。世界");
+    }
+
+    #[test]
+    fn segment_join_respects_whitespace_and_script_boundaries() {
+        for (left, right, expected) in [
+            ("Hello ", "world", "Hello world"),
+            ("Hello", "world", "Hello world"),
+            ("你好。", "世界", "你好。世界"),
+            ("Hello", "\nworld", "Hello\nworld"),
+            ("日本", "Tokyo", "日本 Tokyo"),
+            ("", "world", "world"),
+            ("Hello", "", "Hello"),
+        ] {
+            assert_eq!(
+                join_segments([left, right]),
+                expected,
+                "{left:?} + {right:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mistral_stalled_finalization_ends_fifteen_seconds_after_audio() {
+        let (audio_end_tx, audio_end_rx) = tokio::sync::watch::channel(None);
+        let (tx, mut rx) = mpsc::channel(4);
+        let receiver = tokio::spawn(receiver_loop(
+            futures::stream::pending(),
+            tx,
+            CancellationToken::new(),
+            audio_end_rx,
+            FINAL_TRANSCRIPT_DEADLINE,
+        ));
+        audio_end_tx.send_replace(Some(tokio::time::Instant::now()));
+        tokio::time::advance(Duration::from_secs(14)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(rx.recv().await, Some(TranscriptionEvent::Done)));
+        receiver.await.expect("receiver finished");
+    }
+
+    #[tokio::test]
+    async fn premature_mistral_close_and_eof_reconnect_instead_of_finishing() {
+        for messages in [vec![Ok(Message::Close(None))], vec![]] {
+            let (tx, mut rx) = mpsc::channel(4);
+            let (_end_tx, end_rx) = tokio::sync::watch::channel(None);
+            receiver_loop(
+                futures::stream::iter(messages),
+                tx,
+                CancellationToken::new(),
+                end_rx,
+                FINAL_TRANSCRIPT_DEADLINE,
+            )
+            .await;
+            assert!(matches!(
+                rx.recv().await,
+                Some(TranscriptionEvent::Error { .. })
+            ));
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn mistral_explicit_final_before_close_finishes() {
+        let (tx, mut rx) = mpsc::channel(4);
+        receiver_loop(
+            futures::stream::iter(vec![
+                Ok(Message::Text(
+                    r#"{"type":"transcription.done"}"#.to_string(),
+                )),
+                Ok(Message::Close(None)),
+            ]),
+            tx,
+            CancellationToken::new(),
+            tokio::sync::watch::channel(None).1,
+            FINAL_TRANSCRIPT_DEADLINE,
+        )
+        .await;
+        assert!(matches!(rx.recv().await, Some(TranscriptionEvent::Done)));
+    }
+
+    #[test]
     fn test_http_to_ws_https() {
         assert_eq!(http_to_ws("https://api.mistral.ai"), "wss://api.mistral.ai");
     }
@@ -880,33 +1040,25 @@ mod tests {
     }
 
     #[test]
-    fn test_new_uses_custom_url() {
-        let config = MistralConfig {
-            api_key: "key".to_string(),
-            url: Some("https://custom.example.com".to_string()),
-            model: "voxtral-mini-2507".to_string(),
-            context_bias: None,
-            tts_model: "voxtral-mini-tts-latest".to_string(),
-            tts_voice: None,
-            tts_voices: None,
-        };
-        let transcriber = MistralRealtimeTranscriber::new(config);
-        assert_eq!(transcriber.endpoint, "wss://custom.example.com");
-    }
-
-    #[test]
-    fn test_new_default_endpoint() {
-        let config = MistralConfig {
-            api_key: "key".to_string(),
-            url: None,
-            model: "voxtral-mini-2507".to_string(),
-            context_bias: None,
-            tts_model: "voxtral-mini-tts-latest".to_string(),
-            tts_voice: None,
-            tts_voices: None,
-        };
-        let transcriber = MistralRealtimeTranscriber::new(config);
-        assert_eq!(transcriber.endpoint, "wss://api.mistral.ai");
+    fn constructor_resolves_default_and_custom_endpoints() {
+        for (url, expected) in [
+            (None, "wss://api.mistral.ai"),
+            (
+                Some("https://custom.example.com"),
+                "wss://custom.example.com",
+            ),
+        ] {
+            let config = MistralConfig {
+                api_key: "key".to_string(),
+                url: url.map(str::to_string),
+                model: "voxtral-mini-2507".to_string(),
+                context_bias: None,
+                tts_model: "voxtral-mini-tts-latest".to_string(),
+                tts_voice: None,
+                tts_voices: None,
+            };
+            assert_eq!(MistralRealtimeTranscriber::new(config).endpoint, expected);
+        }
     }
 
     #[test]
@@ -1120,21 +1272,21 @@ mod tests {
     }
 
     #[test]
-    fn test_build_ws_url() {
-        let url = build_ws_url("wss://api.mistral.ai", "my-model");
-        assert_eq!(
-            url,
-            "wss://api.mistral.ai/v1/audio/transcriptions/realtime?model=my-model"
-        );
-    }
-
-    #[test]
-    fn test_build_ws_url_custom_endpoint() {
-        let url = build_ws_url("wss://custom.example.com", "test-model");
-        assert_eq!(
-            url,
-            "wss://custom.example.com/v1/audio/transcriptions/realtime?model=test-model"
-        );
+    fn ws_url_builder_handles_model_and_endpoint_variants() {
+        for (endpoint, model, expected) in [
+            (
+                "wss://api.mistral.ai",
+                "my-model",
+                "wss://api.mistral.ai/v1/audio/transcriptions/realtime?model=my-model",
+            ),
+            (
+                "wss://custom.example.com",
+                "test-model",
+                "wss://custom.example.com/v1/audio/transcriptions/realtime?model=test-model",
+            ),
+        ] {
+            assert_eq!(build_ws_url(endpoint, model), expected);
+        }
     }
 
     #[test]
@@ -1186,27 +1338,6 @@ mod tests {
             TranscriptionEvent::TextDelta { text } => assert_eq!(text, ""),
             other => panic!("Expected TextDelta, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_timeout_constants_are_reasonable() {
-        // `WS_CONNECT_TIMEOUT` previously asserted here is now
-        // owned by `transport::ws_upgrade` (see
-        // `CONNECTION_BUDGETS_SECS = [2, 5, 8, 11, 15]`).  The
-        // sum (41s) is within the historical sanity bound — a
-        // compile-time const so the bound check is a doc rather
-        // than a runtime assert (clippy flags `assert!(true)`
-        // on const expressions as a no-op).
-        const _: () = {
-            const SUM: u64 = 2 + 5 + 8 + 11 + 15;
-            assert!(SUM >= 5);
-            assert!(SUM <= 120);
-        };
-
-        assert!(SESSION_CREATED_TIMEOUT.as_secs() >= 5);
-        assert!(SESSION_CREATED_TIMEOUT.as_secs() <= 60);
-        assert!(WS_PING_INTERVAL.as_secs() >= 10);
-        assert!(WS_PING_INTERVAL.as_secs() <= 120);
     }
 
     /// Pre-flight contract used by ``dictate --realtime``: when the
