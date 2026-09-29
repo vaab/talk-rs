@@ -156,6 +156,48 @@ async fn produce_or_wait(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn default_transcription_uses_authoritative_pick_without_provider_request() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let audio = dir.path().join("memo.ogg");
+        std::fs::write(&audio, b"recording").expect("test audio");
+        crate::recording_cache::write_pick(&audio, "openai", "whisper-1", false, "edited text")
+            .expect("saved pick");
+        let config_file = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_file,
+            format!("output_dir: {}\nproviders: {{}}\n", dir.path().display()),
+        )
+        .expect("test config");
+        let config = Config::load(Some(&config_file)).expect("load isolated config");
+        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+            std::sync::Arc::new(crate::telemetry::NoOpSink);
+
+        let output = produce_or_wait(&audio, &config, Provider::Mistral, &sink)
+            .await
+            .expect("pick bypasses absent provider configuration");
+        assert_eq!(output, "edited text");
+    }
+
+    #[tokio::test]
+    async fn transcribe_rejects_missing_input_before_loading_user_config() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let missing = dir.path().join("missing.ogg");
+        let error = transcribe(
+            vec![missing.display().to_string()],
+            None,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err("missing recording must be rejected");
+        assert_eq!(
+            error.to_string(),
+            format!("Audio error: Input file not found: {}", missing.display())
+        );
+    }
+
     #[test]
     fn test_parse_args_input_only() {
         let args = vec!["audio.ogg".to_string()];
@@ -212,67 +254,5 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires 1 or 2 arguments"));
-    }
-
-    #[tokio::test]
-    async fn test_transcribe_pipeline_with_mock_transcriber() {
-        use crate::config::Provider;
-        use crate::recording_cache;
-        use crate::transcription::{MockOneShotTranscriber, OneShotTranscriber, TranscriptionBody};
-        use std::fs;
-        use tempfile::TempDir;
-
-        // Create temporary directory for test files
-        let temp_dir = TempDir::new().expect("create temp dir");
-
-        // Create a temporary input audio file
-        let input_path = temp_dir.path().join("test-audio.ogg");
-        fs::write(&input_path, b"fake audio data").expect("write input file");
-
-        // Create output path
-        let output_path = temp_dir.path().join("transcript.txt");
-
-        // Create mock transcriber
-        let mock = MockOneShotTranscriber::new("This is a test transcription");
-
-        // Transcribe using mock
-        let transcription = mock
-            .fetch_transcription(TranscriptionBody::File(input_path.clone()))
-            .await
-            .expect("transcribe should succeed");
-
-        let output_text = transcription::format_transcription_output(&transcription, false);
-        let sidecar_path = recording_cache::write_metadata_to_dir(
-            temp_dir.path(),
-            "test-audio",
-            Provider::Mistral,
-            "mock-model",
-            false,
-            &output_text,
-            "test-audio.ogg",
-            &transcription.metadata,
-            transcription.segments.as_deref(),
-            transcription.diarization.as_deref(),
-        )
-        .expect("write sidecar metadata");
-
-        // Write output (simulating what transcribe() does)
-        let mut file = tokio::fs::File::create(&output_path)
-            .await
-            .expect("create output file");
-        file.write_all(output_text.as_bytes())
-            .await
-            .expect("write to file");
-        file.sync_all().await.expect("sync file");
-
-        // Verify output file was created and has correct content
-        let content = fs::read_to_string(&output_path).expect("read output file");
-        assert_eq!(content, "This is a test transcription");
-
-        let sidecar = fs::read_to_string(&sidecar_path).expect("read sidecar file");
-        assert!(sidecar.contains("recording: test-audio.ogg"));
-        assert!(sidecar.contains("provider: mistral"));
-        assert!(sidecar.contains("model: mock-model"));
-        assert!(sidecar.contains("transcript: This is a test transcription"));
     }
 }

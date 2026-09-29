@@ -11,6 +11,129 @@ use talk_rs::config::{Config, MistralConfig, Provider, ProvidersConfig};
 use talk_rs::transcription::transcribe_audio;
 use tempfile::TempDir;
 
+#[test]
+fn transcribe_cli_reports_missing_input_without_loading_user_configuration() {
+    let dir = TempDir::new().expect("tempdir");
+    let missing = dir.path().join("absent.ogg");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_talk-rs"))
+        .arg("transcribe")
+        .arg(&missing)
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env_remove("TALK_RS_LOG_FILE")
+        .output()
+        .expect("run isolated CLI");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("UTF-8 error"),
+        format!(
+            "error: Audio error: Input file not found: {}\n",
+            missing.display()
+        )
+    );
+}
+
+#[test]
+fn transcribe_cli_writes_saved_pick_to_requested_output_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let config_dir = dir.path().join("config").join("talk-rs");
+    fs::create_dir_all(&config_dir).expect("isolated config dir");
+    fs::write(
+        config_dir.join("config.yaml"),
+        format!("output_dir: {}\nproviders: {{}}\n", dir.path().display()),
+    )
+    .expect("isolated config");
+    let audio = dir.path().join("memo.ogg");
+    fs::write(&audio, b"audio").expect("fixture audio");
+    talk_rs::recording_cache::write_pick(
+        &audio,
+        "openai",
+        "whisper-1",
+        false,
+        "edited transcript\nsecond line",
+    )
+    .expect("saved edit");
+    let destination = dir.path().join("transcript.txt");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_talk-rs"))
+        .arg("transcribe")
+        .arg(&audio)
+        .arg(&destination)
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_CACHE_HOME", dir.path().join("cache"))
+        .env_remove("TALK_RS_LOG_FILE")
+        .output()
+        .expect("run isolated CLI");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, b"");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 success"),
+        format!("Transcription saved to: {}\n", destination.display())
+    );
+    assert_eq!(
+        fs::read_to_string(destination).expect("saved output"),
+        "edited transcript\nsecond line"
+    );
+}
+
+#[test]
+fn explicit_model_cli_reads_its_sidecar_instead_of_authoritative_pick() {
+    let dir = TempDir::new().expect("tempdir");
+    let config_dir = dir.path().join("config").join("talk-rs");
+    fs::create_dir_all(&config_dir).expect("isolated config dir");
+    fs::write(
+        config_dir.join("config.yaml"),
+        format!("output_dir: {}\nproviders: {{}}\n", dir.path().display()),
+    )
+    .expect("isolated config");
+    let audio = dir.path().join("memo.ogg");
+    fs::write(&audio, b"audio").expect("fixture audio");
+    talk_rs::recording_cache::write_pick(&audio, "mistral", "chosen", false, "edited pick")
+        .expect("saved edit");
+    talk_rs::recording_cache::TranscriptionCache::store(
+        &audio,
+        Provider::OpenAI,
+        "whisper-1",
+        false,
+        &talk_rs::transcription::TranscriptionResult {
+            text: "model-specific output".into(),
+            ..Default::default()
+        },
+    )
+    .expect("saved model sidecar");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_talk-rs"))
+        .args(["transcribe", "--provider", "openai", "--model", "whisper-1"])
+        .arg(&audio)
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_CACHE_HOME", dir.path().join("cache"))
+        .env_remove("TALK_RS_LOG_FILE")
+        .output()
+        .expect("run isolated CLI");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, b"");
+    assert_eq!(output.stdout, b"model-specific output\n");
+    assert_eq!(
+        talk_rs::recording_cache::read_pick(&audio),
+        Some((
+            Provider::Mistral,
+            "chosen".into(),
+            false,
+            "edited pick".into()
+        ))
+    );
+}
+
 /// Create a minimal WAV file with synthetic PCM data.
 ///
 /// Creates a valid WAV header with 16-bit PCM audio at 16kHz mono.

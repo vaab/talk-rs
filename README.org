@@ -25,8 +25,9 @@ happening.
 
 - *Dictation workflow* -- press a key to start recording, press again
   to stop; transcribed text is pasted automatically.
-  The original clipboard text is restored after pasting and remains
-  available after ~talk-rs~ exits until you copy something else.
+  The original clipboard content (including non-text targets such as images)
+  is restored after pasting and remains available after ~talk-rs~ exits until
+  you copy something else. If there was no clipboard owner, nothing is restored.
 - *Multiple providers* -- Mistral (Voxtral), OpenAI (Whisper / GPT-4o),
   and local on-device Parakeet for batch transcription; Mistral and
   OpenAI realtime streaming via WebSocket.
@@ -151,6 +152,11 @@ Cloud transcription providers require an API key:
 Parakeet is a local, on-device ASR backend using sherpa-onnx on the
 CPU and needs no API key.  After a consent prompt, its model is
 downloaded on first use into ~~/.local/share/talk-rs/models/~.
+Downloaded Parakeet and Kokoro models include a ~.complete~ file with
+required-file sizes; changed sizes cause a fresh consent-gated download.
+Older manually installed models without this file retain the legacy
+non-empty-file check because the release specs do not include exact
+sizes or checksums. The approximate download sizes are only estimates.
 
 ** Installation
 
@@ -206,8 +212,11 @@ providers:
 | Field                        | Description                                          |
 |------------------------------+------------------------------------------------------|
 | ~output_dir~                 | Absolute path to a writable directory for recordings (a leading ~~~ is expanded to your home) |
-| ~providers.mistral.api_key~  | Mistral API key (if using Mistral)                   |
-| ~providers.openai.api_key~   | OpenAI API key (if using OpenAI)                     |
+| ~providers.mistral.api_key~  | Mistral API key (if the section exists; YAML or ~TALK_RS_PROVIDERS_MISTRAL_API_KEY~) |
+| ~providers.openai.api_key~   | OpenAI API key (if the section exists; YAML or ~TALK_RS_PROVIDERS_OPENAI_API_KEY~) |
+
+Unknown keys, including misspellings inside nested provider and paste-tree
+sections, fail configuration loading with an error naming the key.
 
 *** Optional fields
 
@@ -225,7 +234,8 @@ providers:
 | ~providers.openai.keywords~        | /none/                    | Expected vocabulary list for the new models |
 | ~providers.openai.languages~       | /none/                    | Ordered expected-language list     |
 | ~providers.openai.realtime_delay~  | /none/                    | Realtime delay: ~minimal~, ~low~, ~medium~, ~high~, or ~xhigh~ |
-| ~providers.kokoro.model_dir~       | /XDG data dir/            | Kokoro TTS model cache dir (auto-downloaded on first ~speak~) |
+| ~providers.kokoro.model_dir~       | /XDG data dir/            | Kokoro TTS model cache dir (leading ~~/~ expands to home; auto-downloaded on first ~speak~) |
+| ~providers.parakeet.model_dir~     | /XDG data dir/            | Parakeet model cache dir (leading ~~/~ expands to home) |
 | ~providers.kokoro.voice~           | /per-language default/    | Default Kokoro voice name (~af_heart~, ~ff_siwis~, …)          |
 | ~providers.kokoro.num_threads~     | ~4~                       | Kokoro inference threads           |
 | ~providers.kokoro.lang~            | ~en~ (model-baked)        | Default Kokoro phonemization language |
@@ -234,11 +244,11 @@ providers:
 | ~indicators.boop_interval_ms~      | ~5000~                    | Periodic boop interval in ms (~0~ disables boops; also ~--no-boop~) |
 | ~indicators.visual_overlay~        | ~true~                    | Show X11 overlay badge             |
 | ~indicators.viz~                   | /none/                    | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ (also ~--viz~; env ~TALK_RS_INDICATORS_VIZ~) |
-| ~indicators.mono~                  | ~false~                   | Monochrome visualizer (also ~--mono~) |
-| ~paste.chunk_chars~                | ~150~                     | Max chars per paste chunk (~0~ disables chunking; also ~--no-chunk-paste~) |
+| ~indicators.mono~                  | ~false~                   | Monochrome visualizer (env ~TALK_RS_INDICATORS_MONO~; ~--mono~ forces it on) |
+| ~paste.chunk_chars~                | ~150~                     | Max Unicode characters per paste chunk; original whitespace is preserved, and an overlong word may exceed the limit (~0~ disables chunking; also ~--no-chunk-paste~) |
 | ~audio.bt_auto_switch~             | ~true~                    | Auto-switch a connected Bluetooth headset to HFP for the duration of a recording, then restore (also ~--no-bt-auto-switch~; env ~TALK_RS_AUDIO_BT_AUTO_SWITCH~) |
 | ~recording.sample_rate~            | ~48000~                   | Sample rate (Hz) of the ~record~ command's ~.ogg~ output (env ~TALK_RS_RECORDING_SAMPLE_RATE~) |
-| ~recording.channels~               | ~1~                       | Channels for ~record~ output: ~1~ mono, ~2~ stereo (env ~TALK_RS_RECORDING_CHANNELS~) |
+| ~recording.channels~               | ~1~                       | Channels for ~record~ output: only ~1~ mono or ~2~ stereo (env ~TALK_RS_RECORDING_CHANNELS~) |
 | ~recording.bitrate~                | ~128000~                  | Opus bitrate (bps) of the ~record~ command's ~.ogg~ output (env ~TALK_RS_RECORDING_BITRATE~) |
 
 The ~recording.*~ settings control the quality of recordings meant
@@ -307,7 +317,14 @@ export TALK_RS_PROVIDERS_OPENAI_PROMPT="Preserve punctuation and casing."
 export TALK_RS_PROVIDERS_OPENAI_KEYWORDS="Kalysto, talk-rs"
 export TALK_RS_PROVIDERS_OPENAI_LANGUAGES="fr, en"
 export TALK_RS_PROVIDERS_OPENAI_REALTIME_DELAY="low"
+export TALK_RS_INDICATORS_MONO="true"
 #+end_src
+
+For a configured ~providers.mistral~ or ~providers.openai~ section, its
+~api_key~ may be omitted from YAML when the corresponding environment
+variable supplies it.  If neither supplies a key, loading fails and
+names both the YAML field and environment variable.  An environment
+key can also create a provider section absent from YAML.
 
 ~TALK_RS_PROVIDERS_OPENAI_KEYWORDS~ and
 ~TALK_RS_PROVIDERS_OPENAI_LANGUAGES~ are comma-separated lists.  talk-rs
@@ -354,9 +371,9 @@ Options:
 | ~--timestamp~               | Include timestamps in output (~HH:MM:SS~ prefix) |
 | ~--realtime~                | Stream audio via WebSocket (incremental text)   |
 | ~--pick~                    | Show multi-candidate picker (GTK window)        |
-| ~--retry-last~              | Re-transcribe the last cached recording         |
+| ~--retry-last~              | Re-transcribe the last cached recording (conflicts with ~--input-audio-file~) |
 | ~--replace-last-paste~      | Delete previous paste before inserting new text |
-| ~--save <PATH>~             | Save audio recording to a file                  |
+| ~--save <PATH>~             | Save audio even on transcription failure; create parent directories and report copy errors |
 | ~--output-yaml <FILE>~      | Write transcription metadata YAML               |
 | ~--input-audio-file <FILE>~ | Feed a pre-recorded audio file instead of live mic |
 | ~--monitor~                 | Mix system audio (monitor) with mic input       |
@@ -370,6 +387,18 @@ Options:
 | ~--viz <MODE>~              | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ |
 | ~--mono~                    | Monochrome visualizer (theme-aware)             |
 | ~--no-bt-auto-switch~       | Disable Bluetooth headset HFP auto-switch (overrides ~audio.bt_auto_switch~) |
+
+In ~--realtime~ mode, ~--no-paste~ also suppresses incremental pastes.
+For a cached pick opened with ~--input-audio-file~ or ~--retry-last~,
+~--no-paste~ skips delivery while ~--save~ and ~--output-yaml~ still
+export audio and metadata. Confirming a saved selection in the picker
+pastes into the current target: the saved pick records a choice, not
+prior delivery.
+~--replace-last-paste~ removes the previous text only in the same
+target window, before the first segment; later segments append. If a
+reconnected provider revises an already-pasted segment, the cached
+transcript records the correction without pasting a duplicate. After
+audio ends, realtime providers wait at most 15 seconds for final text.
 
 *** Record
 
@@ -437,6 +466,12 @@ Options:
 | ~--diarize~   | Enable speaker diarization (tag by speaker)       |
 | ~--timestamp~ | Include timestamps in output (~HH:MM:SS~ prefix)  |
 
+Transcription sidecars are reused only while the audio file exists and
+its size and modification time match the saved values. Older sidecars
+without those fields remain readable for existing audio files. Model
+names with slashes or spaces are escaped in new sidecar filenames;
+ordinary model names keep their existing filenames.
+
 **** Provider overload
 
 Cloud providers periodically answer =503 high load= or
@@ -444,7 +479,7 @@ Cloud providers periodically answer =503 high load= or
 ~talk-rs~ treats every 5xx and 429 as "busy, try again later" and
 waits between attempts: 5 s, 15 s, 30 s, 60 s, 120 s, 120 s (about
 5.5 minutes in total, seven attempts).  A =Retry-After= header from
-the provider overrides the schedule slot (capped at 120 s).  Each wait
+the provider (seconds or HTTP date) overrides the schedule slot (capped at 120 s).  Each wait
 is logged at ~-v~ as =server retry N/6=.  Other 4xx answers are
 permanent and fail immediately.
 
@@ -453,6 +488,9 @@ separate, shorter schedule and never consume the server-retry
 budget.  Large uploads are given the whole request time budget on
 every attempt, so an 80-minute recording is not cut off by the early
 connection slots.
+In the interactive picker, a connected request has no per-request
+wall-clock cap: slow server processing does not cause the same paid
+transcription POST to be sent again.
 
 If all seven attempts fail the recording is kept in the cache;
 re-run ~transcribe~ on the ~.ogg~ (or ~dictate --retry-last~) once
@@ -565,6 +603,12 @@ the paste aborts with an error instead of resetting modifier state or
 injecting into an ambiguous state. CapsLock and NumLock remain
 unchanged; pressing either lock key during the wait also defers the
 shortcut. A failed target window refocus aborts the retry attempt.
+
+When a target window is known, chunked clipboard pastes retry a shortcut
+only if that target has not fetched the chunk at all. If it fetched the
+chunk fewer times than expected, pasting aborts rather than risking a
+duplicate. =--replace-last-paste= only deletes earlier text when its
+stored window ID matches the current paste target.
 
 Every synthesized key request is checked with the X server. On success,
 =talk-rs= releases its chord in reverse order; on failure, it attempts

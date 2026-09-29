@@ -218,7 +218,9 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
         no_boop: opts.no_boop,
         no_overlay: opts.no_overlay,
         viz: viz_mode,
-        mono: opts.mono,
+        mono: config_for_bt
+            .as_ref()
+            .map_or(opts.mono, |config| config.resolved_mono(opts.mono)),
         boop_interval_ms,
         capture_rate: audio_config.sample_rate,
         pause_audio: false,
@@ -230,38 +232,73 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
             telemetry_rx: None,
         },
     });
-    let mut rx = start_capture_with_feedback(&mut feedback, &mut *capture).await?;
+    record_audio_to_file(
+        &output_path,
+        audio_config,
+        &mut *capture,
+        &mut feedback,
+        async { interrupt.recv().await },
+        move || bt_guard.restore_now_async(),
+    )
+    .await?;
 
-    // Initialize audio writer
-    let mut writer = create_writer(&output_path, audio_config.clone())?;
-    let is_wav = matches!(
-        output_path.extension().and_then(|e| e.to_str()),
-        Some("wav")
-    );
+    println!("Recording saved to: {}", output_path.display());
+    Ok(())
+}
 
-    // Ensure the parent directory exists.  For auto-generated paths this
-    // creates the `YYYY/MM/` subdirectory; for user-provided paths it
-    // creates any missing intermediate directories (principle of least
-    // surprise when the user passes a nested path).
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.map_err(|err| {
-                TalkError::Io(std::io::Error::new(
-                    err.kind(),
-                    format!(
-                        "failed to create recording directory {}: {}",
-                        parent.display(),
-                        err
-                    ),
-                ))
-            })?;
+#[cfg(feature = "capture")]
+async fn record_audio_to_file<Stop, OnStop>(
+    output_path: &Path,
+    audio_config: AudioConfig,
+    capture: &mut dyn AudioCapture,
+    feedback: &mut RecordingFeedback,
+    stop: Stop,
+    on_stop: OnStop,
+) -> Result<(), TalkError>
+where
+    Stop: std::future::Future<Output = Option<()>>,
+    OnStop: FnOnce(),
+{
+    let mut rx = start_capture_with_feedback(feedback, capture).await?;
+
+    let setup = async {
+        let writer = create_writer(output_path, audio_config)?;
+        let is_wav = matches!(
+            output_path.extension().and_then(|e| e.to_str()),
+            Some("wav")
+        );
+
+        // Auto-generated paths create YYYY/MM; explicit paths may be nested.
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                    TalkError::Io(std::io::Error::new(
+                        err.kind(),
+                        format!(
+                            "failed to create recording directory {}: {}",
+                            parent.display(),
+                            err
+                        ),
+                    ))
+                })?;
+            }
         }
+        let file = tokio::fs::File::create(output_path)
+            .await
+            .map_err(TalkError::Io)?;
+        Ok::<_, TalkError>((writer, is_wav, file))
     }
-
-    // Create output file
-    let mut file = tokio::fs::File::create(&output_path)
-        .await
-        .map_err(TalkError::Io)?;
+    .await;
+    let (mut writer, is_wav, mut file) = match setup {
+        Ok(resources) => resources,
+        Err(error) => {
+            feedback.teardown_recording(RecordingBadgeTeardown::Hide);
+            if let Err(stop_error) = capture.stop() {
+                log::warn!("failed to stop capture after recording setup error: {stop_error}");
+            }
+            return Err(error);
+        }
+    };
 
     // Spawn async task to read from capture channel, encode, and write to file
     let encode_task = tokio::spawn(async move {
@@ -325,7 +362,15 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
     });
 
     // Wait for SIGINT (Ctrl+C or toggle-off).
-    if interrupt.recv().await.is_none() {
+    if stop.await.is_none() {
+        feedback.teardown_recording(RecordingBadgeTeardown::Hide);
+        capture.stop()?;
+        on_stop();
+        match encode_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::warn!("recording finalization after closed listener: {error}"),
+            Err(error) => log::warn!("recording task after closed listener: {error}"),
+        }
         return Err(TalkError::Audio(
             "SIGINT listener closed before recording stopped".to_string(),
         ));
@@ -333,8 +378,8 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
 
     println!("Stopping recording...");
 
-    stop_capture_with_feedback(&mut feedback, &mut *capture, || async move {
-        bt_guard.restore_now_async();
+    stop_capture_with_feedback(feedback, capture, || async move {
+        on_stop();
         match encode_task.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => Err(err),
@@ -343,7 +388,6 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
     })
     .await?;
 
-    println!("Recording saved to: {}", output_path.display());
     Ok(())
 }
 
@@ -390,6 +434,138 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use std::sync::{Arc, Mutex};
+
+    struct FiniteCapture {
+        samples: Vec<i16>,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AudioCapture for FiniteCapture {
+        fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(self.samples.clone())
+                .map_err(|error| TalkError::Audio(error.to_string()))?;
+            Ok(rx)
+        }
+
+        fn stop(&mut self) -> Result<(), TalkError> {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_runner_writes_decodable_audio_and_stops_capture_before_returning() {
+        for extension in ["wav", "ogg"] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let path = dir.path().join("nested").join(format!("voice.{extension}"));
+            let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut capture = FiniteCapture {
+                samples: (0..640)
+                    .map(|index| if index % 2 == 0 { 2000 } else { -2000 })
+                    .collect(),
+                stopped: Arc::clone(&stopped),
+            };
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut feedback = RecordingFeedback::new_for_test(events, true);
+
+            record_audio_to_file(
+                &path,
+                AudioConfig::new(),
+                &mut capture,
+                &mut feedback,
+                async { Some(()) },
+                || {},
+            )
+            .await
+            .expect("recording should be finalized");
+
+            let bytes = std::fs::read(&path).expect("read recording");
+            assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+            let decoded = audio::read_audio_as_i16(&path).expect("recording must decode");
+            assert!(
+                decoded.len() >= 640,
+                "recording must retain the audio frames"
+            );
+            assert!(
+                decoded.iter().any(|sample| *sample != 0),
+                "recording must not be silent"
+            );
+            match extension {
+                "wav" => {
+                    assert_eq!(&bytes[..4], b"RIFF");
+                    assert_eq!(&bytes[8..12], b"WAVE");
+                    assert_eq!(bytes.len(), 44 + 640 * 2);
+                }
+                "ogg" => {
+                    assert!(bytes.starts_with(b"OggS"));
+                    assert!(bytes.windows(8).any(|window| window == b"OpusHead"));
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_directory_failure_stops_started_capture() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let occupied_parent = dir.path().join("not-a-directory");
+        std::fs::write(&occupied_parent, b"user file").expect("create conflicting file");
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut capture = FiniteCapture {
+            samples: vec![2000; 320],
+            stopped: Arc::clone(&stopped),
+        };
+        let mut feedback = RecordingFeedback::new_for_test(Arc::new(Mutex::new(Vec::new())), true);
+        let destination = occupied_parent.join("recording.wav");
+
+        let error = record_audio_to_file(
+            &destination,
+            AudioConfig::new(),
+            &mut capture,
+            &mut feedback,
+            async { Some(()) },
+            || {},
+        )
+        .await
+        .expect_err("parent file prevents recording");
+
+        assert!(error
+            .to_string()
+            .contains("failed to create recording directory"));
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read(&occupied_parent).expect("parent file preserved"),
+            b"user file"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_stop_listener_stops_capture_and_reports_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut capture = FiniteCapture {
+            samples: vec![2000; 320],
+            stopped: Arc::clone(&stopped),
+        };
+        let mut feedback = RecordingFeedback::new_for_test(Arc::new(Mutex::new(Vec::new())), true);
+        let error = record_audio_to_file(
+            &dir.path().join("recording.wav"),
+            AudioConfig::new(),
+            &mut capture,
+            &mut feedback,
+            async { None },
+            || {},
+        )
+        .await
+        .expect_err("closed listener cannot report a successful recording");
+        assert_eq!(
+            error.to_string(),
+            "Audio error: SIGINT listener closed before recording stopped"
+        );
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     struct OrderedCapture {
         events: Arc<Mutex<Vec<&'static str>>>,
