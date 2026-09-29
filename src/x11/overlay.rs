@@ -3274,6 +3274,7 @@ mod tests {
     fn render_spectrogram_empty_history_no_panic() {
         let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
         pb.clear(BG_COLOR);
+        let expected = pb.data.clone();
         render_spectrogram(
             &mut pb,
             &[],
@@ -3284,6 +3285,10 @@ mod tests {
             1.0,
             None,
             1.0,
+        );
+        assert_eq!(
+            pb.data, expected,
+            "empty history must leave the badge unchanged"
         );
     }
 
@@ -4007,7 +4012,7 @@ mod tests {
         let mut pb = PixelBuffer::new(SPEC_W, SPEC_H);
         // Pre-fill so any change is detectable.
         pb.clear([0, 0, 0, 0]);
-        render_retry_counter(&mut pb, &font, 2, 4, 0, 5, 1.0);
+        render_retry_counter(&mut pb, font, 2, 4, 0, 5, 1.0);
         let any_painted = pb.data.iter().any(|&b| b != 0);
         assert!(!any_painted, "attempt=0 must not paint anything");
     }
@@ -4023,7 +4028,7 @@ mod tests {
         };
         let mut pb = PixelBuffer::new(SPEC_W, SPEC_H);
         pb.clear([0, 0, 0, 0]);
-        render_retry_counter(&mut pb, &font, 2, 4, 1, 5, 1.0);
+        render_retry_counter(&mut pb, font, 2, 4, 1, 5, 1.0);
         let any_painted = pb.data.iter().any(|&b| b != 0);
         assert!(any_painted, "attempt>=1 must produce visible pixels");
     }
@@ -4041,8 +4046,8 @@ mod tests {
         full.clear([0, 0, 0, 0]);
         let mut half = PixelBuffer::new(SPEC_W, SPEC_H);
         half.clear([0, 0, 0, 0]);
-        render_retry_counter(&mut full, &font, 2, 4, 1, 5, 1.0);
-        render_retry_counter(&mut half, &font, 2, 4, 1, 5, 0.5);
+        render_retry_counter(&mut full, font, 2, 4, 1, 5, 1.0);
+        render_retry_counter(&mut half, font, 2, 4, 1, 5, 0.5);
 
         let full_brightness: u64 = full.data.iter().map(|&b| b as u64).sum();
         let half_brightness: u64 = half.data.iter().map(|&b| b as u64).sum();
@@ -4062,8 +4067,8 @@ mod tests {
     /// glyph rasterisation skip themselves cleanly when no
     /// suitable system font is available (e.g. minimal CI
     /// environments without DejaVu / Liberation / Noto).
-    fn decode_font_or_skip() -> Option<fontdue::Font> {
-        let font = super::super::render_util::load_system_font(RETRY_COUNTER_FONT_SIZE);
+    fn decode_font_or_skip() -> Option<&'static fontdue::Font> {
+        let font = super::super::render_util::test_latin_font();
         if font.is_none() {
             eprintln!("skipped: no system font available for retry counter rendering");
         }

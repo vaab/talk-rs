@@ -222,7 +222,6 @@ fn wait_for_identity(
 }
 
 #[test]
-#[ignore = "requires cc, script, and tmux; owns a private tmux socket"]
 fn isolated_real_pty_and_tmux_follow_only_the_selected_client_pane() {
     let temp = tempfile::tempdir().expect("create fixture directory");
     let opencode = compile_stub(temp.path());
