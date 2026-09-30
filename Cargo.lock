@@ -3596,6 +3596,7 @@ dependencies = [
  "httpdate",
  "indoc",
  "insta",
+ "libc",
  "libpulse-binding",
  "log",
  "nix 0.28.0",
