@@ -9,6 +9,7 @@
 
 #![allow(dead_code)] // each perf test uses a different subset of the harness
 
+pub mod audio;
 pub mod display;
 pub mod fixtures;
 pub mod provider;
@@ -41,6 +42,88 @@ pub fn gate(name: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// Gate a local-model cut: `$name` must name a directory that the
+/// PRODUCTION presence check accepts.  An unset variable skips; a set
+/// but incomplete directory FAILS (talk-rs would take its consent /
+/// download path there, which a measurement must never trigger).
+pub fn model_gate(name: &str, kind: talk_rs::perf_counters::LocalModel) -> Option<ModelDir> {
+    let dir = std::path::PathBuf::from(gate(name)?);
+    assert!(
+        talk_rs::perf_counters::model_present(kind, &dir),
+        "{name}={} is not a complete {kind:?} model (production presence check failed)",
+        dir.display()
+    );
+    let before = tree_state(&dir);
+    Some(ModelDir { dir, before })
+}
+
+/// A validated local-model directory; dropping it asserts the run left
+/// the tree unchanged (no download, no derived-file write).
+pub struct ModelDir {
+    pub dir: std::path::PathBuf,
+    before: Vec<(String, u64, std::time::SystemTime)>,
+}
+
+impl ModelDir {
+    pub fn path(&self) -> &str {
+        self.dir.to_str().expect("utf-8 model dir")
+    }
+
+    pub fn assert_unchanged(&self) {
+        assert_eq!(
+            tree_state(&self.dir),
+            self.before,
+            "the model directory was modified during the measurement"
+        );
+    }
+}
+
+/// (relative path, size, mtime) of every file under `root`, sorted.
+fn tree_state(root: &std::path::Path) -> Vec<(String, u64, std::time::SystemTime)> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(String, u64, std::time::SystemTime)>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                out.push((
+                    rel,
+                    meta.len(),
+                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    // Sibling lock files written by the model fetcher count as changes.
+    if let (Some(parent), Some(name)) = (root.parent(), root.file_name()) {
+        let lock = parent.join(format!("{}.lock", name.to_string_lossy()));
+        if let Ok(meta) = std::fs::metadata(&lock) {
+            out.push((
+                "../<lock>".into(),
+                meta.len(),
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+            ));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// One measurement: `item` (shortlist id) × `cut` (scenario).
@@ -79,8 +162,17 @@ impl Metrics {
     }
 
     pub fn write(&self) {
-        let mut body = format!("item: {}\ncut: {}\nmetrics:\n", self.item, self.cut);
+        let mut body = format!(
+            "item: {}\ncut: {}\nstatus: ran\nmetrics:\n",
+            self.item, self.cut
+        );
         for (name, value) in &self.values {
+            assert!(
+                value.is_finite(),
+                "{}/{}: metric {name} is {value}",
+                self.item,
+                self.cut
+            );
             let _ = writeln!(body, "  {name}: {}", fmt_value(*value));
         }
         eprintln!("perf {}/{}:\n{body}", self.item, self.cut);
@@ -101,17 +193,40 @@ fn fmt_value(v: f64) -> String {
     }
 }
 
-/// Median of a sample (for repeated timing runs).
-pub fn median(values: &mut [f64]) -> f64 {
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = values.len();
-    if n == 0 {
-        return 0.0;
-    }
-    if n % 2 == 1 {
-        values[n / 2]
-    } else {
-        (values[n / 2 - 1] + values[n / 2]) / 2.0
+/// Number of repetitions for timing metrics (`TALK_RS_PERF_REPEAT`,
+/// default 5).  Work counters are deterministic and taken from the
+/// first run.
+pub fn repeats() -> usize {
+    std::env::var("TALK_RS_PERF_REPEAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n >= 1)
+        .unwrap_or(5)
+}
+
+/// Nearest-rank percentile (`p` in 0..=100) of a sample.
+pub fn percentile(values: &[f64], p: f64) -> f64 {
+    assert!(!values.is_empty(), "percentile of an empty sample");
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted[rank.min(sorted.len()) - 1]
+}
+
+impl Metrics {
+    /// Record a repeated timing sample as `<name>` (median),
+    /// `<name>-p90`, `<name>-spread` (max − min) and `<name>-n`.  The
+    /// comparator scores `<name>`, so every timing target is a median.
+    pub fn timing(&mut self, name: &str, samples: &[f64]) -> &mut Self {
+        let (lo, hi) = samples
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &v| {
+                (l.min(v), h.max(v))
+            });
+        self.set(name, percentile(samples, 50.0))
+            .set(&format!("{name}_p90"), percentile(samples, 90.0))
+            .set(&format!("{name}_spread"), hi - lo)
+            .set(&format!("{name}_n"), samples.len() as f64)
     }
 }
 

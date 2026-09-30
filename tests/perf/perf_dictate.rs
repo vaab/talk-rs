@@ -3,27 +3,36 @@
 //! runs at real-time pace and is stopped by SIGINT, exactly like the
 //! toggle shortcut.  Covers items `http-client-pool-prewarm`,
 //! `single-opus-encode`, `upload-normalize-once` (fallback) and the
-//! stop→transcript latency every dictation pays.
+//! overlay's FFT work.
+//!
+//! Every cut checks what the user gets, not only the work done: the
+//! provider's transcript is printed, the cache OGG is a well-formed,
+//! finalized stream that decodes to the dictated audio, and every
+//! upload decodes to that same audio (content envelope against the
+//! paced reference).  Timing metrics are medians over
+//! `TALK_RS_PERF_REPEAT` runs (default 5).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::require_counters;
+use crate::support::audio::{decode_ogg_strict, envelope_correlation};
 use crate::support::fixtures;
 use crate::support::provider::{multipart_file, MockProvider, ProxyOptions, TRANSCRIPT};
 use crate::support::runner::{self, RunReport, Sandbox};
-use crate::support::{config_yaml, Metrics, CHAIN_3};
+use crate::support::{config_yaml, repeats, Metrics, CHAIN_3};
 
 /// Opus frames per second of 16 kHz audio (20 ms frames).
 const FRAMES_PER_SEC: f64 = 50.0;
+/// The paced input loops this 4 s speech-like clip.
+const LOOP_SECONDS: f64 = 4.0;
 
 struct Dictation {
     report: RunReport,
     provider: MockProvider,
     sandbox: Sandbox,
+    sigint_at: Instant,
     /// SIGINT → the mock provider received the (first) POST.
     sigint_to_first_post_ms: f64,
-    /// Proxy accepted the first connection before SIGINT.
-    connected_before_stop: bool,
 }
 
 async fn dictate(seconds: f64, statuses: &[u16], chain: &[&str], proxy: ProxyOptions) -> Dictation {
@@ -31,9 +40,7 @@ async fn dictate(seconds: f64, statuses: &[u16], chain: &[&str], proxy: ProxyOpt
     let provider = MockProvider::start(statuses, Duration::ZERO, proxy).await;
     sandbox.write_config(&config_yaml(&sandbox.output_dir(), &provider.url(), chain));
     let input = sandbox.path().join("speech.wav");
-    // A 4 s loop is replayed at real-time pace for as long as we record.
-    fixtures::write_wav(&input, &fixtures::speech_pcm(4.0, 16_000), 16_000);
-
+    fixtures::write_wav(&input, &fixtures::speech_pcm(LOOP_SECONDS, 16_000), 16_000);
     let mut args = vec![
         "dictate",
         "--no-sounds",
@@ -60,55 +67,89 @@ async fn dictate(seconds: f64, statuses: &[u16], chain: &[&str], proxy: ProxyOpt
     let sigint_to_first_post_ms = first_post.map_or(f64::NAN, |t| {
         t.duration_since(sigint_at).as_secs_f64() * 1000.0
     });
-    let connected_before_stop = provider
-        .proxy
-        .accept_times()
-        .first()
-        .is_some_and(|t| *t < sigint_at);
     Dictation {
         report,
         provider,
         sandbox,
+        sigint_at,
         sigint_to_first_post_ms,
-        connected_before_stop,
     }
+}
+
+/// The paced source's audio for a recording of `samples` samples.
+fn looped_reference(samples: usize) -> Vec<i16> {
+    let clip = fixtures::speech_pcm(LOOP_SECONDS, 16_000);
+    (0..samples).map(|i| clip[i % clip.len()]).collect()
 }
 
 /// Invariants every dictation cut checks: success, the provider's
 /// transcript printed, a complete cache recording of the dictated
-/// length (± one chunk of SIGINT jitter).
-fn assert_delivered(d: &Dictation, seconds: f64) -> f64 {
+/// length (± 1 s of SIGINT jitter) holding the paced speech, and every
+/// upload carrying that same recording.  Returns (recorded seconds,
+/// cache PCM).
+fn assert_delivered(d: &Dictation, seconds: f64) -> (f64, Vec<i16>) {
     d.report.assert_success();
     assert_eq!(d.report.stdout.trim(), TRANSCRIPT);
     let cache = fixtures::only_ogg_in(&d.sandbox.cache_dir().join("recordings"));
-    let recorded = fixtures::ogg_duration(&std::fs::read(&cache).expect("cache ogg"));
+    let cached = decode_ogg_strict(&std::fs::read(&cache).expect("cache ogg"), 16_000);
+    let recorded = cached.len() as f64 / 16_000.0;
     assert!(
         (recorded - seconds).abs() < 1.0,
         "cache OGG holds {recorded:.2}s for a {seconds}s dictation"
     );
-    recorded
+    let r = envelope_correlation(&looped_reference(cached.len()), &cached, 16_000);
+    assert!(
+        r > 0.9,
+        "cache OGG does not hold the dictated speech (r={r:.3})"
+    );
+    (recorded, cached)
 }
 
-fn stop_metrics(m: &mut Metrics, d: &Dictation) {
-    for step in ["capture_stopped", "ogg_flushed", "transcription_done"] {
-        m.set(&format!("stop_{step}_ms"), d.report.stop_ms(step) as f64);
+/// Every upload decodes to the cached recording (same length, same
+/// content).
+async fn assert_uploads_are_recording(d: &Dictation, cached: &[i16]) {
+    for (i, post) in d.provider.posts().await.iter().enumerate() {
+        let uploaded = decode_ogg_strict(&multipart_file(post), 16_000);
+        assert!(
+            uploaded.len().abs_diff(cached.len()) <= 320,
+            "upload {i}: {} samples vs cache {}",
+            uploaded.len(),
+            cached.len()
+        );
+        let r = envelope_correlation(cached, &uploaded, 16_000);
+        assert!(r > 0.95, "upload {i} is not the recording (r={r:.3})");
     }
-    m.set("sigint_to_first_post_ms", d.sigint_to_first_post_ms)
-        .set("child_cpu_ms", d.report.child_cpu_ms)
-        .set("child_maxrss_kb", d.report.child_maxrss_kb as f64);
+}
+
+fn stop_metrics(m: &mut Metrics, runs: &[Dictation]) {
+    for step in ["capture_stopped", "ogg_flushed", "transcription_done"] {
+        let samples: Vec<f64> = runs.iter().map(|d| d.report.stop_ms(step) as f64).collect();
+        m.timing(&format!("stop_{step}_ms"), &samples);
+    }
+    let posts: Vec<f64> = runs.iter().map(|d| d.sigint_to_first_post_ms).collect();
+    m.timing("sigint_to_first_post_ms", &posts)
+        .set("child_cpu_ms", runs[0].report.child_cpu_ms)
+        .set("child_maxrss_kb", runs[0].report.child_maxrss_kb as f64);
 }
 
 /// Short dictation (3 s), provider answers at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn perf_dictate_short_3s() {
     require_counters!();
-    let d = dictate(3.0, &[200], &[], ProxyOptions::default()).await;
-    let recorded = assert_delivered(&d, 3.0);
+    let mut runs = Vec::new();
+    for _ in 0..repeats() {
+        let d = dictate(3.0, &[200], &[], ProxyOptions::default()).await;
+        let (_, cached) = assert_delivered(&d, 3.0);
+        assert_eq!(d.provider.posts().await.len(), 1);
+        assert_uploads_are_recording(&d, &cached).await;
+        runs.push(d);
+    }
+    let d = &runs[0];
+    let recorded = assert_delivered(d, 3.0).0;
     let mut m = Metrics::new("http-client-pool-prewarm", "dictate-short-3s");
-    stop_metrics(&mut m, &d);
+    stop_metrics(&mut m, &runs);
     m.counters(&d.report, &["http_client_builds"])
         .set("tcp_connections", d.provider.proxy.accepted() as f64)
-        .set("connected_before_stop", u8::from(d.connected_before_stop))
         .write();
     Metrics::new("single-opus-encode", "dictate-short-3s")
         .counters(&d.report, &["opus_frames_encoded"])
@@ -116,13 +157,13 @@ async fn perf_dictate_short_3s() {
             "encode_passes",
             d.report.counter("opus_frames_encoded") as f64 / (recorded * FRAMES_PER_SEC),
         )
-        .set("child_cpu_ms", d.report.child_cpu_ms)
         .write();
 }
 
-/// Short dictation over an emulated slow link: the proxy delays every
-/// new connection by 150 ms (TCP + TLS round trips).  A connection
-/// opened while recording (prewarm) takes this off the stop path.
+/// Short dictation over an emulated slow link: every new connection is
+/// delayed 150 ms by the proxy (application-side emulation of TCP+TLS
+/// round trips).  Prewarm is credited only when the connection opened
+/// BEFORE the stop gesture is the one that carries the upload.
 #[tokio::test(flavor = "multi_thread")]
 async fn perf_dictate_short_3s_slow_connect() {
     require_counters!();
@@ -130,12 +171,39 @@ async fn perf_dictate_short_3s_slow_connect() {
         accept_delay: Duration::from_millis(150),
         idle_close: None,
     };
-    let d = dictate(3.0, &[200], &[], proxy).await;
-    assert_delivered(&d, 3.0);
+    let mut runs = Vec::new();
+    let mut prewarmed = Vec::new();
+    let mut capture_start = Vec::new();
+    for _ in 0..repeats() {
+        let d = dictate(3.0, &[200], &[], proxy).await;
+        let (_, cached) = assert_delivered(&d, 3.0);
+        assert_eq!(d.provider.posts().await.len(), 1, "exactly one paid upload");
+        assert_uploads_are_recording(&d, &cached).await;
+        let (_, accepted) = d
+            .provider
+            .proxy
+            .first_post_connection()
+            .expect("POST socket");
+        prewarmed.push(f64::from(u8::from(accepted < d.sigint_at)));
+        capture_start.push(d.report.start.get("capture_started").copied().unwrap_or(0) as f64);
+        runs.push(d);
+    }
     let mut m = Metrics::new("http-client-pool-prewarm", "dictate-short-3s-connect-150ms");
-    stop_metrics(&mut m, &d);
-    m.set("connected_before_stop", u8::from(d.connected_before_stop))
-        .write();
+    stop_metrics(&mut m, &runs);
+    m.set(
+        "upload_on_prewarmed_connection",
+        if prewarmed.iter().all(|&v| v == 1.0) {
+            1.0
+        } else {
+            0.0
+        },
+    )
+    .set(
+        "extra_connections",
+        runs[0].provider.proxy.accepted().saturating_sub(1) as f64,
+    )
+    .timing("start_capture_started_ms", &capture_start)
+    .write();
 }
 
 /// Long dictation (2 min).  The proxy drops connections idle for 30 s,
@@ -150,48 +218,53 @@ async fn perf_dictate_long_2min() {
         idle_close: Some(Duration::from_secs(30)),
     };
     let d = dictate(120.0, &[200], &[], proxy).await;
-    let recorded = assert_delivered(&d, 120.0);
-    assert_eq!(d.provider.posts().await.len(), 1, "exactly one upload");
-    let upload = multipart_file(&d.provider.posts().await[0]);
-    let uploaded = fixtures::ogg_duration(&upload);
-    assert!(
-        (uploaded - recorded).abs() < 0.1,
-        "upload holds {uploaded}s"
-    );
+    let (recorded, cached) = assert_delivered(&d, 120.0);
+    assert_eq!(d.provider.posts().await.len(), 1, "exactly one paid upload");
+    assert_uploads_are_recording(&d, &cached).await;
+    assert_eq!(d.report.counter("data_retries"), 0, "no data retry charged");
     let mut m = Metrics::new("single-opus-encode", "dictate-long-2min");
-    stop_metrics(&mut m, &d);
-    m.counters(&d.report, &["opus_frames_encoded", "http_client_builds"])
-        .set(
-            "encode_passes",
-            d.report.counter("opus_frames_encoded") as f64 / (recorded * FRAMES_PER_SEC),
-        )
-        .write();
+    stop_metrics(&mut m, std::slice::from_ref(&d));
+    m.counters(
+        &d.report,
+        &[
+            "opus_frames_encoded",
+            "http_client_builds",
+            "connection_retries",
+        ],
+    )
+    .set(
+        "encode_passes",
+        d.report.counter("opus_frames_encoded") as f64 / (recorded * FRAMES_PER_SEC),
+    )
+    .write();
 }
 
 /// Fallback: the first chain entry answers 503 to the live upload, the
-/// second 503 again on the file retry, the third succeeds.  The cache
-/// OGG is re-normalized for every file-backed entry today.
+/// second 503 again on the file retry, the third succeeds.  Every entry
+/// must upload the complete recording.
 #[tokio::test(flavor = "multi_thread")]
 async fn perf_dictate_fallback_chain_3() {
     require_counters!();
-    let d = dictate(3.0, &[503, 503, 200], &CHAIN_3, ProxyOptions::default()).await;
-    let recorded = assert_delivered(&d, 3.0);
-    let posts = d.provider.posts().await;
-    assert_eq!(posts.len(), 3);
-    for post in &posts {
-        let uploaded = fixtures::ogg_duration(&multipart_file(post));
-        assert!(
-            (uploaded - recorded).abs() < 0.1,
-            "upload holds {uploaded}s"
-        );
+    let mut runs = Vec::new();
+    let mut busy_to_final = Vec::new();
+    for _ in 0..repeats() {
+        let d = dictate(3.0, &[503, 503, 200], &CHAIN_3, ProxyOptions::default()).await;
+        let (_, cached) = assert_delivered(&d, 3.0);
+        assert_eq!(d.provider.posts().await.len(), 3);
+        assert_uploads_are_recording(&d, &cached).await;
+        let times = d.provider.post_times();
+        busy_to_final.push(times[2].duration_since(times[0]).as_secs_f64() * 1000.0);
+        runs.push(d);
     }
-    let times = d.provider.post_times();
-    let busy_to_final_ms = times[2].duration_since(times[0]).as_secs_f64() * 1000.0;
+    let d = &runs[0];
     let mut m = Metrics::new("upload-normalize-once", "dictate-fallback-chain-3");
-    stop_metrics(&mut m, &d);
-    m.counters(&d.report, &["normalize_calls", "opus_frames_encoded"])
-        .set("first_busy_to_final_post_ms", busy_to_final_ms)
-        .write();
+    stop_metrics(&mut m, &runs);
+    m.counters(
+        &d.report,
+        &["normalize_calls", "upload_encodes", "audio_file_decodes"],
+    )
+    .timing("first_busy_to_final_post_ms", &busy_to_final)
+    .write();
     Metrics::new("http-client-pool-prewarm", "dictate-fallback-chain-3")
         .counters(&d.report, &["http_client_builds"])
         .set("tcp_connections", d.provider.proxy.accepted() as f64)

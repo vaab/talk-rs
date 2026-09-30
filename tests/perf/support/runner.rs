@@ -82,6 +82,13 @@ impl Sandbox {
             .env("PULSE_SERVER", "unix:/nonexistent/talk-rs-perf-pulse")
             .env("PIPEWIRE_REMOTE", "talk-rs-perf-no-such-remote")
             .env("NO_COLOR", "1")
+            // Block any network egress not aimed at the harness's own
+            // loopback servers: an accidental provider or model-download
+            // request fails fast instead of leaving the machine.
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "127.0.0.1,localhost")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -102,7 +109,8 @@ pub struct RunReport {
     pub stop: BTreeMap<String, u64>,
     /// `timing: start +Nms <step>`.
     pub start: BTreeMap<String, u64>,
-    /// Last `perf-counter:` value per name (final dump wins).
+    /// The last COMPLETE framed dump (the exit dump for a finished
+    /// run).  Empty when no complete frame was found.
     pub counters: BTreeMap<String, u64>,
     /// `perf-mark: name=+Nms`.
     pub marks: BTreeMap<String, u64>,
@@ -145,6 +153,88 @@ impl RunReport {
     }
 }
 
+/// Fields every framed dump must carry for resource-based scoring.
+pub const REQUIRED_DUMP_FIELDS: [&str; 5] = [
+    "vm_hwm_kb",
+    "vm_rss_kb",
+    "threads",
+    "cpu_ms",
+    "gtk_stall_max_ms",
+];
+
+/// One complete framed dump (`perf-dump-begin` … `perf-dump-end`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dump {
+    pub id: u64,
+    pub reason: String,
+    /// Milliseconds since the child's counters were initialised.
+    pub t_ms: u64,
+    pub values: BTreeMap<String, u64>,
+}
+
+impl Dump {
+    pub fn get(&self, name: &str) -> u64 {
+        *self
+            .values
+            .get(name)
+            .unwrap_or_else(|| panic!("dump {} lacks required field {name}", self.id))
+    }
+}
+
+/// Every complete, well-formed dump frame in `log`, in order.  A frame
+/// counts only when its end marker was written with the same id and a
+/// field count equal to the lines seen, so a read racing the writer
+/// never yields a partial snapshot.
+pub fn parse_dumps(log: &str) -> Vec<Dump> {
+    let mut dumps = Vec::new();
+    let mut open: Option<Dump> = None;
+    for line in log.lines() {
+        if let Some(rest) = line.split("perf-dump-begin: ").nth(1) {
+            let field = |k: &str| {
+                rest.split_whitespace()
+                    .find_map(|kv| kv.strip_prefix(k))
+                    .map(str::to_string)
+            };
+            open = Some(Dump {
+                id: field("id=")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(u64::MAX),
+                reason: field("reason=").unwrap_or_default(),
+                t_ms: field("t=+")
+                    .and_then(|v| v.trim_end_matches("ms").parse().ok())
+                    .unwrap_or_default(),
+                values: BTreeMap::new(),
+            });
+        } else if let Some(rest) = line.split("perf-dump-end: ").nth(1) {
+            let Some(dump) = open.take() else { continue };
+            let mut id = None;
+            let mut fields = None;
+            for kv in rest.split_whitespace() {
+                if let Some(v) = kv.strip_prefix("id=") {
+                    id = v.parse::<u64>().ok();
+                } else if let Some(v) = kv.strip_prefix("fields=") {
+                    fields = v.parse::<usize>().ok();
+                }
+            }
+            if id == Some(dump.id) && fields == Some(dump.values.len()) {
+                dumps.push(dump);
+            }
+        } else if let Some(rest) = line.strip_prefix("perf-counter: ") {
+            if let (Some(dump), Some((name, value))) = (open.as_mut(), rest.trim().split_once('='))
+            {
+                match value.parse() {
+                    Ok(v) => {
+                        dump.values.insert(name.to_string(), v);
+                    }
+                    // A malformed value invalidates the frame.
+                    Err(_) => open = None,
+                }
+            }
+        }
+    }
+    dumps
+}
+
 pub fn parse_log(log: &str, report: &mut RunReport) {
     for line in log.lines() {
         if let Some(rest) = line.split("timing: ").nth(1) {
@@ -166,12 +256,6 @@ pub fn parse_log(log: &str, report: &mut RunReport) {
                 _ => continue,
             };
             map.entry(step.to_string()).or_insert(ms);
-        } else if let Some(rest) = line.split("perf-counter: ").nth(1) {
-            if let Some((name, value)) = rest.trim().split_once('=') {
-                if let Ok(value) = value.parse() {
-                    report.counters.insert(name.to_string(), value);
-                }
-            }
         } else if let Some(rest) = line.split("perf-mark: ").nth(1) {
             if let Some((name, value)) = rest.trim().split_once("=+") {
                 if let Some(ms) = value.strip_suffix("ms").and_then(|v| v.parse().ok()) {
@@ -179,6 +263,9 @@ pub fn parse_log(log: &str, report: &mut RunReport) {
                 }
             }
         }
+    }
+    if let Some(last) = parse_dumps(log).pop() {
+        report.counters = last.values;
     }
 }
 
@@ -251,26 +338,27 @@ impl Live {
         wait_for_log(&self.log, marker, timeout).await;
     }
 
-    /// Ask the child for a counter dump (`SIGUSR2`) and return it.
-    pub async fn dump(&self) -> BTreeMap<String, u64> {
-        let before = std::fs::read_to_string(&self.log)
-            .unwrap_or_default()
-            .matches("perf-mark: dump=")
-            .count();
+    /// Ask the child for a counter dump (`SIGUSR2`) and return the
+    /// first complete frame written after the request, validated to
+    /// carry every [`REQUIRED_DUMP_FIELDS`].
+    pub async fn dump(&self) -> Dump {
+        let seen = parse_dumps(&std::fs::read_to_string(&self.log).unwrap_or_default())
+            .last()
+            .map(|d| d.id);
         self.signal(nix::sys::signal::Signal::SIGUSR2);
         // Generous: a saturated child (e.g. 200 waterfall threads on
         // open) can take a long time to schedule its signal task.
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             let log = std::fs::read_to_string(&self.log).unwrap_or_default();
-            if log.matches("perf-mark: dump=").count() > before {
-                let last = log.rfind("perf-mark: dump=").unwrap_or_default();
-                let tail = &log[last..];
-                if tail.contains("perf-counter: gtk_stall_max_ms=") {
-                    let mut report = RunReport::default();
-                    parse_log(tail, &mut report);
-                    return report.counters;
+            if let Some(dump) = parse_dumps(&log)
+                .into_iter()
+                .find(|d| d.reason == "signal" && seen.is_none_or(|s| d.id > s))
+            {
+                for field in REQUIRED_DUMP_FIELDS {
+                    let _ = dump.get(field);
                 }
+                return dump;
             }
             let alive = std::fs::read_to_string(format!("/proc/{}/stat", self.pid))
                 .is_ok_and(|stat| !stat.contains(") Z "));
@@ -356,14 +444,18 @@ mod tests {
     use indoc::indoc;
 
     #[test]
-    fn parses_timing_counter_and_mark_lines() {
+    fn parses_timing_marks_and_the_last_complete_dump() {
         let log = indoc! {"
             2026-09-30 10:00:00.000 I talk_rs.dictate.oneshot: timing: stop +1ms capture_stopped
             2026-09-30 10:00:00.100 I talk_rs.dictate: timing: stop +433ms ogg_flushed
             2026-09-30 10:00:00.200 I talk_rs.dictate: timing: start +12ms capture_started
-            2026-09-30 10:00:01.000 I talk_rs.perf_counters: perf-counter: http_client_builds=3
-            2026-09-30 10:00:01.000 I talk_rs.perf_counters: perf-mark: dump=+950ms
-            2026-09-30 10:00:02.000 I talk_rs.perf_counters: perf-counter: http_client_builds=4
+            2026-09-30 10:00:00.300 I talk_rs.speak: perf-mark: speak_handoff=+950ms
+            2026-09-30 10:00:01.000 I talk_rs.perf_counters.enabled: perf-dump-begin: id=0 reason=signal t=+1000ms
+            perf-counter: http_client_builds=3
+            perf-dump-end: id=0 fields=1
+            2026-09-30 10:00:02.000 I talk_rs.perf_counters.enabled: perf-dump-begin: id=1 reason=exit t=+2000ms
+            perf-counter: http_client_builds=4
+            perf-dump-end: id=1 fields=1
         "};
         let mut report = RunReport::default();
         parse_log(log, &mut report);
@@ -371,6 +463,71 @@ mod tests {
         assert_eq!(report.stop_ms("ogg_flushed"), 433);
         assert_eq!(report.start.get("capture_started"), Some(&12));
         assert_eq!(report.counter("http_client_builds"), 4);
-        assert_eq!(report.marks.get("dump"), Some(&950));
+        assert_eq!(report.marks.get("speak_handoff"), Some(&950));
+        let dumps = parse_dumps(log);
+        assert_eq!(dumps.len(), 2);
+        assert_eq!(
+            (dumps[0].id, dumps[0].reason.as_str(), dumps[0].t_ms),
+            (0, "signal", 1000)
+        );
+    }
+
+    /// A reader racing the writer sees a frame without its end marker,
+    /// or a frame whose field count does not match: neither is a dump.
+    #[test]
+    fn partial_or_mismatched_frames_are_not_dumps() {
+        let partial = indoc! {"
+            x perf-dump-begin: id=5 reason=signal t=+10ms
+            perf-counter: a=1
+            perf-counter: b=2
+        "};
+        assert!(parse_dumps(partial).is_empty());
+        let mismatched = indoc! {"
+            x perf-dump-begin: id=5 reason=signal t=+10ms
+            perf-counter: a=1
+            perf-dump-end: id=5 fields=2
+        "};
+        assert!(parse_dumps(mismatched).is_empty());
+        let wrong_id = indoc! {"
+            x perf-dump-begin: id=5 reason=signal t=+10ms
+            perf-counter: a=1
+            perf-dump-end: id=6 fields=1
+        "};
+        assert!(parse_dumps(wrong_id).is_empty());
+        let garbage = indoc! {"
+            x perf-dump-begin: id=5 reason=signal t=+10ms
+            perf-counter: a=12x
+            perf-dump-end: id=5 fields=1
+        "};
+        assert!(parse_dumps(garbage).is_empty());
+    }
+
+    /// Interleaved log lines from other targets between frame lines do
+    /// not break a frame; a restarted frame supersedes an unfinished one.
+    #[test]
+    fn interleaved_lines_and_restarted_frames() {
+        let log = indoc! {"
+            x perf-dump-begin: id=1 reason=signal t=+10ms
+            perf-counter: a=1
+            x perf-dump-begin: id=2 reason=signal t=+20ms
+            2026 D other.target: unrelated line
+            perf-counter: a=2
+            perf-dump-end: id=2 fields=1
+        "};
+        let dumps = parse_dumps(log);
+        assert_eq!(dumps.len(), 1);
+        assert_eq!(dumps[0].id, 2);
+        assert_eq!(dumps[0].get("a"), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "lacks required field vm_hwm_kb")]
+    fn missing_required_field_is_an_error() {
+        let log = indoc! {"
+            x perf-dump-begin: id=1 reason=signal t=+10ms
+            perf-counter: a=1
+            perf-dump-end: id=1 fields=1
+        "};
+        let _ = parse_dumps(log)[0].get("vm_hwm_kb");
     }
 }

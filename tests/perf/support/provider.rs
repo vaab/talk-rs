@@ -160,10 +160,21 @@ pub struct ProxyOptions {
     pub idle_close: Option<Duration>,
 }
 
-/// TCP proxy that records every accepted connection.
+/// What the proxy saw on one accepted client connection.
+#[derive(Debug, Clone)]
+pub struct ConnectionRecord {
+    pub accepted_at: Instant,
+    /// When each request line was seen on this connection, with its
+    /// method (`POST`, `GET`, …).  Requests are associated with the
+    /// socket that carried them.
+    pub requests: Vec<(Instant, String)>,
+}
+
+/// TCP proxy that records every accepted connection and the requests
+/// each one carried.
 pub struct CountingProxy {
     pub addr: std::net::SocketAddr,
-    accepts: Arc<Mutex<Vec<Instant>>>,
+    connections: Arc<Mutex<Vec<ConnectionRecord>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -171,30 +182,64 @@ impl CountingProxy {
     pub async fn start(upstream: std::net::SocketAddr, options: ProxyOptions) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
         let addr = listener.local_addr().expect("proxy addr");
-        let accepts = Arc::new(Mutex::new(Vec::new()));
-        let log = Arc::clone(&accepts);
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&connections);
         let task = tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
-                if let Ok(mut guard) = log.lock() {
-                    guard.push(Instant::now());
-                }
-                tokio::spawn(forward(client, upstream, options));
+                let id = match log.lock() {
+                    Ok(mut guard) => {
+                        guard.push(ConnectionRecord {
+                            accepted_at: Instant::now(),
+                            requests: Vec::new(),
+                        });
+                        guard.len() - 1
+                    }
+                    Err(_) => continue,
+                };
+                tokio::spawn(forward(client, upstream, options, Arc::clone(&log), id));
             }
         });
         Self {
             addr,
-            accepts,
+            connections,
             task,
         }
     }
 
     /// Number of TCP connections accepted so far.
     pub fn accepted(&self) -> usize {
-        self.accepts.lock().map(|g| g.len()).unwrap_or_default()
+        self.connections.lock().map(|g| g.len()).unwrap_or_default()
     }
 
     pub fn accept_times(&self) -> Vec<Instant> {
-        self.accepts.lock().map(|g| g.clone()).unwrap_or_default()
+        self.connections()
+            .into_iter()
+            .map(|c| c.accepted_at)
+            .collect()
+    }
+
+    pub fn connections(&self) -> Vec<ConnectionRecord> {
+        self.connections
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Index of the connection that carried the first POST, and whether
+    /// that connection was accepted before `instant` (i.e. opened before
+    /// the user stopped recording and actually used for the upload).
+    pub fn first_post_connection(&self) -> Option<(usize, Instant)> {
+        self.connections()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                c.requests
+                    .iter()
+                    .find(|(_, m)| m == "POST")
+                    .map(|(t, _)| (i, *t, c.accepted_at))
+            })
+            .min_by_key(|(_, t, _)| *t)
+            .map(|(i, _, accepted)| (i, accepted))
     }
 }
 
@@ -204,7 +249,15 @@ impl Drop for CountingProxy {
     }
 }
 
-async fn forward(mut client: TcpStream, upstream: std::net::SocketAddr, options: ProxyOptions) {
+const METHODS: [&str; 4] = ["POST ", "GET ", "PUT ", "DELETE "];
+
+async fn forward(
+    mut client: TcpStream,
+    upstream: std::net::SocketAddr,
+    options: ProxyOptions,
+    log: Arc<Mutex<Vec<ConnectionRecord>>>,
+    id: usize,
+) {
     tokio::time::sleep(options.accept_delay).await;
     let Ok(mut server) = TcpStream::connect(upstream).await else {
         return;
@@ -218,7 +271,27 @@ async fn forward(mut client: TcpStream, upstream: std::net::SocketAddr, options:
         tokio::select! {
             n = cr.read(&mut cbuf) => match n {
                 Ok(0) | Err(_) => break,
-                Ok(n) => if sw.write_all(&cbuf[..n]).await.is_err() { break },
+                Ok(n) => {
+                    // Request lines at the start of a read are enough:
+                    // HTTP/1.1 clients write each request head at once.
+                    for method in METHODS {
+                        let needle = format!("{method}/");
+                        let mut from = 0;
+                        while let Some(pos) = cbuf[from..n]
+                            .windows(needle.len())
+                            .position(|w| w == needle.as_bytes())
+                        {
+                            let at = from + pos;
+                            if at == 0 || cbuf[at - 1] == b'\n' {
+                                if let Ok(mut guard) = log.lock() {
+                                    guard[id].requests.push((Instant::now(), method.trim().to_string()));
+                                }
+                            }
+                            from = at + needle.len();
+                        }
+                    }
+                    if sw.write_all(&cbuf[..n]).await.is_err() { break }
+                }
             },
             n = sr.read(&mut sbuf) => match n {
                 Ok(0) | Err(_) => break,

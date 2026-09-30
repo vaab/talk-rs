@@ -93,16 +93,41 @@ pub fn write_ogg(path: &Path, seconds: f64, profile: OggProfile) {
     std::fs::write(path, bytes).expect("write OGG fixture");
 }
 
+/// Bump when any generator in this module changes its output: cached
+/// fixtures are keyed by this version, profile and duration, and their
+/// content hash is verified on every use.
+pub const FIXTURE_VERSION: u32 = 2;
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// Long fixtures are costly to encode; keep them once per checkout
-/// under `target/perf-fixtures/` (keyed by name) instead of per test.
+/// under `target/perf-fixtures/`, keyed by generator version, profile
+/// and duration, with a content hash (`.fnv`) checked on every use so a
+/// stale or damaged file is regenerated rather than silently reused.
 pub fn cached_ogg(name: &str, seconds: f64, profile: OggProfile) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/perf-fixtures");
     std::fs::create_dir_all(&dir).expect("fixture cache dir");
-    let path = dir.join(format!("{name}.ogg"));
-    if !path.exists() {
-        let tmp = dir.join(format!("{name}.ogg.partial"));
+    let tag = match profile {
+        OggProfile::Transcription => "upload16k",
+        OggProfile::Recording => "record48k",
+    };
+    let key = format!("{name}-v{FIXTURE_VERSION}-{tag}-{seconds}s");
+    let path = dir.join(format!("{key}.ogg"));
+    let hash_path = dir.join(format!("{key}.fnv"));
+    let valid = std::fs::read(&path)
+        .ok()
+        .zip(std::fs::read_to_string(&hash_path).ok())
+        .is_some_and(|(bytes, hash)| hash.trim() == format!("{:016x}", fnv64(&bytes)));
+    if !valid {
+        let tmp = dir.join(format!("{key}.ogg.partial"));
         write_ogg(&tmp, seconds, profile);
+        let bytes = std::fs::read(&tmp).expect("fixture bytes");
         std::fs::rename(&tmp, &path).expect("publish fixture");
+        std::fs::write(&hash_path, format!("{:016x}\n", fnv64(&bytes))).expect("fixture hash");
     }
     path
 }
@@ -110,34 +135,139 @@ pub fn cached_ogg(name: &str, seconds: f64, profile: OggProfile) -> PathBuf {
 /// Shape of a synthetic recordings library.
 pub struct LibrarySpec {
     pub recordings: usize,
-    /// Recordings without a `.pick.yml` (they get an audio player bar).
+    /// Recordings without a `.pick.yml` (they get an audio player bar
+    /// unless they carry a pick lock).
     pub without_pick: usize,
-    /// Recordings (among those without pick) that already have `.wf`.
-    pub with_waterfall: usize,
+    /// Among the no-pick OGG rows: valid `.wf` waveform caches (warm).
+    pub waveform_warm: usize,
+    /// … `.wf` caches older than their audio (stale → recomputed).
+    pub waveform_stale: usize,
+    /// … truncated `.wf` caches (corrupt → recomputed).
+    pub waveform_corrupt: usize,
+    /// No-pick rows that are imported `.mp4` (AAC) files.  (The browser
+    /// lists `.ogg`, `.m4a`, `.mp4` and `.aac` in `output_dir`; `.wav`
+    /// only in the dictation cache.)
+    pub imported_mp4: usize,
+    /// No-pick rows that are imported M4A (AAC) files.
+    pub imported_m4a: usize,
+    /// No-pick rows that are long recordings (`long_seconds`).
+    pub long_rows: usize,
+    pub long_seconds: f64,
+    /// Rows with a pick lock and no pick ("transcription ongoing").
+    pub in_progress: usize,
     pub seconds_each: f64,
 }
 
 impl LibrarySpec {
-    /// The user's measured library shape: 1504 audio files, 1304
-    /// picks, i.e. ~200 rows rendered as audio player bars.
+    /// The user's measured library shape — 1504 audio files, 1304
+    /// picks, 883 `.wf` — scaled to 1500 rows, with the realistic mix
+    /// of formats, waveform-cache states and lengths among the ~200
+    /// rows rendered as audio player bars.
     pub fn user_like() -> Self {
         Self {
             recordings: 1500,
             without_pick: 200,
-            with_waterfall: 0,
+            waveform_warm: 60,
+            waveform_stale: 10,
+            waveform_corrupt: 10,
+            imported_mp4: 10,
+            imported_m4a: 10,
+            long_rows: 1,
+            long_seconds: 600.0,
+            in_progress: 5,
             seconds_each: 2.0,
         }
     }
 }
 
-/// Build a `YYYY/MM/<timestamp>.ogg` library.  All recordings share one
-/// encoded payload (copied), so building 1500 entries takes a second.
-pub fn build_library(root: &Path, spec: &LibrarySpec) -> Vec<PathBuf> {
+/// What the recordings browser must show for one library entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedRow {
+    /// A transcript row showing this text.
+    Transcript(String),
+    /// An audio player bar (no pick).
+    Player,
+    /// "(transcription ongoing)" (pick lock, no pick).
+    InProgress,
+}
+
+/// A built library: every audio path with what its row must show.
+pub struct Library {
+    pub rows: Vec<(PathBuf, ExpectedRow)>,
+    /// The long no-pick recordings (Play cut targets).
+    pub long_rows: Vec<PathBuf>,
+}
+
+impl Library {
+    /// Expected display order: newest first by file name.
+    pub fn expected_order(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.rows.iter().map(|(p, _)| p.clone()).collect();
+        paths.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        paths
+    }
+}
+
+/// Write a `.wf` waveform cache in the browser's binary format
+/// (u32 columns, u32 rows, f32 peak, column-major f32 data).
+fn write_waveform(path: &Path, columns: u32, rows: u32) {
+    let mut bytes = Vec::new();
+    bytes.extend(columns.to_le_bytes());
+    bytes.extend(rows.to_le_bytes());
+    bytes.extend(0.5f32.to_le_bytes());
+    for i in 0..columns * rows {
+        bytes.extend(((i % 17) as f32 / 17.0).to_le_bytes());
+    }
+    std::fs::write(path, bytes).expect("waveform cache");
+}
+
+fn set_mtime(path: &Path, when: std::time::SystemTime) {
+    let file = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for mtime");
+    file.set_modified(when).expect("set mtime");
+}
+
+/// Build a `YYYY/MM/<timestamp>.<ext>` library matching `spec`.  OGG
+/// rows share one encoded payload (copied), so 1500 entries take about
+/// a second; long rows hard-link a cached fixture.
+pub fn build_library(root: &Path, spec: &LibrarySpec) -> Library {
     let template = root.join(".template.ogg");
     write_ogg(&template, spec.seconds_each, OggProfile::Recording);
     let payload = std::fs::read(&template).expect("template");
     std::fs::remove_file(&template).expect("remove template");
-    let mut paths = Vec::with_capacity(spec.recordings);
+    let m4a_payload = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sine_440_0.5s_mono.m4a"),
+    )
+    .expect("m4a fixture");
+    let long = (spec.long_rows > 0)
+        .then(|| cached_ogg("library-long", spec.long_seconds, OggProfile::Recording));
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+
+    let mut library = Library {
+        rows: Vec::with_capacity(spec.recordings),
+        long_rows: Vec::new(),
+    };
+    // No-pick rows are split, in order, into: in-progress, long, MP4,
+    // M4A, then OGG with warm / stale / corrupt / no waveform cache.
+    let mut cursor = 0;
+    let mut take = |n: usize| {
+        let range = cursor..cursor + n;
+        cursor += n;
+        range
+    };
+    let in_progress = take(spec.in_progress);
+    let long_range = take(spec.long_rows);
+    let mp4_range = take(spec.imported_mp4);
+    let m4a_range = take(spec.imported_m4a);
+    let warm = take(spec.waveform_warm);
+    let stale = take(spec.waveform_stale);
+    let corrupt = take(spec.waveform_corrupt);
+    assert!(
+        cursor <= spec.without_pick,
+        "library spec: too many special no-pick rows"
+    );
+
     for i in 0..spec.recordings {
         let day = i / 24;
         let month = 1 + (day / 28) % 12;
@@ -150,20 +280,54 @@ pub fn build_library(root: &Path, spec: &LibrarySpec) -> Vec<PathBuf> {
             i % 24,
             (i * 7) % 60
         );
-        let audio = dir.join(format!("{stem}.ogg"));
-        std::fs::write(&audio, &payload).expect("library audio");
-        if i >= spec.without_pick {
+        let ext = if mp4_range.contains(&i) {
+            "mp4"
+        } else if m4a_range.contains(&i) {
+            "m4a"
+        } else {
+            "ogg"
+        };
+        let audio = dir.join(format!("{stem}.{ext}"));
+        match (ext, &long) {
+            ("m4a" | "mp4", _) => std::fs::write(&audio, &m4a_payload).expect("aac row"),
+            (_, Some(long)) if long_range.contains(&i) => {
+                std::fs::hard_link(long, &audio)
+                    .or_else(|_| std::fs::copy(long, &audio).map(|_| ()))
+                    .expect("long row");
+                library.long_rows.push(audio.clone());
+            }
+            _ => std::fs::write(&audio, &payload).expect("ogg row"),
+        }
+        let expected = if i >= spec.without_pick {
+            let text = format!("recording number {i} transcript text");
             std::fs::write(
                 dir.join(format!("{stem}.pick.yml")),
                 format!(
-                    "provider: mistral\nmodel: voxtral-mini-2602\nstreaming: false\ntext: recording number {i} transcript text\n"
+                    "provider: mistral\nmodel: voxtral-mini-2602\nstreaming: false\ntext: {text}\n"
                 ),
             )
             .expect("pick file");
-        }
-        paths.push(audio);
+            ExpectedRow::Transcript(text)
+        } else if in_progress.contains(&i) {
+            std::fs::write(dir.join(format!("{stem}.pick-lock.yml")), "").expect("pick lock");
+            ExpectedRow::InProgress
+        } else {
+            let wf = dir.join(format!("{stem}.wf"));
+            if warm.contains(&i) {
+                set_mtime(&audio, past);
+                write_waveform(&wf, 256, 64);
+            } else if stale.contains(&i) {
+                write_waveform(&wf, 256, 64);
+                set_mtime(&wf, past);
+            } else if corrupt.contains(&i) {
+                set_mtime(&audio, past);
+                std::fs::write(&wf, [1u8, 0, 0]).expect("corrupt wf");
+            }
+            ExpectedRow::Player
+        };
+        library.rows.push((audio, expected));
     }
-    paths
+    library
 }
 
 /// Duration (s) of an Opus OGG byte stream from its last page granule.
