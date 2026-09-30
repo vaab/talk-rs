@@ -146,9 +146,9 @@ pub async fn toggle_dispatch(opts: &DictateOpts) -> Result<(), TalkError> {
             pid,
             log_path.display()
         ),
-        ToggleOutcome::Signalled { pid } => slot.trace(&format!(
-            "[DBG] dictate toggle sent SIGINT to daemon PID {pid}"
-        )),
+        ToggleOutcome::Signalled { pid } => {
+            slot.trace(&format!("dictate toggle sent SIGINT to daemon PID {pid}"))
+        }
     }
     Ok(())
 }

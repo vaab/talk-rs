@@ -436,7 +436,7 @@ impl OneShotTranscriber for MistralOneShotTranscriber {
                 mut chunks,
                 file_name,
             } => {
-                log::warn!("[DBG] mistral stream: awaiting audio chunks from encoder");
+                log::debug!("mistral stream: awaiting audio chunks from encoder");
                 let collect_start = Instant::now();
                 let mut bytes = Vec::new();
                 loop {
@@ -456,8 +456,8 @@ impl OneShotTranscriber for MistralOneShotTranscriber {
                     "upload: collected {} bytes for Mistral one-shot request",
                     audio_len
                 );
-                log::warn!(
-                    "[DBG] mistral stream: audio collected ({} bytes in {}ms), building request",
+                log::debug!(
+                    "mistral stream: audio collected ({} bytes in {}ms), building request",
                     audio_len,
                     collect_start.elapsed().as_millis()
                 );

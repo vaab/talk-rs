@@ -441,7 +441,7 @@ fn send_sigint(pid: u32, log_path: &Path) -> Result<(), TalkError> {
         Err(error) => log::debug!("failed to open daemon trace: {error}"),
     };
     let group = Pid::from_raw(-(pid as i32));
-    trace(&format!("[DBG] sending SIGINT to process group {pid}"));
+    trace(&format!("sending SIGINT to process group {pid}"));
     if let Err(group_error) = kill(group, Signal::SIGINT) {
         if group_error != nix::errno::Errno::ESRCH {
             return Err(TalkError::Config(format!(

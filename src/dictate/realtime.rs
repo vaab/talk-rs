@@ -545,9 +545,9 @@ pub(crate) async fn dictate_realtime(
     // where SIGINT arrives before this task is spawned.
     let shutdown_clone = shutdown.clone();
     let ctrlc_task = tokio::spawn(async move {
-        log::warn!("[DBG] dictate_realtime: waiting on shutdown token");
+        log::debug!("dictate_realtime: waiting on shutdown token");
         shutdown_clone.cancelled().await;
-        log::warn!("[DBG] dictate_realtime: shutdown token fired, setting capture_stop");
+        log::debug!("dictate_realtime: shutdown token fired, setting capture_stop");
         capture_stop_clone.store(true, std::sync::atomic::Ordering::Release);
     });
 

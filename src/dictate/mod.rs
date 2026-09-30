@@ -800,13 +800,13 @@ async fn dictate_loaded(
     let shutdown_clone = shutdown.clone();
     let daemon_pid = std::process::id();
     tokio::spawn(async move {
-        log::warn!(
-            "[DBG] daemon {}: ctrl_c handler task polled, registering handler",
+        log::debug!(
+            "daemon {}: ctrl_c handler task polled, registering handler",
             daemon_pid
         );
         let _ = tokio::signal::ctrl_c().await;
-        log::warn!(
-            "[DBG] daemon {}: SIGINT received! cancelling shutdown token",
+        log::debug!(
+            "daemon {}: SIGINT received! cancelling shutdown token",
             daemon_pid
         );
         shutdown_clone.cancel();

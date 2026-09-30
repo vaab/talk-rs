@@ -59,9 +59,9 @@ pub async fn toggle_dispatch(opts: &RecordToggleOpts) -> Result<(), TalkError> {
             pid,
             log_path.display()
         ),
-        ToggleOutcome::Signalled { pid } => slot.trace(&format!(
-            "[DBG] record toggle sent SIGINT to daemon PID {pid}"
-        )),
+        ToggleOutcome::Signalled { pid } => {
+            slot.trace(&format!("record toggle sent SIGINT to daemon PID {pid}"))
+        }
     }
     Ok(())
 }
