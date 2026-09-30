@@ -579,9 +579,7 @@ async fn dictate_loaded(
         None
     };
     if let (Some(chain), Some(path)) = (&chain, &outage_path) {
-        let first = chain.first_available(path.clone()).ok_or_else(|| {
-            TalkError::Config(format!("chain \"{}\" has no eligible entries", chain.name))
-        })?;
+        let first = chain.first_available(&config, path.clone())?;
         plan.provider = first.provider;
         plan.model = first.model.clone();
     }
@@ -889,8 +887,10 @@ async fn dictate_loaded(
     // recording starts — showing a "downloading model" badge.  For
     // this non-interactive surface, selecting the Parakeet provider is
     // the consent (user-confirmed).  No-op once the model is installed.
+    // A chain that lands on Parakeet is not such a selection: it never
+    // downloads, and a missing model fails over like a busy provider.
     #[cfg(feature = "parakeet")]
-    if provider == Provider::Parakeet {
+    if provider == Provider::Parakeet && chain.is_none() {
         let status = crate::transcription::parakeet::consent::resolve(&config)?;
         if !status.present {
             if let Some(o) = feedback.overlay() {

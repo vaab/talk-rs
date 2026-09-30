@@ -528,9 +528,11 @@ async fn prepare_record_input(
         )
         .ok()
         .flatten();
-    let chain_first = selected_chain
-        .as_ref()
-        .and_then(|chain| chain.first_available(transcription::chain::outage_path().ok()?));
+    let chain_first = selected_chain.as_ref().and_then(|chain| {
+        chain
+            .first_available(config, transcription::chain::outage_path().ok()?)
+            .ok()
+    });
     let default_provider = chain_first
         .map(|entry| entry.provider)
         .unwrap_or_else(|| resolve_provider(params.provider, config));

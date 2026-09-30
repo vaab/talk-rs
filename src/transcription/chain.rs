@@ -187,19 +187,62 @@ impl ResolvedChain {
         }
     }
 
-    pub fn first_available(&self, outage_path: PathBuf) -> Option<&ChainEntry> {
-        let memory = OutageMemory::new(outage_path);
-        self.ordered_indices(&memory, 0)
-            .first()
-            .map(|index| &self.entries[*index])
+    /// First entry for a live attempt.  Fails when the only entries left
+    /// are local models that are not installed.
+    pub fn first_available(
+        &self,
+        config: &Config,
+        outage_path: PathBuf,
+    ) -> Result<&ChainEntry, TalkError> {
+        if let Some(entry) = self
+            .available_entries(config, outage_path)
+            .into_iter()
+            .next()
+        {
+            return Ok(entry);
+        }
+        #[cfg(feature = "parakeet")]
+        if self.entries.iter().any(|entry| entry.provider.is_local()) {
+            if let Ok(status) = super::parakeet::consent::resolve(config) {
+                return Err(self.local_model_missing(&status.model_dir));
+            }
+        }
+        Err(TalkError::Config(format!(
+            "chain \"{}\": no entry can run in this build",
+            self.name
+        )))
     }
 
-    pub fn available_entries(&self, outage_path: PathBuf) -> Vec<&ChainEntry> {
+    #[cfg(feature = "parakeet")]
+    fn local_model_missing(&self, model_dir: &Path) -> TalkError {
+        TalkError::Config(format!(
+            "chain \"{}\": the local Parakeet model is not installed at {} and chains never download it; install it once with `talk-rs transcribe --provider parakeet <audio-file>`",
+            self.name,
+            model_dir.display()
+        ))
+    }
+
+    /// Entries usable for a live (during-recording) attempt, in order.
+    /// A local model that is not installed is left out: live attempts
+    /// never download it, and the file fallback reports it instead.
+    pub fn available_entries(&self, config: &Config, outage_path: PathBuf) -> Vec<&ChainEntry> {
         let memory = OutageMemory::new(outage_path);
-        self.ordered_indices(&memory, 0)
+        let usable: Vec<_> = self
+            .ordered_indices(&memory, 0)
             .into_iter()
             .map(|index| &self.entries[index])
-            .collect()
+            .filter(|entry| local_model_installed(entry, config))
+            .collect();
+        if usable.is_empty() {
+            // Only missing local models survived the outage filter: fall
+            // back to the full order, minus those models.
+            return self
+                .entries
+                .iter()
+                .filter(|entry| local_model_installed(entry, config))
+                .collect();
+        }
+        usable
     }
 
     pub fn clear_outage(&self, provider: Provider, outage_path: PathBuf) {
@@ -237,16 +280,27 @@ impl ResolvedChain {
         let indices = self.ordered_indices(&memory, start);
         for (position, index) in indices.iter().enumerate() {
             let entry = &self.entries[*index];
+            // A chain reaches a local model only as a fallback, never as
+            // the user's explicit choice, so it must not start a ~640 MB
+            // download without consent: skip a missing model instead.
             #[cfg(feature = "parakeet")]
             if entry.provider.is_local() {
                 let status = super::parakeet::consent::resolve(config)?;
                 if !status.present {
-                    log::info!(
-                        "chain \"{}\": downloading explicitly configured local Parakeet model",
-                        self.name
-                    );
-                    super::parakeet::model::download_model(&status.model_dir, status.variant)
-                        .await?;
+                    let error = self.local_model_missing(&status.model_dir);
+                    log::warn!("{error}");
+                    attempts.push(Attempt::new(entry, "not installed"));
+                    if let Some(next) = indices.get(position + 1) {
+                        let message = format!(
+                            "{} not installed → {}",
+                            entry.model, self.entries[*next].model
+                        );
+                        if let Some(notify) = notify {
+                            notify(&message);
+                        }
+                    }
+                    last_error = Some(error);
+                    continue;
                 }
             }
             let result = transcribe_audio(
@@ -309,6 +363,20 @@ impl ResolvedChain {
             TalkError::Config(format!("chain \"{}\" has no remaining entries", self.name))
         }))
     }
+}
+
+/// `false` only for a local entry whose model is not on disk.
+#[cfg(feature = "parakeet")]
+fn local_model_installed(entry: &ChainEntry, config: &Config) -> bool {
+    !entry.provider.is_local()
+        || super::parakeet::consent::resolve(config).is_ok_and(|status| status.present)
+}
+
+/// Without the `parakeet` feature no local model can run; the entry is
+/// left out of live attempts and reported by the file fallback.
+#[cfg(not(feature = "parakeet"))]
+fn local_model_installed(entry: &ChainEntry, _config: &Config) -> bool {
+    !entry.provider.is_local()
 }
 
 pub fn outage_path() -> Result<PathBuf, TalkError> {
@@ -417,6 +485,211 @@ mod tests {
             )?
             .ok_or("chain missing")?;
         Ok((dir, config, chain, first, second))
+    }
+
+    /// Chain `local` = `entries`, with Parakeet pointed at an empty
+    /// (model-less) directory and Mistral at `mistral_url`.
+    #[cfg(feature = "parakeet")]
+    fn missing_parakeet_chain(
+        dir: &Path,
+        mistral_url: &str,
+        entries: &str,
+    ) -> Result<(Config, ResolvedChain), Box<dyn std::error::Error>> {
+        let models = dir.join("no-model-here");
+        let config_path = dir.join("config.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "output_dir: {}\nproviders:\n  mistral: {{api_key: test, url: {mistral_url}}}\n  parakeet: {{model_dir: {}}}\ntranscription:\n  chains:\n    local: {entries}\n",
+                dir.display(),
+                models.display()
+            ),
+        )?;
+        let config = Config::load(Some(&config_path))?;
+        let chain = config
+            .resolve_chain(
+                crate::config::ChainCommand::Transcribe,
+                Some("local"),
+                None,
+                None,
+            )?
+            .ok_or("chain missing")?;
+        Ok((config, chain))
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[tokio::test]
+    async fn missing_parakeet_is_skipped_without_download() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let _isolation = ValidationIsolation::new()?;
+        let dir = tempfile::tempdir()?;
+        let mistral = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": [{"id": "voxtral-mini-2602"}]})),
+            )
+            .mount(&mistral)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "remote"})),
+            )
+            .mount(&mistral)
+            .await;
+        let (config, mut chain) =
+            missing_parakeet_chain(dir.path(), &mistral.uri(), "[mistral/voxtral-mini-2602]")?;
+        // Put Parakeet first so skipping it (not merely never reaching
+        // it) is what lets Mistral answer.  Config validation keeps local
+        // entries last, so the order is arranged after loading.
+        chain.entries.insert(
+            0,
+            ChainEntry {
+                provider: Provider::Parakeet,
+                model: "parakeet-tdt-0.6b-v3-int8".into(),
+                realtime_model: None,
+                retries: None,
+                wait: None,
+                languages: None,
+                supports: Vec::new(),
+            },
+        );
+        let audio = dir.path().join("recording.ogg");
+        std::fs::write(&audio, b"not an ogg; upload raw")?;
+        let sink: Arc<dyn TelemetrySink> = Arc::new(crate::telemetry::NoOpSink);
+        let output = chain
+            .run_file(
+                &audio,
+                &config,
+                false,
+                None,
+                &sink,
+                dir.path().join("outages.yml"),
+                0,
+                Vec::new(),
+                None,
+            )
+            .await?;
+        assert_eq!(output.result.text, "remote");
+        assert_eq!(
+            output
+                .attempts
+                .iter()
+                .map(|a| (a.provider.as_str(), a.outcome.as_str()))
+                .collect::<Vec<_>>(),
+            [("parakeet", "not installed"), ("mistral", "success")]
+        );
+        assert!(
+            !dir.path().join("no-model-here").exists(),
+            "the chain must never download the Parakeet model"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn missing_parakeet_is_never_offered_as_the_first_live_entry(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (_config, chain) = missing_parakeet_chain(
+            dir.path(),
+            "http://127.0.0.1:9",
+            "[mistral/voxtral-mini-2602, parakeet]",
+        )?;
+        let outages = dir.path().join("outages.yml");
+        OutageMemory::new(outages.clone()).mark_busy(Provider::Mistral, Duration::from_secs(60));
+        // Mistral is in outage and Parakeet is missing: with nothing
+        // usable, fall back to trying the chain in order (the busy
+        // remote), never to the model that would need a download.
+        assert_eq!(
+            chain
+                .available_entries(&_config, outages)
+                .iter()
+                .map(|e| e.label())
+                .collect::<Vec<_>>(),
+            ["mistral/voxtral-mini-2602"]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn first_available_names_the_missing_local_model() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (config, chain) =
+            missing_parakeet_chain(dir.path(), "http://127.0.0.1:9", "[parakeet]")?;
+        let error = chain
+            .first_available(&config, dir.path().join("outages.yml"))
+            .expect_err("only a missing local model is left");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Configuration error: chain \"local\": the local Parakeet model is not installed at {} and chains never download it; install it once with `talk-rs transcribe --provider parakeet <audio-file>`",
+                dir.path().join("no-model-here").display()
+            )
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[test]
+    fn first_available_without_local_entry_does_not_blame_parakeet(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        // Parakeet is configured (and missing) but the chain never names
+        // it: the error must not send the user to install it.
+        let (config, mut chain) = missing_parakeet_chain(
+            dir.path(),
+            "http://127.0.0.1:9",
+            "[mistral/voxtral-mini-2602]",
+        )?;
+        chain.entries.clear();
+        let error = chain
+            .first_available(&config, dir.path().join("outages.yml"))
+            .expect_err("the chain has no entry");
+        assert_eq!(
+            error.to_string(),
+            "Configuration error: chain \"local\": no entry can run in this build"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "parakeet")]
+    #[tokio::test]
+    async fn missing_parakeet_as_last_entry_explains_how_to_install(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _isolation = ValidationIsolation::new()?;
+        let dir = tempfile::tempdir()?;
+        let (config, chain) =
+            missing_parakeet_chain(dir.path(), "http://127.0.0.1:9", "[parakeet]")?;
+        let audio = dir.path().join("recording.ogg");
+        std::fs::write(&audio, b"audio")?;
+        let sink: Arc<dyn TelemetrySink> = Arc::new(crate::telemetry::NoOpSink);
+        let error = chain
+            .run_file(
+                &audio,
+                &config,
+                false,
+                None,
+                &sink,
+                dir.path().join("outages.yml"),
+                0,
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect_err("nothing can answer");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Configuration error: chain \"local\": the local Parakeet model is not installed at {} and chains never download it; install it once with `talk-rs transcribe --provider parakeet <audio-file>`",
+                dir.path().join("no-model-here").display()
+            )
+        );
+        assert!(!dir.path().join("no-model-here").exists());
+        Ok(())
     }
 
     #[tokio::test]

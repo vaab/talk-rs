@@ -436,7 +436,7 @@ pub(crate) async fn dictate_realtime(
     let outage = outage_path.map(std::path::Path::to_path_buf);
     let choices: Vec<_> = match (chain, &outage) {
         (Some(chain), Some(path)) => chain
-            .available_entries(path.clone())
+            .available_entries(&config, path.clone())
             .into_iter()
             .map(|entry| {
                 (

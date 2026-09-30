@@ -313,6 +313,12 @@ language).  ~supports~ can declare capabilities of future models;
 known models retain their catalog facts.  If none remain, dictation
 refuses before capture.  A chain in ~--pick~ lists its models first.
 
+A chain never downloads the local Parakeet model: reaching it is a
+fallback, not a choice to install ~640 MB.  If the model is missing,
+the entry is skipped (recorded as ~not installed~ in ~attempts~), and
+when nothing else can answer the error says how to install it once:
+~talk-rs transcribe --provider parakeet <audio-file>~.
+
 On a busy response, provider-wide outage memory is written atomically
 to ~$XDG_CACHE_HOME/talk-rs/outages.yml~ (typically
 =~/.cache/talk-rs/outages.yml=).  Subsequent runs skip that provider
