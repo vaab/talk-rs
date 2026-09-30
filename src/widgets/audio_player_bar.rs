@@ -143,6 +143,8 @@ pub(crate) fn build_audio_player_bar(
         let (wf_tx, wf_rx) = std::sync::mpsc::channel::<WfColumns>();
         let wf_audio_path = audio_path.to_path_buf();
         std::thread::spawn(move || {
+            use crate::perf_counters::{gauge_dec, gauge_inc, Gauge};
+            gauge_inc(Gauge::WaterfallWorkersInflight);
             // Try cache first.
             match crate::record::audio::load_waterfall(&wf_audio_path) {
                 Ok(result) => {
@@ -152,6 +154,7 @@ pub(crate) fn build_audio_player_bar(
                     log::warn!("waterfall: {}: {}", wf_audio_path.display(), e);
                 }
             }
+            gauge_dec(Gauge::WaterfallWorkersInflight);
         });
 
         let wf_data_ref = Rc::clone(&wf_data);
@@ -287,7 +290,11 @@ pub(crate) fn build_audio_player_bar(
         let interp: Rc<RefCell<(f64, std::time::Instant)>> =
             Rc::new(RefCell::new((0.0, std::time::Instant::now())));
 
+        // The source is never removed (the callback always returns
+        // `Continue`), so the live gauge is only ever raised here.
+        crate::perf_counters::gauge_inc(crate::perf_counters::Gauge::PlayerTickSourcesLive);
         glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            crate::perf_counters::incr(crate::perf_counters::Counter::PlayerTickCallbacks);
             // Only poll if this bar's play button is the active one.
             let is_active = active_poll
                 .borrow()

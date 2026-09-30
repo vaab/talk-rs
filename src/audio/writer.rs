@@ -222,6 +222,7 @@ impl AudioWriter for OggOpusWriter {
             // Split the borrows: `frame` borrows `pcm_buffer` immutably
             // while `encoder` / `packet_writer` are borrowed mutably.
             let frame = &self.pcm_buffer[pos..pos + samples_per_frame];
+            crate::perf_counters::incr(crate::perf_counters::Counter::OpusFramesEncoded);
 
             // Encode with Opus
             let mut opus_output = vec![0u8; 4000];
@@ -275,6 +276,7 @@ impl AudioWriter for OggOpusWriter {
         loop {
             self.pcm_buffer
                 .resize(self.frame_size * self.channels as usize, 0);
+            crate::perf_counters::incr(crate::perf_counters::Counter::OpusFramesEncoded);
             let mut opus_output = vec![0u8; 4000];
             let len = self
                 .encoder

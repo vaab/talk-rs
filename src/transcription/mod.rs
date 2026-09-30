@@ -73,6 +73,7 @@ pub(crate) fn normalize_file_for_upload(
         )));
     }
 
+    crate::perf_counters::incr(crate::perf_counters::Counter::NormalizeCalls);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
     let normalized_name = format!("{stem}.ogg");
 

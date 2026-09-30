@@ -755,6 +755,11 @@ async fn dictate_loaded(
                 _ => unreachable!("file path selects file source"),
             };
             (capture, encode_config.sample_rate)
+        } else if let Some(paced) = crate::perf_counters::paced_input()? {
+            // Performance-harness only (`perf-counters` feature):
+            // a file replayed at real-time pace stands in for the
+            // microphone.  Always `None` in normal builds.
+            paced
         } else {
             // Prefer PipeWire native capture — matches pw-cat's audio
             // routing (including Bluetooth devices) exactly.  Fall back

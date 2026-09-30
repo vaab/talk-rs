@@ -529,6 +529,12 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 }
 
                 offset.set(end);
+                if end == entries.len() {
+                    crate::perf_counters::mark(&format!(
+                        "record_ui_rows_built_{}",
+                        label.replace(' ', "_")
+                    ));
+                }
                 if end < entries.len() {
                     let next = Rc::clone(&build_batch_ref);
                     glib::idle_add_local_once(move || {
@@ -1250,6 +1256,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
         });
     }
 
+    crate::perf_counters::install_gtk_stall_probe();
     main_loop.run();
     window.close();
 

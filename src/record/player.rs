@@ -44,6 +44,7 @@ impl WavPlayer {
             .unwrap_or("")
             .to_ascii_lowercase();
         let rate = self.inner.device_sample_rate();
+        crate::perf_counters::incr(crate::perf_counters::Counter::PlaybackDecodes);
         let samples = match ext.as_str() {
             "ogg" | "opus" => read_ogg_as_f32(audio_path, rate)?,
             "m4a" | "mp4" | "aac" => read_m4a_as_f32(audio_path, rate)?,

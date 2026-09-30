@@ -579,6 +579,7 @@ pub(crate) fn load_waterfall(
     if let Some(cached) = read_waterfall_cache(audio_path) {
         return Ok(cached);
     }
+    crate::perf_counters::incr(crate::perf_counters::Counter::WaterfallDecodes);
     let samples = read_audio_as_i16(audio_path)?;
     let result = crate::x11::render_util::generate_waterfall_columns(&samples, 16_000);
     if let Err(e) = write_waterfall_cache(audio_path, &result.0, result.1) {

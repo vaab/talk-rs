@@ -953,6 +953,7 @@ pub fn write_pick_if_absent(
 pub fn read_pick(audio_path: &Path) -> Option<(Provider, String, bool, String)> {
     let path = pick_path(audio_path).ok()?;
     let content = fs::read_to_string(&path).ok()?;
+    crate::perf_counters::incr(crate::perf_counters::Counter::PickReads);
     let selection = serde_yaml::from_str::<PickerSelectionMetadata>(&content).ok()?;
     let provider = selection.provider.parse::<Provider>().ok()?;
     Some((

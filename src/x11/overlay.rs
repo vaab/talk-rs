@@ -2289,6 +2289,7 @@ fn overlay_thread(
         }
 
         // ── Read audio and compute visualization frame ──────
+        crate::perf_counters::incr(crate::perf_counters::Counter::OverlayFrames);
 
         let (frame_rms, magnitudes, frame_stuck_at_rail) = {
             let samples = ring

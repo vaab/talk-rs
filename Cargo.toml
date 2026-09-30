@@ -137,6 +137,15 @@ playback = ["dep:cpal"]
 # the capture path shares cpal.
 capture = ["playback", "dep:pipewire", "dep:libpulse-binding"]
 
+# `perf-counters`: observational work counters for the performance
+# harness (``tests/perf_*.rs``, ``bin/perf-report``).  Counts HTTP
+# client builds, Opus frames, FFTs, pick reads, ... at the production
+# sites and logs them as ``perf-counter:`` lines on exit (and on
+# ``SIGUSR2``).  Also enables the hidden ``TALK_RS_PERF_PACED_INPUT``
+# live-capture source.  Off by default: every counter call compiles to
+# nothing, so normal builds are unaffected.
+perf-counters = []
+
 # `ui`: the GTK4 / X11 desktop surface — overlay badge, visualizers,
 # clipboard + paste pipeline, multi-candidate picker, and the
 # recordings browser.  Gates all rendering (fontdue / png), theme

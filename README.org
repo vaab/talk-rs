@@ -728,6 +728,7 @@ consumers can opt out of the desktop stack with
 | ~playback~ | yes     | cpal                                                     | Local audio playback (the ~speak~ command's speakers output; shared player)                                          |
 | ~capture~  | yes     | pipewire, cpal (via ~playback~), libpulse-binding        | Live mic/monitor capture, BT headset HFP switch, indicator tones                                                     |
 | ~ui~       | yes     | gtk4, x11rb, png, fontdue, dark-light, ... (+ ~playback~) | X11 overlay, visualizers, clipboard/paste, picker, recordings browser                                                |
+| ~perf-counters~ | no | (nothing)                                                | Work counters and the paced test input used by the performance harness (~bin/perf-report~, see ~perf/README.org~); zero cost when off |
 
 Example headless consumer (cloud transcription only):
 

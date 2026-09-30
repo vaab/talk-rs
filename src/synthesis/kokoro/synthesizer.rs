@@ -187,6 +187,7 @@ fn run_synthesis(
         ..Default::default()
     };
 
+    crate::perf_counters::incr(crate::perf_counters::Counter::TtsCreates);
     let tts = OfflineTts::create(&config).ok_or_else(|| {
         TalkError::Transcription(format!(
             "kokoro: failed to create OfflineTts (model_dir={})",

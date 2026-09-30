@@ -15,6 +15,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::setup(cli.verbose, cli.log_file.as_deref())?;
+    crate::perf_counters::init();
 
-    action::dispatch(cli.command, cli.verbose).await
+    let result = action::dispatch(cli.command, cli.verbose).await;
+    crate::perf_counters::emit();
+    result
 }

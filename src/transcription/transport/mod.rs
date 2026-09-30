@@ -824,6 +824,7 @@ async fn run_single_http_attempt(
 /// timeout.  Other client settings (TCP keepalive, user_timeout)
 /// match the shared client builder in [`http::build_client`].
 fn build_client_with_connect_timeout(connect_timeout: Duration) -> Result<reqwest::Client, String> {
+    crate::perf_counters::incr(crate::perf_counters::Counter::HttpClientBuilds);
     let builder = reqwest::Client::builder()
         .connect_timeout(connect_timeout)
         .tcp_keepalive(Duration::from_secs(5))

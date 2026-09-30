@@ -131,6 +131,7 @@ pub fn fft_in_place(buf: &mut [Complex]) {
 /// Apply Hann window and compute FFT magnitude spectrum (positive
 /// frequencies only).
 pub fn compute_spectrum(samples: &[f32]) -> Vec<f32> {
+    crate::perf_counters::incr(crate::perf_counters::Counter::FftCalls);
     let n = samples.len();
     let mut buf: Vec<Complex> = samples
         .iter()

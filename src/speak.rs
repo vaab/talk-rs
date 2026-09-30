@@ -383,7 +383,9 @@ pub async fn speak(opts: SpeakOpts) -> Result<(), TalkError> {
         lang: Some(resolved.lang),
     };
 
+    crate::perf_counters::mark("speak_synthesis_start");
     let result = synthesis::synthesize(&config, provider, req).await?;
+    crate::perf_counters::mark("speak_synthesis_done");
 
     log::info!(
         "speak: synthesized {:.2}s of audio ({} samples @ {} Hz) via {}",
@@ -399,7 +401,12 @@ pub async fn speak(opts: SpeakOpts) -> Result<(), TalkError> {
             println!("Saved synthesized audio to: {}", path.display());
             Ok(())
         }
-        None => play(&result.pcm, result.sample_rate),
+        None => {
+            // First audio is handed to the player here, after the whole
+            // synthesis: the harness's time-to-first-sound mark.
+            crate::perf_counters::mark("speak_first_audio");
+            play(&result.pcm, result.sample_rate)
+        }
     }
 }
 

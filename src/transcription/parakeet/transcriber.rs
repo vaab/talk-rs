@@ -274,6 +274,7 @@ fn run_inference(
     // empty text without an error (Phase 0 verified).
     cfg.model_config.model_type = Some("nemo_transducer".into());
 
+    crate::perf_counters::incr(crate::perf_counters::Counter::RecognizerCreates);
     let recognizer = OfflineRecognizer::create(&cfg).ok_or_else(|| {
         TalkError::Transcription(format!(
             "parakeet: failed to create recognizer (variant={}, model_dir contains: {:?})",

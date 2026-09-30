@@ -310,6 +310,7 @@ fn list_ogg_recordings_in_dir(
     dir: &Path,
     config: &Config,
 ) -> Result<Vec<RecordingEntry>, TalkError> {
+    crate::perf_counters::incr(crate::perf_counters::Counter::ListCalls);
     let t = std::time::Instant::now();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -389,6 +390,7 @@ fn list_cache_recordings_in_dir(
     dir: &Path,
     config: &Config,
 ) -> Result<Vec<RecordingEntry>, TalkError> {
+    crate::perf_counters::incr(crate::perf_counters::Counter::ListCalls);
     let t = std::time::Instant::now();
     if !dir.exists() {
         return Ok(Vec::new());

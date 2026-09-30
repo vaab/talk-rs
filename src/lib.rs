@@ -31,6 +31,7 @@ pub mod model_fetch;
 #[cfg(feature = "ui")]
 pub mod paste;
 pub mod paste_config;
+pub mod perf_counters;
 mod proc_stat;
 pub mod record;
 pub mod recording_cache;
