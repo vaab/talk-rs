@@ -882,14 +882,31 @@ mod tests {
 mod perf_playback {
     use super::*;
 
-    /// Long fixtures are cached under `target/perf-fixtures/` (shared
-    /// with `tests/perf`), since encoding an hour takes a while.
-    fn cached_recording(name: &str, seconds: u32) -> std::path::PathBuf {
+    /// Bump when the generator below changes its output.
+    const FIXTURE_VERSION: u32 = 2;
+
+    fn fnv64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// Long fixtures are cached under `target/perf-fixtures/` (encoding
+    /// an hour takes a while), keyed by generator version and duration,
+    /// with a content hash checked on every use so a stale or damaged
+    /// file is regenerated rather than silently reused.
+    fn cached_recording(seconds: u32) -> std::path::PathBuf {
         use crate::audio::{AudioWriter, OggOpusWriter};
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-fixtures");
         std::fs::create_dir_all(&dir).expect("fixture dir");
-        let path = dir.join(format!("{name}.ogg"));
-        if path.exists() {
+        let key = format!("playback-tone-v{FIXTURE_VERSION}-record48k-{seconds}s");
+        let path = dir.join(format!("{key}.ogg"));
+        let hash_path = dir.join(format!("{key}.fnv"));
+        let valid = std::fs::read(&path)
+            .ok()
+            .zip(std::fs::read_to_string(&hash_path).ok())
+            .is_some_and(|(bytes, hash)| hash.trim() == format!("{:016x}", fnv64(&bytes)));
+        if valid {
             return path;
         }
         let cfg = crate::config::AudioConfig {
@@ -909,14 +926,15 @@ mod perf_playback {
             bytes.extend(writer.write_pcm(&pcm).expect("pcm"));
         }
         bytes.extend(writer.finalize().expect("finalize"));
-        let tmp = dir.join(format!("{name}.ogg.partial"));
-        std::fs::write(&tmp, bytes).expect("write fixture");
+        let tmp = dir.join(format!("{key}.ogg.partial"));
+        std::fs::write(&tmp, &bytes).expect("write fixture");
         std::fs::rename(&tmp, &path).expect("publish fixture");
+        std::fs::write(&hash_path, format!("{:016x}\n", fnv64(&bytes))).expect("fixture hash");
         path
     }
 
     fn measure(cut: &str, seconds: u32) {
-        let path = cached_recording(&format!("playback-{seconds}s"), seconds);
+        let path = cached_recording(seconds);
         let t0 = std::time::Instant::now();
         let samples = read_ogg_as_f32(&path, 48_000).expect("decode");
         let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;

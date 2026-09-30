@@ -824,3 +824,311 @@ mod tests {
         drop(payload);
     }
 }
+
+/// Performance harness, item `single-opus-encode`: the correctness a
+/// one-encoder design must keep, proven on the real one-shot pipeline
+/// (cache writer + live upload pipeline + cursor-zero replay):
+///
+/// - the cache OGG and every upload are well-formed Ogg Opus (one
+///   logical stream, `OpusHead`/`OpusTags`, monotonic granules, EOS on
+///   the last page), decode with libopus to exactly the accepted
+///   samples (finite capture with a non-frame-aligned tail), and match
+///   the reference PCM within the codec's error (SNR > 10 dB);
+/// - a transcriber that fails early, one that fails mid-stream (forcing
+///   a cursor-zero replay into a fresh pipeline), and one that blocks
+///   never truncate the recording, and the replayed upload is the
+///   complete recording from its first sample.
+///
+/// Encode work per recorded frame is measured by the binary cuts in
+/// `tests/perf` (`encode-passes`).
+#[cfg(test)]
+mod perf_single_encode {
+    use super::*;
+    use crate::audio::perf_audio::{decode_ogg_strict, envelope_correlation};
+    use async_trait::async_trait;
+    use tokio::sync::{mpsc, Mutex as AsyncMutex};
+
+    /// 3.07 s of speech-like 16 kHz PCM: 153 chunks of 320 plus a
+    /// 237-sample tail (not frame aligned).
+    fn reference_pcm() -> Vec<i16> {
+        (0..(153 * 320 + 237))
+            .map(|i| {
+                let t = i as f32 / 16_000.0;
+                let env = (t * 2.7 * std::f32::consts::TAU).sin().abs();
+                ((env
+                    * (0.35 * (t * 190.0 * std::f32::consts::TAU).sin()
+                        + 0.2 * (t * 760.0 * std::f32::consts::TAU).sin()))
+                    * 20_000.0) as i16
+            })
+            .collect()
+    }
+
+    fn assert_complete_recording(what: &str, bytes: &[u8], reference: &[i16]) {
+        let pcm = decode_ogg_strict(bytes);
+        assert_eq!(
+            pcm.len(),
+            reference.len(),
+            "{what}: sample count (tail included)"
+        );
+        let r = envelope_correlation(reference, &pcm);
+        assert!(
+            r > 0.95,
+            "{what}: decoded audio does not match the input (r={r:.3})"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        Succeed,
+        /// Fail before reading any audio.
+        FailEarly,
+        /// Read `n` chunks then drop the stream (pipeline breaks).
+        FailAfter(usize),
+        /// Read slowly (5 ms per chunk).
+        Slow,
+    }
+
+    /// Records every upload body it receives (per pipeline instance).
+    struct Recorder {
+        behaviour: Behaviour,
+        uploads: Arc<AsyncMutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl OneShotTranscriber for Recorder {
+        async fn validate(&self) -> Result<(), TalkError> {
+            Ok(())
+        }
+
+        async fn fetch_transcription(
+            &self,
+            body: TranscriptionBody,
+        ) -> Result<TranscriptionResult, TalkError> {
+            let TranscriptionBody::Pipe { mut chunks, .. } = body else {
+                panic!("live pipeline must stream chunks");
+            };
+            let mut bytes = Vec::new();
+            let mut n = 0;
+            match self.behaviour {
+                Behaviour::FailEarly => return Err(TalkError::Transcription("fail early".into())),
+                Behaviour::FailAfter(limit) => {
+                    while n < limit {
+                        match chunks.recv().await {
+                            Some(c) => bytes.extend(c),
+                            None => break,
+                        }
+                        n += 1;
+                    }
+                    self.uploads.lock().await.push(bytes);
+                    return Err(TalkError::Transcription("mid-stream failure".into()));
+                }
+                Behaviour::Succeed | Behaviour::Slow => {
+                    while let Some(c) = chunks.recv().await {
+                        if matches!(self.behaviour, Behaviour::Slow) {
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                        bytes.extend(c);
+                    }
+                }
+            }
+            self.uploads.lock().await.push(bytes);
+            Ok(TranscriptionResult {
+                text: "ok".into(),
+                ..TranscriptionResult::default()
+            })
+        }
+    }
+
+    struct Finished {
+        cache: Vec<u8>,
+        uploads: Vec<Vec<u8>>,
+        result: Result<TranscriptionResult, TalkError>,
+    }
+
+    /// Run the production live one-shot path (`dictate_oneshot`, not
+    /// from file) on the finite reference capture, stopped like SIGINT
+    /// once every chunk was delivered.
+    async fn record(behaviour: Behaviour) -> Finished {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = dir.path().join("rec.ogg");
+        let reference = reference_pcm();
+        let (tx, rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        // Real stop order: SIGINT → capture.stop() → the capture's
+        // channel closes.  Closing it first would look like a broken
+        // pipeline to the live loop.
+        struct StopNotifying(Option<tokio::sync::oneshot::Sender<()>>);
+        impl AudioCapture for StopNotifying {
+            fn start(&mut self) -> Result<mpsc::Receiver<Vec<i16>>, TalkError> {
+                Err(TalkError::Audio("already started".into()))
+            }
+            fn stop(&mut self) -> Result<(), TalkError> {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+                Ok(())
+            }
+        }
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let feeder = tokio::spawn(async move {
+            for chunk in reference.chunks(320) {
+                tx.send(chunk.to_vec()).await.expect("PCM accepted");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            stop.cancel();
+            stopped_rx.await.expect("capture stopped");
+            drop(tx);
+        });
+        let uploads = Arc::new(AsyncMutex::new(Vec::new()));
+        let mut capture = StopNotifying(Some(stopped_tx));
+        let mut feedback = no_device_feedback();
+        let (result, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            dictate_oneshot(
+                &mut capture,
+                false,
+                AudioConfig::new(),
+                rx,
+                &cache,
+                Box::new(Recorder {
+                    behaviour,
+                    uploads: Arc::clone(&uploads),
+                }),
+                &shutdown,
+                &mut feedback,
+                None,
+                &offline_config(dir.path()),
+                Provider::Mistral,
+                None,
+                false,
+                false,
+                bt_profile::HeadsetGuard::new(None),
+            ),
+        )
+        .await
+        .expect("dictation finishes");
+        feeder.await.expect("feeder");
+        let cache_bytes = tokio::fs::read(&cache).await.expect("cache OGG");
+        let uploads = uploads.lock().await.clone();
+        Finished {
+            cache: cache_bytes,
+            uploads,
+            result,
+        }
+    }
+
+    /// Success: the cache and the upload are both the complete,
+    /// decodable recording of exactly the accepted samples.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn perf_single_encode_cache_and_upload_are_the_recording() {
+        let reference = reference_pcm();
+        let done = record(Behaviour::Succeed).await;
+        assert_eq!(done.result.expect("transcription").text, "ok");
+        assert_complete_recording("cache", &done.cache, &reference);
+        assert_eq!(done.uploads.len(), 1);
+        assert_complete_recording("upload", &done.uploads[0], &reference);
+    }
+
+    /// Upload failures and a slow consumer never truncate or corrupt
+    /// the recording (it is owned by the recorder, not the network).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn perf_single_encode_failures_never_truncate_cache() {
+        let reference = reference_pcm();
+        for behaviour in [
+            Behaviour::FailEarly,
+            Behaviour::FailAfter(20),
+            Behaviour::Slow,
+        ] {
+            let done = record(behaviour).await;
+            assert_complete_recording("cache", &done.cache, &reference);
+            if matches!(behaviour, Behaviour::Slow) {
+                assert!(done.result.is_ok());
+                assert_complete_recording("slow upload", &done.uploads[0], &reference);
+            }
+        }
+    }
+
+    /// Cursor-zero replay, the mechanism `dictate_oneshot` uses after a
+    /// mid-recording pipeline failure: the first pipeline breaks after
+    /// 20 chunks while audio is still arriving; a fresh pipeline on the
+    /// same shared buffer from cursor 0 uploads the complete recording
+    /// from its first sample, byte-compatible with a single pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn perf_single_encode_replay_from_cursor_zero_is_complete() {
+        let reference = reference_pcm();
+        let buffer = Arc::new(AudioBuffer::new());
+        let uploads = Arc::new(AsyncMutex::new(Vec::new()));
+        let producer = {
+            let buffer = Arc::clone(&buffer);
+            let reference = reference.clone();
+            tokio::spawn(async move {
+                for chunk in reference.chunks(320) {
+                    buffer.push(chunk.to_vec()).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                buffer.close();
+            })
+        };
+        let first = spawn_encode_pipeline(
+            &buffer,
+            AudioConfig::new(),
+            Box::new(Recorder {
+                behaviour: Behaviour::FailAfter(20),
+                uploads: Arc::clone(&uploads),
+            }),
+        );
+        assert!(first.2.await.expect("first pipeline joined").is_err());
+        abort_pipeline(
+            &first.0,
+            &first.1,
+            &tokio::spawn(async {
+                Err::<TranscriptionResult, TalkError>(TalkError::Transcription("done".into()))
+            }),
+        );
+        let second = spawn_encode_pipeline(
+            &buffer,
+            AudioConfig::new(),
+            Box::new(Recorder {
+                behaviour: Behaviour::Succeed,
+                uploads: Arc::clone(&uploads),
+            }),
+        );
+        assert_eq!(
+            second.2.await.expect("replay joined").expect("replay").text,
+            "ok"
+        );
+        producer.await.expect("producer");
+        let uploads = uploads.lock().await.clone();
+        assert_eq!(uploads.len(), 2);
+        assert!(
+            uploads[0].len() < uploads[1].len(),
+            "first upload was cut short"
+        );
+        assert_complete_recording("replayed upload", &uploads[1], &reference);
+    }
+
+    fn no_device_feedback() -> RecordingFeedback {
+        RecordingFeedback::new(crate::audio::recording_feedback::RecordingFeedbackOptions {
+            no_sounds: true,
+            no_boop: true,
+            no_overlay: true,
+            viz: None,
+            mono: false,
+            boop_interval_ms: 0,
+            capture_rate: 16_000,
+            pause_audio: false,
+            suppress_boop: None,
+            overlay: crate::audio::recording_feedback::RecordingOverlayOptions {
+                silence_tx: None,
+                auto_pause: false,
+                telemetry_rx: None,
+            },
+        })
+    }
+
+    fn offline_config(dir: &std::path::Path) -> Config {
+        serde_yaml::from_str(&format!("output_dir: {}\nproviders: {{}}\n", dir.display()))
+            .expect("offline configuration")
+    }
+}

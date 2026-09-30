@@ -1744,3 +1744,365 @@ providers:
         );
     }
 }
+
+/// Performance harness, item `upload-normalize-once`: the upload
+/// preparation contract a memoised / provenance-aware implementation
+/// must keep, measured through the public `transcribe_audio` path
+/// against a local mock provider (validation cache isolated).
+///
+/// - Foreign input (48 kHz **stereo** WAV) is uploaded as a 16 kHz
+///   mono Ogg Opus stream carrying the same audio (strict decode,
+///   envelope correlation), with an explicit multipart length.
+/// - False provenance: a 48 kHz Audio-profile OGG named and placed like
+///   a cache file must still be converted to the upload profile.
+/// - Source replacement between two calls re-prepares from the new
+///   content (the second upload carries the NEW audio).
+/// - Undecodable input still uploads the original bytes and name.
+/// - Three concurrent callers on the same file all receive complete,
+///   identical-content uploads.
+/// - `upload_encodes` counts actual re-encodes (reported per cut).
+#[cfg(test)]
+mod perf_upload_prepare {
+    use super::*;
+    use crate::audio::perf_audio::{decode_ogg_strict, envelope_correlation};
+    use crate::audio::{AudioWriter, OggOpusWriter, WavWriter};
+    use crate::perf_counters::{thread_value, Counter};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct Isolation {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn isolate() -> Isolation {
+        let lock = transport::validate_cache::__TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        std::env::set_var("TALK_RS_VALIDATE_CACHE_PATH", dir.path().join("v.yaml"));
+        transport::validate_cache::__test_reset();
+        Isolation {
+            _lock: lock,
+            _dir: dir,
+        }
+    }
+
+    /// Speech-like PCM whose envelope depends on `seed`.
+    fn speech(seconds: f64, rate: u32, seed: f32) -> Vec<i16> {
+        (0..(seconds * rate as f64) as usize)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                let env = (t * (2.1 + seed) * std::f32::consts::TAU).sin().abs();
+                (env * (t * 210.0 * std::f32::consts::TAU).sin() * 16_000.0) as i16
+            })
+            .collect()
+    }
+
+    fn write_stereo_wav(path: &std::path::Path, mono: &[i16]) {
+        let mut w = WavWriter::new(crate::config::AudioConfig {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 0,
+        });
+        let stereo: Vec<i16> = mono.iter().flat_map(|&s| [s, s]).collect();
+        let mut bytes = w.header().expect("header");
+        bytes.extend(w.write_pcm(&stereo).expect("pcm"));
+        let h = w.finalize().expect("finalize");
+        bytes[..h.len()].copy_from_slice(&h);
+        std::fs::write(path, bytes).expect("write wav");
+    }
+
+    fn write_recording_ogg(path: &std::path::Path, pcm48: &[i16]) {
+        let mut w = OggOpusWriter::new_for_recording(crate::config::AudioConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            bitrate: 64_000,
+        })
+        .expect("writer");
+        let mut bytes = w.header().expect("header");
+        bytes.extend(w.write_pcm(pcm48).expect("pcm"));
+        bytes.extend(w.finalize().expect("finalize"));
+        std::fs::write(path, bytes).expect("write ogg");
+    }
+
+    fn downsample(pcm48: &[i16]) -> Vec<i16> {
+        pcm48.iter().step_by(3).copied().collect()
+    }
+
+    async fn provider() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "voxtral-mini-2602"}, {"id": "voxtral-mini-2507"}, {"id": "voxtral-mini-latest"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "ok"})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn config(dir: &std::path::Path, url: &str) -> Config {
+        serde_yaml::from_str(&format!(
+            "output_dir: {}\nproviders:\n  mistral:\n    api_key: fake\n    url: {url}\n    model: voxtral-mini-2602\n",
+            dir.display()
+        ))
+        .expect("config")
+    }
+
+    /// (file name, content length header, file bytes) of each upload.
+    async fn uploads(server: &MockServer) -> Vec<(String, u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        for r in server.received_requests().await.unwrap_or_default() {
+            if r.method.as_str() != "POST" {
+                continue;
+            }
+            let ct = r
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let boundary = format!(
+                "--{}",
+                ct.split("boundary=").nth(1).unwrap_or("").trim_matches('"')
+            );
+            let len = r
+                .headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let body = &r.body;
+            let find = |h: &[u8], n: &[u8], from: usize| {
+                h[from..]
+                    .windows(n.len())
+                    .position(|w| w == n)
+                    .map(|p| p + from)
+            };
+            let mut pos = 0;
+            while let Some(start) = find(body, boundary.as_bytes(), pos) {
+                if body[start + boundary.len()..].starts_with(b"--") {
+                    break; // closing delimiter
+                }
+                let head_end = find(body, b"\r\n\r\n", start).expect("part headers");
+                let headers = String::from_utf8_lossy(&body[start..head_end]).to_string();
+                let next = find(body, boundary.as_bytes(), head_end).unwrap_or(body.len());
+                if headers.contains("name=\"file\"") {
+                    let name = headers
+                        .split("filename=\"")
+                        .nth(1)
+                        .and_then(|v| v.split('"').next())
+                        .unwrap_or("")
+                        .to_string();
+                    let data = body[head_end + 4..next]
+                        .strip_suffix(b"\r\n")
+                        .unwrap_or(&body[head_end + 4..next]);
+                    out.push((name, len, data.to_vec()));
+                }
+                pos = start + boundary.len();
+            }
+        }
+        out
+    }
+
+    async fn transcribe(path: &std::path::Path, config: &Config) {
+        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+            std::sync::Arc::new(crate::telemetry::NoOpSink);
+        let r = transcribe_audio(
+            path,
+            config,
+            Provider::Mistral,
+            None,
+            false,
+            TranscribeOptions {
+                allow_api: true,
+                ..TranscribeOptions::default()
+            },
+            &sink,
+        )
+        .await
+        .expect("transcription");
+        assert_eq!(r.text, "ok");
+    }
+
+    fn assert_upload_profile(what: &str, bytes: &[u8], reference16: &[i16]) {
+        let head = bytes
+            .windows(8)
+            .position(|w| w == b"OpusHead")
+            .expect("OpusHead");
+        assert_eq!(bytes[head + 9], 1, "{what}: mono");
+        let decoded = decode_ogg_strict(bytes);
+        // A lossy source carries up to one Opus frame (20 ms = 320
+        // samples) of codec delay through decode → re-encode.
+        let diff = decoded.len().abs_diff(reference16.len());
+        assert!(
+            diff <= 320,
+            "{what}: {} vs {} samples",
+            decoded.len(),
+            reference16.len()
+        );
+        let r = envelope_correlation(reference16, &decoded);
+        assert!(r > 0.95, "{what}: wrong audio (r={r:.3})");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn perf_prepare_foreign_stereo_wav_is_converted() {
+        let _iso = isolate();
+        let dir = tempfile::tempdir().expect("tmp");
+        let server = provider().await;
+        let pcm48 = speech(4.0, 48_000, 0.0);
+        let input = dir.path().join("import.wav");
+        write_stereo_wav(&input, &pcm48);
+        let encodes = thread_value(Counter::UploadEncodes);
+        transcribe(&input, &config(dir.path(), &server.uri())).await;
+        let ups = uploads(&server).await;
+        assert_eq!(ups.len(), 1);
+        let (name, len, bytes) = &ups[0];
+        assert_eq!(name, "import.ogg");
+        assert!(
+            *len > bytes.len() as u64,
+            "explicit Content-Length covers the part"
+        );
+        assert_upload_profile("stereo wav", bytes, &downsample(&pcm48));
+        crate::perf_counters::record_metrics(
+            "upload-normalize-once",
+            "prepare-foreign-stereo-wav",
+            &[(
+                "upload_encodes",
+                (thread_value(Counter::UploadEncodes) - encodes) as f64,
+            )],
+        );
+    }
+
+    /// A 48 kHz recording-profile OGG sitting where a dictation cache
+    /// file would, with a cache-like name: provenance is NOT proven by
+    /// location/extension, so it must still be converted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn perf_prepare_false_provenance_ogg_is_converted() {
+        let _iso = isolate();
+        let dir = tempfile::tempdir().expect("tmp");
+        let recordings = dir.path().join("cache/talk-rs/recordings");
+        std::fs::create_dir_all(&recordings).expect("dirs");
+        let server = provider().await;
+        let pcm48 = speech(4.0, 48_000, 0.3);
+        let input = recordings.join("2026-09-30T10-00-00+0200.ogg");
+        write_recording_ogg(&input, &pcm48);
+        let original = std::fs::read(&input).expect("bytes");
+        transcribe(&input, &config(dir.path(), &server.uri())).await;
+        let (_, _, bytes) = uploads(&server).await.remove(0);
+        assert_ne!(bytes, original, "48 kHz input uploaded unconverted");
+        assert_upload_profile("48k ogg", &bytes, &downsample(&pcm48));
+    }
+
+    /// Replacing the source between two calls (new content, same name)
+    /// must upload the new audio, never a stale prepared artifact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn perf_prepare_source_replacement_reprepares() {
+        let _iso = isolate();
+        let dir = tempfile::tempdir().expect("tmp");
+        let server = provider().await;
+        let cfg = config(dir.path(), &server.uri());
+        let input = dir.path().join("memo.wav");
+        let first = speech(3.0, 48_000, 0.0);
+        write_stereo_wav(&input, &first);
+        transcribe(&input, &cfg).await;
+        // Drop the transcript sidecar so the second call reaches the API.
+        for e in std::fs::read_dir(dir.path()).expect("dir").flatten() {
+            if e.path().extension().is_some_and(|x| x == "yml") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = speech(3.5, 48_000, 1.7);
+        write_stereo_wav(&input, &second);
+        transcribe(&input, &cfg).await;
+        let ups = uploads(&server).await;
+        assert_eq!(ups.len(), 2);
+        assert_upload_profile("after replacement", &ups[1].2, &downsample(&second));
+    }
+
+    /// Transcript-cache hit: no upload and no preparation at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn perf_prepare_cache_hit_does_no_work() {
+        let _iso = isolate();
+        let dir = tempfile::tempdir().expect("tmp");
+        let server = provider().await;
+        let cfg = config(dir.path(), &server.uri());
+        let input = dir.path().join("memo.wav");
+        write_stereo_wav(&input, &speech(2.0, 48_000, 0.0));
+        transcribe(&input, &cfg).await;
+        let encodes = thread_value(Counter::UploadEncodes);
+        let decodes = thread_value(Counter::AudioFileDecodes);
+        transcribe(&input, &cfg).await;
+        assert_eq!(uploads(&server).await.len(), 1);
+        assert_eq!(thread_value(Counter::UploadEncodes), encodes);
+        assert_eq!(thread_value(Counter::AudioFileDecodes), decodes);
+    }
+
+    /// Undecodable input: raw bytes and original name are uploaded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn perf_prepare_undecodable_uploads_raw_bytes() {
+        let _iso = isolate();
+        let dir = tempfile::tempdir().expect("tmp");
+        let server = provider().await;
+        let input = dir.path().join("weird.bin");
+        std::fs::write(&input, b"not really audio").expect("write");
+        transcribe(&input, &config(dir.path(), &server.uri())).await;
+        let (name, _, bytes) = uploads(&server).await.remove(0);
+        assert_eq!(name, "weird.bin");
+        assert_eq!(bytes, b"not really audio");
+    }
+
+    /// Three concurrent callers for different models on the same file
+    /// (the picker's pattern) each upload the complete converted audio.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn perf_prepare_concurrent_callers_get_complete_uploads() {
+        let _iso = isolate();
+        let dir = tempfile::tempdir().expect("tmp");
+        let server = provider().await;
+        let cfg = std::sync::Arc::new(config(dir.path(), &server.uri()));
+        let pcm48 = speech(3.0, 48_000, 0.5);
+        let input = std::sync::Arc::new(dir.path().join("memo.wav"));
+        write_stereo_wav(&input, &pcm48);
+        let mut tasks = Vec::new();
+        for model in [
+            "voxtral-mini-2602",
+            "voxtral-mini-2507",
+            "voxtral-mini-latest",
+        ] {
+            let (cfg, input) = (cfg.clone(), input.clone());
+            tasks.push(tokio::spawn(async move {
+                let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+                    std::sync::Arc::new(crate::telemetry::NoOpSink);
+                transcribe_audio(
+                    &input,
+                    &cfg,
+                    Provider::Mistral,
+                    Some(model),
+                    false,
+                    TranscribeOptions {
+                        allow_api: true,
+                        ..TranscribeOptions::default()
+                    },
+                    &sink,
+                )
+                .await
+            }));
+        }
+        for t in tasks {
+            assert_eq!(t.await.expect("join").expect("transcription").text, "ok");
+        }
+        let ups = uploads(&server).await;
+        assert_eq!(ups.len(), 3);
+        for (i, (_, _, bytes)) in ups.iter().enumerate() {
+            assert_upload_profile(&format!("caller {i}"), bytes, &downsample(&pcm48));
+        }
+    }
+}

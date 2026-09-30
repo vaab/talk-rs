@@ -14,6 +14,8 @@ pub mod indicator;
 pub mod mock;
 #[cfg(feature = "capture")]
 pub mod monitor_capture;
+#[cfg(test)]
+pub(crate) mod perf_audio;
 #[cfg(feature = "capture")]
 pub mod pipewire_capture;
 #[cfg(feature = "playback")]

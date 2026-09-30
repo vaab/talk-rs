@@ -1725,48 +1725,88 @@ mod tests {
 }
 
 /// Performance harness, item `openai-realtime-final-early-exit`: how
-/// long the receiver keeps a realtime session open after the audio
-/// ended, when the server has already delivered the committed item's
-/// final transcript but keeps the socket open (paused tokio clock, so
-/// the measurement is exact and instant).
+/// long a realtime session stays open after the audio ended, and the
+/// terminal contract an early exit must keep.
+///
+/// Every scripted session must end with exactly one `Done` (never an
+/// `Error`, never a bare channel close or a panicking receiver), and
+/// the reconciled transcript (items in conversation order, corrections
+/// applied) must contain every item — including an earlier committed
+/// item still completing when the last one finishes.  Paused tokio
+/// clock: the measurements are exact and instant.
 #[cfg(test)]
 mod perf_realtime_end {
     use super::*;
+    use crate::transcription::realtime::OrderedItemTranscript;
 
-    fn committed(item: &str) -> String {
+    fn committed(item: &str, previous: Option<&str>) -> String {
+        let previous = previous.map_or("null".to_string(), |p| format!("\"{p}\""));
         format!(
-            r#"{{"type":"input_audio_buffer.committed","item_id":"{item}","previous_item_id":null}}"#
+            r#"{{"type":"input_audio_buffer.committed","item_id":"{item}","previous_item_id":{previous}}}"#
         )
     }
 
-    fn completed(item: &str, transcript: &str) -> String {
+    fn delta(item: &str, index: u64, text: &str) -> String {
         format!(
-            r#"{{"type":"conversation.item.input_audio_transcription.completed","item_id":"{item}","content_index":0,"transcript":"{transcript}"}}"#
+            r#"{{"type":"conversation.item.input_audio_transcription.delta","item_id":"{item}","content_index":{index},"delta":"{text}"}}"#
         )
     }
 
-    /// Drive `receiver_loop` with a scripted server.  Each script step
-    /// is `(virtual ms after audio end, message)`; after the script the
-    /// server stays silent with the socket open.  Returns the virtual
-    /// ms from audio end to `Done`, and every final transcript seen.
-    async fn session(script: Vec<(u64, String)>) -> (u128, Vec<String>) {
+    fn completed(item: &str, index: u64, transcript: &str) -> String {
+        format!(
+            r#"{{"type":"conversation.item.input_audio_transcription.completed","item_id":"{item}","content_index":{index},"transcript":"{transcript}"}}"#
+        )
+    }
+
+    /// Outcome of one scripted session.
+    #[derive(Debug)]
+    struct Session {
+        /// Virtual ms from audio end to the terminal `Done`.
+        end_ms: u128,
+        /// Reconciled transcript, items in conversation order.
+        text: String,
+    }
+
+    /// Drive `receiver_loop`.  `script` steps are `(virtual ms, message)`
+    /// relative to the moment audio ends; steps with negative times are
+    /// delivered before the audio end.  After the script the server
+    /// stays silent with the socket open.  Panics unless the session
+    /// ends with exactly one `Done`, no `Error`, and a clean join.
+    async fn session(script: Vec<(i64, String)>) -> Session {
         let (audio_end_tx, audio_end_rx) = tokio::sync::watch::channel(None);
         let (msg_tx, msg_rx) =
-            mpsc::channel::<Result<Message, tokio_tungstenite::tungstenite::Error>>(16);
-        let (tx, mut rx) = mpsc::channel(16);
+            mpsc::channel::<Result<Message, tokio_tungstenite::tungstenite::Error>>(32);
+        let (tx, mut rx) = mpsc::channel(32);
+        let audio_done = Arc::new(AtomicBool::new(false));
         let receiver = tokio::spawn(receiver_loop(
             tokio_stream::wrappers::ReceiverStream::new(msg_rx),
             tx,
             CancellationToken::new(),
-            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&audio_done),
             audio_end_rx,
             super::super::realtime::FINAL_TRANSCRIPT_DEADLINE,
         ));
-        let end = tokio::time::Instant::now();
-        audio_end_tx.send_replace(Some(end));
+        let start = tokio::time::Instant::now();
+        let lead = script.iter().map(|(t, _)| (-t).max(0)).max().unwrap_or(0) as u64;
+        let end = start + Duration::from_millis(lead);
+        let ender = tokio::spawn({
+            let audio_done = Arc::clone(&audio_done);
+            async move {
+                tokio::time::sleep_until(end).await;
+                audio_done.store(true, Ordering::Release);
+                audio_end_tx.send_replace(Some(end));
+                // Keep the watch sender alive (like the real sender).
+                std::future::pending::<()>().await;
+            }
+        });
         let server = tokio::spawn(async move {
             for (at_ms, msg) in script {
-                tokio::time::sleep_until(end + Duration::from_millis(at_ms)).await;
+                let at = if at_ms < 0 {
+                    end - Duration::from_millis((-at_ms) as u64)
+                } else {
+                    end + Duration::from_millis(at_ms as u64)
+                };
+                tokio::time::sleep_until(at).await;
                 if msg_tx.send(Ok(Message::Text(msg))).await.is_err() {
                     return;
                 }
@@ -1774,56 +1814,257 @@ mod perf_realtime_end {
             // Keep the socket open: never send Close.
             std::future::pending::<()>().await;
         });
-        let mut finals = Vec::new();
-        let done_at = loop {
+        let mut items = OrderedItemTranscript::default();
+        let mut dones = 0;
+        let end_ms = loop {
             match rx.recv().await {
-                Some(TranscriptionEvent::ItemTextCompleted { transcript, .. }) => {
-                    finals.push(transcript)
+                Some(TranscriptionEvent::ItemCreated {
+                    item_id,
+                    previous_item_id,
+                }) => items.item_created(&item_id, previous_item_id.as_deref()),
+                Some(TranscriptionEvent::ItemTextDelta {
+                    item_id,
+                    content_index,
+                    text,
+                }) => items.append_delta(&item_id, content_index, &text),
+                Some(TranscriptionEvent::ItemTextCompleted {
+                    item_id,
+                    content_index,
+                    transcript,
+                }) => items.complete(&item_id, content_index, &transcript),
+                Some(TranscriptionEvent::Done) => {
+                    dones += 1;
+                    break tokio::time::Instant::now().duration_since(end).as_millis();
                 }
-                Some(TranscriptionEvent::Done) | None => break end.elapsed().as_millis(),
+                Some(TranscriptionEvent::Error { message }) => {
+                    panic!("session ended with an error: {message}")
+                }
                 Some(_) => {}
+                None => panic!("event channel closed without Done"),
             }
         };
+        receiver.await.expect("receiver task must not panic");
+        while let Ok(extra) = rx.try_recv() {
+            assert!(
+                !matches!(extra, TranscriptionEvent::Done),
+                "more than one Done"
+            );
+        }
+        assert_eq!(dones, 1);
         server.abort();
-        let _ = receiver.await;
-        (done_at, finals)
+        ender.abort();
+        Session {
+            end_ms,
+            text: items.drain_terminal().join(" "),
+        }
     }
 
+    /// Main cut: the stop commit's item is transcribed 300 ms after the
+    /// audio end; the server keeps the socket open.
     #[tokio::test(start_paused = true)]
     async fn perf_realtime_session_end_after_final_item() {
-        let (done_ms, finals) = session(vec![
-            (40, committed("item-2")),
-            (300, completed("item-2", "final words")),
+        let s = session(vec![
+            (40, committed("item-2", None)),
+            (300, completed("item-2", 0, "final words")),
         ])
         .await;
-        assert_eq!(finals, vec!["final words".to_string()]);
+        assert_eq!(s.text, "final words");
         crate::perf_counters::record_metrics(
             "openai-realtime-final-early-exit",
             "final-item-socket-open",
-            &[("final_item_ms", 300.0), ("session_end_ms", done_ms as f64)],
+            &[
+                ("final_item_ms", 300.0),
+                ("session_end_ms", s.end_ms as f64),
+            ],
         );
     }
 
-    /// VAD safety invariant: an earlier item's completion (item-1,
-    /// before the stop commit) must not end the session; the final
-    /// item-2 completion arriving 3 s later must still be delivered.
+    /// An earlier VAD item completes before the stop commit; the
+    /// session must wait for the committed final item.
     #[tokio::test(start_paused = true)]
     async fn perf_realtime_earlier_vad_item_does_not_end_session() {
-        let (done_ms, finals) = session(vec![
-            (10, completed("item-1", "first sentence")),
-            (40, committed("item-2")),
-            (3_000, completed("item-2", "second sentence")),
+        let s = session(vec![
+            (-500, committed("item-1", None)),
+            (-100, completed("item-1", 0, "first sentence")),
+            (40, committed("item-2", Some("item-1"))),
+            (3_000, completed("item-2", 0, "second sentence")),
         ])
         .await;
-        assert_eq!(
-            finals,
-            vec!["first sentence".to_string(), "second sentence".to_string()]
-        );
-        assert!(done_ms >= 3_000, "session ended before the final item");
+        assert_eq!(s.text, "first sentence second sentence");
+        assert!(s.end_ms >= 3_000, "session ended before the final item");
         crate::perf_counters::record_metrics(
             "openai-realtime-final-early-exit",
             "vad-earlier-item",
-            &[("session_end_ms", done_ms as f64)],
+            &[("session_end_ms", s.end_ms as f64)],
+        );
+    }
+
+    /// The last committed item completes BEFORE an earlier committed
+    /// item: ending on the last item's completion would drop text.
+    #[tokio::test(start_paused = true)]
+    async fn perf_realtime_earlier_item_still_outstanding() {
+        let s = session(vec![
+            (-400, committed("item-1", None)),
+            (40, committed("item-2", Some("item-1"))),
+            (200, completed("item-2", 0, "second")),
+            (2_000, completed("item-1", 0, "first")),
+        ])
+        .await;
+        assert_eq!(s.text, "first second");
+        assert!(s.end_ms >= 2_000, "session ended with item-1 outstanding");
+        crate::perf_counters::record_metrics(
+            "openai-realtime-final-early-exit",
+            "earlier-item-outstanding",
+            &[("session_end_ms", s.end_ms as f64)],
+        );
+    }
+
+    /// Multiple content parts and a correction: deltas are superseded
+    /// by the authoritative completion of each part; both parts kept.
+    #[tokio::test(start_paused = true)]
+    async fn perf_realtime_multi_part_correction() {
+        let s = session(vec![
+            (20, committed("item-1", None)),
+            (50, delta("item-1", 0, "helo")),
+            (120, completed("item-1", 0, "hello")),
+            (200, delta("item-1", 1, "wrld")),
+            (500, completed("item-1", 1, "world")),
+        ])
+        .await;
+        assert_eq!(s.text, "hello world");
+        crate::perf_counters::record_metrics(
+            "openai-realtime-final-early-exit",
+            "multi-part-correction",
+            &[("session_end_ms", s.end_ms as f64)],
+        );
+    }
+
+    /// Everything completed before the audio ended (empty-tail stop):
+    /// nothing is outstanding at audio end.
+    #[tokio::test(start_paused = true)]
+    async fn perf_realtime_completed_before_audio_end() {
+        let s = session(vec![
+            (-300, committed("item-1", None)),
+            (-50, completed("item-1", 0, "all said")),
+        ])
+        .await;
+        assert_eq!(s.text, "all said");
+        crate::perf_counters::record_metrics(
+            "openai-realtime-final-early-exit",
+            "completed-before-audio-end",
+            &[("session_end_ms", s.end_ms as f64)],
+        );
+    }
+
+    /// The committed item never completes: the bounded 15 s deadline
+    /// still ends the session with the text received so far.
+    #[tokio::test(start_paused = true)]
+    async fn perf_realtime_missing_completion_hits_deadline() {
+        let s = session(vec![
+            (40, committed("item-2", None)),
+            (100, delta("item-2", 0, "partial")),
+        ])
+        .await;
+        assert_eq!(s.text, "partial");
+        assert_eq!(
+            s.end_ms,
+            super::super::realtime::FINAL_TRANSCRIPT_DEADLINE.as_millis()
+        );
+    }
+
+    /// Real sender and receiver over a WebSocket: the client streams
+    /// audio, commits on audio end; a scripted server acknowledges the
+    /// commit, completes the item 300 ms later and keeps the socket
+    /// open.  Measures the end-to-end session end after the commit.
+    #[tokio::test(start_paused = true)]
+    async fn perf_realtime_ws_session_end() {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let mut server_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let (sink, source) = client_ws.split();
+        let (audio_tx, audio_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+        let audio_done = Arc::new(AtomicBool::new(false));
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        let sender = tokio::spawn(sender_loop(
+            audio_rx,
+            sink,
+            cancel.clone(),
+            Arc::clone(&audio_done),
+            end_tx,
+        ));
+        let receiver = tokio::spawn(receiver_loop(
+            source,
+            event_tx,
+            cancel.clone(),
+            audio_done,
+            end_rx,
+            super::super::realtime::FINAL_TRANSCRIPT_DEADLINE,
+        ));
+        let server = tokio::spawn(async move {
+            let mut appended = 0;
+            while let Some(Ok(message)) = server_ws.next().await {
+                let Message::Text(json) = message else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                match value["type"].as_str() {
+                    Some("input_audio_buffer.append") => appended += 1,
+                    Some("input_audio_buffer.commit") => {
+                        let commit_at = tokio::time::Instant::now();
+                        let ack = committed("item-1", None);
+                        let _ = server_ws.send(Message::Text(ack)).await;
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let done = completed("item-1", 0, "spoken words");
+                        let _ = server_ws.send(Message::Text(done)).await;
+                        return (appended, commit_at, server_ws);
+                    }
+                    _ => {}
+                }
+            }
+            panic!("client closed before committing");
+        });
+        for _ in 0..10 {
+            audio_tx.send(vec![1000; 320]).await.expect("audio chunk");
+        }
+        drop(audio_tx);
+        let mut text = Vec::new();
+        loop {
+            match event_rx.recv().await {
+                Some(TranscriptionEvent::ItemTextCompleted { transcript, .. }) => {
+                    text.push(transcript)
+                }
+                Some(TranscriptionEvent::Done) => break,
+                Some(TranscriptionEvent::Error { message }) => panic!("error: {message}"),
+                Some(_) => {}
+                None => panic!("closed without Done"),
+            }
+        }
+        let done_at = tokio::time::Instant::now();
+        let (appended, commit_at, _open_socket) = server.await.expect("server");
+        receiver.await.expect("receiver must not panic");
+        cancel.cancel();
+        let _ = sender.await;
+        assert_eq!(appended, 10);
+        assert_eq!(text, vec!["spoken words".to_string()]);
+        crate::perf_counters::record_metrics(
+            "openai-realtime-final-early-exit",
+            "ws-commit-to-end",
+            &[(
+                "commit_to_session_end_ms",
+                done_at.duration_since(commit_at).as_millis() as f64,
+            )],
         );
     }
 }
