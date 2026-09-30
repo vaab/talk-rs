@@ -1723,3 +1723,107 @@ mod tests {
         );
     }
 }
+
+/// Performance harness, item `openai-realtime-final-early-exit`: how
+/// long the receiver keeps a realtime session open after the audio
+/// ended, when the server has already delivered the committed item's
+/// final transcript but keeps the socket open (paused tokio clock, so
+/// the measurement is exact and instant).
+#[cfg(test)]
+mod perf_realtime_end {
+    use super::*;
+
+    fn committed(item: &str) -> String {
+        format!(
+            r#"{{"type":"input_audio_buffer.committed","item_id":"{item}","previous_item_id":null}}"#
+        )
+    }
+
+    fn completed(item: &str, transcript: &str) -> String {
+        format!(
+            r#"{{"type":"conversation.item.input_audio_transcription.completed","item_id":"{item}","content_index":0,"transcript":"{transcript}"}}"#
+        )
+    }
+
+    /// Drive `receiver_loop` with a scripted server.  Each script step
+    /// is `(virtual ms after audio end, message)`; after the script the
+    /// server stays silent with the socket open.  Returns the virtual
+    /// ms from audio end to `Done`, and every final transcript seen.
+    async fn session(script: Vec<(u64, String)>) -> (u128, Vec<String>) {
+        let (audio_end_tx, audio_end_rx) = tokio::sync::watch::channel(None);
+        let (msg_tx, msg_rx) =
+            mpsc::channel::<Result<Message, tokio_tungstenite::tungstenite::Error>>(16);
+        let (tx, mut rx) = mpsc::channel(16);
+        let receiver = tokio::spawn(receiver_loop(
+            tokio_stream::wrappers::ReceiverStream::new(msg_rx),
+            tx,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(true)),
+            audio_end_rx,
+            super::super::realtime::FINAL_TRANSCRIPT_DEADLINE,
+        ));
+        let end = tokio::time::Instant::now();
+        audio_end_tx.send_replace(Some(end));
+        let server = tokio::spawn(async move {
+            for (at_ms, msg) in script {
+                tokio::time::sleep_until(end + Duration::from_millis(at_ms)).await;
+                if msg_tx.send(Ok(Message::Text(msg))).await.is_err() {
+                    return;
+                }
+            }
+            // Keep the socket open: never send Close.
+            std::future::pending::<()>().await;
+        });
+        let mut finals = Vec::new();
+        let done_at = loop {
+            match rx.recv().await {
+                Some(TranscriptionEvent::ItemTextCompleted { transcript, .. }) => {
+                    finals.push(transcript)
+                }
+                Some(TranscriptionEvent::Done) | None => break end.elapsed().as_millis(),
+                Some(_) => {}
+            }
+        };
+        server.abort();
+        let _ = receiver.await;
+        (done_at, finals)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perf_realtime_session_end_after_final_item() {
+        let (done_ms, finals) = session(vec![
+            (40, committed("item-2")),
+            (300, completed("item-2", "final words")),
+        ])
+        .await;
+        assert_eq!(finals, vec!["final words".to_string()]);
+        crate::perf_counters::record_metrics(
+            "openai-realtime-final-early-exit",
+            "final-item-socket-open",
+            &[("final_item_ms", 300.0), ("session_end_ms", done_ms as f64)],
+        );
+    }
+
+    /// VAD safety invariant: an earlier item's completion (item-1,
+    /// before the stop commit) must not end the session; the final
+    /// item-2 completion arriving 3 s later must still be delivered.
+    #[tokio::test(start_paused = true)]
+    async fn perf_realtime_earlier_vad_item_does_not_end_session() {
+        let (done_ms, finals) = session(vec![
+            (10, completed("item-1", "first sentence")),
+            (40, committed("item-2")),
+            (3_000, completed("item-2", "second sentence")),
+        ])
+        .await;
+        assert_eq!(
+            finals,
+            vec!["first sentence".to_string(), "second sentence".to_string()]
+        );
+        assert!(done_ms >= 3_000, "session ended before the final item");
+        crate::perf_counters::record_metrics(
+            "openai-realtime-final-early-exit",
+            "vad-earlier-item",
+            &[("session_end_ms", done_ms as f64)],
+        );
+    }
+}

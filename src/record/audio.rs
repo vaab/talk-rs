@@ -869,3 +869,82 @@ mod tests {
         );
     }
 }
+
+/// Performance harness, playback of a long recording (runner-up item
+/// `streaming-playback-decode`; also the size of the GTK freeze that
+/// `record-ui-row-work` removes by decoding off the GTK thread): the
+/// recordings browser's Play button runs `WavPlayer::play`, which
+/// decodes the WHOLE file to device-rate f32 on the GTK thread before
+/// the first sample plays.  This measures that decode (time before
+/// first sound; buffer held for the whole playback).
+#[cfg(all(test, feature = "ui"))]
+mod perf_playback {
+    use super::*;
+
+    /// Long fixtures are cached under `target/perf-fixtures/` (shared
+    /// with `tests/perf`), since encoding an hour takes a while.
+    fn cached_recording(name: &str, seconds: u32) -> std::path::PathBuf {
+        use crate::audio::{AudioWriter, OggOpusWriter};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-fixtures");
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let path = dir.join(format!("{name}.ogg"));
+        if path.exists() {
+            return path;
+        }
+        let cfg = crate::config::AudioConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            bitrate: 64_000,
+        };
+        let mut writer = OggOpusWriter::new_for_recording(cfg).expect("writer");
+        let mut bytes = writer.header().expect("header");
+        for second in 0..seconds {
+            let pcm: Vec<i16> = (0..48_000u32)
+                .map(|i| {
+                    let t = (second * 48_000 + i) as f32 / 48_000.0;
+                    ((t * 180.0 * std::f32::consts::TAU).sin() * 8000.0) as i16
+                })
+                .collect();
+            bytes.extend(writer.write_pcm(&pcm).expect("pcm"));
+        }
+        bytes.extend(writer.finalize().expect("finalize"));
+        let tmp = dir.join(format!("{name}.ogg.partial"));
+        std::fs::write(&tmp, bytes).expect("write fixture");
+        std::fs::rename(&tmp, &path).expect("publish fixture");
+        path
+    }
+
+    fn measure(cut: &str, seconds: u32) {
+        let path = cached_recording(&format!("playback-{seconds}s"), seconds);
+        let t0 = std::time::Instant::now();
+        let samples = read_ogg_as_f32(&path, 48_000).expect("decode");
+        let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let decoded_s = samples.len() as f64 / 48_000.0;
+        assert!(
+            (decoded_s - seconds as f64).abs() < 0.1,
+            "decoded {decoded_s}s of a {seconds}s recording"
+        );
+        crate::perf_counters::record_metrics(
+            "streaming-playback-decode",
+            cut,
+            &[
+                ("decode_before_first_sound_ms", decode_ms),
+                (
+                    "playback_buffer_mib",
+                    (samples.len() * std::mem::size_of::<f32>()) as f64 / 1_048_576.0,
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn perf_play_decode_2min() {
+        measure("play-decode-2min", 120);
+    }
+
+    #[test]
+    #[ignore = "long: 1-hour recording fixture"]
+    fn perf_play_decode_1h() {
+        measure("play-decode-1h", 3600);
+    }
+}

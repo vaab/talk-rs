@@ -1138,3 +1138,103 @@ mod tests {
         );
     }
 }
+
+/// Performance harness, item `record-ui-incremental-listing`: the cost
+/// of one full library listing (what the recordings browser runs on
+/// open and, today, again on every file event) on a user-like library
+/// of 1500 recordings, 1300 of them with a pick file.
+#[cfg(test)]
+mod perf_listing {
+    use super::*;
+    use crate::perf_counters::{thread_value, Counter};
+
+    fn library(root: &Path, recordings: usize, without_pick: usize) -> Vec<PathBuf> {
+        use crate::audio::{AudioWriter, OggOpusWriter};
+        let mut writer = OggOpusWriter::new(crate::config::AudioConfig::new()).expect("writer");
+        let payload = [
+            writer.header().expect("header"),
+            writer.write_pcm(&vec![1200; 16_000]).expect("pcm"),
+            writer.finalize().expect("finalize"),
+        ]
+        .concat();
+        (0..recordings)
+            .map(|i| {
+                let dir = root.join(format!("2026/{:02}", 1 + i % 12));
+                std::fs::create_dir_all(&dir).expect("library dir");
+                let audio = dir.join(format!(
+                    "2026-{:02}-{:02}T{:02}-{:02}-00+0200.ogg",
+                    1 + i % 12,
+                    1 + (i / 12) % 28,
+                    (i / 336) % 24,
+                    i % 60
+                ));
+                std::fs::write(&audio, &payload).expect("audio");
+                if i >= without_pick {
+                    recording_cache::write_pick(
+                        &audio,
+                        "mistral",
+                        "voxtral-mini-2602",
+                        false,
+                        &format!("transcript {i}"),
+                    )
+                    .expect("pick");
+                }
+                audio
+            })
+            .collect()
+    }
+
+    #[test]
+    fn perf_list_library_1500() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = library(temp.path(), 1500, 200);
+        let config = tests_config(temp.path());
+
+        let reads_before = thread_value(Counter::PickReads);
+        let t0 = std::time::Instant::now();
+        let rows = list_ogg_recordings_in_dir(temp.path(), &config).expect("listing");
+        let list_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let pick_reads = thread_value(Counter::PickReads) - reads_before;
+
+        // Invariants: every recording listed once, newest first, picks
+        // shown as available transcripts, the rest as player rows.
+        assert_eq!(rows.len(), paths.len());
+        assert!(rows
+            .windows(2)
+            .all(|w| w[0].path.file_name() >= w[1].path.file_name()));
+        let available = rows
+            .iter()
+            .filter(|r| matches!(r.status, recording_cache::TranscriptStatus::Available(_)))
+            .count();
+        assert_eq!(available, 1300);
+
+        crate::perf_counters::record_metrics(
+            "record-ui-incremental-listing",
+            "list-library-1500",
+            &[
+                ("recordings", rows.len() as f64),
+                ("recordings_with_pick", available as f64),
+                ("pick_reads", pick_reads as f64),
+                ("list_ms", list_ms),
+            ],
+        );
+    }
+
+    fn tests_config(root: &Path) -> Config {
+        Config {
+            output_dir: root.to_path_buf(),
+            providers: crate::config::ProvidersConfig {
+                mistral: None,
+                openai: None,
+                parakeet: None,
+                kokoro: None,
+            },
+            indicators: None,
+            transcription: None,
+            speak: None,
+            paste: None,
+            audio: None,
+            recording: None,
+        }
+    }
+}

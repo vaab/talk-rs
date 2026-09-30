@@ -1227,3 +1227,100 @@ providers: {}
         assert_eq!(got, vec!["hello world".to_string()]);
     }
 }
+
+/// Performance harness, item `paste-focus-sleep`: the focus policy's
+/// work and virtual latency when the target is already active, and the
+/// unchanged backoff when it is not.  Driven through the injected seam
+/// with a paused tokio clock, so the numbers are exact and need no X.
+#[cfg(test)]
+mod perf_focus {
+    use super::*;
+    use crate::perf_counters::{thread_value, Counter};
+    use std::sync::{Arc, Mutex};
+
+    /// Run `ensure_focus_with` against a scripted window manager whose
+    /// active window becomes `target` after `focus_requests_needed`
+    /// focus requests.  Returns (result, focus requests, virtual ms,
+    /// focus sleeps).
+    async fn scripted(
+        already_active: bool,
+        focus_requests_needed: usize,
+    ) -> (Result<(), TalkError>, usize, u128, u64) {
+        let requests = Arc::new(Mutex::new(0usize));
+        let focus_log = Arc::clone(&requests);
+        let active_log = Arc::clone(&requests);
+        let sleeps_before = thread_value(Counter::FocusSleeps);
+        let t0 = tokio::time::Instant::now();
+        let result = ensure_focus_with(
+            "4242",
+            move |_wid: String| {
+                let log = Arc::clone(&focus_log);
+                async move {
+                    if let Ok(mut n) = log.lock() {
+                        *n += 1;
+                    }
+                    true
+                }
+            },
+            move || {
+                let log = Arc::clone(&active_log);
+                async move {
+                    let n = log.lock().map(|n| *n).unwrap_or_default();
+                    if already_active || n >= focus_requests_needed {
+                        Some("4242".to_string())
+                    } else {
+                        Some("7".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+        let elapsed = t0.elapsed().as_millis();
+        let n = requests.lock().map(|n| *n).unwrap_or_default();
+        (
+            result,
+            n,
+            elapsed,
+            thread_value(Counter::FocusSleeps) - sleeps_before,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn perf_focus_already_active_target() {
+        let (result, requests, virtual_ms, sleeps) = scripted(true, 0).await;
+        assert!(result.is_ok(), "focus must succeed: {result:?}");
+        crate::perf_counters::record_metrics(
+            "paste-focus-sleep",
+            "already-focused",
+            &[
+                ("focus_requests", requests as f64),
+                ("focus_sleeps", sleeps as f64),
+                ("focus_virtual_ms", virtual_ms as f64),
+            ],
+        );
+    }
+
+    /// Invariant for every experiment: when the target is NOT active
+    /// the ladder 50 / 100 / 200 ms is kept, and an unreachable target
+    /// still aborts after 5 attempts (no keys to the wrong window).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn perf_focus_backoff_unchanged_when_target_not_active() {
+        let (result, requests, settle_ms, _) = scripted(false, 3).await;
+        assert!(result.is_ok(), "focus must succeed: {result:?}");
+        assert_eq!(requests, 3);
+        assert_eq!(settle_ms, 50 + 100 + 200);
+
+        let (result, requests, abort_ms, _) = scripted(false, usize::MAX).await;
+        assert!(result.is_err(), "unreachable target must abort");
+        assert_eq!(requests, 5);
+        assert_eq!(abort_ms, 50 + 100 + 200 + 400 + 800);
+        crate::perf_counters::record_metrics(
+            "paste-focus-sleep",
+            "focus-mismatch",
+            &[
+                ("focus_virtual_ms_third_attempt", settle_ms as f64),
+                ("focus_virtual_ms_abort", abort_ms as f64),
+            ],
+        );
+    }
+}
