@@ -42,6 +42,7 @@ pub(crate) fn build_audio_player_bar(
 
     let play_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     play_bar.set_hexpand(true);
+    crate::perf_counters::incr(crate::perf_counters::Counter::PlayerBarsBuilt);
 
     // ── Waterfall spectrogram (base layer) ─────────────────────
     let waterfall_area = gtk4::DrawingArea::new();
@@ -138,10 +139,16 @@ pub(crate) fn build_audio_player_bar(
     wf_overlay.add_overlay(&cursor_area);
     wf_overlay.set_hexpand(true);
 
+    #[cfg(feature = "perf-counters")]
+    if wf_data.borrow().is_some() {
+        waterfall_area.add_css_class("wf-ready");
+    }
+
     // If no waterfall data provided, compute in background thread.
     if wf_data.borrow().is_none() {
         let (wf_tx, wf_rx) = std::sync::mpsc::channel::<WfColumns>();
         let wf_audio_path = audio_path.to_path_buf();
+        crate::perf_counters::incr(crate::perf_counters::Counter::WaterfallJobsRequested);
         std::thread::spawn(move || {
             use crate::perf_counters::{gauge_dec, gauge_inc, Gauge};
             gauge_inc(Gauge::WaterfallWorkersInflight);
@@ -164,6 +171,11 @@ pub(crate) fn build_audio_player_bar(
                 Ok(result) => {
                     *wf_data_ref.borrow_mut() = Some(result);
                     wf_area_ref.queue_draw();
+                    // Harness-only marker the recordings-browser probe
+                    // reads to see which rows show their waveform.
+                    #[cfg(feature = "perf-counters")]
+                    wf_area_ref.add_css_class("wf-ready");
+                    crate::perf_counters::incr(crate::perf_counters::Counter::WaterfallJobsApplied);
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,

@@ -530,10 +530,9 @@ fn show_recordings_window() -> Result<(), TalkError> {
 
                 offset.set(end);
                 if end == entries.len() {
-                    crate::perf_counters::mark(&format!(
-                        "record_ui_rows_built_{}",
-                        label.replace(' ', "_")
-                    ));
+                    crate::perf_counters::mark_with(|| {
+                        format!("record_ui_rows_built_{}", label.replace(' ', "_"))
+                    });
                 }
                 if end < entries.len() {
                     let next = Rc::clone(&build_batch_ref);
@@ -611,6 +610,11 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 // ── OGG recordings section ──
                 let (ogg_expander, ogg_list) = create_section("Recordings (0)");
                 sections_idle.append(&ogg_expander);
+                #[cfg(feature = "perf-counters")]
+                super::ui_probe::install(vec![
+                    ("Dictation cache", wav_list.clone()),
+                    ("Recordings", ogg_list.clone()),
+                ]);
 
                 // Populate sections via idle callbacks so the GTK
                 // main loop stays responsive between each section.

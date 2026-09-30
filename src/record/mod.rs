@@ -14,6 +14,8 @@ pub(crate) mod player;
 pub(crate) mod toggle;
 #[cfg(feature = "ui")]
 pub(crate) mod ui;
+#[cfg(all(feature = "ui", feature = "perf-counters"))]
+mod ui_probe;
 
 #[cfg(feature = "capture")]
 use crate::audio::bt_profile;

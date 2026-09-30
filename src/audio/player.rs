@@ -36,14 +36,77 @@ struct PlaybackState {
 pub struct AudioPlayer {
     state: std::sync::Arc<std::sync::Mutex<PlaybackState>>,
     device_sample_rate: u32,
-    // Dropping this stops the stream.
-    _stream: cpal::Stream,
+    // Dropping this stops the stream (a cpal stream, or the harness's
+    // capturing sink thread).
+    _stream: OutputStream,
+}
+
+/// What drives [`fill_output`]: the cpal device, or (performance
+/// harness only) a paced capturing sink.  Held only for its `Drop`
+/// (stopping the stream / joining the sink thread), never read.
+#[allow(dead_code)] // variants are kept alive for their Drop, not read
+enum OutputStream {
+    Device(cpal::Stream),
+    #[cfg(feature = "perf-counters")]
+    Capture(perf_sink::CaptureSink),
+}
+
+/// The output callback body, shared by every output backend so that
+/// what a capturing sink consumes is exactly what the device would.
+///
+/// Fills `output` (interleaved, `channels` wide) from the shared
+/// playback state and returns the mono frames taken from the loaded
+/// samples (0 when paused, idle, or the state lock was busy).
+fn fill_output(
+    state: &std::sync::Mutex<PlaybackState>,
+    output: &mut [f32],
+    channels: usize,
+) -> usize {
+    let Ok(mut guard) = state.try_lock() else {
+        output.fill(0.0);
+        return 0;
+    };
+    if guard.paused {
+        output.fill(0.0);
+        return 0;
+    }
+    let frames = output.len() / channels;
+    let mut consumed = 0;
+    for frame_idx in 0..frames {
+        let sample = if guard.position < guard.samples.len() {
+            let s = guard.samples[guard.position];
+            guard.position += 1;
+            consumed += 1;
+            s
+        } else {
+            0.0
+        };
+        for ch in 0..channels {
+            output[frame_idx * channels + ch] = sample;
+        }
+    }
+    consumed
 }
 
 impl AudioPlayer {
     /// Open the default output device and start a silent stream.
     pub fn new() -> Result<Self, TalkError> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(PlaybackState {
+            samples: Vec::new(),
+            position: 0,
+            paused: false,
+        }));
+
+        #[cfg(feature = "perf-counters")]
+        if let Some(sink) = perf_sink::CaptureSink::from_env(std::sync::Arc::clone(&state))? {
+            return Ok(Self {
+                state,
+                device_sample_rate: sink.sample_rate,
+                _stream: OutputStream::Capture(sink),
+            });
+        }
 
         let host = cpal::default_host();
         let device = host
@@ -55,12 +118,6 @@ impl AudioPlayer {
 
         let device_sample_rate = config.sample_rate().0;
         let channels = config.channels() as usize;
-
-        let state = std::sync::Arc::new(std::sync::Mutex::new(PlaybackState {
-            samples: Vec::new(),
-            position: 0,
-            paused: false,
-        }));
         let state_cb = std::sync::Arc::clone(&state);
 
         let stream = device
@@ -71,31 +128,7 @@ impl AudioPlayer {
                     buffer_size: cpal::BufferSize::Default,
                 },
                 move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if let Ok(mut guard) = state_cb.try_lock() {
-                        if guard.paused {
-                            for s in output.iter_mut() {
-                                *s = 0.0;
-                            }
-                            return;
-                        }
-                        let frames = output.len() / channels;
-                        for frame_idx in 0..frames {
-                            let sample = if guard.position < guard.samples.len() {
-                                let s = guard.samples[guard.position];
-                                guard.position += 1;
-                                s
-                            } else {
-                                0.0
-                            };
-                            for ch in 0..channels {
-                                output[frame_idx * channels + ch] = sample;
-                            }
-                        }
-                    } else {
-                        for s in output.iter_mut() {
-                            *s = 0.0;
-                        }
-                    }
+                    fill_output(&state_cb, output, channels);
                 },
                 |err| log::error!("audio output error: {}", err),
                 None,
@@ -109,7 +142,7 @@ impl AudioPlayer {
         Ok(Self {
             state,
             device_sample_rate,
-            _stream: stream,
+            _stream: OutputStream::Device(stream),
         })
     }
 
@@ -126,6 +159,10 @@ impl AudioPlayer {
     /// or use [`play_pcm_blocking`](AudioPlayer::play_pcm_blocking)
     /// which resamples for them.
     pub fn load_f32(&self, samples: Vec<f32>) {
+        crate::perf_counters::gauge_set(
+            crate::perf_counters::Gauge::PlayerRetainedSamples,
+            samples.len() as i64,
+        );
         if let Ok(mut guard) = self.state.lock() {
             guard.samples = samples;
             guard.position = 0;
@@ -171,6 +208,7 @@ impl AudioPlayer {
 
     /// Stop playback immediately and clear the buffer.
     pub fn stop(&self) {
+        crate::perf_counters::gauge_set(crate::perf_counters::Gauge::PlayerRetainedSamples, 0);
         if let Ok(mut guard) = self.state.lock() {
             guard.samples.clear();
             guard.position = 0;
@@ -249,6 +287,120 @@ impl AudioPlayer {
                 }
             })
             .unwrap_or(0.0)
+    }
+}
+
+/// Performance-harness output sink (feature `perf-counters` only).
+///
+/// With `TALK_RS_PERF_AUDIO_SINK=<path>` set, [`AudioPlayer::new`]
+/// opens no device: a thread calls [`fill_output`] every 10 ms of wall
+/// clock with a 10 ms buffer at 48 kHz mono — the pace of a real
+/// device — and appends a line per event to `<path>`:
+///
+/// - `first-audio +<ms> epoch=<unix ms> sample=<n>`: the first
+///   consumed frame whose magnitude exceeds 1e-3 (meaningful sound,
+///   not leading silence), with milliseconds since the sink opened,
+///   the wall clock, and its index among consumed samples;
+/// - `consumed <total>` every second and on drop: frames consumed.
+///
+/// The sink also writes every consumed sample (f32 LE) to
+/// `<path>.pcm` so a test can compare what was played with what was
+/// synthesized or decoded.
+#[cfg(feature = "perf-counters")]
+mod perf_sink {
+    use super::{fill_output, PlaybackState};
+    use crate::error::TalkError;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    pub(super) struct CaptureSink {
+        pub(super) sample_rate: u32,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CaptureSink {
+        pub(super) fn from_env(
+            state: Arc<Mutex<PlaybackState>>,
+        ) -> Result<Option<Self>, TalkError> {
+            let Some(path) = std::env::var_os("TALK_RS_PERF_AUDIO_SINK") else {
+                return Ok(None);
+            };
+            let path = std::path::PathBuf::from(path);
+            let open = |p: &std::path::Path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .map_err(|e| TalkError::Audio(format!("perf sink {}: {e}", p.display())))
+            };
+            let mut events = open(&path)?;
+            let mut pcm = open(&path.with_extension("pcm"))?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            const RATE: u32 = 48_000;
+            let thread = std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let period = std::time::Duration::from_millis(10);
+                let mut buffer = vec![0.0f32; (RATE / 100) as usize];
+                let mut total = 0u64;
+                let mut heard = false;
+                let mut tick = 0u64;
+                let mut next = started;
+                while !flag.load(Ordering::Acquire) {
+                    let consumed = fill_output(&state, &mut buffer, 1);
+                    if consumed > 0 {
+                        let bytes: Vec<u8> = buffer[..consumed]
+                            .iter()
+                            .flat_map(|s| s.to_le_bytes())
+                            .collect();
+                        let _ = pcm.write_all(&bytes);
+                        if !heard {
+                            if let Some(i) = buffer[..consumed].iter().position(|s| s.abs() > 1e-3)
+                            {
+                                heard = true;
+                                let epoch = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or_default();
+                                let _ = writeln!(
+                                    events,
+                                    "first-audio +{}ms epoch={epoch} sample={}",
+                                    started.elapsed().as_millis(),
+                                    total + i as u64
+                                );
+                            }
+                        }
+                        total += consumed as u64;
+                    }
+                    tick += 1;
+                    if tick.is_multiple_of(100) {
+                        let _ = writeln!(events, "consumed {total}");
+                    }
+                    next += period;
+                    if let Some(wait) = next.checked_duration_since(std::time::Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                }
+                let _ = writeln!(events, "consumed {total}");
+                let _ = pcm.flush();
+            });
+            Ok(Some(Self {
+                sample_rate: RATE,
+                stop,
+                thread: Some(thread),
+            }))
+        }
+    }
+
+    impl Drop for CaptureSink {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 }
 

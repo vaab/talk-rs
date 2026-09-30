@@ -334,6 +334,323 @@ fn is_stuck_at_rail(samples: &[f32], rail_floor: f32, flat_eps: f32) -> bool {
     flat && near_rail
 }
 
+// ── Per-frame audio analysis ────────────────────────────────────────
+
+/// Magnitude (normalized, 0.0–1.0) at/above which a *constant* frame is
+/// considered stuck at the i16 rail.  30000/32768 ≈ 0.915; a real
+/// signal essentially never holds a single value this large across an
+/// entire frame.
+const DEAD_SIGNAL_RAIL_FLOOR: f32 = 0.9;
+/// Spread (max−min) below which a frame counts as "constant".  Uses a
+/// tiny epsilon rather than exact equality to tolerate any f32
+/// conversion noise; a stuck rail has spread 0.0.
+const DEAD_SIGNAL_FLAT_EPS: f32 = 1e-6;
+/// 0.5 s grace for PipeWire to fill the ring buffer.
+const DEAD_SIGNAL_TRIGGER_FRAMES: u32 = 30;
+/// Well above mic noise (~0.00004).
+const AUTOPAUSE_RMS_THRESHOLD: f32 = 0.003;
+/// 0.3 seconds at 60 fps.
+const AUTOPAUSE_TRIGGER_FRAMES: u32 = 15;
+/// Seconds of amplitude history shown by the amplitude visualizer.
+const AMP_WINDOW_SECS: f32 = 5.0;
+
+/// Auto-pause transition produced by one analysed frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoPauseChange {
+    /// Silence long enough: pause the pipeline.
+    Paused,
+    /// Speech again: resume the pipeline.
+    Resumed,
+    /// A dead device took priority over an active auto-pause.
+    ResetByDeadSignal,
+}
+
+/// Side effects one analysed frame asks the render loop to apply (the
+/// loop owns the silence channel and the shared pause/live flags).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FrameEffects {
+    /// The frame carried real signal (sets `had_live_audio`).
+    live_audio: bool,
+    /// The device left the dead-signal state (send `false`, unpause).
+    device_recovered: bool,
+    /// The dead-signal state was just entered (send `true`, pause).
+    dead_signal_notified: bool,
+    /// Auto-pause transition, applied after the dead-signal effects.
+    auto_pause: Option<AutoPauseChange>,
+}
+
+/// Every piece of recording-badge state derived from the captured
+/// audio: detectors (RMS, stuck-at-rail dead signal, auto-pause), the
+/// peaks used for normalisation and the visualizer histories.
+///
+/// Kept apart from the X11 render loop so the per-frame computation can
+/// be driven with identical logical frames in tests: an optimisation of
+/// this analysis (e.g. computing the FFT only for spectral visualizers)
+/// must leave every detector and history trace unchanged.
+#[derive(Debug, Clone)]
+struct FrameAnalysis {
+    frame_rms: f32,
+    frame_stuck_at_rail: bool,
+    magnitudes: Vec<f32>,
+    rms_peak: f32,
+    dead_signal_frames: u32,
+    no_sound_active: bool,
+    silence_notified: bool,
+    quiet_frames: u32,
+    auto_paused: bool,
+    effective_freq_max: f32,
+    spec_peak: f32,
+    amp_peak: f32,
+    spectrum_peak: f32,
+    column_frame_counter: u32,
+    spectrogram_history: Vec<Vec<f32>>,
+    amp_history: Vec<f32>,
+    amp_max_frames: usize,
+}
+
+impl FrameAnalysis {
+    fn new() -> Self {
+        let amp_max_frames = (FPS as f32 * AMP_WINDOW_SECS) as usize;
+        Self {
+            frame_rms: 0.0,
+            frame_stuck_at_rail: false,
+            magnitudes: Vec::new(),
+            rms_peak: PEAK_FLOOR,
+            dead_signal_frames: 0,
+            no_sound_active: false,
+            silence_notified: false,
+            quiet_frames: 0,
+            auto_paused: false,
+            effective_freq_max: FREQ_INITIAL_MAX,
+            spec_peak: PEAK_FLOOR,
+            amp_peak: PEAK_FLOOR,
+            spectrum_peak: PEAK_FLOOR,
+            column_frame_counter: 0,
+            spectrogram_history: Vec::new(),
+            amp_history: vec![0.0; amp_max_frames],
+            amp_max_frames,
+        }
+    }
+
+    /// Reset for a new recording session (the column counter keeps
+    /// running, as it always has).
+    fn reset(&mut self) {
+        let column_frame_counter = self.column_frame_counter;
+        *self = Self::new();
+        self.column_frame_counter = column_frame_counter;
+    }
+
+    /// Analyse one render frame of `samples` (the ring buffer's latest
+    /// `FFT_SIZE.max(rms_chunk)` samples).
+    fn analyze(
+        &mut self,
+        samples: &[f32],
+        rms_chunk: usize,
+        viz: Option<crate::config::VizMode>,
+        sample_rate: u32,
+        auto_pause: bool,
+    ) -> FrameEffects {
+        let mut effects = FrameEffects::default();
+        let rms_slice = &samples[samples.len().saturating_sub(rms_chunk.max(1))..];
+        self.frame_rms = rms(rms_slice);
+        // Detect the "stuck at the rail" signature of a dead /
+        // disconnected device: a perfectly constant frame pinned
+        // near the i16 rail (|sample| ≈ 1.0).  This avoids the old
+        // variance heuristic, which mis-flagged the exact-zero
+        // digital silence from Bluetooth HFP mics as a dead device.
+        self.frame_stuck_at_rail =
+            is_stuck_at_rail(rms_slice, DEAD_SIGNAL_RAIL_FLOOR, DEAD_SIGNAL_FLAT_EPS);
+        self.magnitudes = compute_spectrum(samples);
+        let frame_rms = self.frame_rms;
+
+        // Update RMS peak (fast attack, slow decay).
+        self.rms_peak *= PEAK_DECAY;
+        if frame_rms > self.rms_peak {
+            self.rms_peak = frame_rms;
+        }
+        self.rms_peak = self.rms_peak.max(PEAK_FLOOR);
+
+        // ── Dead-signal detection ────────────────────────────
+        // A dead / disconnected device pins every sample at the i16
+        // rail (constant ≈ -1.0): a flat frame at maximum magnitude.
+        // Only that signature counts as a dead device.  Benign silence
+        // (constant zero from an HFP mic, or a quiet room) is NOT dead.
+        if self.frame_stuck_at_rail {
+            self.dead_signal_frames = self.dead_signal_frames.saturating_add(1);
+        } else {
+            if self.no_sound_active {
+                effects.device_recovered = true;
+            }
+            self.dead_signal_frames = 0;
+            self.no_sound_active = false;
+            self.silence_notified = false;
+        }
+        // Mark the session as having captured real audio when the frame
+        // carries actual signal (RMS above the auto-pause noise floor).
+        // This is intentionally NOT set for silent-but-live frames so
+        // the "skip transcription if nothing was ever spoken" guard
+        // keeps working.
+        if frame_rms >= AUTOPAUSE_RMS_THRESHOLD {
+            effects.live_audio = true;
+        }
+        if self.dead_signal_frames >= DEAD_SIGNAL_TRIGGER_FRAMES {
+            self.no_sound_active = true;
+            if !self.silence_notified {
+                effects.dead_signal_notified = true;
+                self.silence_notified = true;
+            }
+        }
+
+        // ── Auto-pause detection ─────────────────────────────
+        // Only active when enabled and we have a working device (not
+        // dead signal).
+        if auto_pause && !self.no_sound_active {
+            if frame_rms < AUTOPAUSE_RMS_THRESHOLD {
+                self.quiet_frames = self.quiet_frames.saturating_add(1);
+            } else {
+                self.quiet_frames = 0;
+                if self.auto_paused {
+                    self.auto_paused = false;
+                    effects.auto_pause = Some(AutoPauseChange::Resumed);
+                }
+            }
+            if self.quiet_frames >= AUTOPAUSE_TRIGGER_FRAMES && !self.auto_paused {
+                self.auto_paused = true;
+                effects.auto_pause = Some(AutoPauseChange::Paused);
+            }
+        } else if !auto_pause {
+            // Auto-pause disabled — ensure flag stays cleared.
+            self.quiet_frames = 0;
+        } else {
+            // Dead signal takes priority — reset auto-pause state.
+            self.quiet_frames = 0;
+            if self.auto_paused {
+                self.auto_paused = false;
+                effects.auto_pause = Some(AutoPauseChange::ResetByDeadSignal);
+            }
+        }
+
+        // Per-viz-mode peak tracking and frequency scaling — updated
+        // every render frame (regardless of the slower column-push
+        // cadence) so normalization stays smooth.  Peaks are still
+        // frozen while the device is dead or auto-pause is active.
+        if !self.auto_paused && !self.no_sound_active {
+            if let Some(mode) = viz {
+                use crate::config::VizMode;
+                match mode {
+                    VizMode::Waterfall => {
+                        // Dynamic frequency scaling.
+                        let nyquist = sample_rate as f32 / 2.0;
+                        let n_mag = self.magnitudes.len();
+                        for (i, &mag) in self.magnitudes.iter().enumerate().rev() {
+                            if mag > FREQ_NOISE_FLOOR {
+                                let freq = (i as f32 / n_mag as f32) * nyquist;
+                                if freq > self.effective_freq_max {
+                                    self.effective_freq_max = freq.min(FREQ_MAX);
+                                }
+                                break;
+                            }
+                        }
+                        // All-time peak for opacity normalization.
+                        let frame_spec_max = self.magnitudes.iter().copied().fold(0.0f32, f32::max);
+                        if frame_spec_max > self.spec_peak {
+                            self.spec_peak = frame_spec_max;
+                        }
+                    }
+                    VizMode::Amplitude => {
+                        if frame_rms > self.amp_peak {
+                            self.amp_peak = frame_rms;
+                        }
+                    }
+                    VizMode::Spectrum => {
+                        self.spectrum_peak *= PEAK_DECAY;
+                        let frame_peak = self.magnitudes.iter().copied().fold(0.0f32, f32::max);
+                        if frame_peak > self.spectrum_peak {
+                            self.spectrum_peak = frame_peak;
+                        }
+                        self.spectrum_peak = self.spectrum_peak.max(PEAK_FLOOR);
+                    }
+                }
+            }
+        }
+        effects
+    }
+
+    /// Advance the waterfall/amplitude column cadence for this frame.
+    /// Returns `true` when a column was pushed (the caller then pushes
+    /// its phase and throughput columns on the same time axis).
+    ///
+    /// The waterfall scrolls at a *constant* wall-clock rate (one
+    /// column every [`COLUMN_PERIOD_FRAMES`] render frames), regardless
+    /// of whether the user is currently speaking.  During auto-pause,
+    /// an *empty* column is pushed instead of skipping the push, so
+    /// the growing "hole" in the spectrogram represents the pause.
+    fn advance_column(
+        &mut self,
+        viz: Option<crate::config::VizMode>,
+        sample_rate: u32,
+        idle_phase: bool,
+    ) -> bool {
+        self.column_frame_counter = self.column_frame_counter.wrapping_add(1);
+        // During transcription, the audio capture is stopped and the
+        // dead-signal detector will fire (stale samples → variance 0
+        // → no_sound_active = true).  We must keep pushing columns
+        // regardless so the phase line and throughput bars continue
+        // to advance on the time axis.
+        if !(self
+            .column_frame_counter
+            .is_multiple_of(COLUMN_PERIOD_FRAMES)
+            && (!self.no_sound_active || idle_phase))
+        {
+            return false;
+        }
+        if let Some(mode) = viz {
+            use crate::config::VizMode;
+            match mode {
+                VizMode::Waterfall => {
+                    let column = if self.auto_paused || idle_phase {
+                        // Empty column → no visible content, but the
+                        // column still advances so the time axis
+                        // keeps moving.
+                        vec![0.0f32; SPEC_H]
+                    } else {
+                        map_spectrum_to_column(
+                            &self.magnitudes,
+                            SPEC_H,
+                            sample_rate,
+                            self.effective_freq_max,
+                        )
+                    };
+                    self.spectrogram_history.push(column);
+                    if self.spectrogram_history.len() > SPEC_W {
+                        let excess = self.spectrogram_history.len() - SPEC_W;
+                        self.spectrogram_history.drain(..excess);
+                    }
+                }
+                VizMode::Amplitude => {
+                    // 0.0 during pause / transcribing / model-download
+                    // so the history also shows a visible gap.
+                    let val = if self.auto_paused || idle_phase {
+                        0.0
+                    } else {
+                        self.frame_rms
+                    };
+                    self.amp_history.push(val);
+                    if self.amp_history.len() > self.amp_max_frames {
+                        let excess = self.amp_history.len() - self.amp_max_frames;
+                        self.amp_history.drain(..excess);
+                    }
+                }
+                VizMode::Spectrum => {
+                    // Spectrum viz has no history; it renders a live
+                    // snapshot of `magnitudes` each frame.
+                }
+            }
+        }
+        true
+    }
+}
+
 /// Decode an embedded PNG into RGBA pixels.
 fn decode_png(bytes: &[u8]) -> Result<RgbaImage, TalkError> {
     let decoder = png::Decoder::new(bytes);
@@ -1778,28 +2095,11 @@ fn overlay_thread(
     // user paused talking.  A constant-zero frame is benign silence
     // (handled by auto-pause); only a constant frame *near the rail*
     // is a dead device.
-    let mut dead_signal_frames: u32 = 0;
-    let mut no_sound_active: bool = false;
-    let mut silence_notified: bool = false;
-    // Magnitude (normalized, 0.0–1.0) at/above which a *constant* frame
-    // is considered stuck at the i16 rail.  30000/32768 ≈ 0.915; a real
-    // signal essentially never holds a single value this large across
-    // an entire frame.
-    const DEAD_SIGNAL_RAIL_FLOOR: f32 = 0.9;
-    // Spread (max−min) below which a frame counts as "constant".  Uses
-    // a tiny epsilon rather than exact equality to tolerate any f32
-    // conversion noise; a stuck rail has spread 0.0.
-    const DEAD_SIGNAL_FLAT_EPS: f32 = 1e-6;
-    const DEAD_SIGNAL_TRIGGER_FRAMES: u32 = 30; // 0.5s grace for PipeWire to fill the ring buffer
 
     // ── Auto-pause state ─────────────────────────────────────────────
     // Pause the recording pipeline when the user stops speaking.
     // Uses RMS threshold (not variance) because this distinguishes
     // "quiet room with working mic" from "speech".
-    let mut quiet_frames: u32 = 0;
-    let mut auto_paused: bool = false;
-    const AUTOPAUSE_RMS_THRESHOLD: f32 = 0.003; // well above mic noise (~0.00004)
-    const AUTOPAUSE_TRIGGER_FRAMES: u32 = 15; // 0.3 seconds at 60fps
 
     // Diagnostic logging counter (logs every ~1 second = 60 frames).
     let mut diag_frame_counter: u32 = 0;
@@ -1813,16 +2113,8 @@ fn overlay_thread(
     let mut current_gc: Option<Gcontext> = None;
     let mut is_recording = false;
 
-    let mut spectrogram_history: Vec<Vec<f32>> = Vec::new();
     let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
-    let mut rms_peak: f32 = PEAK_FLOOR;
-
-    // Waterfall column advance counter.  Incremented every render
-    // frame; a new column is pushed to [`spectrogram_history`] (and
-    // amplitude/spectrum equivalents) only when the counter is a
-    // multiple of [`COLUMN_PERIOD_FRAMES`].  This decouples the
-    // waterfall's temporal resolution from the 60 fps render rate.
-    let mut column_frame_counter: u32 = 0;
+    let mut analysis = FrameAnalysis::new();
 
     // ── Phase overlay state ──────────────────────��───────────────
     //
@@ -1894,17 +2186,6 @@ fn overlay_thread(
     // aligned with the first visible column of each new session.
     let mut columns_pushed_total: u64 = 0;
 
-    // Amplitude history for amplitude viz mode: one RMS value per frame.
-    let amp_window_secs: f32 = 5.0;
-    let amp_max_frames = (FPS as f32 * amp_window_secs) as usize;
-    let mut amp_history: Vec<f32> = vec![0.0; amp_max_frames];
-    let mut amp_peak: f32 = PEAK_FLOOR;
-    // Spectrum peak for spectrum viz mode.
-    let mut spectrum_peak: f32 = PEAK_FLOOR;
-    let mut spec_peak: f32 = PEAK_FLOOR;
-    // Dynamic frequency ceiling — grows as higher harmonics appear.
-    let mut effective_freq_max: f32 = FREQ_INITIAL_MAX;
-
     // ── Event loop ───────────────────────────────────────────────────
 
     loop {
@@ -1959,7 +2240,7 @@ fn overlay_thread(
                     is_recording = true;
                     is_transcribing = false;
                     is_downloading = false;
-                    spectrogram_history.clear();
+                    analysis.reset();
                     phase_history.clear();
                     upload_history.clear();
                     download_history.clear();
@@ -1977,18 +2258,6 @@ fn overlay_thread(
                     current_phase = Phase::Idle;
                     current_retry = None;
                     current_backoff = None;
-                    rms_peak = PEAK_FLOOR;
-                    spec_peak = PEAK_FLOOR;
-                    spectrum_peak = PEAK_FLOOR;
-                    amp_peak = PEAK_FLOOR;
-                    amp_history.clear();
-                    amp_history.resize(amp_max_frames, 0.0);
-                    effective_freq_max = FREQ_INITIAL_MAX;
-                    dead_signal_frames = 0;
-                    no_sound_active = false;
-                    silence_notified = false;
-                    quiet_frames = 0;
-                    auto_paused = false;
                     pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                     had_live_audio.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2058,7 +2327,7 @@ fn overlay_thread(
                     is_recording = true;
                     is_transcribing = false;
                     is_downloading = true;
-                    spectrogram_history.clear();
+                    analysis.reset();
                     phase_history.clear();
                     upload_history.clear();
                     download_history.clear();
@@ -2076,18 +2345,6 @@ fn overlay_thread(
                     current_phase = Phase::Idle;
                     current_retry = None;
                     current_backoff = None;
-                    rms_peak = PEAK_FLOOR;
-                    spec_peak = PEAK_FLOOR;
-                    spectrum_peak = PEAK_FLOOR;
-                    amp_peak = PEAK_FLOOR;
-                    amp_history.clear();
-                    amp_history.resize(amp_max_frames, 0.0);
-                    effective_freq_max = FREQ_INITIAL_MAX;
-                    dead_signal_frames = 0;
-                    no_sound_active = false;
-                    silence_notified = false;
-                    quiet_frames = 0;
-                    auto_paused = false;
                     pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                     had_live_audio.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2119,7 +2376,7 @@ fn overlay_thread(
                     is_transcribing = false;
                     is_downloading = false;
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
-                    spectrogram_history.clear();
+                    analysis.reset();
                     phase_history.clear();
                     upload_history.clear();
                     download_history.clear();
@@ -2137,18 +2394,6 @@ fn overlay_thread(
                     current_phase = Phase::Idle;
                     current_retry = None;
                     current_backoff = None;
-                    rms_peak = PEAK_FLOOR;
-                    spec_peak = PEAK_FLOOR;
-                    spectrum_peak = PEAK_FLOOR;
-                    amp_peak = PEAK_FLOOR;
-                    amp_history.clear();
-                    amp_history.resize(amp_max_frames, 0.0);
-                    effective_freq_max = FREQ_INITIAL_MAX;
-                    dead_signal_frames = 0;
-                    no_sound_active = false;
-                    silence_notified = false;
-                    quiet_frames = 0;
-                    auto_paused = false;
                     pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                     had_live_audio.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2288,32 +2533,37 @@ fn overlay_thread(
             }
         }
 
-        // ── Read audio and compute visualization frame ──────
+        // ── Read audio and analyse the frame ─────────────────
+        //
+        // Detectors (RMS, stuck-at-rail dead signal, auto-pause,
+        // had-live-audio), peaks and the visualizer histories live in
+        // [`FrameAnalysis`]; its side effects (silence channel, pause
+        // flag) are applied here, in the same order as before.
         crate::perf_counters::incr(crate::perf_counters::Counter::OverlayFrames);
-
-        let (frame_rms, magnitudes, frame_stuck_at_rail) = {
-            let samples = ring
-                .lock()
-                .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
-                .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)]);
-            let rms_slice = &samples[samples.len().saturating_sub(rms_chunk.max(1))..];
-            let fr = rms(rms_slice);
-            // Detect the "stuck at the rail" signature of a dead /
-            // disconnected device: a perfectly constant frame pinned
-            // near the i16 rail (|sample| ≈ 1.0).  This avoids the old
-            // variance heuristic, which mis-flagged the exact-zero
-            // digital silence from Bluetooth HFP mics as a dead device.
-            let stuck = is_stuck_at_rail(rms_slice, DEAD_SIGNAL_RAIL_FLOOR, DEAD_SIGNAL_FLAT_EPS);
-            let mags = compute_spectrum(&samples);
-            (fr, mags, stuck)
-        };
-
-        // Update RMS peak (fast attack, slow decay).
-        rms_peak *= PEAK_DECAY;
-        if frame_rms > rms_peak {
-            rms_peak = frame_rms;
+        let samples = ring
+            .lock()
+            .map(|g| g.read_last(FFT_SIZE.max(rms_chunk)))
+            .unwrap_or_else(|_| vec![0.0; FFT_SIZE.max(rms_chunk)]);
+        let was_no_sound = analysis.no_sound_active;
+        let effects = analysis.analyze(&samples, rms_chunk, viz, sample_rate, auto_pause);
+        if effects.live_audio {
+            had_live_audio.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        rms_peak = rms_peak.max(PEAK_FLOOR);
+        if effects.device_recovered {
+            if let Some(ref tx) = silence_tx {
+                let _ = tx.send(false);
+            }
+            // Resume the recording pipeline — the device is back.
+            pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        if effects.dead_signal_notified {
+            if let Some(ref tx) = silence_tx {
+                let _ = tx.send(true);
+            }
+            // Pause the recording pipeline so dead-signal frames
+            // are not forwarded to the OGG encoder / transcriber.
+            pause_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // ── Diagnostic logging (once per second) ─────────────
         diag_frame_counter += 1;
@@ -2321,51 +2571,11 @@ fn overlay_thread(
             diag_frame_counter = 0;
             log::debug!(
                 "[audio-diag] rms={:.6} stuck_at_rail={}",
-                frame_rms,
-                frame_stuck_at_rail,
+                analysis.frame_rms,
+                analysis.frame_stuck_at_rail,
             );
         }
-
-        // ── Dead-signal detection ────────────────────────────
-        // A dead / disconnected device pins every sample at the i16
-        // rail (constant ≈ -1.0): a flat frame at maximum magnitude.
-        // Only that signature counts as a dead device.  Benign silence
-        // (constant zero from an HFP mic, or a quiet room) is NOT dead.
-        let was_no_sound = no_sound_active;
-        if frame_stuck_at_rail {
-            dead_signal_frames = dead_signal_frames.saturating_add(1);
-        } else {
-            if no_sound_active {
-                if let Some(ref tx) = silence_tx {
-                    let _ = tx.send(false);
-                }
-                // Resume the recording pipeline — the device is back.
-                pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            dead_signal_frames = 0;
-            no_sound_active = false;
-            silence_notified = false;
-        }
-        // Mark the session as having captured real audio when the frame
-        // carries actual signal (RMS above the auto-pause noise floor).
-        // This is intentionally NOT set for silent-but-live frames so
-        // the "skip transcription if nothing was ever spoken" guard in
-        // streaming.rs keeps working.
-        if frame_rms >= AUTOPAUSE_RMS_THRESHOLD {
-            had_live_audio.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        if dead_signal_frames >= DEAD_SIGNAL_TRIGGER_FRAMES {
-            no_sound_active = true;
-            if !silence_notified {
-                if let Some(ref tx) = silence_tx {
-                    let _ = tx.send(true);
-                }
-                // Pause the recording pipeline so dead-signal frames
-                // are not forwarded to the OGG encoder / transcriber.
-                pause_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                silence_notified = true;
-            }
-        }
+        let no_sound_active = analysis.no_sound_active;
 
         // ── Centered no-sound overlay transitions ────────────
         if no_sound_active && !was_no_sound {
@@ -2416,78 +2626,21 @@ fn overlay_thread(
             destroy_current(&conn, &mut centered_window, &mut centered_gc);
         }
 
-        // ── Auto-pause detection ─────────────────────────────
-        // Only active when enabled and we have a working device (not dead signal).
-        if auto_pause && !no_sound_active {
-            if frame_rms < AUTOPAUSE_RMS_THRESHOLD {
-                quiet_frames = quiet_frames.saturating_add(1);
-            } else {
-                quiet_frames = 0;
-                if auto_paused {
-                    auto_paused = false;
-                    pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                    log::debug!("auto-pause: resumed (speech detected)");
-                }
-            }
-            if quiet_frames >= AUTOPAUSE_TRIGGER_FRAMES && !auto_paused {
-                auto_paused = true;
+        // Auto-pause and peak tracking ran inside `analysis.analyze`;
+        // apply the auto-pause transitions to the pipeline flag.
+        match effects.auto_pause {
+            Some(AutoPauseChange::Paused) => {
                 pause_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 log::debug!("auto-pause: paused (silence detected)");
             }
-        } else if !auto_pause {
-            // Auto-pause disabled — ensure flag stays cleared.
-            quiet_frames = 0;
-        } else {
-            // Dead signal takes priority — reset auto-pause state.
-            quiet_frames = 0;
-            if auto_paused {
-                auto_paused = false;
+            Some(AutoPauseChange::Resumed) => {
+                pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                log::debug!("auto-pause: resumed (speech detected)");
+            }
+            Some(AutoPauseChange::ResetByDeadSignal) => {
                 pause_flag.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-        }
-
-        // Per-viz-mode peak tracking and frequency scaling — updated
-        // every render frame (regardless of the slower column-push
-        // cadence) so normalization stays smooth.  Peaks are still
-        // frozen while the device is dead or auto-pause is active.
-        if !auto_paused && !no_sound_active {
-            if let Some(mode) = viz {
-                use crate::config::VizMode;
-                match mode {
-                    VizMode::Waterfall => {
-                        // Dynamic frequency scaling.
-                        let nyquist = sample_rate as f32 / 2.0;
-                        let n_mag = magnitudes.len();
-                        for (i, &mag) in magnitudes.iter().enumerate().rev() {
-                            if mag > FREQ_NOISE_FLOOR {
-                                let freq = (i as f32 / n_mag as f32) * nyquist;
-                                if freq > effective_freq_max {
-                                    effective_freq_max = freq.min(FREQ_MAX);
-                                }
-                                break;
-                            }
-                        }
-                        // All-time peak for opacity normalization.
-                        let frame_spec_max = magnitudes.iter().copied().fold(0.0f32, f32::max);
-                        if frame_spec_max > spec_peak {
-                            spec_peak = frame_spec_max;
-                        }
-                    }
-                    VizMode::Amplitude => {
-                        if frame_rms > amp_peak {
-                            amp_peak = frame_rms;
-                        }
-                    }
-                    VizMode::Spectrum => {
-                        spectrum_peak *= PEAK_DECAY;
-                        let frame_peak = magnitudes.iter().copied().fold(0.0f32, f32::max);
-                        if frame_peak > spectrum_peak {
-                            spectrum_peak = frame_peak;
-                        }
-                        spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
-                    }
-                }
-            }
+            None => {}
         }
 
         // ── Waterfall column advance ─────────────────────────
@@ -2506,58 +2659,8 @@ fn overlay_thread(
         // Peak tracking above is still frame-rate-driven so
         // normalization adapts smoothly even when the column rate
         // is slower.
-        column_frame_counter = column_frame_counter.wrapping_add(1);
-        // During transcription, the audio capture is stopped and the
-        // dead-signal detector will fire (stale samples → variance 0
-        // → no_sound_active = true).  We must keep pushing columns
-        // regardless so the phase line and throughput bars continue
-        // to advance on the time axis.
-        if column_frame_counter.is_multiple_of(COLUMN_PERIOD_FRAMES)
-            && (!no_sound_active || is_transcribing || is_downloading)
-        {
-            if let Some(mode) = viz {
-                use crate::config::VizMode;
-                match mode {
-                    VizMode::Waterfall => {
-                        let column = if auto_paused || is_transcribing || is_downloading {
-                            // Empty column → no visible content, but the
-                            // column still advances so the time axis
-                            // keeps moving and the spectrogram "hole"
-                            // grows with real elapsed time.
-                            vec![0.0f32; SPEC_H]
-                        } else {
-                            map_spectrum_to_column(
-                                &magnitudes,
-                                SPEC_H,
-                                sample_rate,
-                                effective_freq_max,
-                            )
-                        };
-                        spectrogram_history.push(column);
-                        if spectrogram_history.len() > SPEC_W {
-                            spectrogram_history.drain(..spectrogram_history.len() - SPEC_W);
-                        }
-                    }
-                    VizMode::Amplitude => {
-                        // 0.0 during pause / transcribing /
-                        // model-download so the history also shows
-                        // a visible gap.
-                        let val = if auto_paused || is_transcribing || is_downloading {
-                            0.0
-                        } else {
-                            frame_rms
-                        };
-                        amp_history.push(val);
-                        if amp_history.len() > amp_max_frames {
-                            amp_history.drain(..amp_history.len() - amp_max_frames);
-                        }
-                    }
-                    VizMode::Spectrum => {
-                        // Spectrum viz has no history; it renders a
-                        // live snapshot of `magnitudes` each frame.
-                    }
-                }
-            }
+        // (Column cadence and histories: see `FrameAnalysis::advance_column`.)
+        if analysis.advance_column(viz, sample_rate, is_transcribing || is_downloading) {
             // Every column push — even empty columns during pause —
             // advances the absolute-column counter the time-grid
             // overlay uses to space its vertical marks one per
@@ -2605,6 +2708,17 @@ fn overlay_thread(
         }
 
         // ── Render badge ─────────────────────────────────────
+        // Values the renderer reads (unchanged names from before the
+        // analysis moved into `FrameAnalysis`).
+        let frame_rms = analysis.frame_rms;
+        let rms_peak = analysis.rms_peak;
+        let auto_paused = analysis.auto_paused;
+        let spec_peak = analysis.spec_peak;
+        let amp_peak = analysis.amp_peak;
+        let spectrum_peak = analysis.spectrum_peak;
+        let magnitudes: &Vec<f32> = &analysis.magnitudes;
+        let spectrogram_history: &Vec<Vec<f32>> = &analysis.spectrogram_history;
+        let amp_history: &Vec<f32> = &analysis.amp_history;
 
         pb.clear(BG_COLOR);
         draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
@@ -2629,7 +2743,7 @@ fn overlay_thread(
                     VizMode::Waterfall => {
                         render_spectrogram(
                             &mut pb,
-                            &spectrogram_history,
+                            spectrogram_history,
                             SPEC_LEFT,
                             SPEC_TOP,
                             SPEC_W,
@@ -2642,7 +2756,7 @@ fn overlay_thread(
                     VizMode::Amplitude => {
                         render_amplitude_badge(
                             &mut pb,
-                            &amp_history,
+                            amp_history,
                             amp_peak,
                             SPEC_LEFT,
                             SPEC_TOP,
@@ -2655,7 +2769,7 @@ fn overlay_thread(
                     VizMode::Spectrum => {
                         render_spectrum_badge(
                             &mut pb,
-                            &magnitudes,
+                            magnitudes,
                             spectrum_peak,
                             SPEC_LEFT,
                             SPEC_TOP,
@@ -2768,7 +2882,7 @@ fn overlay_thread(
                     VizMode::Waterfall => {
                         render_spectrogram(
                             &mut pb,
-                            &spectrogram_history,
+                            spectrogram_history,
                             SPEC_LEFT,
                             SPEC_TOP,
                             SPEC_W,
@@ -2781,7 +2895,7 @@ fn overlay_thread(
                     VizMode::Amplitude => {
                         render_amplitude_badge(
                             &mut pb,
-                            &amp_history,
+                            amp_history,
                             amp_peak,
                             SPEC_LEFT,
                             SPEC_TOP,
@@ -2794,7 +2908,7 @@ fn overlay_thread(
                     VizMode::Spectrum => {
                         render_spectrum_badge(
                             &mut pb,
-                            &magnitudes,
+                            magnitudes,
                             spectrum_peak,
                             SPEC_LEFT,
                             SPEC_TOP,
@@ -2857,7 +2971,7 @@ fn overlay_thread(
                     VizMode::Waterfall => {
                         render_spectrogram(
                             &mut pb,
-                            &spectrogram_history,
+                            spectrogram_history,
                             SPEC_LEFT,
                             SPEC_TOP,
                             SPEC_W,
@@ -2870,7 +2984,7 @@ fn overlay_thread(
                     VizMode::Amplitude => {
                         render_amplitude_badge(
                             &mut pb,
-                            &amp_history,
+                            amp_history,
                             amp_peak,
                             SPEC_LEFT,
                             SPEC_TOP,
@@ -2883,7 +2997,7 @@ fn overlay_thread(
                     VizMode::Spectrum => {
                         render_spectrum_badge(
                             &mut pb,
-                            &magnitudes,
+                            magnitudes,
                             spectrum_peak,
                             SPEC_LEFT,
                             SPEC_TOP,
@@ -4074,5 +4188,441 @@ mod tests {
             eprintln!("skipped: no system font available for retry counter rendering");
         }
         font
+    }
+}
+
+/// Performance harness, item `overlay-fft-gating`: the recording
+/// badge's per-frame analysis driven with identical logical frames, so
+/// an optimisation of the FFT work (gating it to spectral visualizers,
+/// reusing buffers) can prove every detector and history is unchanged.
+#[cfg(test)]
+mod perf_frame_analysis {
+    use super::*;
+    use crate::config::VizMode;
+    use crate::perf_counters::{thread_value, Counter};
+
+    const RATE: u32 = 16_000;
+    const RMS_CHUNK: usize = RATE as usize / FPS as usize;
+    const WINDOW: usize = FFT_SIZE;
+
+    /// One logical frame of the scripted signal.
+    #[derive(Clone, Copy)]
+    enum Signal {
+        Speech,
+        Silence,
+        RailLow,
+        RailHigh,
+        DcOffset,
+        Burst,
+    }
+
+    /// 7 s script at 60 fps: speech, zero silence (auto-pause), speech,
+    /// a device stuck at each rail (dead signal), DC offset, short
+    /// spectral bursts, then the transcribing phase.
+    fn script() -> Vec<(Signal, bool)> {
+        let mut out = Vec::new();
+        let mut push = |signal, frames: usize, transcribing| {
+            out.extend(std::iter::repeat_n((signal, transcribing), frames));
+        };
+        push(Signal::Speech, 90, false);
+        push(Signal::Silence, 40, false);
+        push(Signal::Speech, 30, false);
+        push(Signal::RailLow, 45, false);
+        push(Signal::Speech, 20, false);
+        push(Signal::RailHigh, 40, false);
+        push(Signal::DcOffset, 30, false);
+        for _ in 0..6 {
+            push(Signal::Burst, 2, false);
+            push(Signal::Silence, 8, false);
+        }
+        push(Signal::Speech, 60, false);
+        push(Signal::Speech, 45, true);
+        out
+    }
+
+    /// Ring-buffer content for frame `n`: the latest `WINDOW` samples.
+    fn frame_samples(signal: Signal, n: usize) -> Vec<f32> {
+        let base = n * RMS_CHUNK;
+        (0..WINDOW)
+            .map(|i| {
+                let t = (base + i) as f32 / RATE as f32;
+                match signal {
+                    Signal::Speech => {
+                        let env = (t * 3.0 * std::f32::consts::TAU).sin().abs();
+                        env * (0.3 * (t * 180.0 * std::f32::consts::TAU).sin()
+                            + 0.15 * (t * 900.0 * std::f32::consts::TAU).sin())
+                    }
+                    Signal::Silence => 0.0,
+                    Signal::RailLow => -1.0,
+                    Signal::RailHigh => 32767.0 / 32768.0,
+                    Signal::DcOffset => 0.2,
+                    Signal::Burst => 0.6 * (t * 4000.0 * std::f32::consts::TAU).sin(),
+                }
+            })
+            .collect()
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq)]
+    struct Trace {
+        /// Per frame: rms bits, stuck, no-sound, auto-paused, effects.
+        detectors: Vec<(u32, bool, bool, bool, FrameEffects)>,
+        /// Per frame: rms/spec/amp/spectrum peaks, frequency ceiling.
+        peaks: Vec<[u32; 5]>,
+        /// Final histories and per-frame column push decision.
+        columns_pushed: Vec<bool>,
+        spectrogram: Vec<Vec<u32>>,
+        amplitude: Vec<u32>,
+    }
+
+    fn run(viz: Option<VizMode>, auto_pause: bool) -> Trace {
+        let mut analysis = FrameAnalysis::new();
+        let mut trace = Trace::default();
+        for (n, (signal, transcribing)) in script().into_iter().enumerate() {
+            let samples = frame_samples(signal, n);
+            let effects = analysis.analyze(&samples, RMS_CHUNK, viz, RATE, auto_pause);
+            trace.detectors.push((
+                analysis.frame_rms.to_bits(),
+                analysis.frame_stuck_at_rail,
+                analysis.no_sound_active,
+                analysis.auto_paused,
+                effects,
+            ));
+            trace.peaks.push([
+                analysis.rms_peak.to_bits(),
+                analysis.spec_peak.to_bits(),
+                analysis.amp_peak.to_bits(),
+                analysis.spectrum_peak.to_bits(),
+                analysis.effective_freq_max.to_bits(),
+            ]);
+            trace
+                .columns_pushed
+                .push(analysis.advance_column(viz, RATE, transcribing));
+        }
+        trace.spectrogram = analysis
+            .spectrogram_history
+            .iter()
+            .map(|c| c.iter().map(|v| v.to_bits()).collect())
+            .collect();
+        trace.amplitude = analysis.amp_history.iter().map(|v| v.to_bits()).collect();
+        trace
+    }
+
+    /// FNV-1a: stable across Rust releases, unlike `DefaultHasher`.
+    struct Fnv(u64);
+    impl std::hash::Hasher for Fnv {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for b in bytes {
+                self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+
+    fn digest(trace: &Trace) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        for d in &trace.detectors {
+            (
+                d.0,
+                d.1,
+                d.2,
+                d.3,
+                d.4.live_audio,
+                d.4.device_recovered,
+                d.4.dead_signal_notified,
+            )
+                .hash(&mut h);
+            format!("{:?}", d.4.auto_pause).hash(&mut h);
+        }
+        trace.peaks.hash(&mut h);
+        trace.columns_pushed.hash(&mut h);
+        trace.spectrogram.hash(&mut h);
+        trace.amplitude.hash(&mut h);
+        h.finish()
+    }
+
+    /// Detector behaviour on the script, independent of the visualizer:
+    /// rails trigger dead signal after the 30-frame grace (not zero
+    /// silence), silence triggers auto-pause after 15 frames, speech
+    /// resumes it, and a recovered device is reported once.
+    #[test]
+    fn perf_frame_analysis_detectors_follow_the_signal() {
+        let trace = run(None, true);
+        let dead: Vec<usize> = trace
+            .detectors
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.4.dead_signal_notified)
+            .map(|(i, _)| i)
+            .collect();
+        // RailLow starts at frame 160, RailHigh at 225: 30th rail frame.
+        assert_eq!(dead, vec![160 + 29, 225 + 29]);
+        let recovered = trace
+            .detectors
+            .iter()
+            .filter(|d| d.4.device_recovered)
+            .count();
+        assert_eq!(recovered, 2);
+        let paused_at = trace
+            .detectors
+            .iter()
+            .position(|d| d.4.auto_pause == Some(AutoPauseChange::Paused));
+        assert_eq!(paused_at, Some(90 + 14));
+        assert!(trace
+            .detectors
+            .iter()
+            .any(|d| d.4.auto_pause == Some(AutoPauseChange::Resumed)));
+        assert!(trace.detectors[0].4.live_audio);
+        // Every detector trace is identical whatever the visualizer.
+        for viz in [
+            Some(VizMode::Amplitude),
+            Some(VizMode::Waterfall),
+            Some(VizMode::Spectrum),
+        ] {
+            assert_eq!(run(viz, true).detectors, trace.detectors, "{viz:?}");
+        }
+    }
+
+    /// Golden digests of the complete traces (detectors, peaks, column
+    /// cadence, spectrogram and amplitude histories) per visualizer,
+    /// frozen from the implementation before any FFT optimisation.
+    /// Gating or reusing the FFT must keep every digest identical.
+    #[test]
+    fn perf_frame_analysis_traces_match_reference() {
+        let cases = [
+            ("none", None),
+            ("amplitude", Some(VizMode::Amplitude)),
+            ("waterfall", Some(VizMode::Waterfall)),
+            ("spectrum", Some(VizMode::Spectrum)),
+        ];
+        let got: Vec<(&str, u64)> = cases
+            .iter()
+            .map(|(n, v)| (*n, digest(&run(*v, true))))
+            .collect();
+        eprintln!("frame-analysis digests: {got:?}");
+        assert_eq!(got, REFERENCE_DIGESTS.to_vec());
+    }
+
+    /// Frozen by running `perf_frame_analysis_traces_match_reference`
+    /// on the unmodified per-frame analysis (FFT every frame).
+    const REFERENCE_DIGESTS: [(&str, u64); 4] = [
+        ("none", 2177901371061533892),
+        ("amplitude", 9213364403852148943),
+        ("waterfall", 16117603875973026452),
+        ("spectrum", 11382950317640610928),
+    ];
+
+    /// The pre-extraction render-loop analysis, transcribed verbatim
+    /// from `overlay_thread` (state as locals, side effects recorded
+    /// in the order the loop performed them).  Proves the extraction
+    /// into `FrameAnalysis` changed nothing; keep it frozen.
+    fn legacy_run(viz: Option<VizMode>, auto_pause: bool) -> Trace {
+        let mut trace = Trace::default();
+        let (mut dead_signal_frames, mut no_sound_active, mut silence_notified) =
+            (0u32, false, false);
+        let (mut quiet_frames, mut auto_paused) = (0u32, false);
+        let mut rms_peak = PEAK_FLOOR;
+        let (mut spec_peak, mut amp_peak, mut spectrum_peak) = (PEAK_FLOOR, PEAK_FLOOR, PEAK_FLOOR);
+        let mut effective_freq_max = FREQ_INITIAL_MAX;
+        let mut column_frame_counter = 0u32;
+        let mut spectrogram_history: Vec<Vec<f32>> = Vec::new();
+        let amp_max_frames = (FPS as f32 * 5.0) as usize;
+        let mut amp_history = vec![0.0f32; amp_max_frames];
+        for (n, (signal, transcribing)) in script().into_iter().enumerate() {
+            let samples = frame_samples(signal, n);
+            let mut fx = FrameEffects::default();
+            let rms_slice = &samples[samples.len().saturating_sub(RMS_CHUNK.max(1))..];
+            let frame_rms = rms(rms_slice);
+            let frame_stuck_at_rail = is_stuck_at_rail(rms_slice, 0.9, 1e-6);
+            let magnitudes = compute_spectrum(&samples);
+            rms_peak *= PEAK_DECAY;
+            if frame_rms > rms_peak {
+                rms_peak = frame_rms;
+            }
+            rms_peak = rms_peak.max(PEAK_FLOOR);
+            if frame_stuck_at_rail {
+                dead_signal_frames = dead_signal_frames.saturating_add(1);
+            } else {
+                if no_sound_active {
+                    fx.device_recovered = true;
+                }
+                dead_signal_frames = 0;
+                no_sound_active = false;
+                silence_notified = false;
+            }
+            if frame_rms >= 0.003 {
+                fx.live_audio = true;
+            }
+            if dead_signal_frames >= 30 {
+                no_sound_active = true;
+                if !silence_notified {
+                    fx.dead_signal_notified = true;
+                    silence_notified = true;
+                }
+            }
+            if auto_pause && !no_sound_active {
+                if frame_rms < 0.003 {
+                    quiet_frames = quiet_frames.saturating_add(1);
+                } else {
+                    quiet_frames = 0;
+                    if auto_paused {
+                        auto_paused = false;
+                        fx.auto_pause = Some(AutoPauseChange::Resumed);
+                    }
+                }
+                if quiet_frames >= 15 && !auto_paused {
+                    auto_paused = true;
+                    fx.auto_pause = Some(AutoPauseChange::Paused);
+                }
+            } else if !auto_pause {
+                quiet_frames = 0;
+            } else {
+                quiet_frames = 0;
+                if auto_paused {
+                    auto_paused = false;
+                    fx.auto_pause = Some(AutoPauseChange::ResetByDeadSignal);
+                }
+            }
+            if !auto_paused && !no_sound_active {
+                match viz {
+                    Some(VizMode::Waterfall) => {
+                        let nyquist = RATE as f32 / 2.0;
+                        let n_mag = magnitudes.len();
+                        for (i, &mag) in magnitudes.iter().enumerate().rev() {
+                            if mag > FREQ_NOISE_FLOOR {
+                                let freq = (i as f32 / n_mag as f32) * nyquist;
+                                if freq > effective_freq_max {
+                                    effective_freq_max = freq.min(FREQ_MAX);
+                                }
+                                break;
+                            }
+                        }
+                        let m = magnitudes.iter().copied().fold(0.0f32, f32::max);
+                        if m > spec_peak {
+                            spec_peak = m;
+                        }
+                    }
+                    Some(VizMode::Amplitude) => {
+                        if frame_rms > amp_peak {
+                            amp_peak = frame_rms;
+                        }
+                    }
+                    Some(VizMode::Spectrum) => {
+                        spectrum_peak *= PEAK_DECAY;
+                        let m = magnitudes.iter().copied().fold(0.0f32, f32::max);
+                        if m > spectrum_peak {
+                            spectrum_peak = m;
+                        }
+                        spectrum_peak = spectrum_peak.max(PEAK_FLOOR);
+                    }
+                    None => {}
+                }
+            }
+            trace.detectors.push((
+                frame_rms.to_bits(),
+                frame_stuck_at_rail,
+                no_sound_active,
+                auto_paused,
+                fx,
+            ));
+            trace.peaks.push([
+                rms_peak.to_bits(),
+                spec_peak.to_bits(),
+                amp_peak.to_bits(),
+                spectrum_peak.to_bits(),
+                effective_freq_max.to_bits(),
+            ]);
+            column_frame_counter = column_frame_counter.wrapping_add(1);
+            let pushed = column_frame_counter.is_multiple_of(COLUMN_PERIOD_FRAMES)
+                && (!no_sound_active || transcribing);
+            if pushed {
+                match viz {
+                    Some(VizMode::Waterfall) => {
+                        let column = if auto_paused || transcribing {
+                            vec![0.0f32; SPEC_H]
+                        } else {
+                            map_spectrum_to_column(&magnitudes, SPEC_H, RATE, effective_freq_max)
+                        };
+                        spectrogram_history.push(column);
+                        if spectrogram_history.len() > SPEC_W {
+                            spectrogram_history.drain(..spectrogram_history.len() - SPEC_W);
+                        }
+                    }
+                    Some(VizMode::Amplitude) => {
+                        amp_history.push(if auto_paused || transcribing {
+                            0.0
+                        } else {
+                            frame_rms
+                        });
+                        if amp_history.len() > amp_max_frames {
+                            amp_history.drain(..amp_history.len() - amp_max_frames);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            trace.columns_pushed.push(pushed);
+        }
+        trace.spectrogram = spectrogram_history
+            .iter()
+            .map(|c| c.iter().map(|v| v.to_bits()).collect())
+            .collect();
+        trace.amplitude = amp_history.iter().map(|v| v.to_bits()).collect();
+        trace
+    }
+
+    /// The extracted `FrameAnalysis` reproduces the original inline
+    /// render-loop analysis exactly, for every visualizer and with
+    /// auto-pause on and off.
+    #[test]
+    fn perf_frame_analysis_matches_legacy_inline_loop() {
+        for viz in [
+            None,
+            Some(VizMode::Amplitude),
+            Some(VizMode::Waterfall),
+            Some(VizMode::Spectrum),
+        ] {
+            for auto_pause in [true, false] {
+                assert_eq!(
+                    run(viz, auto_pause),
+                    legacy_run(viz, auto_pause),
+                    "{viz:?} {auto_pause}"
+                );
+            }
+        }
+    }
+
+    /// FFT work and spectrum allocations per analysed frame, per
+    /// visualizer (the measurement for `overlay-fft-gating`).
+    #[test]
+    fn perf_frame_analysis_fft_work() {
+        let frames = script().len() as f64;
+        for (name, viz) in [
+            ("none", None),
+            ("amplitude", Some(VizMode::Amplitude)),
+            ("waterfall", Some(VizMode::Waterfall)),
+            ("spectrum", Some(VizMode::Spectrum)),
+        ] {
+            let ffts = thread_value(Counter::FftCalls);
+            let allocs = thread_value(Counter::SpectrumAllocs);
+            let _ = run(viz, true);
+            crate::perf_counters::record_metrics(
+                "overlay-fft-gating",
+                &format!("frame-analysis-viz-{name}"),
+                &[
+                    ("frames", frames),
+                    (
+                        "fft_per_frame",
+                        (thread_value(Counter::FftCalls) - ffts) as f64 / frames,
+                    ),
+                    (
+                        "spectrum_allocs_per_frame",
+                        (thread_value(Counter::SpectrumAllocs) - allocs) as f64 / frames,
+                    ),
+                ],
+            );
+        }
     }
 }
