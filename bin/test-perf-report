@@ -1,0 +1,19 @@
+#!/bin/bash
+#
+# Run the sunit tests of ``bin/perf-report`` (test/perf-report/).
+
+exname="$(basename "$0")"
+self_dir=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
+base=$(realpath -- "$self_dir/..")
+export base
+
+case "${1:-}" in
+    -h|--help)
+        echo "Usage: $exname [sunit options...]" >&2
+        exit 0
+        ;;
+esac
+
+command -v sunit >/dev/null || { echo "Error: sunit is required" >&2; exit 1; }
+cd "$base/test/perf-report" || exit 1
+exec sunit -e helpers.sh "$@"

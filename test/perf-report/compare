@@ -1,0 +1,65 @@
+# -*- mode: shell-script -*-
+# ``--compare`` scores a report against the targets and a baseline,
+# one line per target/guard on stdout, exit 1 when anything regressed
+# or is missing.
+
+source "$base/test/perf-report/helpers.sh"
+
+setup() {
+    perf_report_fixtures
+}
+
+try '
+cat > "$test_tmpdir/now.yaml" <<YAML
+results:
+  item-a:
+    c1: {calls: 1, wait-ms: 400, latency-ms: 250}
+    c2: {invariant: 7}
+  item-b:
+    c3: {flag: 1}
+YAML
+NO_COLOR=1 "$base/bin/perf-report" --targets "$test_tmpdir/targets.yaml" \
+    --compare "$test_tmpdir/baseline.yaml" --report "$test_tmpdir/now.yaml"
+' "every target met"
+is errlvl 0
+is out 'met item-a c1 calls baseline=3 now=1 target="<= 1" delta=-2 kind=work
+met item-a c1 wait-ms baseline=1000 now=400 target="<= 0.5x" delta=-600 kind=timing
+met item-a c1 latency-ms baseline=400 now=250 target="-100" delta=-150 kind=timing
+met item-a c2 invariant baseline=7 now=7 target="== 7" delta=+0 kind=work
+met item-b c3 flag baseline=0 now=1 target="== 1" delta=+1 kind=work' TRIM
+
+try '
+cat > "$test_tmpdir/now.yaml" <<YAML
+results:
+  item-a:
+    c1: {calls: 3, wait-ms: 1300, latency-ms: 350}
+    c2: {invariant: 6}
+YAML
+NO_COLOR=1 "$base/bin/perf-report" --targets "$test_tmpdir/targets.yaml" \
+    --compare "$test_tmpdir/baseline.yaml" --report "$test_tmpdir/now.yaml"
+' "unchanged, worse, broken guard, skipped cut"
+is errlvl 1
+is out 'not-met item-a c1 calls baseline=3 now=3 target="<= 1" delta=+0 kind=work
+regressed item-a c1 wait-ms baseline=1000 now=1300 target="<= 0.5x" delta=+300 kind=timing
+not-met item-a c1 latency-ms baseline=400 now=350 target="-100" delta=-50 kind=timing
+regressed item-a c2 invariant baseline=7 now=6 target="== 7" delta=-1 kind=work
+skipped item-b c3 flag baseline=0 now=- target="== 1" delta=- kind=work' TRIM
+
+try '
+cat > "$test_tmpdir/now.yaml" <<YAML
+results:
+  item-a:
+    c1: {calls: 1, wait-ms: 1240, latency-ms: 300}
+    c2: {invariant: 7}
+  item-b:
+    c3: {other: 1}
+YAML
+NO_COLOR=1 "$base/bin/perf-report" --targets "$test_tmpdir/targets.yaml" \
+    --compare "$test_tmpdir/baseline.yaml" --report "$test_tmpdir/now.yaml"
+' "timing noise tolerated, metric missing from a cut that ran"
+is errlvl 1
+is out 'met item-a c1 calls baseline=3 now=1 target="<= 1" delta=-2 kind=work
+not-met item-a c1 wait-ms baseline=1000 now=1240 target="<= 0.5x" delta=+240 kind=timing
+met item-a c1 latency-ms baseline=400 now=300 target="-100" delta=-100 kind=timing
+met item-a c2 invariant baseline=7 now=7 target="== 7" delta=+0 kind=work
+missing item-b c3 flag baseline=0 now=- target="== 1" delta=- kind=work' TRIM

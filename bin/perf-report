@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+#
+# Run the talk-rs performance suite, collect its metrics into one YAML
+# report, and optionally score the report against perf/targets.yaml
+# and a baseline report.
+#
+# Data (the report, or the comparison table) goes to stdout; progress
+# and cargo output go to stderr.
+
+set -euo pipefail
+
+exname="${0##*/}"
+self_dir=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
+base=$(realpath -- "$self_dir/..")
+version="0.1.0"
+
+die()  { echo "Error: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+
+usage() {
+    cat <<EOF
+Usage: $exname [OPTIONS]
+       $exname --compare BASELINE.yaml [--report REPORT.yaml] [OPTIONS]
+
+Run the talk-rs performance suite (debug build, feature
+\`perf-counters\`, serial) and print a YAML report on stdout.
+
+With --compare, score a report against perf/targets.yaml and the given
+baseline report, and print one line per target:
+
+    <status> <item> <cut> <metric> baseline=<b> now=<v> target="<t>" delta=<d>
+
+where <status> is one of: met, not-met, regressed (a guard broke, or
+the value moved the wrong way: work metrics beyond 10 %, timing metrics
+beyond 25 % and 20 units), missing (the cut ran but lacks the metric),
+skipped (the cut was not part of this run, e.g. no --display).
+
+Options:
+  --ignored             also run #[ignore]d cuts: long recordings
+                        (2 min dictation, 20 min transcribe, 1 h
+                        playback) and isolated-display cuts
+  --display             run only the isolated-display cuts in addition
+                        to the default ones (subset of --ignored)
+  --models              run the local-model cuts; needs
+                        \$TALK_RS_TEST_PARAKEET_MODEL_DIR and/or
+                        \$TALK_RS_TEST_KOKORO_MODEL_DIR
+  --all                 --ignored plus --models
+  -o, --output FILE     also write the report to FILE
+  --compare BASELINE    compare a report (fresh run, or --report) to
+                        BASELINE and perf/targets.yaml
+  --report REPORT       with --compare: score REPORT instead of running
+  --targets FILE        targets file (default: perf/targets.yaml)
+  --results-dir DIR     keep the raw per-cut metric files in DIR
+  -h, --help            show this help
+  --version             show version
+
+Environment:
+  TALK_RS_TEST_PARAKEET_MODEL_DIR   Parakeet model dir (for --models)
+  TALK_RS_TEST_KOKORO_MODEL_DIR     Kokoro model dir (for --models)
+  NO_COLOR                          disable colored status words
+
+Examples:
+  $exname -o perf/baseline.yaml --all
+  $exname --compare perf/baseline.yaml
+  $exname --compare perf/baseline.yaml --report /tmp/exp.yaml
+EOF
+}
+
+run_ignored=
+run_display=
+run_models=
+output=
+compare=
+report=
+targets="$base/perf/targets.yaml"
+results_dir=
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --ignored) run_ignored=1 ;;
+        --display) run_display=1 ;;
+        --models) run_models=1 ;;
+        --all) run_ignored=1; run_models=1 ;;
+        -o|--output) [ "$#" -ge 2 ] || die "$1 needs a file"; output="$2"; shift ;;
+        --compare) [ "$#" -ge 2 ] || die "$1 needs a file"; compare="$2"; shift ;;
+        --report) [ "$#" -ge 2 ] || die "$1 needs a file"; report="$2"; shift ;;
+        --targets) [ "$#" -ge 2 ] || die "$1 needs a file"; targets="$2"; shift ;;
+        --results-dir) [ "$#" -ge 2 ] || die "$1 needs a directory"; results_dir="$2"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --version) echo "$exname $version"; exit 0 ;;
+        --) shift; break ;;
+        *) die "unknown argument: $1 (see --help)" ;;
+    esac
+    shift
+done
+[ "$#" -eq 0 ] || die "unexpected argument: $1 (see --help)"
+[ -z "$report" ] || [ -n "$compare" ] || die "--report needs --compare"
+
+command -v yq >/dev/null || die "yq is required (https://github.com/mikefarah/yq)"
+
+use_color() { [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; }
+
+## Run the suite and assemble a report on stdout.
+run_suite() {
+    local out_dir="$1" log="$1/cargo.log"
+    local features="perf-counters"
+    local -a lib_args=(--lib) perf_args=(--test perf) filter_args=()
+
+    command -v cargo >/dev/null || die "cargo is required"
+    (cd "$base" && ./autogen.sh >/dev/null 2>&1) || die "./autogen.sh failed"
+
+    if [ -n "$run_ignored" ]; then
+        filter_args=(--include-ignored)
+    fi
+    info "perf: building (features: $features)"
+    (cd "$base" && cargo test --features "$features" --no-run "${lib_args[@]}" "${perf_args[@]}" >"$log" 2>&1) \
+        || { cat "$log" >&2; die "build failed"; }
+
+    # run_cargo LABEL CARGO_ARGS... -- LIBTEST_ARGS...
+    run_cargo() {
+        local label="$1"; shift
+        info "perf: running $label"
+        (cd "$base" && TALK_RS_PERF_OUT="$out_dir/metrics" \
+            cargo test --features "$features" "$@" --test-threads=1 >>"$log" 2>&1) \
+            || { tail -n 60 "$log" >&2; die "$label failed (full log: $log)"; }
+    }
+
+    run_cargo "in-crate cuts" "${lib_args[@]}" -- perf_ "${filter_args[@]}"
+    run_cargo "binary cuts" "${perf_args[@]}" -- "${filter_args[@]}"
+    if [ -z "$run_ignored" ] && [ -n "$run_display" ]; then
+        run_cargo "display cuts" "${perf_args[@]}" -- --ignored perf_overlay perf_record_ui
+    fi
+    if [ -n "$run_models" ]; then
+        if [ -z "${TALK_RS_TEST_PARAKEET_MODEL_DIR:-}${TALK_RS_TEST_KOKORO_MODEL_DIR:-}" ]; then
+            info "perf: --models: no model dir set; model cuts will report SKIP"
+        fi
+        if [ -z "$run_ignored" ]; then
+            run_cargo "model cuts" "${perf_args[@]}" -- --ignored perf_parakeet perf_speak
+        fi
+    fi
+
+    local skipped
+    skipped=$(grep -c '^SKIP' "$log" || true)
+    [ "$skipped" -eq 0 ] || info "perf: $skipped cut(s) skipped (see $log)"
+    assemble "$out_dir/metrics"
+}
+
+## Merge per-cut metric files into one report (stdout).
+assemble() {
+    local dir="$1"
+    local -a files=()
+    shopt -s nullglob
+    files=("$dir"/*.yaml)
+    shopt -u nullglob
+    [ "${#files[@]}" -gt 0 ] || die "no metrics were recorded"
+    {
+        echo "# talk-rs performance report"
+        echo "generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "commit: $(git -C "$base" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        echo "host: $(uname -n)"
+        echo "build: debug, features perf-counters, serial"
+        # shellcheck disable=SC2016 # yq expression, not shell
+        yq eval-all '. as $x ireduce ({}; . * {"results": {$x.item: {$x.cut: $x.metrics}}})' "${files[@]}"
+    }
+}
+
+## Evaluate "criterion" for value v against baseline b; prints met|not-met.
+check() {
+    local criterion="$1" v="$2" b="$3"
+    awk -v c="$criterion" -v v="$v" -v b="$b" 'BEGIN {
+        gsub(/"/, "", c)
+        if (c ~ /^-[0-9.]+$/) { ok = (v <= b + c); print (ok ? "met" : "not-met"); exit }
+        op = c; sub(/[ ]*[0-9.].*$/, "", op); gsub(/ /, "", op)
+        n = c; sub(/^[<>=!]+[ ]*/, "", n)
+        if (n ~ /x$/) { sub(/x$/, "", n); n = n * b }
+        n += 0
+        if (op == "<=") ok = (v <= n)
+        else if (op == "<") ok = (v < n)
+        else if (op == ">=") ok = (v >= n)
+        else if (op == ">") ok = (v > n)
+        else if (op == "==") ok = (v == n)
+        else { print "bad-criterion"; exit }
+        print (ok ? "met" : "not-met")
+    }'
+}
+
+## Direction of improvement implied by a criterion: lower|higher|exact.
+direction() {
+    case "$1" in
+        "<"*|-*) echo lower ;;
+        ">"*) echo higher ;;
+        *) echo exact ;;
+    esac
+}
+
+## Print one comparison line per target and guard (stdout).
+compare_reports() {
+    local current="$1" baseline="$2"
+    local item cut metric target kind role now was status dir delta worse=0
+    [ -f "$targets" ] || die "targets file not found: $targets"
+    [ -f "$baseline" ] || die "baseline report not found: $baseline"
+
+    # shellcheck disable=SC2016 # yq expression, not shell
+    while IFS=$'\t' read -r role item cut metric target kind; do
+        now=$(yq ".results[\"$item\"][\"$cut\"][\"$metric\"] // \"\"" "$current")
+        was=$(yq ".results[\"$item\"][\"$cut\"][\"$metric\"] // \"\"" "$baseline")
+        if [ -z "$now" ]; then
+            delta="-"
+            if [ "$(yq ".results[\"$item\"][\"$cut\"] | type" "$current")" = "!!map" ]; then
+                status=missing
+            else
+                status=skipped
+            fi
+        else
+            status=$(check "$target" "$now" "${was:-0}")
+            delta=$(awk -v a="$now" -v b="${was:-0}" 'BEGIN { printf "%+g", a - b }')
+            if [ "$role" = guard ] && [ "$status" = not-met ]; then
+                status=regressed
+            elif [ "$role" = target ] && [ "$status" = not-met ] && [ -n "$was" ]; then
+                dir=$(direction "$target")
+                if awk -v a="$now" -v b="$was" -v d="$dir" -v k="$kind" 'BEGIN {
+                        ab = (b < 0 ? -b : b)
+                        m = (k == "timing") ? ab * 0.25 : ab * 0.10
+                        if (k == "timing" && m < 20) m = 20
+                        exit !((d == "lower" && a > b + m) || (d == "higher" && a < b - m))
+                    }'; then
+                    status=regressed
+                fi
+            fi
+        fi
+        case "$status" in regressed|missing) worse=1 ;; esac
+        printf '%s %s %s %s baseline=%s now=%s target="%s" delta=%s kind=%s\n' \
+            "$(paint "$status")" "$item" "$cut" "$metric" "${was:--}" "${now:--}" \
+            "$target" "$delta" "$kind"
+    done < <(yq '.items | to_entries | .[] | .key as $i |
+                  ((.value.targets // []) | map(["target", $i, .cut, .metric, .target, .kind]))
+                  + ((.value.guards // []) | map(["guard", $i, .cut, .metric, .target, .kind]))
+                  | .[] | @tsv' "$targets" | grep -v '^$')
+    return "$worse"
+}
+
+paint() {
+    if ! use_color; then
+        printf '%s' "$1"
+        return
+    fi
+    case "$1" in
+        met) printf '\033[32m%s\033[0m' "$1" ;;
+        not-met) printf '\033[33m%s\033[0m' "$1" ;;
+        skipped) printf '\033[2m%s\033[0m' "$1" ;;
+        *) printf '\033[31m%s\033[0m' "$1" ;;
+    esac
+}
+
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/talk-rs-perf.XXXXXX")
+cleanup() { rm -rf "$work_dir"; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+if [ -n "$report" ]; then
+    [ -f "$report" ] || die "report not found: $report"
+    current="$report"
+else
+    mkdir -p "$work_dir/metrics"
+    current="$work_dir/report.yaml"
+    run_suite "$work_dir" >"$current"
+    if [ -n "$results_dir" ]; then
+        mkdir -p "$results_dir"
+        cp "$work_dir"/metrics/*.yaml "$work_dir/cargo.log" "$results_dir"/
+    fi
+    if [ -n "$output" ]; then
+        cp "$current" "$output"
+        info "perf: report written to $output"
+    fi
+fi
+
+if [ -n "$compare" ]; then
+    compare_reports "$current" "$compare"
+elif [ -z "$report" ]; then
+    cat "$current"
+fi

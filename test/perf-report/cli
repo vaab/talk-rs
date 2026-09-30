@@ -1,0 +1,20 @@
+# -*- mode: shell-script -*-
+# Command-line contract: help/version on stdout-free stderr rules,
+# argument validation fails fast with exit 1.
+
+try '"$base/bin/perf-report" --version'
+noerror
+is out reg '^perf-report [0-9]+\.[0-9]+\.[0-9]+$' TRIM
+
+try '"$base/bin/perf-report" --help | head -1'
+noerror
+is out 'Usage: perf-report [OPTIONS]' TRIM
+
+try '"$base/bin/perf-report" --bogus'
+is errlvl 1
+is out ''
+is err 'Error: unknown argument: --bogus (see --help)' TRIM
+
+try '"$base/bin/perf-report" --report x.yaml'
+is errlvl 1
+is err 'Error: --report needs --compare' TRIM
