@@ -275,6 +275,7 @@ fn run_inference(
     cfg.model_config.model_type = Some("nemo_transducer".into());
 
     crate::perf_counters::incr(crate::perf_counters::Counter::RecognizerCreates);
+    crate::perf_counters::mark("parakeet_init_start");
     let recognizer = OfflineRecognizer::create(&cfg).ok_or_else(|| {
         TalkError::Transcription(format!(
             "parakeet: failed to create recognizer (variant={}, model_dir contains: {:?})",
@@ -286,9 +287,11 @@ fn run_inference(
         ))
     })?;
 
+    crate::perf_counters::mark("parakeet_ready");
     let stream = recognizer.create_stream();
     stream.accept_waveform(PARAKEET_SAMPLE_RATE_HZ, samples_f32);
     recognizer.decode(&stream);
+    crate::perf_counters::mark("parakeet_decoded");
 
     let result = stream.get_result().ok_or_else(|| {
         TalkError::Transcription(

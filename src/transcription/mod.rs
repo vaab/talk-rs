@@ -114,6 +114,7 @@ fn encode_16k_mono_ogg(path: &std::path::Path) -> Result<Vec<u8>, TalkError> {
     // `read_audio_as_i16` decodes wav/ogg/opus/m4a/mp4/aac, resampling
     // to 16 kHz and downmixing to mono — exactly the target form.
     let pcm = crate::record::audio::read_audio_as_i16(path)?;
+    crate::perf_counters::incr(crate::perf_counters::Counter::UploadEncodes);
 
     // 16 kHz mono is the hardcoded transcription profile.
     let mut writer = OggOpusWriter::new(crate::config::AudioConfig::new())?;

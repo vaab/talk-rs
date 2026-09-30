@@ -132,6 +132,8 @@ pub fn fft_in_place(buf: &mut [Complex]) {
 /// frequencies only).
 pub fn compute_spectrum(samples: &[f32]) -> Vec<f32> {
     crate::perf_counters::incr(crate::perf_counters::Counter::FftCalls);
+    // Each call allocates its complex work buffer and output vector.
+    crate::perf_counters::incr(crate::perf_counters::Counter::SpectrumAllocs);
     let n = samples.len();
     let mut buf: Vec<Complex> = samples
         .iter()

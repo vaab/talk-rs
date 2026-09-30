@@ -591,6 +591,7 @@ pub(crate) fn load_waterfall(
 /// Read any supported audio file (WAV or OGG Opus) as mono 16-bit PCM
 /// at 16 kHz, suitable for [`crate::x11::render_util::generate_waterfall_columns`].
 pub(crate) fn read_audio_as_i16(path: &std::path::Path) -> Result<Vec<i16>, TalkError> {
+    crate::perf_counters::incr(crate::perf_counters::Counter::AudioFileDecodes);
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

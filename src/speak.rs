@@ -402,9 +402,11 @@ pub async fn speak(opts: SpeakOpts) -> Result<(), TalkError> {
             Ok(())
         }
         None => {
-            // First audio is handed to the player here, after the whole
-            // synthesis: the harness's time-to-first-sound mark.
-            crate::perf_counters::mark("speak_first_audio");
+            // The PCM is handed to the player here.  This is NOT when
+            // sound starts (the player still has to open its output and
+            // consume the samples); the harness measures real first
+            // consumption with its capturing sink.
+            crate::perf_counters::mark("speak_handoff");
             play(&result.pcm, result.sample_rate)
         }
     }

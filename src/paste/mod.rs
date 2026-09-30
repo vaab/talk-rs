@@ -85,24 +85,19 @@ pub const PASTE_CHUNK_CHARS: usize = 150;
 /// Returns `Ok(())` when the target window is confirmed active, or
 /// `Err` if focus could not be established after all retries.
 pub async fn ensure_focus(window_id: &str) -> Result<(), TalkError> {
-    ensure_focus_with(
-        window_id,
-        |wid: String| async move { focus_window(&wid).await },
-        get_active_window,
-    )
-    .await
+    ensure_focus_with(window_id, focus_window, get_active_window).await
 }
 
 /// [`ensure_focus`] with the X11 focus request and active-window query
 /// injected, so the focus/backoff policy can be exercised without an
 /// X server (see the `ensure_focus_*` tests).
-async fn ensure_focus_with<F, FFut, A, AFut>(
-    window_id: &str,
+async fn ensure_focus_with<'w, F, FFut, A, AFut>(
+    window_id: &'w str,
     focus: F,
     active_window: A,
 ) -> Result<(), TalkError>
 where
-    F: Fn(String) -> FFut,
+    F: Fn(&'w str) -> FFut,
     FFut: std::future::Future<Output = bool>,
     A: Fn() -> AFut,
     AFut: std::future::Future<Output = Option<String>>,
@@ -110,7 +105,7 @@ where
     let mut delay_ms = FOCUS_INITIAL_DELAY_MS;
 
     for attempt in 1..=FOCUS_MAX_RETRIES {
-        focus(window_id.to_string()).await;
+        focus(window_id).await;
         crate::perf_counters::incr(crate::perf_counters::Counter::FocusSleeps);
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
@@ -1253,7 +1248,7 @@ mod perf_focus {
         let t0 = tokio::time::Instant::now();
         let result = ensure_focus_with(
             "4242",
-            move |_wid: String| {
+            move |_wid: &str| {
                 let log = Arc::clone(&focus_log);
                 async move {
                     if let Ok(mut n) = log.lock() {

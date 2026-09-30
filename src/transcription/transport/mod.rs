@@ -413,6 +413,7 @@ pub async fn http_request(
             req.retry_schedule.data_backoffs.len(),
             reason,
         );
+        crate::perf_counters::incr(crate::perf_counters::Counter::DataRetries);
         sink.emit(TranscriptionEvent::RetryScheduled {
             kind: crate::telemetry::RetryKind::Data,
             attempt: retry_num,
@@ -486,6 +487,7 @@ async fn run_connection_phase(
                 .as_ref()
                 .map(|f| f.to_string())
                 .unwrap_or_else(|| "connection failed".into());
+            crate::perf_counters::incr(crate::perf_counters::Counter::ConnectionRetries);
             sink.emit(TranscriptionEvent::RetryScheduled {
                 kind: crate::telemetry::RetryKind::Connection,
                 attempt: idx as u32,
@@ -977,6 +979,7 @@ pub async fn ws_upgrade(
                 .as_ref()
                 .map(|f| f.to_string())
                 .unwrap_or_else(|| "ws connection failed".into());
+            crate::perf_counters::incr(crate::perf_counters::Counter::ConnectionRetries);
             sink.emit(TranscriptionEvent::RetryScheduled {
                 kind: crate::telemetry::RetryKind::Connection,
                 attempt: idx as u32,
@@ -1052,6 +1055,7 @@ pub async fn ws_upgrade(
                     req.provider_name,
                     delay.as_secs()
                 );
+                crate::perf_counters::incr(crate::perf_counters::Counter::DataRetries);
                 sink.emit(TranscriptionEvent::RetryScheduled {
                     kind: crate::telemetry::RetryKind::Data,
                     attempt: attempt_num,

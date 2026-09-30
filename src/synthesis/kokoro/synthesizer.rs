@@ -201,6 +201,7 @@ fn run_synthesis(
         ..Default::default()
     };
 
+    crate::perf_counters::mark("kokoro_ready");
     let audio = tts
         .generate_with_config(text, &gen_config, None::<fn(&[f32], f32) -> bool>)
         .ok_or_else(|| TalkError::Transcription("kokoro: generation failed".to_string()))?;

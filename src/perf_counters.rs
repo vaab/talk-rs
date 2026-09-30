@@ -54,11 +54,29 @@ pub enum Counter {
     WaterfallDecodes,
     /// Whole-file decodes performed to start playback.
     PlaybackDecodes,
+    /// Whole-file audio decodes (`read_audio_as_i16`), whatever asked.
+    AudioFileDecodes,
+    /// Upload re-encodes actually performed (after any cache decision).
+    UploadEncodes,
+    /// Connection-phase retries scheduled by the HTTP/WS transport.
+    ConnectionRetries,
+    /// Data-phase (5xx/429) retries scheduled by the transport.
+    DataRetries,
+    /// `<stem>.pick.yml` read attempts, including missing files.
+    PickReadAttempts,
+    /// Waterfall computations requested by recordings-browser rows.
+    WaterfallJobsRequested,
+    /// Waterfall results delivered to (applied by) their row widget.
+    WaterfallJobsApplied,
+    /// Audio player bars built by the recordings browser.
+    PlayerBarsBuilt,
+    /// Spectrum scratch buffers allocated (one per FFT today).
+    SpectrumAllocs,
 }
 
 impl Counter {
     /// Every counter, in emission order.
-    pub const ALL: [Counter; 13] = [
+    pub const ALL: [Counter; 22] = [
         Counter::HttpClientBuilds,
         Counter::NormalizeCalls,
         Counter::OpusFramesEncoded,
@@ -72,6 +90,15 @@ impl Counter {
         Counter::PlayerTickCallbacks,
         Counter::WaterfallDecodes,
         Counter::PlaybackDecodes,
+        Counter::AudioFileDecodes,
+        Counter::UploadEncodes,
+        Counter::ConnectionRetries,
+        Counter::DataRetries,
+        Counter::PickReadAttempts,
+        Counter::WaterfallJobsRequested,
+        Counter::WaterfallJobsApplied,
+        Counter::PlayerBarsBuilt,
+        Counter::SpectrumAllocs,
     ];
 
     /// Stable snake_case name used in `perf-counter:` lines.
@@ -90,6 +117,15 @@ impl Counter {
             Counter::PlayerTickCallbacks => "player_tick_callbacks",
             Counter::WaterfallDecodes => "waterfall_decodes",
             Counter::PlaybackDecodes => "playback_decodes",
+            Counter::AudioFileDecodes => "audio_file_decodes",
+            Counter::UploadEncodes => "upload_encodes",
+            Counter::ConnectionRetries => "connection_retries",
+            Counter::DataRetries => "data_retries",
+            Counter::PickReadAttempts => "pick_read_attempts",
+            Counter::WaterfallJobsRequested => "waterfall_jobs_requested",
+            Counter::WaterfallJobsApplied => "waterfall_jobs_applied",
+            Counter::PlayerBarsBuilt => "player_bars_built",
+            Counter::SpectrumAllocs => "spectrum_allocs",
         }
     }
 }
@@ -103,13 +139,16 @@ pub enum Gauge {
     PlayerTickSourcesLive,
     /// Waterfall computations currently running on worker threads.
     WaterfallWorkersInflight,
+    /// PCM samples currently held by the shared audio player.
+    PlayerRetainedSamples,
 }
 
 impl Gauge {
     /// Every gauge, in emission order.
-    pub const ALL: [Gauge; 2] = [
+    pub const ALL: [Gauge; 3] = [
         Gauge::PlayerTickSourcesLive,
         Gauge::WaterfallWorkersInflight,
+        Gauge::PlayerRetainedSamples,
     ];
 
     /// Stable snake_case name; the maximum is emitted as `<name>_max`.
@@ -117,6 +156,7 @@ impl Gauge {
         match self {
             Gauge::PlayerTickSourcesLive => "player_tick_sources_live",
             Gauge::WaterfallWorkersInflight => "waterfall_workers_inflight",
+            Gauge::PlayerRetainedSamples => "player_retained_samples",
         }
     }
 }
@@ -180,6 +220,12 @@ mod enabled {
         GAUGES[gauge_index(gauge)].fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub fn gauge_set(gauge: Gauge, value: i64) {
+        let i = gauge_index(gauge);
+        GAUGES[i].store(value, Ordering::Relaxed);
+        GAUGE_MAX[i].fetch_max(value, Ordering::Relaxed);
+    }
+
     pub fn snapshot() -> Vec<(String, u64)> {
         let mut out: Vec<(String, u64)> = Counter::ALL
             .iter()
@@ -211,12 +257,17 @@ mod enabled {
     }
 
     /// Resource usage of this process so far, from `/proc/self`:
-    /// peak RSS (`VmHWM`), live threads and user+system CPU time.
+    /// peak and current RSS (`VmHWM`, `VmRSS`), live threads and
+    /// user+system CPU time.
     #[cfg(feature = "perf-counters")]
     fn process_resources() -> Vec<(String, u64)> {
         let mut out = Vec::new();
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            for (key, name) in [("VmHWM:", "vm_hwm_kb"), ("Threads:", "threads")] {
+            for (key, name) in [
+                ("VmHWM:", "vm_hwm_kb"),
+                ("VmRSS:", "vm_rss_kb"),
+                ("Threads:", "threads"),
+            ] {
                 if let Some(value) = status
                     .lines()
                     .find_map(|l| l.strip_prefix(key))
@@ -257,11 +308,29 @@ mod enabled {
         log::info!("perf-mark: {}=+{}ms", name, elapsed_ms());
     }
 
+    /// Sequence number of the next dump.
     #[cfg(feature = "perf-counters")]
-    pub fn emit() {
-        for (name, value) in snapshot() {
-            log::info!("perf-counter: {}={}", name, value);
+    static DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// One framed dump: `perf-dump-begin: id=N t=+Ms`, one
+    /// `perf-counter:` line per value, `perf-dump-end: id=N fields=K`.
+    /// A reader parses exactly one complete frame (end marker seen,
+    /// field count matching), so a read racing the writer never
+    /// yields a partial snapshot.  The whole frame is one log record,
+    /// written by a single `write` call.
+    #[cfg(feature = "perf-counters")]
+    pub fn emit(reason: &str) {
+        let id = DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let values = snapshot();
+        let mut frame = format!(
+            "perf-dump-begin: id={id} reason={reason} t=+{}ms",
+            elapsed_ms()
+        );
+        for (name, value) in &values {
+            frame.push_str(&format!("\nperf-counter: {name}={value}"));
         }
+        frame.push_str(&format!("\nperf-dump-end: id={id} fields={}", values.len()));
+        log::info!("{frame}");
         // The stall maximum is a per-window measurement: each dump
         // closes one observation window.
         GTK_STALL_MAX_MS.store(0, Ordering::Relaxed);
@@ -277,8 +346,7 @@ mod enabled {
                     return;
                 };
                 while usr2.recv().await.is_some() {
-                    mark("dump");
-                    emit();
+                    emit("signal");
                 }
             });
         }
@@ -352,21 +420,26 @@ pub(crate) fn thread_value(counter: Counter) -> u64 {
 /// performance tests; `tests/perf_support` has the same format.
 #[cfg(test)]
 pub(crate) fn record_metrics(item: &str, cut: &str, metrics: &[(&str, f64)]) {
-    let Some(dir) = std::env::var_os("TALK_RS_PERF_OUT") else {
-        return;
-    };
-    let mut body = format!("item: {item}\ncut: {cut}\nmetrics:\n");
+    let mut body = format!("item: {item}\ncut: {cut}\nstatus: ran\nmetrics:\n");
     for (name, value) in metrics {
+        assert!(value.is_finite(), "{item}/{cut}: metric {name} is {value}");
         let name = name.replace('_', "-");
-        if value.fract() == 0.0 {
+        if value.fract() == 0.0 && value.abs() < 1e15 {
             body.push_str(&format!("  {name}: {}\n", *value as i64));
         } else {
             body.push_str(&format!("  {name}: {value:.3}\n"));
         }
     }
+    eprintln!("perf {item}/{cut}:\n{body}");
+    let Some(dir) = std::env::var_os("TALK_RS_PERF_OUT") else {
+        return;
+    };
     let dir = std::path::PathBuf::from(dir);
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join(format!("{item}--{cut}.yaml")), body);
+    // Export failures fail the cut: a silently missing result would
+    // otherwise look like a skipped cut to the comparator.
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    let path = dir.join(format!("{item}--{cut}.yaml"));
+    std::fs::write(&path, body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
 /// Log `perf-mark: <name>=+<ms>` relative to [`init`].
@@ -378,11 +451,34 @@ pub fn mark(name: &str) {
     let _ = name;
 }
 
-/// Log one `perf-counter:` line per counter and gauge.
+/// Log one framed dump (`perf-dump-begin` … `perf-dump-end`) of every
+/// counter and gauge.  `reason` labels the frame (`exit`, `signal`).
 #[inline(always)]
-pub fn emit() {
+pub fn emit(reason: &str) {
     #[cfg(feature = "perf-counters")]
-    enabled::emit();
+    enabled::emit(reason);
+    #[cfg(not(feature = "perf-counters"))]
+    let _ = reason;
+}
+
+/// Set `gauge` to an absolute level (and raise its maximum).
+#[inline(always)]
+pub fn gauge_set(gauge: Gauge, value: i64) {
+    #[cfg(any(test, feature = "perf-counters"))]
+    enabled::gauge_set(gauge, value);
+    #[cfg(not(any(test, feature = "perf-counters")))]
+    let _ = (gauge, value);
+}
+
+/// Evaluate `f` and log its result as a `perf-mark:` only when the
+/// feature is on.  Use this instead of [`mark`] when building the name
+/// itself costs work, so a normal build does not even evaluate it.
+#[inline(always)]
+pub fn mark_with<F: FnOnce() -> String>(f: F) {
+    #[cfg(feature = "perf-counters")]
+    enabled::mark(&f());
+    #[cfg(not(feature = "perf-counters"))]
+    let _ = f;
 }
 
 /// Start the process clock used by [`mark`] and install the
@@ -531,5 +627,33 @@ mod paced {
             self.running.store(false, Ordering::Release);
             Ok(())
         }
+    }
+}
+
+/// Local model kinds the performance harness can gate on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalModel {
+    /// Parakeet TDT INT8 (transcription).
+    Parakeet,
+    /// Kokoro multi-lang (synthesis).
+    Kokoro,
+}
+
+/// The production presence check for a local model directory (no
+/// network, never downloads).  The harness uses it to refuse to run a
+/// model cut against an incomplete directory, where talk-rs would
+/// otherwise take its consent/download path.  A thin re-export of the
+/// existing checks, so it is not gated on the feature.
+pub fn model_present(kind: LocalModel, dir: &std::path::Path) -> bool {
+    match kind {
+        #[cfg(feature = "parakeet")]
+        LocalModel::Parakeet => crate::transcription::parakeet::model::is_present(
+            dir,
+            crate::config::ParakeetVariant::Int8,
+        ),
+        #[cfg(feature = "kokoro")]
+        LocalModel::Kokoro => crate::synthesis::kokoro::model::is_present(dir),
+        #[allow(unreachable_patterns)] // reachable when a model feature is off
+        _ => false,
     }
 }

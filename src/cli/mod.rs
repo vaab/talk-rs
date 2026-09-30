@@ -18,6 +18,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     crate::perf_counters::init();
 
     let result = action::dispatch(cli.command, cli.verbose).await;
-    crate::perf_counters::emit();
+    crate::perf_counters::emit("exit");
     result
 }
