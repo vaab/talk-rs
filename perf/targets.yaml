@@ -1,118 +1,259 @@
 # Pass criteria for the performance shortlist.
 #
-# One entry per shortlisted improvement ("item").  Each target names a
-# measurement cut (produced by a test in ``tests/perf/`` or an in-crate
-# ``perf_*`` test), a metric recorded by that cut, the value measured
-# on unmodified master (``baseline``, informational — the authoritative
-# numbers live in ``perf/baseline.yaml``) and the criterion an
-# experiment must meet.
+# One entry per shortlisted improvement ("item").  Each item lists:
 #
-# Criterion syntax (``bin/perf-report --compare``):
-#   "<= N" / "< N" / ">= N" / "> N" / "== N"   absolute bound
-#   "<= 0.5x"                                   relative to the baseline value
-#   "-50"                                       at least 50 below the baseline
+# - summary:       what the improvement is;
+# - cuts:          every cut the item's verdict depends on: all must
+#                  have run for a strict verdict;
+# - models:        local models the cuts need (``parakeet``, ``kokoro``);
+# - tests:         the performance tests producing the item's cuts
+#                  (run with ignored tests included);
+# - prerequisites: correctness tests that must pass before the item is
+#                  scored (the behaviour its perf cuts cannot see).
+#                  ``scope`` is ``lib`` (in-crate tests), ``perf`` (the
+#                  ``tests/perf`` binary) or ``test`` (another
+#                  integration binary, named by ``name``); ``filter`` is
+#                  the libtest name filter;
+# - targets:       metric criteria that prove the improvement;
+# - guards:        metric criteria that hold today and must keep holding.
 #
-# ``kind: work`` targets are deterministic work counts: a miss is a
-# real miss.  ``kind: timing`` targets are wall-clock or CPU numbers
-# with tolerant thresholds; compare them from the same machine,
-# debug build, serial run (``bin/perf-report`` always runs serially).
+# Each target/guard names the cut (``perf/README.org``), the metric
+# recorded by that cut, the value measured on master (``baseline``,
+# informational — the authoritative numbers are in
+# ``perf/baseline.yaml``), the criterion and its kind:
 #
-# ``guard`` targets are invariants that hold today and must keep
-# holding; an experiment that breaks one is "regressed" even if its
-# own target is met.  Every test additionally asserts its correctness
-# invariants (same transcript, complete cache OGG, same upload audio,
-# ...) and fails outright if they break.
+#   target: "<= N" | "< N" | ">= N" | "> N" | "== N"   absolute bound
+#           "<= 0.5x" | ">= 0.95x"                     relative to baseline
+#           "-100"                                     at least 100 below baseline
+#   kind:   work     deterministic work count (exact; no noise margin)
+#           timing   median of repeated runs (noise margin applies)
+#   worse:  higher | lower   direction in which the metric regresses
+#                            (default: inferred from the criterion)
+#   advisory: true   reported but never required: the metric cannot, on
+#                    its own, prove the improvement (see README.org).
+#
+# ``bin/perf-report --compare BASELINE --item ID --strict`` requires
+# every cut of ID to have run, every non-advisory target of ID to be
+# ``met``, and no guard or metric of ANY item that ran to regress.
 
 items:
   paste-focus-sleep:
     summary: skip the 50 ms focus-settle sleep when the target window is already active
+    cuts: [already-focused, focus-mismatch]
+    tests:
+      - {scope: lib, filter: "paste::perf_focus"}
+    prerequisites:
+      - {scope: lib, filter: "paste::"}
     targets:
       - {cut: already-focused, metric: focus-virtual-ms, baseline: 50, target: "<= 5", kind: work}
       - {cut: already-focused, metric: focus-sleeps, baseline: 1, target: "== 0", kind: work}
+      - {cut: already-focused, metric: focus-requests, baseline: 1, target: "== 0", kind: work}
     guards:
       - {cut: focus-mismatch, metric: focus-virtual-ms-third-attempt, baseline: 350, target: "== 350", kind: work}
       - {cut: focus-mismatch, metric: focus-virtual-ms-abort, baseline: 1550, target: "== 1550", kind: work}
 
   record-ui-row-work:
     summary: one shared playback tick, bounded waterfall workers, no synchronous decode on Play
+    cuts: [library-1500-idle, library-1500-open, play-long-row]
+    tests:
+      - {scope: perf, filter: "perf_record_ui::"}
+    prerequisites:
+      - {scope: lib, filter: "record::"}
+      - {scope: lib, filter: "widgets::"}
     targets:
-      - {cut: library-1500-idle, metric: player-tick-sources-live, baseline: 200, target: "<= 1", kind: work}
-      - {cut: library-1500-idle, metric: player-tick-callbacks-per-s, baseline: 12340, target: "<= 100", kind: timing}
-      - {cut: library-1500-idle, metric: waterfall-workers-inflight-max, baseline: 200, target: "<= 4", kind: work}
-      - {cut: library-1500-idle, metric: vm-hwm-kb, baseline: 840360, target: "<= 0.5x", kind: timing}
+      - {cut: library-1500-idle, metric: player-tick-sources-live, baseline: 195, target: "<= 1", kind: work}
+      - {cut: library-1500-idle, metric: player-tick-callbacks-per-s, baseline: 10914, target: "<= 100", kind: timing}
+      - {cut: library-1500-idle, metric: idle-cpu-ms-per-s, baseline: 60.86, target: "<= 0.5x", kind: timing, advisory: true}
+      - {cut: library-1500-open, metric: waterfall-workers-inflight-max, baseline: 135, target: "<= 4", kind: work}
+      - {cut: play-long-row, metric: gtk-stall-max-ms, baseline: 12734, target: "<= 200", kind: timing}
+      - {cut: play-long-row, metric: click-handler-ms, baseline: 12711, target: "<= 50", kind: timing}
     guards:
-      - {cut: library-1500-idle, metric: waterfall-decodes, baseline: 200, target: "<= 200", kind: work}
+      - {cut: library-1500-idle, metric: player-bars, baseline: 195, target: "== 195", kind: work}
+      - {cut: library-1500-open, metric: waterfall-jobs-applied, baseline: 195, target: "== 195", kind: work}
+      - {cut: library-1500-open, metric: all-waveforms-ms, baseline: 128241, target: "<= 1.5x", kind: timing, worse: higher}
+      - {cut: library-1500-idle, metric: vm-hwm-kb, baseline: 878952, target: "<= 1.1x", kind: timing, worse: higher}
 
   streaming-playback-decode:
     summary: (runner-up) decode long recordings incrementally instead of whole-file before playing
+    cuts: [play-long-row, play-decode-2min, play-decode-1h]
+    tests:
+      - {scope: perf, filter: "perf_record_ui::"}
+      - {scope: lib, filter: "record::audio::perf_playback"}
+    prerequisites:
+      - {scope: lib, filter: "record::"}
+      - {scope: lib, filter: "audio::player"}
     targets:
-      - {cut: play-decode-1h, metric: decode-before-first-sound-ms, baseline: 13858, target: "<= 500", kind: timing}
-      - {cut: play-decode-1h, metric: playback-buffer-mib, baseline: 659, target: "<= 50", kind: work}
-      - {cut: play-decode-2min, metric: decode-before-first-sound-ms, baseline: 519, target: "<= 100", kind: timing}
+      - {cut: play-long-row, metric: click-to-first-sound-ms, baseline: 12681, target: "<= 500", kind: timing}
+      - {cut: play-long-row, metric: retained-fraction-of-file, baseline: 1.0, target: "<= 0.1", kind: work}
+      - {cut: play-long-row, metric: play-rss-growth-mib, baseline: 139, target: "<= 0.2x", kind: timing}
+      # Full-file decode speed of the compatibility helper: diagnostic
+      # only (a streaming player need not change it).
+      - {cut: play-decode-1h, metric: decode-before-first-sound-ms, baseline: 26556, target: "<= 500", kind: timing, advisory: true}
+      - {cut: play-decode-1h, metric: playback-buffer-mib, baseline: 659, target: "<= 50", kind: work, advisory: true}
+    guards: []
 
   upload-normalize-once:
     summary: normalize a file once per chain, off the tokio worker; skip it for proven own-cache OGG
+    cuts:
+      - transcribe-fallback-chain-3-2min
+      - dictate-fallback-chain-3
+      - transcribe-own-cache-ogg-2min
+      - runtime-heartbeat-2min
+      - prepare-foreign-stereo-wav
+    tests:
+      - {scope: perf, filter: "perf_transcribe::"}
+      - {scope: perf, filter: "perf_dictate::perf_dictate_fallback_chain_3"}
+      - {scope: lib, filter: "transcription::perf_upload_prepare"}
+    prerequisites:
+      - {scope: lib, filter: "transcription::tests::test_normalize"}
+      - {scope: lib, filter: "transcription::chain"}
     targets:
-      - {cut: transcribe-fallback-chain-3-2min, metric: normalize-calls, baseline: 3, target: "<= 1", kind: work}
-      - {cut: transcribe-fallback-chain-3-2min, metric: first-busy-to-final-post-ms, baseline: 4075, target: "<= 0.3x", kind: timing}
-      - {cut: dictate-fallback-chain-3, metric: normalize-calls, baseline: 2, target: "<= 1", kind: work}
-      - {cut: transcribe-own-cache-ogg-2min, metric: normalize-calls, baseline: 1, target: "== 0", kind: work}
-      - {cut: transcribe-own-cache-ogg-2min, metric: upload-is-file-bytes, baseline: 0, target: "== 1", kind: work}
-      - {cut: runtime-heartbeat-2min, metric: heartbeat-max-gap-ms, baseline: 2135, target: "<= 50", kind: timing}
+      - {cut: transcribe-fallback-chain-3-2min, metric: upload-encodes, baseline: 3, target: "<= 1", kind: work}
+      - {cut: transcribe-fallback-chain-3-2min, metric: audio-file-decodes, baseline: 3, target: "<= 1", kind: work}
+      - {cut: transcribe-fallback-chain-3-2min, metric: first-busy-to-final-post-ms, baseline: 9305, target: "<= 0.3x", kind: timing}
+      - {cut: dictate-fallback-chain-3, metric: upload-encodes, baseline: 2, target: "<= 1", kind: work}
+      - {cut: transcribe-own-cache-ogg-2min, metric: upload-encodes, baseline: 1, target: "== 0", kind: work}
+      - {cut: runtime-heartbeat-2min, metric: heartbeat-max-gap-ms, baseline: 3481, target: "<= 50", kind: timing}
+    guards:
+      - {cut: prepare-foreign-stereo-wav, metric: upload-encodes, baseline: 1, target: "== 1", kind: work}
 
   record-ui-incremental-listing:
     summary: list on a worker, refresh one entry per file event, read each pick once
+    cuts: [list-library-1500, library-1500-open, library-1500-one-pick-event]
+    tests:
+      - {scope: lib, filter: "record::entries::perf_listing"}
+      - {scope: perf, filter: "perf_record_ui::"}
+    prerequisites:
+      - {scope: lib, filter: "record::entries"}
     targets:
       - {cut: list-library-1500, metric: pick-reads, baseline: 2600, target: "<= 1300", kind: work}
       - {cut: library-1500-one-pick-event, metric: list-calls, baseline: 2, target: "== 0", kind: work}
-      - {cut: library-1500-one-pick-event, metric: pick-reads, baseline: 5204, target: "<= 5", kind: work}
-      - {cut: library-1500-open, metric: gtk-stall-max-ms, baseline: 1242, target: "<= 200", kind: timing}
+      - {cut: library-1500-one-pick-event, metric: pick-read-attempts, baseline: 5980, target: "<= 5", kind: work}
+      - {cut: library-1500-open, metric: gtk-stall-max-ms, baseline: 5624, target: "<= 200", kind: timing}
     guards:
       - {cut: list-library-1500, metric: recordings-with-pick, baseline: 1300, target: "== 1300", kind: work}
+      - {cut: library-1500-one-pick-event, metric: event-to-row-updated-ms, baseline: 4650, target: "<= 2x", kind: timing, worse: higher}
 
   http-client-pool-prewarm:
     summary: share one reqwest client per connect budget; pre-connect while recording
+    cuts:
+      - transport-sequential-20
+      - transcribe-fallback-chain-3-2min
+      - dictate-short-3s-connect-150ms
+      - dictate-short-3s
+    tests:
+      - {scope: perf, filter: "perf_transport::"}
+      - {scope: perf, filter: "perf_transcribe::perf_transcribe_fallback_chain_2min"}
+      - {scope: perf, filter: "perf_dictate::perf_dictate_short_3s"}
+    prerequisites:
+      - {scope: test, name: transport_integration, filter: ""}
     targets:
-      - {cut: transcribe-fallback-chain-3-2min, metric: http-client-builds, baseline: 6, target: "<= 1", kind: work}
+      # One client per connect-budget value actually used: a healthy
+      # sequence uses the first budget only.
+      - {cut: transport-sequential-20, metric: http-client-builds, baseline: 20, target: "<= 1", kind: work}
+      - {cut: transport-sequential-20, metric: tcp-connections, baseline: 20, target: "<= 1", kind: work}
       - {cut: transcribe-fallback-chain-3-2min, metric: tcp-connections, baseline: 6, target: "<= 2", kind: work}
-      - {cut: dictate-short-3s-connect-150ms, metric: connected-before-stop, baseline: 0, target: "== 1", kind: work}
-      - {cut: dictate-short-3s-connect-150ms, metric: sigint-to-first-post-ms, baseline: 184, target: "-100", kind: timing}
+      - {cut: dictate-short-3s-connect-150ms, metric: upload-on-prewarmed-connection, baseline: 0, target: "== 1", kind: work}
+      - {cut: dictate-short-3s-connect-150ms, metric: sigint-to-first-post-ms, baseline: 179, target: "-100", kind: timing}
     guards:
-      - {cut: dictate-short-3s, metric: stop-transcription-done-ms, baseline: 45, target: "<= 200", kind: timing}
+      - {cut: dictate-short-3s-connect-150ms, metric: extra-connections, baseline: 0, target: "<= 1", kind: work}
+      - {cut: dictate-short-3s-connect-150ms, metric: start-capture-started-ms, baseline: 9, target: "<= 50", kind: timing, worse: higher}
+      - {cut: dictate-short-3s, metric: stop-transcription-done-ms, baseline: 38, target: "<= 200", kind: timing, worse: higher}
 
   overlay-fft-gating:
-    summary: compute the overlay FFT only when a spectral visualizer needs it
+    summary: compute the overlay FFT only when a spectral visualizer needs it (and reuse its buffers)
+    cuts:
+      - frame-analysis-viz-none
+      - frame-analysis-viz-amplitude
+      - frame-analysis-viz-waterfall
+      - frame-analysis-viz-spectrum
+      - recording-5s-viz-none
+    tests:
+      - {scope: lib, filter: "x11::overlay::perf_frame_analysis"}
+      - {scope: perf, filter: "perf_dictate::perf_overlay_fft_viz_none"}
+    prerequisites:
+      - {scope: lib, filter: "x11::render_util"}
+      - {scope: lib, filter: "x11::overlay"}
     targets:
+      - {cut: frame-analysis-viz-none, metric: fft-per-frame, baseline: 1, target: "== 0", kind: work}
+      - {cut: frame-analysis-viz-amplitude, metric: fft-per-frame, baseline: 1, target: "== 0", kind: work}
       - {cut: recording-5s-viz-none, metric: fft-per-frame, baseline: 1, target: "== 0", kind: work}
-      - {cut: recording-5s-viz-amplitude, metric: fft-per-frame, baseline: 1, target: "== 0", kind: work}
+      - {cut: frame-analysis-viz-waterfall, metric: spectrum-allocs-per-frame, baseline: 1, target: "== 0", kind: work, advisory: true}
     guards:
-      - {cut: recording-5s-viz-waterfall, metric: fft-per-frame, baseline: 1, target: ">= 0.45", kind: work}
+      # Spectral visualizers keep their FFT cadence (one per frame).
+      - {cut: frame-analysis-viz-waterfall, metric: fft-per-frame, baseline: 1, target: "== 1", kind: work}
+      - {cut: frame-analysis-viz-spectrum, metric: fft-per-frame, baseline: 1, target: "== 1", kind: work}
 
   openai-realtime-final-early-exit:
-    summary: end the OpenAI realtime session once the committed item is transcribed
+    summary: end the OpenAI realtime session once every committed item is transcribed
+    cuts:
+      - final-item-socket-open
+      - vad-earlier-item
+      - earlier-item-outstanding
+      - multi-part-correction
+      - completed-before-audio-end
+      - ws-commit-to-end
+    tests:
+      - {scope: lib, filter: "transcription::openai_realtime::perf_realtime_end"}
+    prerequisites:
+      - {scope: lib, filter: "transcription::openai_realtime"}
+      - {scope: lib, filter: "dictate::realtime"}
     targets:
       - {cut: final-item-socket-open, metric: session-end-ms, baseline: 15000, target: "<= 1000", kind: work}
+      - {cut: ws-commit-to-end, metric: commit-to-session-end-ms, baseline: 15000, target: "<= 1000", kind: work}
+      - {cut: multi-part-correction, metric: session-end-ms, baseline: 15000, target: "<= 1000", kind: work}
+      - {cut: completed-before-audio-end, metric: session-end-ms, baseline: 15000, target: "<= 1000", kind: work}
     guards:
-      - {cut: vad-earlier-item, metric: session-end-ms, baseline: 15000, target: ">= 3000", kind: work}
+      - {cut: vad-earlier-item, metric: session-end-ms, baseline: 15000, target: ">= 3000", kind: work, worse: lower}
+      - {cut: earlier-item-outstanding, metric: session-end-ms, baseline: 15000, target: ">= 2000", kind: work, worse: lower}
 
   single-opus-encode:
     summary: encode the recording once for both the cache OGG and the upload
+    cuts: [dictate-short-3s, dictate-long-2min]
+    tests:
+      - {scope: perf, filter: "perf_dictate::perf_dictate_short_3s"}
+      - {scope: perf, filter: "perf_dictate::perf_dictate_long_2min"}
+      - {scope: lib, filter: "dictate::oneshot::perf_single_encode"}
+    prerequisites:
+      - {scope: lib, filter: "dictate::oneshot"}
+      - {scope: lib, filter: "audio::"}
     targets:
       - {cut: dictate-short-3s, metric: encode-passes, baseline: 2.013, target: "<= 1.05", kind: work}
-      - {cut: dictate-long-2min, metric: encode-passes, baseline: 2, target: "<= 1.05", kind: work}
+      - {cut: dictate-long-2min, metric: encode-passes, baseline: 2.0, target: "<= 1.05", kind: work}
+    guards: []
 
   parakeet-warm:
     summary: build the Parakeet recognizer before it is needed (primary, or on first chain failure)
+    cuts: [parakeet-primary-3s, chain-cloud-busy-parakeet-last, chain-cloud-ok]
+    models: [parakeet]
+    tests:
+      - {scope: perf, filter: "perf_models::perf_parakeet"}
+    prerequisites:
+      - {scope: lib, filter: "transcription::parakeet"}
+      - {scope: lib, filter: "transcription::chain"}
     targets:
-      - {cut: parakeet-primary-3s, metric: stop-transcription-done-ms, baseline: 2378, target: "<= 0.5x", kind: timing}
-      - {cut: chain-cloud-busy-parakeet-last, metric: stop-transcription-done-ms, baseline: 2497, target: "<= 0.6x", kind: timing}
+      - {cut: parakeet-primary-3s, metric: stop-transcription-done-ms, baseline: 3452, target: "<= 0.5x", kind: timing}
+      # The immediate cloud → Parakeet chain gives a first-failure warm
+      # start almost no time to overlap: reported, not required.
+      - {cut: chain-cloud-busy-parakeet-last, metric: stop-transcription-done-ms, baseline: 3879, target: "<= 0.6x", kind: timing, advisory: true}
     guards:
       - {cut: chain-cloud-ok, metric: recognizer-creates, baseline: 0, target: "== 0", kind: work}
-      - {cut: chain-cloud-ok, metric: child-maxrss-kb, baseline: 72900, target: "<= 1.1x", kind: timing}
+      - {cut: chain-cloud-ok, metric: child-maxrss-kb, baseline: 73384, target: "<= 1.1x", kind: timing, worse: higher}
+      - {cut: parakeet-primary-3s, metric: recognizer-creates, baseline: 1, target: "== 1", kind: work}
+      - {cut: parakeet-primary-3s, metric: start-capture-started-ms, baseline: 11, target: "<= 100", kind: timing, worse: higher}
 
   speak-streaming-playback:
     summary: start Kokoro playback while synthesis continues
+    cuts: [kokoro-paragraph]
+    models: [kokoro]
+    tests:
+      - {scope: perf, filter: "perf_models::perf_speak"}
+    prerequisites:
+      - {scope: lib, filter: "speak::"}
+      - {scope: lib, filter: "synthesis::"}
     targets:
-      - {cut: kokoro-paragraph, metric: first-audio-ratio, baseline: 1, target: "<= 0.3", kind: timing}
+      - {cut: kokoro-paragraph, metric: first-sound-ratio, baseline: 1.004, target: "<= 0.3", kind: timing}
+      - {cut: kokoro-paragraph, metric: handoff-ms, baseline: 46522, target: "<= 0.3x", kind: timing, advisory: true}
     guards:
-      - {cut: kokoro-paragraph, metric: wav-seconds, baseline: 27.194, target: ">= 0.95x", kind: work}
+      - {cut: kokoro-paragraph, metric: played-vs-saved-envelope-r, baseline: 0.975, target: ">= 0.8", kind: work, worse: lower}
+      - {cut: kokoro-paragraph, metric: played-seconds, baseline: 27.189, target: ">= 0.95x", kind: work, worse: lower}

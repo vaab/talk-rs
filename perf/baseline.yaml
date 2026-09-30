@@ -1,8 +1,86 @@
-# talk-rs performance report
-generated: 2026-09-30T13:04:42Z
-commit: 4c48160
+# talk-rs performance baseline (bin/perf-score --calibrate)
+generated: '2026-09-30T19:54:12Z'
+commit: 98c0d0c
 host: wen
-build: debug, features perf-counters, serial
+build: debug, features perf-counters, serial, repeat 5
+runs:
+- scope: lib
+  name: ''
+  filter: perf_
+  state: passed
+- scope: perf
+  name: ''
+  filter: ''
+  state: passed
+- scope: lib
+  name: ''
+  filter: 'audio::'
+  state: passed
+- scope: lib
+  name: ''
+  filter: audio::player
+  state: passed
+- scope: lib
+  name: ''
+  filter: dictate::oneshot
+  state: passed
+- scope: lib
+  name: ''
+  filter: dictate::realtime
+  state: passed
+- scope: lib
+  name: ''
+  filter: 'paste::'
+  state: passed
+- scope: lib
+  name: ''
+  filter: 'record::'
+  state: passed
+- scope: lib
+  name: ''
+  filter: record::entries
+  state: passed
+- scope: lib
+  name: ''
+  filter: 'speak::'
+  state: passed
+- scope: lib
+  name: ''
+  filter: 'synthesis::'
+  state: passed
+- scope: lib
+  name: ''
+  filter: transcription::chain
+  state: passed
+- scope: lib
+  name: ''
+  filter: transcription::openai_realtime
+  state: passed
+- scope: lib
+  name: ''
+  filter: transcription::parakeet
+  state: passed
+- scope: lib
+  name: ''
+  filter: transcription::tests::test_normalize
+  state: passed
+- scope: lib
+  name: ''
+  filter: 'widgets::'
+  state: passed
+- scope: lib
+  name: ''
+  filter: x11::overlay
+  state: passed
+- scope: lib
+  name: ''
+  filter: x11::render_util
+  state: passed
+- scope: test
+  name: transport_integration
+  filter: ''
+  state: passed
+skips: null
 results:
   http-client-pool-prewarm:
     dictate-fallback-chain-3:
@@ -10,64 +88,127 @@ results:
       tcp-connections: 5
     dictate-short-3s-connect-150ms:
       stop-capture-stopped-ms: 0
-      stop-ogg-flushed-ms: 20
-      stop-transcription-done-ms: 186
-      sigint-to-first-post-ms: 184.231
-      child-cpu-ms: 384.233
-      child-maxrss-kb: 72064
-      connected-before-stop: 0
+      stop-capture-stopped-ms-p90: 0
+      stop-capture-stopped-ms-spread: 0
+      stop-capture-stopped-ms-n: 5
+      stop-ogg-flushed-ms: 19
+      stop-ogg-flushed-ms-p90: 50
+      stop-ogg-flushed-ms-spread: 45
+      stop-ogg-flushed-ms-n: 5
+      stop-transcription-done-ms: 180
+      stop-transcription-done-ms-p90: 212
+      stop-transcription-done-ms-spread: 33
+      stop-transcription-done-ms-n: 5
+      sigint-to-first-post-ms: 178.809
+      sigint-to-first-post-ms-p90: 210.645
+      sigint-to-first-post-ms-spread: 33.736
+      sigint-to-first-post-ms-n: 5
+      child-cpu-ms: 369.354
+      child-maxrss-kb: 71808
+      upload-on-prewarmed-connection: 0
+      extra-connections: 0
+      start-capture-started-ms: 9
+      start-capture-started-ms-p90: 10
+      start-capture-started-ms-spread: 4
+      start-capture-started-ms-n: 5
     dictate-short-3s:
       stop-capture-stopped-ms: 0
-      stop-ogg-flushed-ms: 28
-      stop-transcription-done-ms: 45
-      sigint-to-first-post-ms: 43.594
-      child-cpu-ms: 343.762
-      child-maxrss-kb: 72596
+      stop-capture-stopped-ms-p90: 165
+      stop-capture-stopped-ms-spread: 165
+      stop-capture-stopped-ms-n: 5
+      stop-ogg-flushed-ms: 23
+      stop-ogg-flushed-ms-p90: 240
+      stop-ogg-flushed-ms-spread: 227
+      stop-ogg-flushed-ms-n: 5
+      stop-transcription-done-ms: 38
+      stop-transcription-done-ms-p90: 241
+      stop-transcription-done-ms-spread: 205
+      stop-transcription-done-ms-n: 5
+      sigint-to-first-post-ms: 36.494
+      sigint-to-first-post-ms-p90: 210.779
+      sigint-to-first-post-ms-spread: 176.257
+      sigint-to-first-post-ms-n: 5
+      child-cpu-ms: 377.158
+      child-maxrss-kb: 72768
       http-client-builds: 1
       tcp-connections: 1
-      connected-before-stop: 0
     transcribe-fallback-chain-3-2min:
       http-client-builds: 6
       requests: 6
       tcp-connections: 6
+    transport-sequential-20:
+      requests: 20
+      tcp-connections: 20
+      http-client-builds: 20
   openai-realtime-final-early-exit:
+    completed-before-audio-end:
+      session-end-ms: 15000
+    earlier-item-outstanding:
+      session-end-ms: 15000
     final-item-socket-open:
       final-item-ms: 300
       session-end-ms: 15000
+    multi-part-correction:
+      session-end-ms: 15000
     vad-earlier-item:
       session-end-ms: 15000
+    ws-commit-to-end:
+      commit-to-session-end-ms: 15000
   overlay-fft-gating:
+    frame-analysis-viz-amplitude:
+      frames: 460
+      fft-per-frame: 1
+      spectrum-allocs-per-frame: 1
+    frame-analysis-viz-none:
+      frames: 460
+      fft-per-frame: 1
+      spectrum-allocs-per-frame: 1
+    frame-analysis-viz-spectrum:
+      frames: 460
+      fft-per-frame: 1
+      spectrum-allocs-per-frame: 1
+    frame-analysis-viz-waterfall:
+      frames: 460
+      fft-per-frame: 1
+      spectrum-allocs-per-frame: 1
     recording-5s-viz-amplitude:
-      overlay-frames: 289
-      fft-calls: 289
+      overlay-frames: 286
+      fft-calls: 286
       fft-per-frame: 1
-      child-cpu-ms: 5786.868
+      child-cpu-ms: 6521.439
     recording-5s-viz-none:
-      overlay-frames: 290
-      fft-calls: 290
+      overlay-frames: 283
+      fft-calls: 283
       fft-per-frame: 1
-      child-cpu-ms: 6088.815
+      child-cpu-ms: 6619.584
     recording-5s-viz-waterfall:
-      overlay-frames: 290
-      fft-calls: 290
+      overlay-frames: 277
+      fft-calls: 277
       fft-per-frame: 1
-      child-cpu-ms: 6292.977
+      child-cpu-ms: 6819.609
   parakeet-warm:
     chain-cloud-busy-parakeet-last:
       recognizer-creates: 1
-      stop-transcription-done-ms: 2497
-      child-maxrss-kb: 1099644
-      child-cpu-ms: 2885.551
+      stop-transcription-done-ms: 3879
+      start-capture-started-ms: 20
+      child-maxrss-kb: 1071944
+      child-cpu-ms: 4690.082
+      recognizer-init-ms: 3442
+      inference-ms: 272
     chain-cloud-ok:
       recognizer-creates: 0
-      stop-transcription-done-ms: 49
-      child-maxrss-kb: 72900
-      child-cpu-ms: 529.038
+      stop-transcription-done-ms: 539
+      start-capture-started-ms: 12
+      child-maxrss-kb: 73384
+      child-cpu-ms: 713.325
     parakeet-primary-3s:
       recognizer-creates: 1
-      stop-transcription-done-ms: 2378
-      child-maxrss-kb: 1074380
-      child-cpu-ms: 3128.238
+      stop-transcription-done-ms: 3452
+      start-capture-started-ms: 11
+      child-maxrss-kb: 1057140
+      child-cpu-ms: 4541.504
+      recognizer-init-ms: 3044
+      inference-ms: 299
   paste-focus-sleep:
     already-focused:
       focus-requests: 1
@@ -78,91 +219,436 @@ results:
       focus-virtual-ms-abort: 1550
   record-ui-incremental-listing:
     library-1500-one-pick-event:
+      event-to-row-updated-ms: 4649.904
       list-calls: 2
       pick-reads: 5204
-      gtk-stall-max-ms: 441
+      pick-read-attempts: 5980
+      gtk-stall-max-ms: 4625
     library-1500-open:
-      open-to-rows-built-ms: 9029
+      rows-listed-ms: 68255.965
       list-calls: 2
       pick-reads: 2600
-      recordings-with-pick: 1300
-      gtk-stall-max-ms: 1242
+      pick-read-attempts: 2990
+      gtk-stall-max-ms: 5624
     list-library-1500:
       recordings: 1500
       recordings-with-pick: 1300
       pick-reads: 2600
-      list-ms: 205.503
+      list-ms: 260.85
   record-ui-row-work:
     library-1500-idle:
-      rows-with-player: 200
-      player-tick-sources-live: 200
-      player-tick-callbacks-per-s: 12340
-      waterfall-workers-inflight-max: 200
-      waterfall-decodes: 200
-      rows-built-to-waterfalls-done-ms: 94429.455
-      idle-cpu-ms-per-s: 1012
-      threads-after-open: 79
-      vm-hwm-kb: 840360
+      player-bars: 195
+      player-tick-sources-live: 195
+      player-tick-callbacks-per-s: 10914.397
+      idle-cpu-ms-per-s: 60.86
+      idle-window-s: 10.023
+      vm-hwm-kb: 878952
+    library-1500-open:
+      waterfall-jobs-requested: 195
+      waterfall-jobs-applied: 195
+      waterfall-workers-inflight-max: 135
+      waterfall-decodes: 135
+      threads-after-open: 80
+      first-waveform-ms: 69054.757
+      all-waveforms-ms: 128241.378
+    play-long-row:
+      click-handler-ms: 12711
+      click-to-first-sound-ms: 12681
+      gtk-stall-max-ms: 12734
+      playback-decodes: 1
   single-opus-encode:
     dictate-long-2min:
       stop-capture-stopped-ms: 0
-      stop-ogg-flushed-ms: 20
-      stop-transcription-done-ms: 42
-      sigint-to-first-post-ms: 39.635
-      child-cpu-ms: 8092.722
-      child-maxrss-kb: 77076
-      opus-frames-encoded: 12006
+      stop-capture-stopped-ms-p90: 0
+      stop-capture-stopped-ms-spread: 0
+      stop-capture-stopped-ms-n: 1
+      stop-ogg-flushed-ms: 7
+      stop-ogg-flushed-ms-p90: 7
+      stop-ogg-flushed-ms-spread: 0
+      stop-ogg-flushed-ms-n: 1
+      stop-transcription-done-ms: 96
+      stop-transcription-done-ms-p90: 96
+      stop-transcription-done-ms-spread: 0
+      stop-transcription-done-ms-n: 1
+      sigint-to-first-post-ms: 93.316
+      sigint-to-first-post-ms-p90: 93.316
+      sigint-to-first-post-ms-spread: 0
+      sigint-to-first-post-ms-n: 1
+      child-cpu-ms: 8297.046
+      child-maxrss-kb: 73948
+      opus-frames-encoded: 12004
       http-client-builds: 1
-      encode-passes: 2.000
+      connection-retries: 0
+      encode-passes: 2.0
     dictate-short-3s:
       opus-frames-encoded: 306
       encode-passes: 2.013
-      child-cpu-ms: 343.762
   speak-streaming-playback:
     kokoro-paragraph:
       tts-creates: 1
-      first-audio-ms: 26882
-      synthesis-ms: 26882
-      first-audio-ratio: 1
-      wav-seconds: 27.194
-      child-maxrss-kb: 661680
+      first-sound-ms: 46729
+      handoff-ms: 46522
+      synthesis-ms: 46521
+      first-sound-ratio: 1.004
+      played-seconds: 27.189
+      saved-seconds: 27.201
+      played-vs-saved-envelope-r: 0.975
+      child-maxrss-kb: 661456
   streaming-playback-decode:
     play-decode-1h:
-      decode-before-first-sound-ms: 13858.238
+      decode-before-first-sound-ms: 26556.001
       playback-buffer-mib: 659.183
     play-decode-2min:
-      decode-before-first-sound-ms: 519.478
+      decode-before-first-sound-ms: 561.995
       playback-buffer-mib: 21.976
+    play-long-row:
+      click-to-first-sound-ms: 12681
+      player-retained-mib: 109.867
+      retained-fraction-of-file: 1.0
+      play-rss-growth-mib: 139.082
   upload-normalize-once:
     dictate-fallback-chain-3:
       stop-capture-stopped-ms: 0
-      stop-ogg-flushed-ms: 24
-      stop-transcription-done-ms: 319
-      sigint-to-first-post-ms: 50.646
-      child-cpu-ms: 604.009
-      child-maxrss-kb: 74360
+      stop-capture-stopped-ms-p90: 0
+      stop-capture-stopped-ms-spread: 0
+      stop-capture-stopped-ms-n: 5
+      stop-ogg-flushed-ms: 15
+      stop-ogg-flushed-ms-p90: 23
+      stop-ogg-flushed-ms-spread: 19
+      stop-ogg-flushed-ms-n: 5
+      stop-transcription-done-ms: 640
+      stop-transcription-done-ms-p90: 701
+      stop-transcription-done-ms-spread: 134
+      stop-transcription-done-ms-n: 5
+      sigint-to-first-post-ms: 49.499
+      sigint-to-first-post-ms-p90: 83.574
+      sigint-to-first-post-ms-spread: 42.705
+      sigint-to-first-post-ms-n: 5
+      child-cpu-ms: 1052.463
+      child-maxrss-kb: 70604
       normalize-calls: 2
-      opus-frames-encoded: 614
-      first-busy-to-final-post-ms: 265.613
+      upload-encodes: 2
+      audio-file-decodes: 2
+      first-busy-to-final-post-ms: 585.912
+      first-busy-to-final-post-ms-p90: 656.308
+      first-busy-to-final-post-ms-spread: 132.303
+      first-busy-to-final-post-ms-n: 5
+    prepare-foreign-stereo-wav:
+      upload-encodes: 1
     runtime-heartbeat-2min:
-      heartbeat-max-gap-ms: 2134.635
+      heartbeat-max-gap-ms: 3480.891
     transcribe-fallback-chain-3-2min:
       normalize-calls: 3
+      upload-encodes: 3
+      audio-file-decodes: 3
       opus-frames-encoded: 18006
-      first-busy-to-final-post-ms: 4074.512
-      wall-ms: 6219.009
-      child-cpu-ms: 6210.663
-      child-maxrss-kb: 90760
+      first-busy-to-final-post-ms: 9304.596
+      first-busy-to-final-post-ms-p90: 11209.24
+      first-busy-to-final-post-ms-spread: 2710.867
+      first-busy-to-final-post-ms-n: 5
+      wall-ms: 14306.092
+      wall-ms-p90: 18886.166
+      wall-ms-spread: 5875.248
+      wall-ms-n: 5
+      child-cpu-ms: 12643.035
+      child-maxrss-kb: 91180
     transcribe-long-20min:
       normalize-calls: 1
-      opus-frames-encoded: 60002
-      post-received-after-start-ms: 20763.472
-      wall-ms: 20770.761
-      child-cpu-ms: 20764.730
-      child-maxrss-kb: 357340
+      upload-encodes: 1
+      audio-file-decodes: 1
+      post-received-after-start-ms: 40172.471
+      wall-ms: 40182.356
+      child-cpu-ms: 39111.029
+      child-maxrss-kb: 355252
     transcribe-own-cache-ogg-2min:
       normalize-calls: 1
-      opus-frames-encoded: 6002
+      upload-encodes: 1
+      audio-file-decodes: 1
       upload-is-file-bytes: 0
-      wall-ms: 2452.435
-      child-cpu-ms: 2451.810
+      child-cpu-ms: 2736.818
+noise:
+  http-client-pool-prewarm:
+    dictate-fallback-chain-3:
+      http-client-builds: 0.0
+      tcp-connections: 0.0
+    dictate-short-3s-connect-150ms:
+      stop-capture-stopped-ms: 0.0
+      stop-capture-stopped-ms-p90: 0.0
+      stop-capture-stopped-ms-spread: 0.0
+      stop-capture-stopped-ms-n: 0.0
+      stop-ogg-flushed-ms: 0.421
+      stop-ogg-flushed-ms-p90: 0.057
+      stop-ogg-flushed-ms-spread: 0.1
+      stop-ogg-flushed-ms-n: 0.0
+      stop-transcription-done-ms: 0.155
+      stop-transcription-done-ms-p90: 0.226
+      stop-transcription-done-ms-spread: 0.598
+      stop-transcription-done-ms-n: 0.0
+      sigint-to-first-post-ms: 0.157
+      sigint-to-first-post-ms-p90: 0.217
+      sigint-to-first-post-ms-spread: 0.571
+      sigint-to-first-post-ms-n: 0.0
+      child-cpu-ms: 0.109
+      child-maxrss-kb: 0.011
+      upload-on-prewarmed-connection: 0.0
+      extra-connections: 0.0
+      start-capture-started-ms: 0.1
+      start-capture-started-ms-p90: 0.762
+      start-capture-started-ms-spread: 0.882
+      start-capture-started-ms-n: 0.0
+    dictate-short-3s:
+      stop-capture-stopped-ms: 0.0
+      stop-capture-stopped-ms-p90: 1.0
+      stop-capture-stopped-ms-spread: 1.0
+      stop-capture-stopped-ms-n: 0.0
+      stop-ogg-flushed-ms: 0.304
+      stop-ogg-flushed-ms-p90: 0.917
+      stop-ogg-flushed-ms-spread: 0.934
+      stop-ogg-flushed-ms-n: 0.0
+      stop-transcription-done-ms: 0.397
+      stop-transcription-done-ms-p90: 0.705
+      stop-transcription-done-ms-spread: 0.829
+      stop-transcription-done-ms-n: 0.0
+      sigint-to-first-post-ms: 0.386
+      sigint-to-first-post-ms-p90: 0.675
+      sigint-to-first-post-ms-spread: 0.803
+      sigint-to-first-post-ms-n: 0.0
+      child-cpu-ms: 0.632
+      child-maxrss-kb: 0.006
+      http-client-builds: 0.0
+      tcp-connections: 0.0
+    transcribe-fallback-chain-3-2min:
+      http-client-builds: 0.0
+      requests: 0.0
+      tcp-connections: 0.0
+    transport-sequential-20:
+      requests: 0.0
+      tcp-connections: 0.0
+      http-client-builds: 0.0
+  openai-realtime-final-early-exit:
+    completed-before-audio-end:
+      session-end-ms: 0.0
+    earlier-item-outstanding:
+      session-end-ms: 0.0
+    final-item-socket-open:
+      final-item-ms: 0.0
+      session-end-ms: 0.0
+    multi-part-correction:
+      session-end-ms: 0.0
+    vad-earlier-item:
+      session-end-ms: 0.0
+    ws-commit-to-end:
+      commit-to-session-end-ms: 0.0
+  overlay-fft-gating:
+    frame-analysis-viz-amplitude:
+      frames: 0.0
+      fft-per-frame: 0.0
+      spectrum-allocs-per-frame: 0.0
+    frame-analysis-viz-none:
+      frames: 0.0
+      fft-per-frame: 0.0
+      spectrum-allocs-per-frame: 0.0
+    frame-analysis-viz-spectrum:
+      frames: 0.0
+      fft-per-frame: 0.0
+      spectrum-allocs-per-frame: 0.0
+    frame-analysis-viz-waterfall:
+      frames: 0.0
+      fft-per-frame: 0.0
+      spectrum-allocs-per-frame: 0.0
+    recording-5s-viz-amplitude:
+      overlay-frames: 0.08
+      fft-calls: 0.08
+      fft-per-frame: 0.0
+      child-cpu-ms: 0.215
+    recording-5s-viz-none:
+      overlay-frames: 0.017
+      fft-calls: 0.017
+      fft-per-frame: 0.0
+      child-cpu-ms: 0.117
+    recording-5s-viz-waterfall:
+      overlay-frames: 0.025
+      fft-calls: 0.025
+      fft-per-frame: 0.0
+      child-cpu-ms: 0.232
+  parakeet-warm:
+    chain-cloud-busy-parakeet-last:
+      recognizer-creates: 0.0
+      stop-transcription-done-ms: 0.236
+      start-capture-started-ms: 0.3
+      child-maxrss-kb: 0.012
+      child-cpu-ms: 0.261
+      recognizer-init-ms: 0.183
+      inference-ms: 0.515
+    chain-cloud-ok:
+      recognizer-creates: 0.0
+      stop-transcription-done-ms: 0.835
+      start-capture-started-ms: 0.5
+      child-maxrss-kb: 0.001
+      child-cpu-ms: 0.245
+    parakeet-primary-3s:
+      recognizer-creates: 0.0
+      stop-transcription-done-ms: 0.221
+      start-capture-started-ms: 0.364
+      child-maxrss-kb: 0.015
+      child-cpu-ms: 0.207
+      recognizer-init-ms: 0.237
+      inference-ms: 0.113
+  paste-focus-sleep:
+    already-focused:
+      focus-requests: 0.0
+      focus-sleeps: 0.0
+      focus-virtual-ms: 0.0
+    focus-mismatch:
+      focus-virtual-ms-third-attempt: 0.0
+      focus-virtual-ms-abort: 0.0
+  record-ui-incremental-listing:
+    library-1500-one-pick-event:
+      event-to-row-updated-ms: 0.831
+      list-calls: 0.0
+      pick-reads: 0.0
+      pick-read-attempts: 0.0
+      gtk-stall-max-ms: 0.829
+    library-1500-open:
+      rows-listed-ms: 0.336
+      list-calls: 0.0
+      pick-reads: 0.0
+      pick-read-attempts: 0.0
+      gtk-stall-max-ms: 0.35
+    list-library-1500:
+      recordings: 0.0
+      recordings-with-pick: 0.0
+      pick-reads: 0.0
+      list-ms: 0.278
+  record-ui-row-work:
+    library-1500-idle:
+      player-bars: 0.0
+      player-tick-sources-live: 0.0
+      player-tick-callbacks-per-s: 0.088
+      idle-cpu-ms-per-s: 0.738
+      idle-window-s: 0.0
+      vm-hwm-kb: 0.011
+    library-1500-open:
+      waterfall-jobs-requested: 0.0
+      waterfall-jobs-applied: 0.0
+      waterfall-workers-inflight-max: 0.015
+      waterfall-decodes: 0.0
+      threads-after-open: 0.0
+      first-waveform-ms: 0.329
+      all-waveforms-ms: 0.293
+    play-long-row:
+      click-handler-ms: 0.675
+      click-to-first-sound-ms: 0.675
+      gtk-stall-max-ms: 0.675
+      playback-decodes: 0.0
+  single-opus-encode:
+    dictate-long-2min:
+      stop-capture-stopped-ms: 0.0
+      stop-capture-stopped-ms-p90: 0.0
+      stop-capture-stopped-ms-spread: 0.0
+      stop-capture-stopped-ms-n: 0.0
+      stop-ogg-flushed-ms: 0.759
+      stop-ogg-flushed-ms-p90: 0.759
+      stop-ogg-flushed-ms-spread: 0.0
+      stop-ogg-flushed-ms-n: 0.0
+      stop-transcription-done-ms: 0.518
+      stop-transcription-done-ms-p90: 0.518
+      stop-transcription-done-ms-spread: 0.0
+      stop-transcription-done-ms-n: 0.0
+      sigint-to-first-post-ms: 0.521
+      sigint-to-first-post-ms-p90: 0.521
+      sigint-to-first-post-ms-spread: 0.0
+      sigint-to-first-post-ms-n: 0.0
+      child-cpu-ms: 0.232
+      child-maxrss-kb: 0.043
+      opus-frames-encoded: 0.0
+      http-client-builds: 0.0
+      connection-retries: 0.0
+      encode-passes: 0.0
+    dictate-short-3s:
+      opus-frames-encoded: 0.007
+      encode-passes: 0.0
+  speak-streaming-playback:
+    kokoro-paragraph:
+      tts-creates: 0.0
+      first-sound-ms: 0.045
+      handoff-ms: 0.046
+      synthesis-ms: 0.046
+      first-sound-ratio: 0.0
+      played-seconds: 0.001
+      saved-seconds: 0.0
+      played-vs-saved-envelope-r: 0.018
+      child-maxrss-kb: 0.001
+  streaming-playback-decode:
+    play-decode-1h:
+      decode-before-first-sound-ms: 0.033
+      playback-buffer-mib: 0.0
+    play-decode-2min:
+      decode-before-first-sound-ms: 0.212
+      playback-buffer-mib: 0.0
+    play-long-row:
+      click-to-first-sound-ms: 0.675
+      player-retained-mib: 0.0
+      retained-fraction-of-file: 0.0
+      play-rss-growth-mib: 0.0
+  upload-normalize-once:
+    dictate-fallback-chain-3:
+      stop-capture-stopped-ms: 0.0
+      stop-capture-stopped-ms-p90: 0.0
+      stop-capture-stopped-ms-spread: 0.0
+      stop-capture-stopped-ms-n: 0.0
+      stop-ogg-flushed-ms: 0.133
+      stop-ogg-flushed-ms-p90: 0.304
+      stop-ogg-flushed-ms-spread: 0.421
+      stop-ogg-flushed-ms-n: 0.0
+      stop-transcription-done-ms: 0.253
+      stop-transcription-done-ms-p90: 0.014
+      stop-transcription-done-ms-spread: 0.58
+      stop-transcription-done-ms-n: 0.0
+      sigint-to-first-post-ms: 0.13
+      sigint-to-first-post-ms-p90: 0.099
+      sigint-to-first-post-ms-spread: 0.189
+      sigint-to-first-post-ms-n: 0.0
+      child-cpu-ms: 0.013
+      child-maxrss-kb: 0.098
+      normalize-calls: 0.0
+      upload-encodes: 0.0
+      audio-file-decodes: 0.0
+      first-busy-to-final-post-ms: 0.32
+      first-busy-to-final-post-ms-p90: 0.025
+      first-busy-to-final-post-ms-spread: 0.555
+      first-busy-to-final-post-ms-n: 0.0
+    prepare-foreign-stereo-wav:
+      upload-encodes: 0.0
+    runtime-heartbeat-2min:
+      heartbeat-max-gap-ms: 0.402
+    transcribe-fallback-chain-3-2min:
+      normalize-calls: 0.0
+      upload-encodes: 0.0
+      audio-file-decodes: 0.0
+      opus-frames-encoded: 0.0
+      first-busy-to-final-post-ms: 0.004
+      first-busy-to-final-post-ms-p90: 0.115
+      first-busy-to-final-post-ms-spread: 0.569
+      first-busy-to-final-post-ms-n: 0.0
+      wall-ms: 0.021
+      wall-ms-p90: 0.19
+      wall-ms-spread: 0.618
+      wall-ms-n: 0.0
+      child-cpu-ms: 0.155
+      child-maxrss-kb: 0.005
+    transcribe-long-20min:
+      normalize-calls: 0.0
+      upload-encodes: 0.0
+      audio-file-decodes: 0.0
+      post-received-after-start-ms: 0.044
+      wall-ms: 0.044
+      child-cpu-ms: 0.042
+      child-maxrss-kb: 0.002
+    transcribe-own-cache-ogg-2min:
+      normalize-calls: 0.0
+      upload-encodes: 0.0
+      audio-file-decodes: 0.0
+      upload-is-file-bytes: 0.0
+      child-cpu-ms: 0.333
+noise-source: 2026-09-30T19:54:12Z vs 2026-09-30 22:09:51Z
