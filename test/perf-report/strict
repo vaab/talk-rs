@@ -1,0 +1,70 @@
+# -*- mode: shell-script -*-
+# ``--item ID --strict``: accepted only when every cut of ID ran, every
+# non-advisory target of ID is met, its prerequisites passed, and
+# nothing regressed anywhere.
+
+source "$base/test/perf-report/helpers.sh"
+
+setup() {
+    perf_report_fixtures
+}
+
+GOOD='results:
+  item-a:
+    c1: {calls: 1, wait-ms: 400, latency-ms: 250, extra: 2}
+    c2: {invariant: 7}'
+export GOOD
+RUNS='[{scope: lib, filter: "a::", state: passed}, {scope: lib, filter: "a_pre::", state: passed}]'
+export RUNS
+
+try '
+source "$base/test/perf-report/helpers.sh"
+sed -i "s/metric: extra, target: \"<= 10\"/metric: extra, target: \"<= 1\"/" "$test_tmpdir/targets.yaml"
+printf "%s\n" "$GOOD" | perf_report_candidate "$RUNS"
+perf_report_compare --item item-a --strict
+' "accepted: targets met, advisory miss tolerated, other items not run"
+is errlvl 0
+is err part "ACCEPTED: item-a"
+is out 'met item-a c1 calls baseline=3 now=1 target="<= 1" delta=-2 kind=work
+met item-a c1 wait-ms baseline=1000 now=400 target="<= 0.5x" delta=-600 kind=timing
+met item-a c1 latency-ms baseline=400 now=250 target="-100" delta=-150 kind=timing
+not-met item-a c1 extra baseline=2 now=2 target="<= 1" delta=+0 kind=work advisory
+met item-a c2 invariant baseline=7 now=7 target="== 7" delta=+0 kind=work' TRIM
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "%s\n" "$GOOD" | sed "s/calls: 1/calls: 2/" | perf_report_candidate "$RUNS"
+perf_report_compare --item item-a --strict
+' "rejected: a required target not met"
+is errlvl 1
+is err part "c1/calls: not-met"
+is err part "REJECTED: item-a"
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "%s\n" "$GOOD" | perf_report_candidate "[{scope: lib, filter: \"a::\", state: passed}]"
+perf_report_compare --item item-a --strict
+' "rejected: a prerequisite did not run"
+is errlvl 1
+is err part "prerequisite"
+
+try '
+source "$base/test/perf-report/helpers.sh"
+perf_report_candidate "[]" <<YAML
+results: {}
+YAML
+perf_report_compare --item item-a --strict
+' "rejected: the item cuts did not run"
+is errlvl 1
+is err part "cut did not run"
+
+try '
+source "$base/test/perf-report/helpers.sh"
+{ printf "%s\n" "$GOOD"; printf "  item-b:\n    c3: {flag: 0}\n"; } \
+  | perf_report_candidate "[{scope: lib, filter: \"a::\", state: passed}, {scope: lib, filter: \"a_pre::\", state: passed}, {scope: perf, filter: \"b::\", state: passed}]"
+yq -i ".items[\"item-b\"].guards = [{\"cut\": \"c3\", \"metric\": \"flag\", \"target\": \">= 1\", \"kind\": \"work\"}]" "$test_tmpdir/targets.yaml"
+yq -i ".results[\"item-b\"].c3.flag = 1" "$test_tmpdir/baseline.yaml"
+perf_report_compare --item item-a --strict
+' "rejected: another item regressed"
+is errlvl 1
+is out part "regressed item-b c3 flag"

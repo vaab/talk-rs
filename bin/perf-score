@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Score a talk-rs performance report against perf/targets.yaml.
+
+Used by ``bin/perf-report --compare``; runnable on its own.  Prints one
+line per target/guard on stdout; diagnostics on stderr.
+
+Fail-closed contract (exit 1 unless every rule holds):
+
+- the targets file and both reports are well-formed (schema checked);
+  the scored report carries its run manifest (``runs``);
+- every value compared is a finite number, every criterion parses,
+  relative criteria have a baseline value;
+- a cut whose producing test was selected in the run but has no
+  results is ``failed`` (not ``skipped``); a cut present without the
+  metric is ``missing``;
+- a guard that does not hold is ``regressed``; any metric that moved in
+  its "worse" direction beyond noise is ``regressed`` — independently of
+  whether its target is met (exact ``==`` criteria without an explicit
+  direction regress when a value the baseline satisfied is lost);
+- with ``--strict --item ID``: every cut of ID ran, every non-advisory
+  target of ID is ``met``, every prerequisite of ID passed.
+
+Exit status: 0 success, 1 rules violated, 2 malformed input.
+"""
+
+import argparse
+import math
+import re
+import sys
+
+import yaml
+
+VERSION = "0.2.0"
+
+CRITERION = re.compile(r"^\s*(<=|>=|==|<|>)\s*(-?\d+(?:\.\d+)?)(x?)\s*$")
+SAVING = re.compile(r"^\s*-(\d+(?:\.\d+)?)\s*$")
+
+
+class InputError(Exception):
+    """Malformed input: exit 2."""
+
+
+def load_yaml(path, what):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except FileNotFoundError as exc:
+        raise InputError(f"{what} not found: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise InputError(f"{what} is not valid YAML: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise InputError(f"{what} is not a mapping: {path}")
+    return data
+
+
+def validate_targets(targets):
+    items = targets.get("items")
+    if not isinstance(items, dict) or not items:
+        raise InputError("targets: .items must be a non-empty map")
+    problems = []
+    for item, spec in items.items():
+        if not isinstance(spec, dict):
+            problems.append(f"{item}: not a map")
+            continue
+        cuts = spec.get("cuts") or []
+        if not cuts:
+            problems.append(f"{item}: no cuts listed")
+        if not spec.get("tests"):
+            problems.append(f"{item}: no tests listed")
+        for sel in (spec.get("tests") or []) + (spec.get("prerequisites") or []):
+            if not isinstance(sel, dict) or sel.get("scope") not in ("lib", "perf", "test"):
+                problems.append(f"{item}: bad test selection {sel!r}")
+            elif sel["scope"] == "test" and not sel.get("name"):
+                problems.append(f"{item}: test selection without name {sel!r}")
+        for role in ("targets", "guards"):
+            for entry in spec.get(role) or []:
+                if not isinstance(entry, dict):
+                    problems.append(f"{item}: {role} entry is not a map")
+                    continue
+                for key in ("cut", "metric", "target", "kind"):
+                    if not entry.get(key) and entry.get(key) != 0:
+                        problems.append(f"{item}: {role} entry without {key}: {entry}")
+                if entry.get("kind") not in ("work", "timing"):
+                    problems.append(f"{item}: bad kind in {entry}")
+                if entry.get("worse") not in (None, "higher", "lower"):
+                    problems.append(f"{item}: bad worse in {entry}")
+                if entry.get("cut") not in cuts:
+                    problems.append(f"{item}: cut {entry.get('cut')} not listed in cuts")
+                if not (CRITERION.match(str(entry.get("target", ""))) or SAVING.match(str(entry.get("target", "")))):
+                    problems.append(f"{item}: unparsable criterion {entry.get('target')!r}")
+    if problems:
+        raise InputError("invalid targets file:\n  " + "\n  ".join(problems))
+    return items
+
+
+def validate_report(report, what):
+    results = report.get("results")
+    if not isinstance(results, dict):
+        raise InputError(f"{what}: .results must be a map")
+    for item, cuts in results.items():
+        if not isinstance(cuts, dict):
+            raise InputError(f"{what}: results.{item} must be a map of cuts")
+        for cut, metrics in cuts.items():
+            if not isinstance(metrics, dict):
+                raise InputError(f"{what}: results.{item}.{cut} must be a map of metrics")
+    runs = report.get("runs")
+    if what == "report":
+        # A scored report must say what ran: without the manifest a
+        # vanished cut could not be told apart from an unselected one.
+        if not isinstance(runs, list):
+            raise InputError(f"{what}: .runs (the run manifest) must be a list")
+        if not runs and results:
+            raise InputError(f"{what}: results without any recorded run")
+    return results, runs
+
+
+def number(value):
+    """Finite float, or None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def check(criterion, now, baseline):
+    """'met' / 'not-met' / 'invalid'."""
+    text = str(criterion)
+    saving = SAVING.match(text)
+    if saving:
+        if baseline is None:
+            return "invalid"
+        return "met" if now <= baseline - float(saving.group(1)) else "not-met"
+    match = CRITERION.match(text)
+    if not match:
+        return "invalid"
+    op, bound, relative = match.group(1), float(match.group(2)), match.group(3)
+    if relative:
+        if baseline is None:
+            return "invalid"
+        bound *= baseline
+    ok = {
+        "<=": now <= bound,
+        "<": now < bound,
+        ">=": now >= bound,
+        ">": now > bound,
+        "==": now == bound,
+    }[op]
+    return "met" if ok else "not-met"
+
+
+def worse_direction(entry):
+    if entry.get("worse"):
+        return entry["worse"]
+    text = str(entry["target"]).strip()
+    if text.startswith("<") or text.startswith("-"):
+        return "higher"
+    if text.startswith(">"):
+        return "lower"
+    return "exact"
+
+
+def worsened(direction, now, baseline, kind, noise=0.0):
+    """Beyond noise in `direction`.  Timing margins are the larger of
+    25 %, 20 units, and twice the relative drift measured between the
+    independent baseline runs (``noise`` in the baseline report)."""
+    if kind == "work":
+        margin = abs(baseline) * 0.10
+    else:
+        margin = max(abs(baseline) * 0.25, 20.0, abs(baseline) * 2.0 * noise)
+    if direction == "higher":
+        return now > baseline + margin
+    return now < baseline - margin
+
+
+def selection_ran(runs, selection):
+    """State of the run covering `selection`: 'passed', 'failed' or None."""
+    state = None
+    for run in runs or []:
+        if run.get("scope") != selection.get("scope"):
+            continue
+        if selection.get("scope") == "test" and run.get("name") != selection.get("name"):
+            continue
+        run_filter = run.get("filter") or ""
+        if run_filter == "" or (selection.get("filter") or "").startswith(run_filter):
+            if run.get("state") == "failed":
+                return "failed"
+            state = state or run.get("state")
+    return state
+
+
+def paint(status, color):
+    if not color:
+        return status
+    code = {"met": "32", "not-met": "33", "skipped": "2"}.get(status, "31")
+    return f"\033[{code}m{status}\033[0m"
+
+
+def fmt(value):
+    if value is None:
+        return "-"
+    if float(value).is_integer() and abs(value) < 1e15:
+        return str(int(value))
+    return f"{value:.3f}"
+
+
+def score(targets_path, report_path, baseline_path, item, strict, color, out, err):
+    targets = validate_targets(load_yaml(targets_path, "targets file"))
+    if item and item not in targets:
+        raise InputError(f"unknown item: {item}")
+    current, runs = validate_report(load_yaml(report_path, "report"), "report")
+    baseline_doc = load_yaml(baseline_path, "baseline")
+    baseline, _ = validate_report(baseline_doc, "baseline")
+    noise = baseline_doc.get("noise") or {}
+    if not isinstance(noise, dict):
+        raise InputError("baseline: .noise must be a map")
+
+    def noise_of(it, cut, metric):
+        value = number((noise.get(it) or {}).get(cut, {}).get(metric))
+        return value if value is not None and value >= 0 else 0.0
+
+    bad = False
+    strict_problems = []
+    for it, spec in targets.items():
+        tests = spec.get("tests") or []
+        test_states = [selection_ran(runs, t) for t in tests]
+        prereq_states = [selection_ran(runs, t) for t in spec.get("prerequisites") or []]
+        item_failed = any(s == "failed" for s in test_states + prereq_states)
+        item_selected = bool(tests) and all(s is not None for s in test_states)
+        entries = [("target", e) for e in spec.get("targets") or []] + [
+            ("guard", e) for e in spec.get("guards") or []
+        ]
+        for role, entry in entries:
+            cut, metric, kind = entry["cut"], entry["metric"], entry["kind"]
+            advisory = bool(entry.get("advisory"))
+            cut_now = current.get(it, {}).get(cut)
+            raw_now = cut_now.get(metric) if isinstance(cut_now, dict) else None
+            raw_was = baseline.get(it, {}).get(cut, {}).get(metric)
+            now, was = number(raw_now), number(raw_was)
+            delta = None
+            if isinstance(cut_now, dict):
+                if raw_now is None:
+                    status = "missing"
+                elif now is None or (raw_was is not None and was is None):
+                    status = "invalid"
+                else:
+                    status = check(entry["target"], now, was)
+                    if status != "invalid":
+                        direction = worse_direction(entry)
+                        if role == "guard" and status == "not-met":
+                            status = "regressed"
+                        elif was is not None and direction == "exact":
+                            # An exact criterion regresses only by LOSING
+                            # a value the baseline already satisfied.
+                            if status == "not-met" and check(entry["target"], was, was) == "met":
+                                status = "regressed"
+                        elif was is not None and worsened(
+                            direction, now, was, kind, noise_of(it, cut, metric)
+                        ):
+                            status = "regressed"
+                        if was is not None:
+                            delta = now - was
+            elif item_failed:
+                status = "failed"
+            elif item_selected:
+                status = "failed"
+            else:
+                status = "skipped"
+            if status in ("regressed", "missing", "failed", "invalid"):
+                bad = True
+            if strict and it == item:
+                if status == "skipped":
+                    strict_problems.append(f"{cut}/{metric}: cut did not run")
+                elif role == "target" and not advisory and status != "met":
+                    strict_problems.append(f"{cut}/{metric}: {status}")
+            if item and it != item and status in ("met", "not-met", "skipped"):
+                continue
+            out.write(
+                f"{paint(status, color)} {it} {cut} {metric} baseline={fmt(was)} "
+                f"now={fmt(now) if now is not None else (raw_now if raw_now is not None else '-')} "
+                f'target="{entry["target"]}" delta={"-" if delta is None else f"{delta:+g}"} '
+                f"kind={kind}{' advisory' if advisory else ''}\n"
+            )
+        if strict and it == item:
+            for sel, state in zip(spec.get("prerequisites") or [], prereq_states):
+                if state != "passed":
+                    strict_problems.append(f"prerequisite {sel} {state or 'not run'}")
+    if strict:
+        if bad or strict_problems:
+            for problem in strict_problems:
+                err.write(f"perf: {item}: {problem}\n")
+            err.write(f"perf: REJECTED: {item}\n")
+            return 1
+        err.write(f"perf: ACCEPTED: {item} meets its targets; nothing regressed\n")
+        return 0
+    return 1 if bad else 0
+
+
+def calibrate(first_path, second_path, out):
+    """Write FIRST as the baseline, with a ``noise`` map: for every
+    numeric metric present in both independent runs, the relative drift
+    |a - b| / max(|a|, |b|)."""
+    first = load_yaml(first_path, "first run")
+    second = load_yaml(second_path, "second run")
+    a_res, _ = validate_report(first, "first run")
+    b_res, _ = validate_report(second, "second run")
+    noise = {}
+    for it, cuts in a_res.items():
+        for cut, metrics in cuts.items():
+            for metric, raw in metrics.items():
+                a = number(raw)
+                b = number((b_res.get(it) or {}).get(cut, {}).get(metric))
+                if a is None or b is None:
+                    continue
+                scale = max(abs(a), abs(b))
+                drift = abs(a - b) / scale if scale else 0.0
+                noise.setdefault(it, {}).setdefault(cut, {})[metric] = round(drift, 3)
+    for key in ("generated",):
+        if key in first and not isinstance(first[key], str):
+            first[key] = first[key].strftime("%Y-%m-%dT%H:%M:%SZ")
+    first["noise"] = noise
+    first["noise-source"] = f"{first.get('generated')} vs {second.get('generated')}".replace("+00:00", "Z")
+    header = "# talk-rs performance baseline (bin/perf-score --calibrate)\n"
+    out.write(header + yaml.safe_dump(first, sort_keys=False, width=100))
+    return 0
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "--calibrate":
+        if len(argv) != 3:
+            sys.stderr.write("Usage: perf-score --calibrate FIRST.yaml SECOND.yaml > baseline.yaml\n")
+            return 2
+        try:
+            return calibrate(argv[1], argv[2], sys.stdout)
+        except InputError as exc:
+            sys.stderr.write(f"Error: {exc}\n")
+            return 2
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n", 1)[0],
+        epilog="Also: perf-score --calibrate FIRST.yaml SECOND.yaml > baseline.yaml",
+    )
+    parser.add_argument("--targets", required=True)
+    parser.add_argument("--report", required=True)
+    parser.add_argument("--baseline", required=True)
+    parser.add_argument("--item")
+    parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--color", action="store_true")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    args = parser.parse_args(argv)
+    if args.strict and not args.item:
+        parser.error("--strict needs --item")
+    try:
+        return score(
+            args.targets, args.report, args.baseline, args.item, args.strict,
+            args.color, sys.stdout, sys.stderr,
+        )
+    except InputError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

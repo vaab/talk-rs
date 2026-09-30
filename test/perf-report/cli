@@ -1,6 +1,6 @@
 # -*- mode: shell-script -*-
-# Command-line contract: help/version on stdout-free stderr rules,
-# argument validation fails fast with exit 1.
+# Command-line contract: help and version, fail fast (exit 2) on bad
+# arguments with nothing on stdout.
 
 try '"$base/bin/perf-report" --version'
 noerror
@@ -8,13 +8,25 @@ is out reg '^perf-report [0-9]+\.[0-9]+\.[0-9]+$' TRIM
 
 try '"$base/bin/perf-report" --help | head -1'
 noerror
-is out 'Usage: perf-report [OPTIONS]' TRIM
+is out 'Usage: perf-report [RUN OPTIONS]' TRIM
 
 try '"$base/bin/perf-report" --bogus'
-is errlvl 1
+is errlvl 2
 is out ''
 is err 'Error: unknown argument: --bogus (see --help)' TRIM
 
 try '"$base/bin/perf-report" --report x.yaml'
-is errlvl 1
+is errlvl 2
 is err 'Error: --report needs --compare' TRIM
+
+try '"$base/bin/perf-report" --item paste-focus-sleep --strict'
+is errlvl 2
+is err 'Error: --strict needs --compare' TRIM
+
+try '"$base/bin/perf-report" --compare x.yaml --report x.yaml --item no-such-item'
+is errlvl 2
+is err part 'unknown item: no-such-item'
+
+try '"$base/bin/perf-report" --repeat 0'
+is errlvl 2
+is err part '--repeat needs a positive integer'
