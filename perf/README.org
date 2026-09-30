@@ -1,0 +1,143 @@
+* talk-rs performance harness
+
+A shared yardstick for the performance shortlist. Every experiment (one
+improvement per branch) is scored against the same cuts, the same
+targets (~perf/targets.yaml~) and the same baseline
+(~perf/baseline.yaml~, measured on unmodified master).
+
+** Running
+
+#+begin_src sh
+bin/perf-report                         # default cuts, YAML report on stdout
+bin/perf-report --all -o /tmp/me.yaml   # + long, display and model cuts
+bin/perf-report --compare perf/baseline.yaml            # run, then score
+bin/perf-report --compare perf/baseline.yaml --report /tmp/me.yaml
+bin/test-perf-report                    # the runner's own tests (sunit)
+#+end_src
+
+The runner builds the debug test binaries with
+~--features perf-counters~, runs every cut *serially* (timings are
+meaningless under parallel load), and merges each cut's metric file into
+one report. ~--compare~ prints one line per target:
+
+#+begin_example
+met       paste-focus-sleep already-focused focus-virtual-ms baseline=50 now=0 target="<= 5" delta=-50 kind=work
+not-met   http-client-pool-prewarm transcribe-fallback-chain-3-2min http-client-builds baseline=6 now=6 ...
+regressed upload-normalize-once runtime-heartbeat-2min heartbeat-max-gap-ms ...
+#+end_example
+
+~regressed~ means a guard broke, or the metric moved the wrong way
+beyond noise (10 % for ~work~ counts; 25 % and at least 20 units for
+~timing~). ~missing~ means the cut ran but lacks the metric; ~skipped~
+means the cut was not part of the run (e.g. no ~--display~). The exit
+status is non-zero on ~regressed~ or ~missing~.
+
+Gating:
+
+| Flag        | Adds                                                        | Needs                                                              |
+|-------------+-------------------------------------------------------------+--------------------------------------------------------------------|
+| (default)   | in-crate cuts, binary cuts with mock providers              | nothing                                                            |
+| ~--display~ | overlay FFT cuts, ~record --ui~ on a 1500-recording library | ~Xvfb~, or ~weston~ (headless+Xwayland)                            |
+| ~--ignored~ | ~--display~ + 2 min dictation, 20 min transcribe, 1 h play  | as above; a few minutes                                            |
+| ~--models~  | Parakeet and Kokoro cuts                                    | ~TALK_RS_TEST_PARAKEET_MODEL_DIR~, ~TALK_RS_TEST_KOKORO_MODEL_DIR~ |
+
+Plain ~cargo test~ stays green without any of this: counter-reading
+tests skip when the feature is off, heavy cuts are ~#[ignore]~-d.
+
+** Isolation
+
+Nothing touches the user's session. Binary cuts run ~talk-rs~ with a
+cleared environment, temporary ~XDG_*~ dirs, their own
+~TALK_RS_VALIDATE_CACHE_PATH~, no credentials, the ALSA ~null~ PCM and
+unreachable PulseAudio/PipeWire sockets. Display cuts start their own X
+server (Xvfb, else headless Weston + Xwayland, which also provides an
+EWMH window manager) and only ever signal that child. Local models are
+read from the given directories, never downloaded.
+
+** Harness pieces
+
+- ~src/perf_counters.rs~ — work counters behind the ~perf-counters~
+  feature (zero cost otherwise; also live in the crate's own unit tests,
+  per thread). Logged as ~perf-counter: name=value~ on exit and on
+  ~SIGUSR2~, together with ~vm_hwm_kb~, ~threads~, ~cpu_ms~ and
+  ~gtk_stall_max_ms~ (largest gap between 16 ms GTK main-loop ticks
+  since the previous dump, when ~TALK_RS_PERF_GTK_PROBE~ is set).
+  ~perf-mark: name=+Nms~ lines time phases (~speak_first_audio~,
+  ~record_ui_rows_built_Recordings~, ...).
+- ~TALK_RS_PERF_PACED_INPUT=<wav>~ (feature only) — replaces the
+  microphone with a WAV replayed at real-time pace, so the live one-shot
+  path (SIGINT stop, live upload, fallback) runs without hardware.
+- ~ensure_focus_with~ — the paste focus policy with the X11 calls
+  injected, measured on a paused tokio clock.
+- ~tests/perf/support/~ — fixture factory (speech-like PCM, WAV/OGG in
+  both profiles, 1500-recording ~YYYY/MM~ library), isolated runner
+  (~timing:~ / ~perf-counter:~ / ~perf-mark:~ parsing, child CPU and
+  peak RSS, SIGINT/SIGUSR2 driving), wiremock provider behind a counting
+  TCP proxy (accepted connections, injected connect delay, idle close),
+  isolated display, and the metric writer (~TALK_RS_PERF_OUT~).
+
+** Cuts
+
+Item ids are those of the consolidated shortlist. "Where" is the test
+that produces the cut (~lib~ ~ in-crate =perf_*~ test, ~perf~ =
+~tests/perf/~).
+
+| Item                             | Cut                                                                   | What it exercises                                                                                                              | Where                                    | Gate           |
+|----------------------------------+-----------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------+------------------------------------------+----------------|
+| paste-focus-sleep                | already-focused                                                       | focus policy when the target is already active                                                                                 | lib ~paste::perf_focus~                  | —            |
+| paste-focus-sleep                | focus-mismatch                                                        | backoff ladder / abort when it is not (guard)                                                                                  | lib ~paste::perf_focus~                  | —            |
+| record-ui-row-work               | library-1500-idle                                                     | ~record --ui~ on 1500 recordings (200 without pick, no ~.wf~): timers, tick callbacks/s, waterfall workers, idle CPU, peak RSS | perf ~perf_record_ui~                    | display        |
+| streaming-playback-decode        | play-decode-2min / play-decode-1h                                     | whole-file decode the Play button runs before the first sample                                                                 | lib ~record::audio::perf_playback~       | 1 h: ignored   |
+| upload-normalize-once            | transcribe-fallback-chain-3-2min                                      | ~transcribe --chain~ of a 2 min recording, entries 1-2 answer 503                                                              | perf ~perf_transcribe~                   | —            |
+| upload-normalize-once            | dictate-fallback-chain-3                                              | live 3 s dictation, live upload 503, file retry 503, third entry answers                                                       | perf ~perf_dictate~                      | —            |
+| upload-normalize-once            | transcribe-own-cache-ogg-2min                                         | ~transcribe~ of a file talk-rs wrote in its own cache (already upload profile)                                                 | perf ~perf_transcribe~                   | —            |
+| upload-normalize-once            | runtime-heartbeat-2min                                                | 10 ms heartbeat on a 1-worker runtime while a 2 min upload is prepared                                                         | perf ~perf_transcribe~                   | —            |
+| upload-normalize-once            | transcribe-long-20min                                                 | ~transcribe~ of a 20 min recording                                                                                             | perf ~perf_transcribe~                   | ignored        |
+| record-ui-incremental-listing    | list-library-1500                                                     | one full listing of the 1500-recording library                                                                                 | lib ~record::entries::perf_listing~      | —            |
+| record-ui-incremental-listing    | library-1500-open / -one-pick-event                                   | browser open; one pick written while open                                                                                      | perf ~perf_record_ui~                    | display        |
+| http-client-pool-prewarm         | dictate-short-3s                                                      | live 3 s dictation, provider answers at once                                                                                   | perf ~perf_dictate~                      | —            |
+| http-client-pool-prewarm         | dictate-short-3s-connect-150ms                                        | same, every new TCP connection delayed 150 ms                                                                                  | perf ~perf_dictate~                      | —            |
+| http-client-pool-prewarm         | ~*-fallback-chain-3*~                                                   | client builds and TCP connections across a chain                                                                               | perf                                     | —            |
+| overlay-fft-gating               | recording-5s-viz-{none,amplitude,waterfall}                           | 5 s dictation with the badge on an isolated display                                                                            | perf ~perf_dictate~                      | display        |
+| openai-realtime-final-early-exit | final-item-socket-open                                                | server delivers the committed item's transcript 300 ms after audio end, keeps socket open                                      | lib ~openai_realtime::perf_realtime_end~ | —            |
+| openai-realtime-final-early-exit | vad-earlier-item                                                      | an earlier VAD item completes first (guard: must not end the session)                                                          | lib                                      | —            |
+| single-opus-encode               | dictate-short-3s / dictate-long-2min                                  | Opus frames encoded per recorded frame                                                                                         | perf ~perf_dictate~                      | 2 min: ignored |
+| parakeet-warm                    | parakeet-primary-3s / chain-cloud-busy-parakeet-last / chain-cloud-ok | live 3 s dictation of real speech                                                                                              | perf ~perf_models~                       | models         |
+| speak-streaming-playback         | kokoro-paragraph                                                      | ~speak~ of a 480-character paragraph; time to first audio; ~-o~ duration                                                           | perf ~perf_models~                       | models         |
+
+Every cut also asserts invariants that hold today and must keep holding
+(same transcript delivered, complete cache OGG of the dictated length,
+every chain entry uploads the same audio, one player bar per no-pick
+row, every recording listed, ...): an experiment that breaks one fails
+the run.
+
+** For experiments
+
+1. Branch from ~perf/harness~ (or rebase onto it). Keep the counters:
+   when you move work, move its counter with it (e.g. a shared HTTP
+   client still counts ~http_client_builds~ where it is built).
+2. Implement one item; do not edit ~perf/targets.yaml~ or
+   ~perf/baseline.yaml~.
+3. On the same machine as the baseline, run
+   ~bin/perf-report --all --compare perf/baseline.yaml~ (models
+   variables set if your item needs them). Your item's ~target~ lines
+   must read ~met~; nothing anywhere may read ~regressed~ or ~missing~.
+4. ~kind: work~ lines are deterministic. ~kind: timing~ lines carry
+   tolerant thresholds; if one is borderline, rerun before concluding.
+5. Report the comparison output in the experiment summary.
+
+** Known limits
+
+- Timings are debug builds on a loaded developer machine; compare only
+  runs from the same host. ~record --ui~ numbers in particular include
+  200 concurrent waterfall decodes competing for the CPU.
+- The paste cut measures the focus policy (virtual time), not an
+  end-to-end X11 paste: the stop→first-paste wall time also includes X
+  server round trips that the policy change does not affect.
+- Connection costs are emulated (plain HTTP through a delaying proxy);
+  real TLS / VPN savings must be confirmed against a live provider.
+- The OpenAI realtime cut drives the receiver with a scripted stream;
+  whether the real service keeps the socket open after the final item
+  must be confirmed live before shipping item 7.
+- ~speak~ first-audio is the moment PCM is handed to the player; the
+  audible onset through a real device is not measured.

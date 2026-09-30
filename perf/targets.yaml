@@ -1,0 +1,118 @@
+# Pass criteria for the performance shortlist.
+#
+# One entry per shortlisted improvement ("item").  Each target names a
+# measurement cut (produced by a test in ``tests/perf/`` or an in-crate
+# ``perf_*`` test), a metric recorded by that cut, the value measured
+# on unmodified master (``baseline``, informational — the authoritative
+# numbers live in ``perf/baseline.yaml``) and the criterion an
+# experiment must meet.
+#
+# Criterion syntax (``bin/perf-report --compare``):
+#   "<= N" / "< N" / ">= N" / "> N" / "== N"   absolute bound
+#   "<= 0.5x"                                   relative to the baseline value
+#   "-50"                                       at least 50 below the baseline
+#
+# ``kind: work`` targets are deterministic work counts: a miss is a
+# real miss.  ``kind: timing`` targets are wall-clock or CPU numbers
+# with tolerant thresholds; compare them from the same machine,
+# debug build, serial run (``bin/perf-report`` always runs serially).
+#
+# ``guard`` targets are invariants that hold today and must keep
+# holding; an experiment that breaks one is "regressed" even if its
+# own target is met.  Every test additionally asserts its correctness
+# invariants (same transcript, complete cache OGG, same upload audio,
+# ...) and fails outright if they break.
+
+items:
+  paste-focus-sleep:
+    summary: skip the 50 ms focus-settle sleep when the target window is already active
+    targets:
+      - {cut: already-focused, metric: focus-virtual-ms, baseline: 50, target: "<= 5", kind: work}
+      - {cut: already-focused, metric: focus-sleeps, baseline: 1, target: "== 0", kind: work}
+    guards:
+      - {cut: focus-mismatch, metric: focus-virtual-ms-third-attempt, baseline: 350, target: "== 350", kind: work}
+      - {cut: focus-mismatch, metric: focus-virtual-ms-abort, baseline: 1550, target: "== 1550", kind: work}
+
+  record-ui-row-work:
+    summary: one shared playback tick, bounded waterfall workers, no synchronous decode on Play
+    targets:
+      - {cut: library-1500-idle, metric: player-tick-sources-live, baseline: 200, target: "<= 1", kind: work}
+      - {cut: library-1500-idle, metric: player-tick-callbacks-per-s, baseline: 12340, target: "<= 100", kind: timing}
+      - {cut: library-1500-idle, metric: waterfall-workers-inflight-max, baseline: 200, target: "<= 4", kind: work}
+      - {cut: library-1500-idle, metric: vm-hwm-kb, baseline: 840360, target: "<= 0.5x", kind: timing}
+    guards:
+      - {cut: library-1500-idle, metric: waterfall-decodes, baseline: 200, target: "<= 200", kind: work}
+
+  streaming-playback-decode:
+    summary: (runner-up) decode long recordings incrementally instead of whole-file before playing
+    targets:
+      - {cut: play-decode-1h, metric: decode-before-first-sound-ms, baseline: 13858, target: "<= 500", kind: timing}
+      - {cut: play-decode-1h, metric: playback-buffer-mib, baseline: 659, target: "<= 50", kind: work}
+      - {cut: play-decode-2min, metric: decode-before-first-sound-ms, baseline: 519, target: "<= 100", kind: timing}
+
+  upload-normalize-once:
+    summary: normalize a file once per chain, off the tokio worker; skip it for proven own-cache OGG
+    targets:
+      - {cut: transcribe-fallback-chain-3-2min, metric: normalize-calls, baseline: 3, target: "<= 1", kind: work}
+      - {cut: transcribe-fallback-chain-3-2min, metric: first-busy-to-final-post-ms, baseline: 4075, target: "<= 0.3x", kind: timing}
+      - {cut: dictate-fallback-chain-3, metric: normalize-calls, baseline: 2, target: "<= 1", kind: work}
+      - {cut: transcribe-own-cache-ogg-2min, metric: normalize-calls, baseline: 1, target: "== 0", kind: work}
+      - {cut: transcribe-own-cache-ogg-2min, metric: upload-is-file-bytes, baseline: 0, target: "== 1", kind: work}
+      - {cut: runtime-heartbeat-2min, metric: heartbeat-max-gap-ms, baseline: 2135, target: "<= 50", kind: timing}
+
+  record-ui-incremental-listing:
+    summary: list on a worker, refresh one entry per file event, read each pick once
+    targets:
+      - {cut: list-library-1500, metric: pick-reads, baseline: 2600, target: "<= 1300", kind: work}
+      - {cut: library-1500-one-pick-event, metric: list-calls, baseline: 2, target: "== 0", kind: work}
+      - {cut: library-1500-one-pick-event, metric: pick-reads, baseline: 5204, target: "<= 5", kind: work}
+      - {cut: library-1500-open, metric: gtk-stall-max-ms, baseline: 1242, target: "<= 200", kind: timing}
+    guards:
+      - {cut: list-library-1500, metric: recordings-with-pick, baseline: 1300, target: "== 1300", kind: work}
+
+  http-client-pool-prewarm:
+    summary: share one reqwest client per connect budget; pre-connect while recording
+    targets:
+      - {cut: transcribe-fallback-chain-3-2min, metric: http-client-builds, baseline: 6, target: "<= 1", kind: work}
+      - {cut: transcribe-fallback-chain-3-2min, metric: tcp-connections, baseline: 6, target: "<= 2", kind: work}
+      - {cut: dictate-short-3s-connect-150ms, metric: connected-before-stop, baseline: 0, target: "== 1", kind: work}
+      - {cut: dictate-short-3s-connect-150ms, metric: sigint-to-first-post-ms, baseline: 184, target: "-100", kind: timing}
+    guards:
+      - {cut: dictate-short-3s, metric: stop-transcription-done-ms, baseline: 45, target: "<= 200", kind: timing}
+
+  overlay-fft-gating:
+    summary: compute the overlay FFT only when a spectral visualizer needs it
+    targets:
+      - {cut: recording-5s-viz-none, metric: fft-per-frame, baseline: 1, target: "== 0", kind: work}
+      - {cut: recording-5s-viz-amplitude, metric: fft-per-frame, baseline: 1, target: "== 0", kind: work}
+    guards:
+      - {cut: recording-5s-viz-waterfall, metric: fft-per-frame, baseline: 1, target: ">= 0.45", kind: work}
+
+  openai-realtime-final-early-exit:
+    summary: end the OpenAI realtime session once the committed item is transcribed
+    targets:
+      - {cut: final-item-socket-open, metric: session-end-ms, baseline: 15000, target: "<= 1000", kind: work}
+    guards:
+      - {cut: vad-earlier-item, metric: session-end-ms, baseline: 15000, target: ">= 3000", kind: work}
+
+  single-opus-encode:
+    summary: encode the recording once for both the cache OGG and the upload
+    targets:
+      - {cut: dictate-short-3s, metric: encode-passes, baseline: 2.013, target: "<= 1.05", kind: work}
+      - {cut: dictate-long-2min, metric: encode-passes, baseline: 2, target: "<= 1.05", kind: work}
+
+  parakeet-warm:
+    summary: build the Parakeet recognizer before it is needed (primary, or on first chain failure)
+    targets:
+      - {cut: parakeet-primary-3s, metric: stop-transcription-done-ms, baseline: 2378, target: "<= 0.5x", kind: timing}
+      - {cut: chain-cloud-busy-parakeet-last, metric: stop-transcription-done-ms, baseline: 2497, target: "<= 0.6x", kind: timing}
+    guards:
+      - {cut: chain-cloud-ok, metric: recognizer-creates, baseline: 0, target: "== 0", kind: work}
+      - {cut: chain-cloud-ok, metric: child-maxrss-kb, baseline: 72900, target: "<= 1.1x", kind: timing}
+
+  speak-streaming-playback:
+    summary: start Kokoro playback while synthesis continues
+    targets:
+      - {cut: kokoro-paragraph, metric: first-audio-ratio, baseline: 1, target: "<= 0.3", kind: timing}
+    guards:
+      - {cut: kokoro-paragraph, metric: wav-seconds, baseline: 27.194, target: ">= 0.95x", kind: work}
