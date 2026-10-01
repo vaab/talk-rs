@@ -15,6 +15,8 @@ Fail-closed contract (exit 1 unless every rule holds):
   metric is ``missing``.  A test selection counts as selected when a
   run that included ignored tests covered it; with ``--item ID``,
   another item's selections count only when run explicitly;
+- a criterion may be a conjunction (``"<= 0.1x & <= 1500"``): met when
+  every clause holds;
 - a guard that does not hold is ``regressed``; any metric that moved in
   its "worse" direction beyond noise is ``regressed`` — independently of
   whether its target is met (exact ``==`` criteria without an explicit
@@ -88,7 +90,7 @@ def validate_targets(targets):
                     problems.append(f"{item}: bad worse in {entry}")
                 if entry.get("cut") not in cuts:
                     problems.append(f"{item}: cut {entry.get('cut')} not listed in cuts")
-                if not (CRITERION.match(str(entry.get("target", ""))) or SAVING.match(str(entry.get("target", "")))):
+                if not parses(entry.get("target", "")):
                     problems.append(f"{item}: unparsable criterion {entry.get('target')!r}")
     if problems:
         raise InputError("invalid targets file:\n  " + "\n  ".join(problems))
@@ -129,9 +131,25 @@ def number(value):
     return value if math.isfinite(value) else None
 
 
+def clauses(criterion):
+    """The ``&``-separated clauses of a criterion (all must hold)."""
+    return [part.strip() for part in str(criterion).split("&")]
+
+
+def parses(criterion):
+    return all(CRITERION.match(part) or SAVING.match(part) for part in clauses(criterion))
+
+
 def check(criterion, now, baseline):
-    """'met' / 'not-met' / 'invalid'."""
-    text = str(criterion)
+    """'met' / 'not-met' / 'invalid'; a conjunction is met when every
+    clause is."""
+    results = [check_clause(part, now, baseline) for part in clauses(criterion)]
+    if "invalid" in results:
+        return "invalid"
+    return "not-met" if "not-met" in results else "met"
+
+
+def check_clause(text, now, baseline):
     saving = SAVING.match(text)
     if saving:
         if baseline is None:
@@ -158,12 +176,15 @@ def check(criterion, now, baseline):
 def worse_direction(entry):
     if entry.get("worse"):
         return entry["worse"]
-    text = str(entry["target"]).strip()
-    if text.startswith("<") or text.startswith("-"):
-        return "higher"
-    if text.startswith(">"):
-        return "lower"
-    return "exact"
+    directions = set()
+    for text in clauses(entry["target"]):
+        if text.startswith("<") or text.startswith("-"):
+            directions.add("higher")
+        elif text.startswith(">"):
+            directions.add("lower")
+        else:
+            directions.add("exact")
+    return directions.pop() if len(directions) == 1 else "exact"
 
 
 def worsened(direction, now, baseline, kind, noise=0.0):

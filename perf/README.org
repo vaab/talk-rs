@@ -36,7 +36,8 @@ Rules for experiments:
 4. ~kind: work~ lines are deterministic.  ~kind: timing~ lines are
    medians of ~--repeat~ runs (default 5) with ~-p90~, ~-spread~ and
    ~-n~ recorded next to them; if one is borderline, rerun with a
-   larger ~--repeat~.
+   larger ~--repeat~.  Some timing cuts are a single sample (no ~-n~):
+   see [[*Single-sample timing targets]].
 5. Paste the comparison output into the experiment report.
 
 ** Running
@@ -72,6 +73,9 @@ regressed upload-normalize-once runtime-heartbeat-2min heartbeat-max-gap-ms ...
 | ~failed~    | the cut's test or a prerequisite failed, or it was selected and produced nothing                                   |
 | ~skipped~   | the cut was not selected in this run                                                                                |
 | ~invalid~   | non-numeric or non-finite value, or a relative criterion without a baseline value                                  |
+
+A criterion may be a conjunction of clauses, ~"<= 0.1x & <= 1500"~: it
+is met only when every clause holds.
 
 A cut counts as selected — so that producing nothing makes it ~failed~
 rather than ~skipped~ — when a run of a superset of its tests (libtest
@@ -225,6 +229,40 @@ outright when they break.
 - ~speak-streaming-playback / handoff-ms~: handing PCM to the player is
   not sound; ~first-sound-ratio~ (consumed by the output) is the
   acceptance measure.
+
+** Single-sample timing targets
+
+These cuts record one sample per run, not a median of ~--repeat~ runs:
+the display cuts (~record --ui~ on a 1500-recording library, its Play
+click) and the in-process heartbeat.  Their metrics are maxima or
+first-event latencies, so one scheduler hiccup on the shared host sets
+the value: implementations that demonstrably moved the blocking work
+off the thread measured, between runs, 28–633 ms of heartbeat gap and
+175–585 ms of GTK stall (including GTK's first tooltip popup on the
+software-GL test display, 170–370 ms alone).
+
+What these targets must separate is "the blocking work is still on the
+thread" — whose cost is the whole operation, seconds — from "it is
+gone".  So they are a fraction of the baseline, far from both, plus an
+absolute cap that keeps them strict if a baseline is ever recalibrated
+under load:
+
+| Item / cut / metric                                               | Baseline | Target               | Bound | Still blocking                             |
+|-------------------------------------------------------------------+----------+----------------------+-------+--------------------------------------------|
+| upload-normalize-once runtime-heartbeat-2min heartbeat-max-gap-ms | 3481     | ~<= 0.25x & <= 1000~ | 870   | the preparation, >= 1x                     |
+| record-ui-row-work play-long-row gtk-stall-max-ms                 | 12734    | ~<= 0.1x & <= 1500~  | 1273  | the decode, ~1x                            |
+| record-ui-row-work play-long-row click-handler-ms                 | 12711    | ~<= 0.02x & <= 400~  | 254   | the decode, ~1x                            |
+| streaming-playback-decode play-long-row click-to-first-sound-ms   | 12681    | ~<= 0.08x & <= 1500~ | 1014  | whole-file decode off the GTK thread, ~4 s |
+| record-ui-incremental-listing library-1500-open gtk-stall-max-ms  | 5624     | ~<= 0.1x & <= 1000~  | 562   | the listing, ~1x                           |
+
+They stay required (not advisory).  The other timing targets are
+medians (~first-busy-to-final-post-ms~, ~sigint-to-first-post-ms~),
+rates (~player-tick-callbacks-per-s~), ratios (~first-sound-ratio~) or
+already relative to a baseline of the same order
+(~stop-transcription-done-ms <= 0.5x~), and are unchanged.  Repeating
+the single-sample cuts and scoring their median would need the perf
+tests to loop; until then a borderline value is settled by rerunning
+the item.
 
 ** Refreshing the baseline
 

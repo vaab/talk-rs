@@ -163,3 +163,32 @@ yq -i ".results[\"item-a\"].c1[\"wait-ms\"] = 1500 | .runs = []" "$test_tmpdir/b
 "$base/bin/perf-score" --calibrate "$test_tmpdir/baseline.yaml" "$test_tmpdir/b2.yaml" | yq ".noise[\"item-a\"].c1[\"wait-ms\"]"
 ' "calibration records the relative drift between two runs"
 is out "0.333" TRIM
+
+try '
+source "$base/test/perf-report/helpers.sh"
+sed -i "s/target: \"<= 0.5x\"/target: \"<= 0.5x \& <= 450\"/" "$test_tmpdir/targets.yaml"
+for v in 400 480; do
+  perf_report_candidate "$ALL_RUNS" <<YAML
+results:
+  item-a:
+    c1: {calls: 1, wait-ms: $v, latency-ms: 250, extra: 2}
+    c2: {invariant: 7}
+  item-b:
+    c3: {flag: 1}
+YAML
+  perf_report_compare | grep wait-ms
+done
+' "a conjunction is met only when every clause holds"
+is out 'met item-a c1 wait-ms baseline=1000 now=400 target="<= 0.5x & <= 450" delta=-600 kind=timing
+not-met item-a c1 wait-ms baseline=1000 now=480 target="<= 0.5x & <= 450" delta=-520 kind=timing' TRIM
+
+try '
+source "$base/test/perf-report/helpers.sh"
+sed -i "s/target: \"<= 0.5x\"/target: \"<= 0.5x \& banana\"/" "$test_tmpdir/targets.yaml"
+perf_report_candidate "$ALL_RUNS" <<YAML
+results: {}
+YAML
+perf_report_compare
+' "an unparsable clause rejects the targets file"
+is errlvl 2
+is err part "unparsable criterion"
