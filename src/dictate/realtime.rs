@@ -489,6 +489,14 @@ pub(crate) async fn dictate_realtime(
                         model: candidate_model.clone().unwrap_or_default(),
                         outcome: "success".into(),
                     });
+                    if let (Some(viz), Some(notice)) = (
+                        visualizer,
+                        candidate_model
+                            .as_deref()
+                            .and_then(|model| chain.fallback_notice(*candidate, model)),
+                    ) {
+                        viz.pin_message(&notice);
+                    }
                 }
                 selected = Some((events, feeder, *candidate, candidate_model.clone()));
                 break;

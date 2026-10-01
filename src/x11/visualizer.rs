@@ -47,6 +47,8 @@ const BG: [u8; 4] = [0x00, 0x00, 0x00, 0xFF]; // #000000 black
 const TEXT_COLOR: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF]; // #ffffff white
 /// Reddish colour for error/status messages (BGRA).
 const ERROR_COLOR: [u8; 4] = [0x55, 0x55, 0xFF, 0xFF]; // #ff5555 reddish
+/// Pinned status line colour (fallback model notice): a warning, not an error.
+const PINNED_COLOR: [u8; 4] = [0x00, 0xC0, 0xFF, 0xFF]; // #ffc000 amber
 /// Brightest dot colour (BGRA).
 const DOT_HI: [u8; 4] = [0xCC, 0xCC, 0xCC, 0xFF]; // #cccccc
 /// Dimmest dot colour (BGRA).
@@ -223,6 +225,77 @@ const MESSAGE_TTL_SECS: f32 = 3.0;
 /// Seconds a TTL message stays fully opaque before starting to fade.
 const MESSAGE_FADE_DELAY_SECS: f32 = 1.0;
 
+/// Role of one text-panel row; selects its colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineKind {
+    /// Persistent status line (e.g. the fallback model in use).
+    Pinned,
+    /// Fading status / error message.
+    Status,
+    /// Live transcription text with animated dots.
+    Live,
+}
+
+/// One text-panel row ready to render.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PanelLine<'a> {
+    text: &'a str,
+    kind: LineKind,
+    /// Fade opacity, 1.0 = fully visible.
+    alpha: f32,
+}
+
+/// Rows to render, top to bottom: the pinned line, then TTL messages
+/// newest first, then the live text.  When over [`MAX_TEXT_LINES`], the
+/// oldest TTL messages are dropped first; the pinned line and live text
+/// are kept.  Expired TTL messages must already be pruned.
+fn panel_lines<'a>(
+    pinned: Option<&'a str>,
+    ttl_messages: &'a [(String, std::time::Instant)],
+    live_text: &'a str,
+    now: std::time::Instant,
+) -> Vec<PanelLine<'a>> {
+    let fade_duration = MESSAGE_TTL_SECS - MESSAGE_FADE_DELAY_SECS;
+    let mut status: Vec<PanelLine<'a>> = ttl_messages
+        .iter()
+        .rev()
+        .map(|(text, expires)| {
+            let remaining = expires.saturating_duration_since(now).as_secs_f32();
+            let elapsed = MESSAGE_TTL_SECS - remaining;
+            let alpha = if elapsed < MESSAGE_FADE_DELAY_SECS {
+                1.0
+            } else {
+                ((MESSAGE_TTL_SECS - elapsed) / fade_duration).clamp(0.0, 1.0)
+            };
+            PanelLine {
+                text,
+                kind: LineKind::Status,
+                alpha,
+            }
+        })
+        .collect();
+    let fixed = usize::from(pinned.is_some()) + usize::from(!live_text.is_empty());
+    status.truncate((MAX_TEXT_LINES as usize).saturating_sub(fixed));
+
+    let mut lines = Vec::with_capacity(status.len() + fixed);
+    if let Some(text) = pinned {
+        lines.push(PanelLine {
+            text,
+            kind: LineKind::Pinned,
+            alpha: 1.0,
+        });
+    }
+    lines.extend(status);
+    if !live_text.is_empty() {
+        lines.push(PanelLine {
+            text: live_text,
+            kind: LineKind::Live,
+            alpha: 1.0,
+        });
+    }
+    lines
+}
+
 enum VizCommand {
     /// Show the text panel.
     Show,
@@ -233,6 +306,9 @@ enum VizCommand {
     /// Push a status message with its own TTL.  Messages stack
     /// vertically and disappear individually when their TTL expires.
     PushMessage { text: String },
+    /// Set the pinned status line: shown above everything else, never
+    /// fades, replaced by the next pin, gone when the thread exits.
+    Pin { text: String },
     /// Shut down the thread.
     Quit,
 }
@@ -300,6 +376,14 @@ impl VisualizerHandle {
     /// Multiple messages stack vertically; each has its own TTL.
     pub fn push_message(&self, text: &str) {
         let _ = self.tx.send(VizCommand::PushMessage {
+            text: text.to_string(),
+        });
+    }
+
+    /// Pin a status line that stays visible, without fading, for the
+    /// rest of the dictation.  A later pin replaces it.
+    pub fn pin_message(&self, text: &str) {
+        let _ = self.tx.send(VizCommand::Pin {
             text: text.to_string(),
         });
     }
@@ -421,6 +505,9 @@ fn visualizer_thread(
     let mut text_is_mapped = false;
     // TTL status messages: each entry is (text, expiry instant).
     let mut ttl_messages: Vec<(String, std::time::Instant)> = Vec::new();
+    // Pinned status line: survives `Hide` and stays until the thread
+    // quits, i.e. until the dictation (paste included) is over.
+    let mut pinned: Option<String> = None;
     // Last rendered line count — used to avoid redundant window resizes.
     let mut prev_text_lines: u16 = 0;
     let mut frame_counter: u64 = 0;
@@ -429,13 +516,13 @@ fn visualizer_thread(
     // ── Event loop ───────────────────────────────────────────────────
     //
     // Two states:
-    //   1. Text active (`is_showing` or TTL messages pending): render at
-    //      60 fps so fade animation stays smooth.
-    //   2. Idle (`!is_showing`, no TTL messages): block on `rx.recv()`.
+    //   1. Text active (`is_showing`, a pinned line, or TTL messages
+    //      pending): render at 60 fps so fade animation stays smooth.
+    //   2. Idle (none of the above): block on `rx.recv()`.
 
     loop {
         // Idle: no pending messages → block.
-        if !is_showing && ttl_messages.is_empty() {
+        if !is_showing && pinned.is_none() && ttl_messages.is_empty() {
             if should_quit {
                 break;
             }
@@ -452,6 +539,9 @@ fn visualizer_thread(
                         + std::time::Duration::from_secs_f32(MESSAGE_TTL_SECS);
                     ttl_messages.push((text, expires));
                     // Fall through to render loop on next iteration.
+                }
+                Ok(VizCommand::Pin { text }) => {
+                    pinned = Some(text);
                 }
                 Ok(VizCommand::Quit) | Err(_) => {
                     should_quit = true;
@@ -477,11 +567,17 @@ fn visualizer_thread(
                             + std::time::Duration::from_secs_f32(MESSAGE_TTL_SECS);
                         ttl_messages.push((text, expires));
                     }
+                    Ok(VizCommand::Pin { text }) => {
+                        pinned = Some(text);
+                    }
                     Ok(VizCommand::Show) => {
                         is_showing = true;
                     }
                     Ok(VizCommand::Quit) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         is_showing = false;
+                        // The dictation is over: the pinned line goes
+                        // with it; only fading messages may finish.
+                        pinned = None;
                         should_quit = true;
                         break;
                     }
@@ -494,7 +590,7 @@ fn visualizer_thread(
             break;
         }
 
-        if !is_showing && ttl_messages.is_empty() {
+        if !is_showing && pinned.is_none() && ttl_messages.is_empty() {
             // No pending messages — go idle.
             continue;
         }
@@ -514,33 +610,7 @@ fn visualizer_thread(
         let now_ttl = std::time::Instant::now();
         ttl_messages.retain(|(_, expires)| *expires > now_ttl);
 
-        // Collect all lines to render: TTL messages (newest first), then live text.
-        // Each entry carries a fade alpha (1.0 = fully visible).
-        let fade_duration = MESSAGE_TTL_SECS - MESSAGE_FADE_DELAY_SECS;
-        let mut text_lines: Vec<(&str, f32)> = ttl_messages
-            .iter()
-            .rev()
-            .map(|(t, expires)| {
-                let remaining = expires.duration_since(now_ttl).as_secs_f32();
-                let elapsed = MESSAGE_TTL_SECS - remaining;
-                let alpha = if elapsed < MESSAGE_FADE_DELAY_SECS {
-                    1.0
-                } else {
-                    ((MESSAGE_TTL_SECS - elapsed) / fade_duration).clamp(0.0, 1.0)
-                };
-                (t.as_str(), alpha)
-            })
-            .collect();
-        let mut n_ttl = text_lines.len();
-        if !current_text.is_empty() {
-            text_lines.push((&current_text, 1.0));
-        }
-        // Cap to max lines (keep most recent).
-        if text_lines.len() > MAX_TEXT_LINES as usize {
-            let drop = text_lines.len() - MAX_TEXT_LINES as usize;
-            text_lines = text_lines.split_off(drop);
-            n_ttl = n_ttl.saturating_sub(drop);
-        }
+        let text_lines = panel_lines(pinned.as_deref(), &ttl_messages, &current_text, now_ttl);
         let n_lines = text_lines.len() as u16;
 
         // On-demand text panel visibility + dynamic height.
@@ -566,16 +636,21 @@ fn visualizer_thread(
         }
 
         // Text panel — render each line into its own row.
-        // TTL status lines use reddish colour without dots; the live
-        // transcription line (if any) uses white with animated dots.
+        // The pinned line is amber, TTL status lines reddish (both
+        // without dots); the live transcription line (if any) is white
+        // with animated dots.
         if let Some(ref f) = font {
             let dot_br = dot_wave(frame_counter);
-            for (i, (line, alpha)) in text_lines.iter().enumerate() {
+            for (i, line) in text_lines.iter().enumerate() {
                 text_pb.clear_rounded(BG, TEXT_CORNER_RADIUS);
-                if i < n_ttl {
-                    render_text_status(&mut text_pb, line, f, ERROR_COLOR, *alpha);
-                } else {
-                    render_text(&mut text_pb, line, f, dot_br);
+                match line.kind {
+                    LineKind::Pinned => {
+                        render_text_status(&mut text_pb, line.text, f, PINNED_COLOR, line.alpha)
+                    }
+                    LineKind::Status => {
+                        render_text_status(&mut text_pb, line.text, f, ERROR_COLOR, line.alpha)
+                    }
+                    LineKind::Live => render_text(&mut text_pb, line.text, f, dot_br),
                 }
 
                 let _ = conn.put_image(
@@ -667,6 +742,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Line collection ───────────────────────────────────────────────
+
+    fn secs_from(now: std::time::Instant, secs: f32) -> std::time::Instant {
+        now + std::time::Duration::from_secs_f32(secs)
+    }
+
+    #[test]
+    fn panel_lines_put_pinned_first_then_newest_ttl_then_live_text() {
+        let now = std::time::Instant::now();
+        let ttl = vec![
+            ("older".to_string(), secs_from(now, 2.5)),
+            ("newer".to_string(), secs_from(now, 2.9)),
+        ];
+        let lines = panel_lines(Some("pinned"), &ttl, "live", now);
+        let kinds: Vec<_> = lines.iter().map(|l| (l.text, l.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("pinned", LineKind::Pinned),
+                ("newer", LineKind::Status),
+                ("older", LineKind::Status),
+                ("live", LineKind::Live),
+            ]
+        );
+    }
+
+    #[test]
+    fn panel_lines_pinned_stays_fully_opaque() {
+        let now = std::time::Instant::now();
+        let lines = panel_lines(Some("pinned"), &[], "", now);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].alpha, 1.0);
+    }
+
+    #[test]
+    fn panel_lines_overflow_drops_oldest_status_never_pinned() {
+        let now = std::time::Instant::now();
+        let ttl: Vec<_> = (0..MAX_TEXT_LINES + 2)
+            .map(|i| (format!("s{i}"), secs_from(now, 2.0 + i as f32 * 0.01)))
+            .collect();
+        let lines = panel_lines(Some("pinned"), &ttl, "live", now);
+        assert_eq!(lines.len(), MAX_TEXT_LINES as usize);
+        assert_eq!(lines[0].text, "pinned");
+        assert_eq!(lines.last().map(|l| l.text), Some("live"));
     }
 
     #[test]

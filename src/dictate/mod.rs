@@ -916,6 +916,14 @@ async fn dictate_loaded(
     if let Some(ref viz) = visualizer {
         log::debug!("showing visualizer text panel");
         viz.show(crate::x11::overlay::BADGE_W);
+        // A chain whose primary model sits in outage memory starts on a
+        // fallback: say so for the whole dictation, not just in the log.
+        if let Some(notice) = chain
+            .as_ref()
+            .and_then(|chain| chain.fallback_notice(provider, &effective_model))
+        {
+            viz.pin_message(&notice);
+        }
     }
     feedback.start_boop();
 
@@ -1198,6 +1206,18 @@ async fn dictate_loaded(
                             model: effective_model.clone(),
                             outcome: "busy".into(),
                         }];
+                        // Pin the next model now: the fallback request is
+                        // where the user waits, and the pin is confirmed
+                        // (or replaced) by the model that answers.
+                        if let (Some(viz), Some(notice)) = (
+                            &visualizer,
+                            chain
+                                .entries
+                                .get(first_index + 1)
+                                .and_then(|next| chain.fallback_notice(next.provider, &next.model)),
+                        ) {
+                            viz.pin_message(&notice);
+                        }
                         let notify = |message: &str| {
                             if let Some(viz) = &visualizer {
                                 viz.push_message(message);
@@ -1222,6 +1242,12 @@ async fn dictate_loaded(
                         Ok(outcome) => {
                             provider = outcome.provider;
                             effective_model = outcome.model;
+                            if let (Some(viz), Some(notice)) = (
+                                &visualizer,
+                                chain.fallback_notice(provider, &effective_model),
+                            ) {
+                                viz.pin_message(&notice);
+                            }
                             outcome.result
                         }
                         Err(final_err) => {

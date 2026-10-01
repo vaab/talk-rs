@@ -326,6 +326,13 @@ until the ~Retry-After~ duration or ~outage_memory~ expires; if every
 eligible provider is marked busy, they are still attempted in order.
 Success clears its marker.  A corrupt file is ignored with a warning.
 
+Whenever ~dictate~ transcribes with any entry other than the chain's
+first one, the text panel below the badge shows a persistent amber
+line naming the model in use and the primary one, e.g. ~⚠
+gpt-transcribe (voxtral-mini-2602 unavailable)~.  It appears as soon
+as the fallback is known (at start when the primary is in outage
+memory, at the switch otherwise) and stays until the dictation ends.
+
 *** Foreground application paste routing
 
 The recursive ~paste:~ tree supports ~match-foreground-app~ beneath

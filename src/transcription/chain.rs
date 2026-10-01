@@ -259,6 +259,17 @@ impl ResolvedChain {
             .mark_busy(provider, retry_after.unwrap_or(self.outage_memory));
     }
 
+    /// User-facing notice when the answering model is not the chain's
+    /// first entry, e.g. `⚠ gpt-transcribe (voxtral-mini-2602 unavailable)`.
+    /// `None` when the primary model answers.
+    pub fn fallback_notice(&self, provider: Provider, model: &str) -> Option<String> {
+        let primary = self.entries.first()?;
+        if primary.provider == provider && primary.model == model {
+            return None;
+        }
+        Some(format!("⚠ {} ({} unavailable)", model, primary.model))
+    }
+
     /// A live upload already tried `start - 1`; callers can supply that
     /// failed attempt and walk the remaining file-backed candidates.
     #[allow(clippy::too_many_arguments)] // file input, requirement filters, and live-upload continuation are independent
@@ -909,6 +920,54 @@ mod tests {
                 .entries
                 .len(),
             2
+        );
+    }
+
+    fn fallback_test_chain() -> ResolvedChain {
+        ResolvedChain {
+            name: "dictate".into(),
+            entries: vec![
+                entry(Provider::Mistral, "voxtral-mini-2602"),
+                entry(Provider::OpenAI, "gpt-transcribe"),
+            ],
+            outage_memory: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn fallback_notice_is_silent_on_the_primary_model() {
+        let chain = fallback_test_chain();
+        assert_eq!(
+            chain.fallback_notice(Provider::Mistral, "voxtral-mini-2602"),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_notice_names_the_answering_and_the_primary_model() {
+        let chain = fallback_test_chain();
+        assert_eq!(
+            chain
+                .fallback_notice(Provider::OpenAI, "gpt-transcribe")
+                .as_deref(),
+            Some("⚠ gpt-transcribe (voxtral-mini-2602 unavailable)")
+        );
+    }
+
+    #[test]
+    fn fallback_notice_compares_provider_not_only_model_name() {
+        let chain = ResolvedChain {
+            entries: vec![
+                entry(Provider::Mistral, "same-name"),
+                entry(Provider::OpenAI, "same-name"),
+            ],
+            ..fallback_test_chain()
+        };
+        assert_eq!(
+            chain
+                .fallback_notice(Provider::OpenAI, "same-name")
+                .as_deref(),
+            Some("⚠ same-name (same-name unavailable)")
         );
     }
 
