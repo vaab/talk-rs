@@ -73,6 +73,15 @@ regressed upload-normalize-once runtime-heartbeat-2min heartbeat-max-gap-ms ...
 | ~skipped~   | the cut was not selected in this run                                                                                |
 | ~invalid~   | non-numeric or non-finite value, or a relative criterion without a baseline value                                  |
 
+A cut counts as selected — so that producing nothing makes it ~failed~
+rather than ~skipped~ — when a run of a superset of its tests (libtest
+filters match by substring) included ignored tests; the manifest
+records ~ignored:~ per run (older manifests: a prerequisite run had
+none, any other run had them).  With ~--item ID~ another item's cuts
+count as selected only when that item's own test selections were run:
+the prerequisites of ID never make a foreign cut ~failed~, so ~--strict~
+judges ID's own cuts and prerequisites, plus any metric that ran.
+
 Noise margins for regression: ~work~ 10 %; ~timing~ the largest of
 25 %, 20 units, and twice the drift measured between two independent
 baseline runs (the ~noise:~ map of ~perf/baseline.yaml~, written by

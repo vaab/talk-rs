@@ -12,7 +12,9 @@ Fail-closed contract (exit 1 unless every rule holds):
   relative criteria have a baseline value;
 - a cut whose producing test was selected in the run but has no
   results is ``failed`` (not ``skipped``); a cut present without the
-  metric is ``missing``;
+  metric is ``missing``.  A test selection counts as selected when a
+  run that included ignored tests covered it; with ``--item ID``,
+  another item's selections count only when run explicitly;
 - a guard that does not hold is ``regressed``; any metric that moved in
   its "worse" direction beyond noise is ``regressed`` — independently of
   whether its target is met (exact ``==`` criteria without an explicit
@@ -111,6 +113,11 @@ def validate_report(report, what):
             raise InputError(f"{what}: .runs (the run manifest) must be a list")
         if not runs and results:
             raise InputError(f"{what}: results without any recorded run")
+        for run in runs:
+            if not isinstance(run, dict):
+                raise InputError(f"{what}: run entry is not a map: {run!r}")
+            if "ignored" in run and str(run["ignored"]) not in ("0", "1", "only"):
+                raise InputError(f"{what}: bad ignored mode in run {run}")
     return results, runs
 
 
@@ -172,19 +179,49 @@ def worsened(direction, now, baseline, kind, noise=0.0):
     return now < baseline - margin
 
 
-def selection_ran(runs, selection):
-    """State of the run covering `selection`: 'passed', 'failed' or None."""
+def selection_key(sel):
+    return (sel.get("scope"), sel.get("name") or "", sel.get("filter") or "")
+
+
+def ran_ignored(run, prereq_keys):
+    """Whether `run` included ``#[ignore]``-d tests (``--include-ignored``).
+
+    Manifests written before ``ignored`` was recorded are read the way
+    ``bin/perf-report`` ran them: a run of a prerequisite selection ran
+    without ignored tests, any other run included them."""
+    mode = run.get("ignored")
+    if mode is None:
+        return selection_key(run) not in prereq_keys
+    return str(mode) == "1"
+
+
+def selection_ran(runs, selection, prereq_keys, cuts=True, explicit=False):
+    """State of the runs covering `selection`: 'passed', 'failed' or None.
+
+    A run covers a selection when it ran a superset of its tests: same
+    scope (and binary), and its libtest filter is a substring of the
+    selection's (libtest filters match by substring).  With `cuts`, the
+    selection produces perf cuts, which may be ``#[ignore]``-d: only a
+    run that included ignored tests covers it.  With `explicit`, only a
+    run of exactly this selection counts."""
     state = None
+    sel_filter = selection.get("filter") or ""
     for run in runs or []:
         if run.get("scope") != selection.get("scope"):
             continue
         if selection.get("scope") == "test" and run.get("name") != selection.get("name"):
             continue
         run_filter = run.get("filter") or ""
-        if run_filter == "" or (selection.get("filter") or "").startswith(run_filter):
-            if run.get("state") == "failed":
-                return "failed"
-            state = state or run.get("state")
+        if explicit:
+            if run_filter != sel_filter:
+                continue
+        elif run_filter not in sel_filter:
+            continue
+        if cuts and not ran_ignored(run, prereq_keys):
+            continue
+        if run.get("state") == "failed":
+            return "failed"
+        state = state or run.get("state")
     return state
 
 
@@ -218,13 +255,23 @@ def score(targets_path, report_path, baseline_path, item, strict, color, out, er
         value = number((noise.get(it) or {}).get(cut, {}).get(metric))
         return value if value is not None and value >= 0 else 0.0
 
+    prereq_keys = {
+        selection_key(sel) for spec in targets.values() for sel in spec.get("prerequisites") or []
+    }
     bad = False
     strict_problems = []
     for it, spec in targets.items():
         tests = spec.get("tests") or []
-        test_states = [selection_ran(runs, t) for t in tests]
-        prereq_states = [selection_ran(runs, t) for t in spec.get("prerequisites") or []]
-        item_failed = any(s == "failed" for s in test_states + prereq_states)
+        # With --item, the run was asked about that item only: another
+        # item's cuts count as selected only when its own test
+        # selections were run, never because a broader run (e.g. the
+        # item's prerequisites) happens to cover them.
+        foreign = bool(item) and it != item
+        test_states = [selection_ran(runs, t, prereq_keys, explicit=foreign) for t in tests]
+        prereq_states = [
+            selection_ran(runs, t, prereq_keys, cuts=False) for t in spec.get("prerequisites") or []
+        ]
+        item_failed = any(s == "failed" for s in test_states + ([] if foreign else prereq_states))
         item_selected = bool(tests) and all(s is not None for s in test_states)
         entries = [("target", e) for e in spec.get("targets") or []] + [
             ("guard", e) for e in spec.get("guards") or []

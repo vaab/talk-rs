@@ -25,7 +25,8 @@ Usage: $exname [RUN OPTIONS]
 
 Run the talk-rs performance suite (debug build, feature
 \`perf-counters\`, serial) and print a YAML report on stdout.  The
-report records every test selection run and its outcome.
+report records every test selection run, whether it included ignored
+tests, and its outcome.
 
 With --compare, score a report against perf/targets.yaml and the given
 baseline report, one line per target or guard:
@@ -190,7 +191,7 @@ run_suite() {
         state=passed
         (cd "$base" && cargo test "${cargo_args[@]}" -- "${libtest[@]}" >>"$log" 2>&1) || state=failed
         [ "$state" = passed ] || info "perf: FAILED: $scope${name:+/$name} ${filter:-<all>} (see $log)"
-        printf '%s\t%s\t%s\t%s\n' "$scope" "${name:--}" "${filter:--}" "$state" >>"$out_dir/runs.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$scope" "${name:--}" "${filter:--}" "$ignored" "$state" >>"$out_dir/runs.tsv"
     done < <(selections)
     grep -h '^SKIP' "$log" | sort -u >"$out_dir/skips.txt" || true
     [ ! -s "$out_dir/skips.txt" ] || info "perf: $(wc -l <"$out_dir/skips.txt") skip notice(s) (see report)"
@@ -218,11 +219,12 @@ assemble() {
     echo "host: $(uname -n)"
     echo "build: debug, features perf-counters, serial, repeat $repeat"
     echo "runs:"
-    local scope name filter state line
-    while IFS=$'\t' read -r scope name filter state; do
+    local scope name filter ignored state line
+    while IFS=$'\t' read -r scope name filter ignored state; do
         [ "$name" != - ] || name=""
         [ "$filter" != - ] || filter=""
-        printf '  - {scope: %s, name: "%s", filter: "%s", state: %s}\n' "$scope" "$name" "$filter" "$state"
+        printf '  - {scope: %s, name: "%s", filter: "%s", ignored: "%s", state: %s}\n' \
+            "$scope" "$name" "$filter" "$ignored" "$state"
     done <"$dir/runs.tsv"
     echo "skips:"
     while IFS= read -r line; do

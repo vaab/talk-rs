@@ -1,0 +1,94 @@
+# -*- mode: shell-script -*-
+# Which cuts a run selected.  A selection is covered by a run of a
+# superset of its tests that included ignored tests; with ``--item ID``
+# another item's cuts count only when that item's own selections ran.
+# A cut that was not selected is ``skipped``, never ``failed``.
+
+source "$base/test/perf-report/helpers.sh"
+
+setup() {
+    perf_report_fixtures
+    # item-c's perf test lives under item-a's prerequisite filter, as
+    # ``record::audio::perf_playback`` lives under ``record::``.
+    yq -i '.items["item-c"] = {"cuts": ["c4"],
+        "tests": [{"scope": "lib", "filter": "a_pre::perf_c"}],
+        "targets": [{"cut": "c4", "metric": "ms", "target": "<= 10", "kind": "timing"}]}' \
+        "$test_tmpdir/targets.yaml"
+    yq -i '.results["item-c"].c4.ms = 100' "$test_tmpdir/baseline.yaml"
+}
+
+GOOD='results:
+  item-a:
+    c1: {calls: 1, wait-ms: 400, latency-ms: 250, extra: 2}
+    c2: {invariant: 7}'
+export GOOD
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "%s\n" "$GOOD" | perf_report_candidate "[{scope: lib, filter: \"a::\", state: passed},
+  {scope: lib, filter: \"a_pre::\", state: passed}]"
+perf_report_compare --item item-a --strict
+' "legacy manifest: a prerequisite run does not select a foreign item"
+is errlvl 0
+is err part "ACCEPTED: item-a"
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "%s\n" "$GOOD" | perf_report_candidate "[{scope: lib, filter: \"a::\", ignored: \"1\", state: passed},
+  {scope: lib, filter: \"a_pre::\", ignored: \"0\", state: passed}]"
+perf_report_compare --item item-a --strict
+' "a run without ignored tests does not select a foreign item"
+is errlvl 0
+is err part "ACCEPTED: item-a"
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "%s\n" "$GOOD" | perf_report_candidate "[{scope: lib, filter: \"\", ignored: \"1\", state: passed},
+  {scope: lib, filter: \"a_pre::\", ignored: \"0\", state: passed}]"
+perf_report_compare --item item-a --strict | grep -c item-c
+' "--item: a broad run that covers a foreign item does not select it"
+is err part "ACCEPTED: item-a"
+is out "0" TRIM
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "%s\n" "$GOOD" | perf_report_candidate "[{scope: lib, filter: \"a::\", ignored: \"1\", state: passed},
+  {scope: lib, filter: \"a_pre::\", ignored: \"0\", state: passed},
+  {scope: lib, filter: \"a_pre::perf_c\", ignored: \"1\", state: passed}]"
+perf_report_compare --item item-a --strict
+' "--item: a foreign item explicitly run without its cut is failed"
+is errlvl 1
+is out part "failed item-c c4 ms"
+is err part "REJECTED: item-a"
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "results: {}\n" | perf_report_candidate "[{scope: lib, filter: \"a::\", ignored: \"1\", state: passed},
+  {scope: lib, filter: \"a_pre::\", ignored: \"0\", state: passed}]"
+perf_report_compare --item item-a --strict
+' "the item own cuts still fail closed"
+is errlvl 1
+is out part "failed item-a c1 calls"
+is err part "REJECTED: item-a"
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "%s\n" "$GOOD" | perf_report_candidate "[{scope: lib, filter: \"\", ignored: \"1\", state: passed}]"
+perf_report_compare | grep item-c
+' "no --item: a run with ignored tests covering a cut that produced nothing is failed"
+is out 'failed item-c c4 ms baseline=100 now=- target="<= 10" delta=- kind=timing' TRIM
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "%s\n" "$GOOD" | perf_report_candidate "[{scope: lib, filter: \"\", ignored: \"0\", state: passed}]"
+perf_report_compare | grep item-c
+' "no --item: a run without ignored tests does not select a perf cut"
+is out 'skipped item-c c4 ms baseline=100 now=- target="<= 10" delta=- kind=timing' TRIM
+
+try '
+source "$base/test/perf-report/helpers.sh"
+printf "%s\n" "$GOOD" | perf_report_candidate "[{scope: lib, filter: \"a::\", ignored: \"maybe\", state: passed}]"
+perf_report_compare
+' "an unknown ignored mode is an input error"
+is errlvl 2
+is err part "bad ignored mode"
