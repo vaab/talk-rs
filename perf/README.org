@@ -68,7 +68,7 @@ regressed upload-normalize-once runtime-heartbeat-2min heartbeat-max-gap-ms ...
 |-------------+---------------------------------------------------------------------------------------------------------------------|
 | ~met~       | the criterion holds                                                                                                 |
 | ~not-met~   | the criterion does not hold (and the metric is no worse than baseline)                                              |
-| ~regressed~ | a guard does not hold, or the metric moved in its "worse" direction beyond noise, whether or not its target is met |
+| ~regressed~ | a guard does not hold, or a target metric moved in its "worse" direction beyond noise, whether or not its target is met |
 | ~missing~   | the cut ran but did not record the metric                                                                           |
 | ~failed~    | the cut's test or a prerequisite failed, or it was selected and produced nothing                                   |
 | ~skipped~   | the cut was not selected in this run                                                                                |
@@ -91,7 +91,12 @@ Noise margins for regression: ~work~ 10 %; ~timing~ the largest of
 baseline runs (the ~noise:~ map of ~perf/baseline.yaml~, written by
 ~bin/perf-score --calibrate FIRST SECOND~); an ~==~ target regresses
 when a value the baseline satisfied is lost.  The direction is inferred from the criterion (~<=~ → higher
-is worse) or set with ~worse:~.  Exit status: 0 success; 1 when
+is worse) or set with ~worse:~.  A guard *is* the tolerated bound: while
+it holds it is never ~regressed~ for moving toward that bound — a
+minimum-wait floor (~session-end-ms >= 3000~) far below a 15 s deadline
+baseline, or ~start-capture-started-ms <= 50~ above a 9 ms baseline.
+Only a guard whose explicit ~worse:~ points away from its bound keeps
+the noise check.  Exit status: 0 success; 1 when
 anything is ~regressed~ / ~missing~ / ~failed~ / ~invalid~ (or, with
 ~--strict~, the item is rejected); 2 on malformed input — the targets
 file (entries, criteria, cut lists) and both reports are schema-checked,

@@ -20,7 +20,10 @@ Fail-closed contract (exit 1 unless every rule holds):
 - a guard that does not hold is ``regressed``; any metric that moved in
   its "worse" direction beyond noise is ``regressed`` — independently of
   whether its target is met (exact ``==`` criteria without an explicit
-  direction regress when a value the baseline satisfied is lost);
+  direction regress when a value the baseline satisfied is lost); a
+  guard that holds is never regressed for moving toward its own bound
+  (only an explicit ``worse:`` pointing away from the bound keeps the
+  noise check);
 - with ``--strict --item ID``: every cut of ID ran, every non-advisory
   target of ID is ``met``, every prerequisite of ID passed.
 
@@ -176,6 +179,12 @@ def check_clause(text, now, baseline):
 def worse_direction(entry):
     if entry.get("worse"):
         return entry["worse"]
+    return bound_direction(entry)
+
+
+def bound_direction(entry):
+    """Direction in which the criterion's own bound lies: ``higher``
+    for ``<=`` / savings, ``lower`` for ``>=``, else ``exact``."""
     directions = set()
     for text in clauses(entry["target"]):
         if text.startswith("<") or text.startswith("-"):
@@ -316,6 +325,12 @@ def score(targets_path, report_path, baseline_path, item, strict, color, out, er
                         direction = worse_direction(entry)
                         if role == "guard" and status == "not-met":
                             status = "regressed"
+                        elif role == "guard" and direction == bound_direction(entry):
+                            # A guard IS the tolerated bound: while it
+                            # holds, moving toward it (e.g. a minimum-wait
+                            # floor far below a deadline baseline) is not
+                            # a regression.
+                            pass
                         elif was is not None and direction == "exact":
                             # An exact criterion regresses only by LOSING
                             # a value the baseline already satisfied.

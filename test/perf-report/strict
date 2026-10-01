@@ -68,3 +68,25 @@ perf_report_compare --item item-a --strict
 ' "rejected: another item regressed"
 is errlvl 1
 is out part "regressed item-b c3 flag"
+
+try '
+source "$base/test/perf-report/helpers.sh"
+yq -i ".items[\"item-a\"].guards += [{\"cut\": \"c2\", \"metric\": \"wait-floor-ms\", \"target\": \">= 3000\", \"kind\": \"work\"}]" "$test_tmpdir/targets.yaml"
+yq -i ".results[\"item-a\"].c2[\"wait-floor-ms\"] = 15000" "$test_tmpdir/baseline.yaml"
+printf "%s\n" "$GOOD" | sed "s/invariant: 7}/invariant: 7, wait-floor-ms: 3250}/" | perf_report_candidate "$RUNS"
+perf_report_compare --item item-a --strict
+' "accepted: a held minimum-wait floor far below a deadline baseline"
+is errlvl 0
+is err part "ACCEPTED: item-a"
+is out part 'met item-a c2 wait-floor-ms baseline=15000 now=3250 target=">= 3000" delta=-11750 kind=work'
+
+try '
+source "$base/test/perf-report/helpers.sh"
+yq -i ".items[\"item-a\"].guards += [{\"cut\": \"c2\", \"metric\": \"wait-floor-ms\", \"target\": \">= 3000\", \"kind\": \"work\"}]" "$test_tmpdir/targets.yaml"
+yq -i ".results[\"item-a\"].c2[\"wait-floor-ms\"] = 15000" "$test_tmpdir/baseline.yaml"
+printf "%s\n" "$GOOD" | sed "s/invariant: 7}/invariant: 7, wait-floor-ms: 2900}/" | perf_report_candidate "$RUNS"
+perf_report_compare --item item-a --strict
+' "rejected: the same floor violated"
+is errlvl 1
+is out part 'regressed item-a c2 wait-floor-ms baseline=15000 now=2900 target=">= 3000"'
+is err part "REJECTED: item-a"

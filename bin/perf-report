@@ -34,9 +34,10 @@ baseline report, one line per target or guard:
     <status> <item> <cut> <metric> baseline=<b> now=<v> target="<t>" delta=<d> kind=<k>[ advisory]
 
   met / not-met   the criterion holds / does not hold
-  regressed       a guard does not hold, or the metric moved in its
-                  "worse" direction beyond noise (work: 10 %; timing:
-                  25 % and 20 units), whether or not its target is met;
+  regressed       a guard does not hold, or a target metric moved in
+                  its "worse" direction beyond noise (work: 10 %; timing:
+                  25 % and 20 units), whether or not its target is met
+                  (a guard that holds is its own tolerance);
                   an "==" target regresses when a value the baseline
                   satisfied is lost
   missing         the cut ran but did not record the metric

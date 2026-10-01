@@ -192,3 +192,21 @@ perf_report_compare
 ' "an unparsable clause rejects the targets file"
 is errlvl 2
 is err part "unparsable criterion"
+
+try '
+source "$base/test/perf-report/helpers.sh"
+yq -i ".items[\"item-a\"].guards += [{\"cut\": \"c2\", \"metric\": \"ms\", \"target\": \"<= 50\", \"kind\": \"timing\"},
+  {\"cut\": \"c2\", \"metric\": \"score\", \"target\": \"<= 50\", \"kind\": \"work\", \"worse\": \"lower\"}]" "$test_tmpdir/targets.yaml"
+yq -i ".results[\"item-a\"].c2.ms = 9 | .results[\"item-a\"].c2.score = 40" "$test_tmpdir/baseline.yaml"
+perf_report_candidate "$ALL_RUNS" <<YAML
+results:
+  item-a:
+    c1: {calls: 1, wait-ms: 400, latency-ms: 250, extra: 2}
+    c2: {invariant: 7, ms: 45, score: 10}
+  item-b:
+    c3: {flag: 1}
+YAML
+perf_report_compare | grep -E "c2 (ms|score)"
+' "a held guard moving toward its bound is met; an explicit worse away from it still regresses"
+is out 'met item-a c2 ms baseline=9 now=45 target="<= 50" delta=+36 kind=timing
+regressed item-a c2 score baseline=40 now=10 target="<= 50" delta=-30 kind=work' TRIM
