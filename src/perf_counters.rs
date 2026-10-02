@@ -212,6 +212,13 @@ mod enabled {
         THREAD_COUNTERS.with(|c| c[counter_index(counter)].get())
     }
 
+    /// Add `n` to this thread's mirror of `counter` only.
+    #[cfg(test)]
+    pub fn credit_thread(counter: Counter, n: u64) {
+        let i = counter_index(counter);
+        THREAD_COUNTERS.with(|c| c[i].set(c[i].get() + n));
+    }
+
     pub fn gauge_inc(gauge: Gauge) {
         let i = gauge_index(gauge);
         let now = GAUGES[i].fetch_add(1, Ordering::Relaxed) + 1;
@@ -415,6 +422,47 @@ pub fn snapshot() -> Vec<(String, u64)> {
 #[cfg(test)]
 pub(crate) fn thread_value(counter: Counter) -> u64 {
     enabled::thread_value(counter)
+}
+
+/// Work counted on one thread while it ran a job on behalf of another
+/// (see [`measure_thread_work`]).  Only the crate's unit tests read
+/// per-thread counters, so outside them this is an empty value.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ThreadWork {
+    #[cfg(test)]
+    counts: [u64; Counter::ALL.len()],
+}
+
+/// Run `f` and return the work it counted on the current thread, so a
+/// job moved to a worker thread can be credited back to the thread
+/// that asked for it ([`credit_thread_work`]).  Process-wide counters
+/// are unaffected: they already include the work.
+#[inline(always)]
+pub(crate) fn measure_thread_work<T>(f: impl FnOnce() -> T) -> (T, ThreadWork) {
+    #[cfg(test)]
+    {
+        let before = Counter::ALL.map(enabled::thread_value);
+        let value = f();
+        let mut work = ThreadWork::default();
+        for (i, counter) in Counter::ALL.iter().enumerate() {
+            work.counts[i] = enabled::thread_value(*counter) - before[i];
+        }
+        (value, work)
+    }
+    #[cfg(not(test))]
+    (f(), ThreadWork::default())
+}
+
+/// Add `work`, measured on another thread, to the calling thread's
+/// counters (process-wide totals are left unchanged).
+#[inline(always)]
+pub(crate) fn credit_thread_work(work: ThreadWork) {
+    #[cfg(test)]
+    for (i, counter) in Counter::ALL.iter().enumerate() {
+        enabled::credit_thread(*counter, work.counts[i]);
+    }
+    #[cfg(not(test))]
+    let _ = work;
 }
 
 /// Append one measurement to `$TALK_RS_PERF_OUT/<item>--<cut>.yaml`

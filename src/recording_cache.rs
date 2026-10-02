@@ -92,6 +92,10 @@ pub struct RecordingMetadata {
     pub audio_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_mtime_ns: Option<u128>,
+    /// Optional stronger identity for verified cloud publications. Older sidecars
+    /// retain their original size/mtime-only reading rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_identity: Option<AudioIdentity>,
     /// Optional API metadata captured during transcription.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<CommonMetadata>,
@@ -104,6 +108,28 @@ pub struct RecordingMetadata {
     pub diarization: Option<Vec<CommonDiarizationSegment>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<crate::transcription::chain::Attempt>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioIdentity {
+    dev: u64,
+    ino: u64,
+    ctime: (i64, i64),
+}
+
+impl AudioIdentity {
+    fn matches(&self, metadata: &fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.dev == metadata.dev()
+            && self.ino == metadata.ino()
+            && self.ctime == (metadata.ctime(), metadata.ctime_nsec())
+    }
+}
+
+struct AudioFingerprint {
+    size: u64,
+    mtime_ns: u128,
+    identity: Option<AudioIdentity>,
 }
 
 /// Minimal metadata used for retry/replacement flows.
@@ -344,6 +370,70 @@ impl TranscriptionCache {
         realtime: bool,
         result: &TranscriptionResult,
     ) -> Result<PathBuf, TalkError> {
+        Self::store_with_fingerprint(audio_path, provider, model, realtime, result, None)
+    }
+
+    /// Publish a cloud response only for the source version validated by the caller.
+    /// The sidecar carries that version's fingerprint, never a later path occupant's.
+    pub(crate) async fn store_verified(
+        audio_path: &Path,
+        provider: Provider,
+        model: &str,
+        realtime: bool,
+        result: &TranscriptionResult,
+        source: &crate::transcription::SourceVersion,
+    ) -> Result<PathBuf, TalkError> {
+        let fingerprint = source
+            .mtime
+            .0
+            .try_into()
+            .ok()
+            .and_then(|seconds: u128| seconds.checked_mul(1_000_000_000))
+            .and_then(|seconds| seconds.checked_add(source.mtime.1 as u128))
+            .ok_or_else(|| {
+                TalkError::Config("source modification time is not representable".into())
+            })?;
+        let unchanged = || async {
+            matches!(crate::transcription::SourceVersion::of(audio_path).await,
+                Ok(current) if current == *source)
+        };
+        if !unchanged().await {
+            return Err(TalkError::Transcription(
+                "audio file changed before cache publication".into(),
+            ));
+        }
+        let (dev, ino, ctime) = source.cache_identity();
+        let stored = Self::store_with_fingerprint(
+            audio_path,
+            provider,
+            model,
+            realtime,
+            result,
+            Some(AudioFingerprint {
+                size: source.len,
+                mtime_ns: fingerprint,
+                identity: Some(AudioIdentity { dev, ino, ctime }),
+            }),
+        )?;
+        // Never delete here: another writer may already have replaced this sidecar.
+        // The saved A fingerprint makes this publication unreadable for B even if
+        // the source changes in the final interval.
+        if !unchanged().await {
+            return Err(TalkError::Transcription(
+                "audio file changed during cache publication".into(),
+            ));
+        }
+        Ok(stored)
+    }
+
+    fn store_with_fingerprint(
+        audio_path: &Path,
+        provider: Provider,
+        model: &str,
+        realtime: bool,
+        result: &TranscriptionResult,
+        fingerprint: Option<AudioFingerprint>,
+    ) -> Result<PathBuf, TalkError> {
         let dir = audio_path
             .parent()
             .ok_or_else(|| TalkError::Config("audio path has no parent directory".to_string()))?;
@@ -356,7 +446,7 @@ impl TranscriptionCache {
             .and_then(|n| n.to_str())
             .ok_or_else(|| TalkError::Config("audio path has no filename".to_string()))?;
         let text = crate::transcription::format_transcription_output(result, false);
-        write_metadata_to_dir(
+        write_metadata_to_dir_with_fingerprint(
             dir,
             stem,
             provider,
@@ -367,6 +457,7 @@ impl TranscriptionCache {
             &result.metadata,
             result.segments.as_deref(),
             result.diarization.as_deref(),
+            fingerprint,
         )
     }
 
@@ -391,6 +482,10 @@ impl TranscriptionCache {
             || meta.audio_mtime_ns.is_some_and(|mtime| {
                 audio_meta.modified().ok().and_then(system_time_ns) != Some(mtime)
             })
+            || meta
+                .audio_identity
+                .as_ref()
+                .is_some_and(|identity| !identity.matches(audio_meta))
         {
             return Err(TalkError::Config(format!(
                 "stale sidecar {}",
@@ -1006,7 +1101,52 @@ pub fn write_metadata_to_dir(
     segments: Option<&[crate::transcription::TranscriptSegment]>,
     diarization: Option<&[crate::transcription::DiarizationSegment]>,
 ) -> Result<PathBuf, TalkError> {
-    let audio_meta = fs::metadata(dir.join(audio_filename)).ok();
+    write_metadata_to_dir_with_fingerprint(
+        dir,
+        timestamp,
+        provider,
+        model,
+        realtime,
+        transcript,
+        audio_filename,
+        transcription_metadata,
+        segments,
+        diarization,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_metadata_to_dir_with_fingerprint(
+    dir: &Path,
+    timestamp: &str,
+    provider: Provider,
+    model: &str,
+    realtime: bool,
+    transcript: &str,
+    audio_filename: &str,
+    transcription_metadata: &TranscriptionMetadata,
+    segments: Option<&[crate::transcription::TranscriptSegment]>,
+    diarization: Option<&[crate::transcription::DiarizationSegment]>,
+    fingerprint: Option<AudioFingerprint>,
+) -> Result<PathBuf, TalkError> {
+    let sampled = if fingerprint.is_none() {
+        fs::metadata(dir.join(audio_filename)).ok()
+    } else {
+        None
+    };
+    let fingerprint = fingerprint.or_else(|| {
+        sampled.as_ref().and_then(|meta| {
+            meta.modified()
+                .ok()
+                .and_then(system_time_ns)
+                .map(|mtime_ns| AudioFingerprint {
+                    size: meta.len(),
+                    mtime_ns,
+                    identity: None,
+                })
+        })
+    });
     let meta = RecordingMetadata {
         recording: audio_filename.to_string(),
         provider: provider.to_string(),
@@ -1014,11 +1154,12 @@ pub fn write_metadata_to_dir(
         realtime,
         transcript: transcript.to_string(),
         timestamp: timestamp.to_string(),
-        audio_size: audio_meta.as_ref().map(|meta| meta.len()),
-        audio_mtime_ns: audio_meta
+        audio_size: fingerprint
             .as_ref()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(system_time_ns),
+            .map(|fingerprint| fingerprint.size)
+            .or_else(|| sampled.as_ref().map(|meta| meta.len())),
+        audio_mtime_ns: fingerprint.as_ref().map(|fingerprint| fingerprint.mtime_ns),
+        audio_identity: fingerprint.and_then(|fingerprint| fingerprint.identity),
         metadata: common_metadata_from_transcription(transcription_metadata),
         provider_api: provider_api_metadata_from_transcription(transcription_metadata),
         segments: common_segments_from_result(segments),
@@ -1380,6 +1521,7 @@ mod tests {
             timestamp: "2026-02-18T12-33-45".to_string(),
             audio_size: None,
             audio_mtime_ns: None,
+            audio_identity: None,
             metadata: None,
             provider_api: None,
             segments: None,
@@ -1586,6 +1728,7 @@ mod tests {
             timestamp: "2026-02-18T12-33-45".to_string(),
             audio_size: None,
             audio_mtime_ns: None,
+            audio_identity: None,
             metadata: None,
             provider_api: None,
             segments: None,
@@ -1612,6 +1755,7 @@ mod tests {
             timestamp: "2026-02-18T12-33-45".to_string(),
             audio_size: None,
             audio_mtime_ns: None,
+            audio_identity: None,
             metadata: Some(CommonMetadata {
                 request_latency_ms: Some(123),
                 session_elapsed_ms: None,
@@ -1661,6 +1805,7 @@ mod tests {
             timestamp: "2026-02-18T12-33-45".to_string(),
             audio_size: None,
             audio_mtime_ns: None,
+            audio_identity: None,
             metadata: None,
             provider_api: None,
             diarization: None,
@@ -1687,6 +1832,7 @@ mod tests {
             timestamp: "2026-02-18T12-33-45".to_string(),
             audio_size: None,
             audio_mtime_ns: None,
+            audio_identity: None,
             metadata: None,
             provider_api: None,
             segments: None,

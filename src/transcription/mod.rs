@@ -124,6 +124,414 @@ fn encode_16k_mono_ogg(path: &std::path::Path) -> Result<Vec<u8>, TalkError> {
     Ok(out)
 }
 
+/// The upload payload prepared for one version of an audio file.
+#[derive(Debug)]
+pub(crate) struct PreparedUpload {
+    /// Bytes of the multipart file part, shared by every attempt.
+    pub(crate) bytes: std::sync::Arc<Vec<u8>>,
+    /// File name advertised in the multipart file part.
+    pub(crate) file_name: String,
+}
+
+/// Prepare an on-disk audio file for upload: the same result as
+/// [`normalize_file_for_upload`], with three differences in how the
+/// work is done.
+///
+/// - **Off the async runtime**: the decode/encode runs on tokio's
+///   blocking pool, so a long file never stalls the worker that also
+///   drives timers, sockets and the UI feedback of the caller.
+/// - **Once per file version**: the result is memoised per source
+///   version (see [`UploadPreparations`]), and concurrent callers for
+///   the same version share one preparation.  A fallback chain, or a
+///   picker asking several models, prepares the file once instead of
+///   once per provider.  Replacing or editing the file changes its
+///   version, so the next call prepares the new content.
+/// - **No re-encode of talk-rs's own dictation recordings**: a file
+///   directly in the recordings cache directory whose stream proves it
+///   was written by talk-rs at exactly the upload profile (see
+///   [`is_own_upload_profile_recording`]) is uploaded as is.  Location
+///   or extension alone prove nothing: any other file is normalized,
+///   including recordings written before the encoder settings were
+///   recorded in the stream.
+///
+/// `cancel`, when it fires, abandons the wait (the caller gets a
+/// "cancelled" error); a preparation another caller shares continues
+/// on the blocking pool and stays memoised.
+pub(crate) async fn prepare_file_upload(
+    path: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<std::sync::Arc<PreparedUpload>, TalkError> {
+    static PROCESS: std::sync::OnceLock<UploadPreparations> = std::sync::OnceLock::new();
+    PROCESS
+        .get_or_init(|| UploadPreparations::new(PREPARED_UPLOADS_KEPT))
+        .prepare(path, cancel, prepare_upload_blocking)
+        .await
+}
+
+/// Number of prepared uploads kept for reuse: a chain or a picker
+/// works on one recording at a time; the bound keeps a long-lived
+/// process (picker, recordings browser) from accumulating payloads.
+const PREPARED_UPLOADS_KEPT: usize = 4;
+const PREPARED_UPLOADS_BYTES: usize = 32 * 1024 * 1024;
+
+type PreparedSlot = std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<PreparedUpload>>>;
+
+/// Identity of one version of a source file: its resolved path, inode
+/// and the size and timestamps any rewrite changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceVersion {
+    path: PathBuf,
+    input_path: PathBuf,
+    direct_file: bool,
+    dev: u64,
+    ino: u64,
+    pub(crate) len: u64,
+    pub(crate) mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl SourceVersion {
+    pub(crate) fn cache_identity(&self) -> (u64, u64, (i64, i64)) {
+        (self.dev, self.ino, self.ctime)
+    }
+
+    pub(crate) async fn of(path: &Path) -> Result<Self, TalkError> {
+        use std::os::unix::fs::MetadataExt;
+        let inspect_error = |e: std::io::Error| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                TalkError::Transcription(format!("Audio file not found: {}", path.display()))
+            } else {
+                TalkError::Transcription(format!(
+                    "Failed to inspect audio file {}: {e}",
+                    path.display()
+                ))
+            }
+        };
+        let canonical = tokio::fs::canonicalize(path).await.map_err(inspect_error)?;
+        let meta = tokio::fs::metadata(&canonical)
+            .await
+            .map_err(inspect_error)?;
+        let direct_file = !tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(inspect_error)?
+            .file_type()
+            .is_symlink();
+        let current = tokio::fs::metadata(path).await.map_err(inspect_error)?;
+        if (
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        ) != (
+            current.dev(),
+            current.ino(),
+            current.len(),
+            current.mtime(),
+            current.mtime_nsec(),
+            current.ctime(),
+            current.ctime_nsec(),
+        ) {
+            return Err(TalkError::Transcription(
+                "audio file changed while inspecting it".into(),
+            ));
+        }
+        Ok(Self {
+            path: canonical,
+            input_path: path.to_path_buf(),
+            direct_file,
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+/// Upload preparations memoised per source version, most recent last,
+/// at most `kept` of them.
+pub(crate) struct UploadPreparations {
+    kept: usize,
+    slots: std::sync::Arc<std::sync::Mutex<Vec<(SourceVersion, PreparedSlot)>>>,
+    active: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>>,
+    #[cfg(test)]
+    shared_attachments: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    completed_maintenance: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl UploadPreparations {
+    pub(crate) fn new(kept: usize) -> Self {
+        Self {
+            kept,
+            slots: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            active: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            shared_attachments: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            completed_maintenance: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// The prepared upload of `path`'s current version, produced by
+    /// `prepare` on the blocking pool the first time it is asked for
+    /// (see [`prepare_file_upload`]).  A failed preparation is not
+    /// memoised: the next caller tries again.
+    pub(crate) async fn prepare(
+        &self,
+        path: &Path,
+        cancel: &tokio_util::sync::CancellationToken,
+        prepare: fn(&Path) -> Result<PreparedUpload, TalkError>,
+    ) -> Result<std::sync::Arc<PreparedUpload>, TalkError> {
+        for _ in 0..3 {
+            let version = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(TalkError::Transcription("cancelled by caller".into())),
+                version = SourceVersion::of(path) => version?,
+            };
+            let slot = self.slot(version.clone());
+            let slots = self.slots.clone();
+            let kept = self.kept;
+            #[cfg(test)]
+            let maintenance = self.completed_maintenance.clone();
+            let path = path.to_path_buf();
+            let permit = self
+                .active
+                .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
+                .clone();
+            // The waiter owns initialization independently of its caller.
+            let wait = tokio::spawn(async move {
+                let prepared = slot
+                    .get_or_try_init(|| async move {
+                        let _permit = permit.acquire_owned().await.map_err(|e| {
+                            TalkError::Transcription(format!(
+                                "upload preparation capacity closed: {e}"
+                            ))
+                        })?;
+                        let (prepared, work) = tokio::task::spawn_blocking(move || {
+                            crate::perf_counters::measure_thread_work(|| prepare(&path))
+                        })
+                        .await
+                        .map_err(|e| {
+                            TalkError::Transcription(format!("upload preparation failed: {e}"))
+                        })?;
+                        crate::perf_counters::credit_thread_work(work);
+                        prepared.map(std::sync::Arc::new)
+                    })
+                    .await
+                    .cloned();
+                if prepared.is_ok() {
+                    let mut entries = slots.lock().unwrap_or_else(|p| p.into_inner());
+                    Self::trim_slots(&mut entries, kept);
+                }
+                #[cfg(test)]
+                maintenance.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                prepared
+            });
+            let prepared = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(TalkError::Transcription("cancelled by caller".into())),
+                prepared = wait => prepared
+                    .map_err(|e| TalkError::Transcription(format!("upload preparation failed: {e}")))?,
+            };
+            let prepared = prepared?;
+            let current = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(TalkError::Transcription("cancelled by caller".into())),
+                current = SourceVersion::of(&version.input_path) => current?,
+            };
+            if current == version {
+                return Ok(prepared);
+            }
+            self.remove(&version);
+        }
+        Err(TalkError::Transcription(
+            "audio file changed while it was being prepared".into(),
+        ))
+    }
+
+    /// The slot of `version`, created if needed.  Older versions of the
+    /// same file can never be asked for again and are dropped.
+    fn slot(&self, version: SourceVersion) -> PreparedSlot {
+        let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        slots.retain(|(v, cell)| {
+            v.input_path != version.input_path || *v == version || !cell.initialized()
+        });
+        if let Some(index) = slots.iter().position(|(v, _)| *v == version) {
+            let entry = slots.remove(index);
+            let slot = entry.1.clone();
+            slots.push(entry);
+            #[cfg(test)]
+            self.shared_attachments
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return slot;
+        }
+        let slot = PreparedSlot::default();
+        slots.push((version, slot.clone()));
+        Self::trim_slots(&mut slots, self.kept);
+        slot
+    }
+
+    fn remove(&self, version: &SourceVersion) {
+        let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        slots.retain(|(v, _)| v != version);
+    }
+
+    fn trim_slots(slots: &mut Vec<(SourceVersion, PreparedSlot)>, kept: usize) {
+        let mut completed = slots.iter().filter(|(_, s)| s.initialized()).count();
+        let mut bytes: usize = slots
+            .iter()
+            .filter_map(|(_, s)| s.get())
+            .map(|p| p.bytes.len())
+            .sum();
+        while completed > kept || bytes > PREPARED_UPLOADS_BYTES {
+            let Some(index) = slots.iter().position(|(_, s)| s.initialized()) else {
+                break;
+            };
+            let (_, removed) = slots.remove(index);
+            if let Some(payload) = removed.get() {
+                bytes -= payload.bytes.len();
+            }
+            completed -= 1;
+        }
+    }
+}
+
+/// The blocking part of [`prepare_file_upload`].
+fn prepare_upload_blocking(path: &Path) -> Result<PreparedUpload, TalkError> {
+    let recordings = crate::recording_cache::recordings_dir().ok();
+    prepare_upload_from(path, recordings.as_deref())
+}
+
+/// The local-profile eligibility fast path for files directly in `recordings` (the
+/// dictation cache directory), else [`normalize_file_for_upload`].
+fn prepare_upload_from(
+    path: &Path,
+    recordings: Option<&Path>,
+) -> Result<PreparedUpload, TalkError> {
+    if path.extension().is_some_and(|ext| ext == "ogg")
+        && recordings.is_some_and(|dir| is_directly_in(path, dir))
+    {
+        if let Ok(bytes) = std::fs::read(path) {
+            if is_own_upload_profile_recording(&bytes) {
+                log::info!(
+                    "upload: {} is a talk-rs recording at the upload profile; sending it as is ({} bytes)",
+                    path.display(),
+                    bytes.len()
+                );
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("audio.ogg")
+                    .to_string();
+                return Ok(PreparedUpload {
+                    bytes: std::sync::Arc::new(bytes),
+                    file_name,
+                });
+            }
+        }
+    }
+    let (bytes, file_name) = normalize_file_for_upload(path)?;
+    Ok(PreparedUpload {
+        bytes: std::sync::Arc::new(bytes),
+        file_name,
+    })
+}
+
+/// Whether `path` lies directly in `dir` (symlinks resolved on both
+/// sides).
+fn is_directly_in(path: &Path, dir: &Path) -> bool {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
+    }
+    let (Ok(dir), Ok(parent)) = (
+        dir.canonicalize(),
+        path.parent().unwrap_or(Path::new(".")).canonicalize(),
+    ) else {
+        return false;
+    };
+    parent == dir
+}
+
+/// Whether `bytes` is eligible as one complete Ogg Opus stream at the
+/// writer's upload profile (the one
+/// [`encode_16k_mono_ogg`] would produce: Voip, 16 kHz, mono, same
+/// bitrate), so re-encoding it would only lose quality.
+///
+/// Checks: a single logical stream; a mono, mapping-family-0
+/// `OpusHead` (pre-skip is not checked); `OpusTags` carrying the encoder
+/// profile hint (not authentication of the writer);
+/// every page intact (CRC-checked by the reader); and an
+/// end-of-stream page, so an interrupted recording is still repaired
+/// by the normal path.
+pub(crate) fn is_own_upload_profile_recording(bytes: &[u8]) -> bool {
+    use crate::audio::writer::{encoder_profile, opus_tags_encoder};
+
+    if !ogg_pages_are_contiguous(bytes) {
+        return false;
+    }
+    let upload_profile =
+        encoder_profile(opus::Application::Voip, &crate::config::AudioConfig::new());
+    let mut reader = ogg::reading::PacketReader::new(std::io::Cursor::new(bytes));
+    let packet = |reader: &mut ogg::reading::PacketReader<_>| reader.read_packet().ok().flatten();
+    let Some(head) = packet(&mut reader) else {
+        return false;
+    };
+    let serial = head.stream_serial();
+    let head_ok = head.first_in_stream()
+        && head.data.len() == 19
+        && head.data.starts_with(b"OpusHead")
+        && head.data[8] == 1
+        && head.data[9] == 1
+        && head.data[12..16] == 48_000u32.to_le_bytes()
+        && head.data[16..18] == 0i16.to_le_bytes()
+        && head.data[18] == 0;
+    if !head_ok {
+        return false;
+    }
+    let Some(tags) = packet(&mut reader) else {
+        return false;
+    };
+    if tags.stream_serial() != serial || opus_tags_encoder(&tags.data) != Some(&upload_profile) {
+        return false;
+    }
+    loop {
+        match reader.read_packet() {
+            Ok(Some(p)) if p.stream_serial() != serial => return false,
+            Ok(Some(p)) if p.last_in_stream() => {
+                // Nothing may follow the end of the stream.
+                return matches!(reader.read_packet(), Ok(None));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
+fn ogg_pages_are_contiguous(mut bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    while !bytes.is_empty() {
+        if bytes.len() < 27 || &bytes[..4] != b"OggS" || bytes[4] != 0 {
+            return false;
+        }
+        let segments = bytes[26] as usize;
+        let Some(laces) = bytes.get(27..27 + segments) else {
+            return false;
+        };
+        let size = 27 + segments + laces.iter().map(|&lace| lace as usize).sum::<usize>();
+        let Some(rest) = bytes.get(size..) else {
+            return false;
+        };
+        bytes = rest;
+    }
+    true
+}
+
 /// Per-request wall-clock-timeout policy for one-shot transcription.
 ///
 /// Two distinct call contexts demand opposite defaults:
@@ -885,6 +1293,14 @@ pub async fn transcribe_audio(
         return Err(TalkError::CacheOnly);
     }
 
+    // Capture source identity before taking the model lock; an inspection
+    // error must not leave that lock behind.
+    let upload_source = if provider.is_local() {
+        None
+    } else {
+        Some(SourceVersion::of(audio_path).await?)
+    };
+
     // Acquire per-model lock before calling the API, unless the
     // caller has already registered via `jobs::register_local`
     // (which writes the same lock with a richer payload).
@@ -939,9 +1355,34 @@ pub async fn transcribe_audio(
 
     match api_result {
         Ok(result) => {
-            if let Err(e) =
+            if let Some(source) = &upload_source {
+                if !matches!(SourceVersion::of(audio_path).await, Ok(current) if current == *source)
+                {
+                    release_lock("after source change");
+                    return Err(TalkError::Transcription(
+                        "audio file changed while transcription was in progress".into(),
+                    ));
+                }
+            }
+            let stored = if let Some(source) = &upload_source {
+                TranscriptionCache::store_verified(
+                    audio_path,
+                    provider,
+                    &effective_model,
+                    false,
+                    &result,
+                    source,
+                )
+                .await
+            } else {
                 TranscriptionCache::store(audio_path, provider, &effective_model, false, &result)
-            {
+            };
+            if let Err(e) = stored {
+                if matches!(&e, TalkError::Transcription(message) if message.starts_with("audio file changed"))
+                {
+                    release_lock("after source change during publication");
+                    return Err(e);
+                }
                 log::warn!("failed to cache transcription result: {}", e);
             }
             release_lock("after success");
@@ -1745,6 +2186,809 @@ providers:
     }
 }
 
+/// Specification of upload preparation: the provenance fast path, the
+/// per-version memo, concurrency and cancellation.
+#[cfg(test)]
+mod upload_prepare_tests {
+    use super::*;
+    use crate::audio::{AudioWriter, OggOpusWriter};
+    use crate::perf_counters::{thread_value, Counter};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+
+    fn tone(seconds: f64, rate: u32) -> Vec<i16> {
+        (0..(seconds * rate as f64) as usize)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                ((t * 330.0 * std::f32::consts::TAU).sin() * 9_000.0) as i16
+            })
+            .collect()
+    }
+
+    /// A finalized stream from `writer` carrying `pcm`.
+    fn ogg(mut writer: OggOpusWriter, pcm: &[i16]) -> Vec<u8> {
+        let mut bytes = writer.header().expect("header");
+        bytes.extend(writer.write_pcm(pcm).expect("pcm"));
+        bytes.extend(writer.finalize().expect("finalize"));
+        bytes
+    }
+
+    /// What dictation writes into the recordings cache.
+    fn dictation_ogg(seconds: f64) -> Vec<u8> {
+        ogg(
+            OggOpusWriter::new(crate::config::AudioConfig::new()).expect("writer"),
+            &tone(seconds, 16_000),
+        )
+    }
+
+    /// What `talk-rs record` writes (48 kHz, Audio application).
+    fn recording_ogg(seconds: f64) -> Vec<u8> {
+        let config = crate::config::AudioConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            bitrate: 64_000,
+        };
+        ogg(
+            OggOpusWriter::new_for_recording(config).expect("writer"),
+            &tone(seconds, 48_000),
+        )
+    }
+
+    /// Prepare `name` (holding `bytes`) placed directly in a stand-in
+    /// recordings directory, or next to it; returns the upload and the
+    /// re-encodes it took.
+    fn prepare_placed(bytes: &[u8], in_recordings: bool) -> (PreparedUpload, u64) {
+        let root = tempfile::tempdir().expect("tmp");
+        let recordings = root.path().join("recordings");
+        std::fs::create_dir_all(&recordings).expect("dir");
+        let dir = if in_recordings {
+            recordings.clone()
+        } else {
+            root.path().to_path_buf()
+        };
+        let path = dir.join("2026-10-01T09-00-00+0200.ogg");
+        std::fs::write(&path, bytes).expect("write");
+        let encodes = thread_value(Counter::UploadEncodes);
+        let prepared = prepare_upload_from(&path, Some(&recordings)).expect("prepare");
+        (prepared, thread_value(Counter::UploadEncodes) - encodes)
+    }
+
+    #[test]
+    fn own_dictation_recording_is_uploaded_as_is() {
+        let original = dictation_ogg(1.5);
+        let (prepared, encodes) = prepare_placed(&original, true);
+        assert_eq!(encodes, 0);
+        assert_eq!(*prepared.bytes, original);
+        assert_eq!(prepared.file_name, "2026-10-01T09-00-00+0200.ogg");
+    }
+
+    #[test]
+    fn upload_profile_recording_outside_the_cache_is_normalized() {
+        let original = dictation_ogg(1.5);
+        let (prepared, encodes) = prepare_placed(&original, false);
+        assert_eq!(encodes, 1);
+        assert_ne!(*prepared.bytes, original);
+    }
+
+    #[test]
+    fn other_profile_in_the_cache_is_normalized() {
+        let original = recording_ogg(1.5);
+        let (prepared, encodes) = prepare_placed(&original, true);
+        assert_eq!(encodes, 1);
+        assert_ne!(*prepared.bytes, original);
+        assert!(is_own_upload_profile_recording(&prepared.bytes));
+    }
+
+    #[test]
+    fn unfinished_or_damaged_recording_in_the_cache_is_normalized() {
+        let original = dictation_ogg(1.5);
+        // Interrupted recording: no end-of-stream page.
+        let last_page = original
+            .windows(4)
+            .rposition(|w| w == b"OggS")
+            .expect("pages");
+        let (prepared, encodes) = prepare_placed(&original[..last_page], true);
+        assert_eq!(encodes, 1);
+        assert_ne!(*prepared.bytes, &original[..last_page]);
+        // One flipped byte in the audio: page checksum fails.
+        let mut damaged = original.clone();
+        let mid = damaged.len() / 2;
+        damaged[mid] ^= 0x55;
+        assert!(!is_own_upload_profile_recording(&damaged));
+        // Something appended after the end of the stream.
+        let mut chained = original.clone();
+        chained.extend_from_slice(&dictation_ogg(0.5));
+        assert!(!is_own_upload_profile_recording(&chained));
+        assert!(is_own_upload_profile_recording(&original));
+        let mut junk = original.clone();
+        junk.extend_from_slice(b"unframed trailing data");
+        assert!(!is_own_upload_profile_recording(&junk));
+    }
+
+    #[test]
+    fn remuxed_header_and_foreign_serial_cannot_claim_the_upload_profile() {
+        use ogg::{PacketWriteEndInfo, PacketWriter};
+        let original = dictation_ogg(0.1);
+        for changed in [Some(8), Some(9), Some(12), Some(16), Some(18), None] {
+            let mut reader = ogg::reading::PacketReader::new(std::io::Cursor::new(&original));
+            let mut writer = PacketWriter::new(Vec::new());
+            let mut index = 0;
+            while let Some(mut packet) = reader.read_packet().expect("packet") {
+                if index == 0 {
+                    if let Some(byte) = changed {
+                        packet.data[byte] ^= 1;
+                    }
+                }
+                let serial = if changed.is_none() && index > 1 {
+                    43
+                } else {
+                    42
+                };
+                let end = if packet.last_in_stream() {
+                    PacketWriteEndInfo::EndStream
+                } else {
+                    PacketWriteEndInfo::EndPage
+                };
+                let granule = packet.absgp_page();
+                writer
+                    .write_packet(packet.data, serial, end, granule)
+                    .expect("write");
+                index += 1;
+            }
+            assert!(
+                !is_own_upload_profile_recording(writer.inner_mut()),
+                "changed {changed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ogg_bytes_are_never_own_recordings() {
+        assert!(!is_own_upload_profile_recording(b""));
+        assert!(!is_own_upload_profile_recording(b"not really audio"));
+        let (prepared, _) = prepare_placed(b"not really audio", true);
+        // Undecodable: original bytes under the original name.
+        assert_eq!(*prepared.bytes, b"not really audio");
+        assert_eq!(prepared.file_name, "2026-10-01T09-00-00+0200.ogg");
+    }
+
+    #[test]
+    fn symlinked_cache_parent_keeps_the_fast_path_but_file_alias_does_not() {
+        let root = tempfile::tempdir().expect("tmp");
+        let recordings = root.path().join("recordings");
+        std::fs::create_dir(&recordings).expect("recordings");
+        let link = root.path().join("cache-link");
+        std::os::unix::fs::symlink(&recordings, &link).expect("link");
+        let file = link.join("voice.ogg");
+        let bytes = dictation_ogg(0.1);
+        std::fs::write(&file, &bytes).expect("write");
+        assert_eq!(
+            *prepare_upload_from(&file, Some(&recordings))
+                .expect("fast")
+                .bytes,
+            bytes
+        );
+
+        let alias = root.path().join("alias.ogg");
+        std::os::unix::fs::symlink(&file, &alias).expect("alias");
+        assert_ne!(
+            *prepare_upload_from(&alias, Some(&recordings))
+                .expect("normalize")
+                .bytes,
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn aliases_keep_their_own_decode_and_upload_names_in_both_orders() {
+        let root = tempfile::tempdir().expect("tmp");
+        let target = root.path().join("source.wav");
+        let mut writer = crate::audio::WavWriter::new(crate::config::AudioConfig::new());
+        let mut wav = writer.header().expect("header");
+        wav.extend(writer.write_pcm(&[1000; 320]).expect("pcm"));
+        let header = writer.finalize().expect("finalize");
+        wav[..header.len()].copy_from_slice(&header);
+        std::fs::write(&target, &wav).expect("write");
+        let spoken = root.path().join("spoken.wav");
+        let opaque = root.path().join("opaque.bin");
+        std::os::unix::fs::symlink(&target, &spoken).expect("link");
+        std::os::unix::fs::symlink(&target, &opaque).expect("link");
+        for raw_first in [true, false] {
+            let memo = UploadPreparations::new(2);
+            let cancel = CancellationToken::new();
+            let paths = if raw_first {
+                [&opaque, &spoken]
+            } else {
+                [&spoken, &opaque]
+            };
+            for path in paths {
+                let prepared = memo
+                    .prepare(path, &cancel, prepare_upload_blocking)
+                    .await
+                    .expect("prepared");
+                if path == &opaque {
+                    assert_eq!(prepared.file_name, "opaque.bin");
+                    assert_eq!(*prepared.bytes, wav);
+                } else {
+                    assert_eq!(prepared.file_name, "spoken.ogg");
+                    assert!(is_own_upload_profile_recording(&prepared.bytes));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_during_preparation_returns_current_bytes() {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn prepare(path: &Path) -> Result<PreparedUpload, TalkError> {
+            let bytes = std::fs::read(path)?;
+            if RUNS.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::fs::write(path, b"second").map_err(TalkError::Io)?;
+            }
+            Ok(PreparedUpload {
+                bytes: std::sync::Arc::new(bytes),
+                file_name: "audio.bin".into(),
+            })
+        }
+        let root = tempfile::tempdir().expect("tmp");
+        let path = root.path().join("audio.bin");
+        std::fs::write(&path, b"first").expect("write");
+        let memo = UploadPreparations::new(2);
+        let prepared = memo
+            .prepare(&path, &CancellationToken::new(), prepare)
+            .await
+            .expect("prepared");
+        assert_eq!(&*prepared.bytes, b"second");
+        assert_eq!(RUNS.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_does_not_schedule_preparation() {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn prepare(_: &Path) -> Result<PreparedUpload, TalkError> {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            Err(TalkError::Transcription("unexpected work".into()))
+        }
+        let root = tempfile::tempdir().expect("tmp");
+        let path = root.path().join("audio.bin");
+        std::fs::write(&path, b"audio").expect("write");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let memo = UploadPreparations::new(2);
+        let err = memo
+            .prepare(&path, &cancel, prepare)
+            .await
+            .expect_err("cancelled");
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert_eq!(RUNS.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Memo ──────────────────────────────────────────────────────
+
+    /// A preparation that records each run and takes `DELAY`.
+    macro_rules! counting_prepare {
+        ($runs:ident, $delay_ms:expr) => {{
+            static $runs: AtomicUsize = AtomicUsize::new(0);
+            fn prepare(path: &Path) -> Result<PreparedUpload, TalkError> {
+                $runs.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis($delay_ms));
+                Ok(PreparedUpload {
+                    bytes: std::sync::Arc::new(std::fs::read(path)?),
+                    file_name: "x.ogg".into(),
+                })
+            }
+            (
+                &$runs,
+                prepare as fn(&Path) -> Result<PreparedUpload, TalkError>,
+            )
+        }};
+    }
+
+    #[tokio::test]
+    async fn same_version_is_prepared_once_and_a_new_version_again() {
+        let (runs, prepare) = counting_prepare!(RUNS, 0);
+        let memo = UploadPreparations::new(2);
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("memo.ogg");
+        std::fs::write(&path, b"first").expect("write");
+        let cancel = CancellationToken::new();
+        let a = memo.prepare(&path, &cancel, prepare).await.expect("a");
+        let b = memo.prepare(&path, &cancel, prepare).await.expect("b");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        assert_eq!(*a.bytes, b"first");
+
+        // Replaced by a new file of the same size: new inode/ctime.
+        let tmp = dir.path().join("memo.tmp");
+        std::fs::write(&tmp, b"secnd").expect("write");
+        std::fs::rename(&tmp, &path).expect("rename");
+        let c = memo.prepare(&path, &cancel, prepare).await.expect("c");
+        assert_eq!(*c.bytes, b"secnd");
+        // Rewritten in place.
+        std::fs::write(&path, b"third, longer").expect("write");
+        let d = memo.prepare(&path, &cancel, prepare).await.expect("d");
+        assert_eq!(*d.bytes, b"third, longer");
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+        // Only the current version of a file is kept.
+        assert_eq!(memo.slots.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn memo_is_bounded_and_keeps_aliases_distinct() {
+        let (runs, prepare) = counting_prepare!(RUNS, 0);
+        let memo = UploadPreparations::new(2);
+        let dir = tempfile::tempdir().expect("tmp");
+        let cancel = CancellationToken::new();
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let p = dir.path().join(format!("{i}.ogg"));
+                std::fs::write(&p, format!("audio {i}")).expect("write");
+                p
+            })
+            .collect();
+        let link = dir.path().join("link.ogg");
+        std::os::unix::fs::symlink(&paths[0], &link).expect("symlink");
+        memo.prepare(&paths[0], &cancel, prepare).await.expect("0");
+        memo.prepare(&link, &cancel, prepare).await.expect("link");
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        for p in &paths[1..] {
+            memo.prepare(p, &cancel, prepare).await.expect("p");
+        }
+        assert_eq!(memo.slots.lock().expect("lock").len(), 2);
+        // The oldest was evicted, so it is prepared again.
+        memo.prepare(&paths[0], &cancel, prepare)
+            .await
+            .expect("0 again");
+        assert_eq!(runs.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn oversized_raw_payload_is_delivered_but_not_retained() {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn prepare(_: &Path) -> Result<PreparedUpload, TalkError> {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(PreparedUpload {
+                bytes: std::sync::Arc::new(vec![1; PREPARED_UPLOADS_BYTES + 1]),
+                file_name: "raw.bin".into(),
+            })
+        }
+        let root = tempfile::tempdir().expect("tmp");
+        let path = root.path().join("raw.bin");
+        std::fs::write(&path, b"source").expect("write");
+        let memo = UploadPreparations::new(2);
+        for expected in 1..=2 {
+            let prepared = memo
+                .prepare(&path, &CancellationToken::new(), prepare)
+                .await
+                .expect("payload");
+            assert_eq!(prepared.bytes.len(), PREPARED_UPLOADS_BYTES + 1);
+            assert_eq!(RUNS.load(Ordering::SeqCst), expected);
+            assert!(memo.slots.lock().expect("lock").is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_preparations_trim_on_detached_completion() {
+        use std::sync::{Condvar, Mutex};
+        static GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+        static COMPLETED: AtomicUsize = AtomicUsize::new(0);
+        fn prepare(_: &Path) -> Result<PreparedUpload, TalkError> {
+            let mut released = GATE.0.lock().expect("gate");
+            while !*released {
+                released = GATE.1.wait(released).expect("gate wait");
+            }
+            drop(released);
+            let bytes = std::sync::Arc::new(vec![0; 4 * 1024 * 1024]);
+            COMPLETED.fetch_add(1, Ordering::SeqCst);
+            Ok(PreparedUpload {
+                bytes,
+                file_name: "audio.bin".into(),
+            })
+        }
+
+        let root = tempfile::tempdir().expect("tmp");
+        let memo = std::sync::Arc::new(UploadPreparations::new(PREPARED_UPLOADS_KEPT));
+        let mut callers = Vec::new();
+        let mut tokens = Vec::new();
+        for n in 0..10 {
+            let path = root.path().join(format!("{n}.bin"));
+            std::fs::write(&path, b"source").expect("write");
+            let token = CancellationToken::new();
+            tokens.push(token.clone());
+            let owner = memo.clone();
+            callers.push(tokio::spawn(async move {
+                owner.prepare(&path, &token, prepare).await
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while memo.slots.lock().expect("slots").len() != 10 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("registered");
+        for token in tokens {
+            token.cancel();
+        }
+        for caller in callers {
+            assert!(caller.await.expect("caller").is_err());
+        }
+        *GATE.0.lock().expect("gate") = true;
+        GATE.1.notify_all();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while memo.completed_maintenance.load(Ordering::SeqCst) != 10 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed");
+        assert_eq!(COMPLETED.load(Ordering::SeqCst), 10);
+        let slots = memo.slots.lock().expect("slots");
+        let entries = slots.iter().filter(|(_, slot)| slot.initialized()).count();
+        let bytes: usize = slots
+            .iter()
+            .filter_map(|(_, slot)| slot.get())
+            .map(|upload| upload.bytes.len())
+            .sum();
+        assert!(
+            entries <= PREPARED_UPLOADS_KEPT,
+            "retained {entries} entries"
+        );
+        assert!(bytes <= PREPARED_UPLOADS_BYTES, "retained {bytes} bytes");
+    }
+
+    #[tokio::test]
+    async fn publication_does_not_stamp_old_response_with_replacement_identity() {
+        let root = tempfile::tempdir().expect("tmp");
+        let path = root.path().join("recording.wav");
+        std::fs::write(&path, b"audio A").expect("write A");
+        let uploaded = SourceVersion::of(&path).await.expect("version A");
+        let result = TranscriptionResult {
+            text: "text for A".into(),
+            ..Default::default()
+        };
+        assert_eq!(SourceVersion::of(&path).await.expect("checked A"), uploaded);
+        let replacement = root.path().join("replacement.wav");
+        std::fs::write(&replacement, b"different replacement audio B").expect("write B");
+        std::fs::rename(&replacement, &path).expect("replace");
+        assert!(crate::recording_cache::TranscriptionCache::store_verified(
+            &path,
+            Provider::OpenAI,
+            "gpt-transcribe",
+            false,
+            &result,
+            &uploaded,
+        )
+        .await
+        .is_err());
+        assert!(
+            crate::recording_cache::TranscriptionCache::get(
+                &path,
+                Provider::OpenAI,
+                "gpt-transcribe",
+            )
+            .is_none(),
+            "replacement B must not receive A's transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_sidecar_rejects_replacement_with_matching_size_and_mtime() {
+        let root = tempfile::tempdir().expect("tmp");
+        let path = root.path().join("recording.wav");
+        std::fs::write(&path, b"audio A").expect("write A");
+        let uploaded = SourceVersion::of(&path).await.expect("version A");
+        let modified = std::fs::metadata(&path)
+            .expect("metadata A")
+            .modified()
+            .expect("mtime A");
+        let result = TranscriptionResult {
+            text: "text for A".into(),
+            ..Default::default()
+        };
+        crate::recording_cache::TranscriptionCache::store_verified(
+            &path,
+            Provider::OpenAI,
+            "gpt-transcribe",
+            false,
+            &result,
+            &uploaded,
+        )
+        .await
+        .expect("store A");
+        assert_eq!(
+            crate::recording_cache::TranscriptionCache::get(
+                &path,
+                Provider::OpenAI,
+                "gpt-transcribe",
+            )
+            .expect("A sidecar")
+            .text,
+            "text for A"
+        );
+        let replacement = root.path().join("replacement.wav");
+        std::fs::write(&replacement, b"audio B").expect("write B");
+        std::fs::File::open(&replacement)
+            .expect("open B")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("match mtime");
+        std::fs::rename(&replacement, &path).expect("replace");
+        assert!(
+            crate::recording_cache::TranscriptionCache::get(
+                &path,
+                Provider::OpenAI,
+                "gpt-transcribe",
+            )
+            .is_none(),
+            "matching size/mtime must not authenticate a different inode"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn active_slots_remain_shared_under_eviction_pressure() {
+        use std::collections::HashMap;
+        use std::sync::{mpsc, Mutex, OnceLock};
+        type Gate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+        static GATES: OnceLock<Mutex<HashMap<PathBuf, Gate>>> = OnceLock::new();
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn prepare(path: &Path) -> Result<PreparedUpload, TalkError> {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            let gate = GATES
+                .get()
+                .expect("gates")
+                .lock()
+                .expect("lock")
+                .remove(path);
+            if let Some((entered, release)) = gate {
+                entered.send(()).expect("entered");
+                release.recv().expect("release");
+            }
+            Ok(PreparedUpload {
+                bytes: std::sync::Arc::new(std::fs::read(path)?),
+                file_name: "audio.bin".into(),
+            })
+        }
+        let root = tempfile::tempdir().expect("tmp");
+        let memo = std::sync::Arc::new(UploadPreparations::new(2));
+        let mut jobs = Vec::new();
+        let mut gates = Vec::new();
+        for n in 0..3 {
+            let path = root.path().join(format!("{n}.bin"));
+            std::fs::write(&path, b"audio").expect("write");
+            let (entered, ready) = mpsc::channel();
+            let (release, waiting) = mpsc::channel();
+            GATES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .expect("lock")
+                .insert(path.clone(), (entered, waiting));
+            gates.push((ready, release));
+            let memo = memo.clone();
+            jobs.push(tokio::spawn(async move {
+                memo.prepare(&path, &CancellationToken::new(), prepare)
+                    .await
+            }));
+        }
+        for (ready, _) in &gates {
+            tokio::task::block_in_place(|| ready.recv().expect("started"));
+        }
+        let attached_before = memo.shared_attachments.load(Ordering::SeqCst);
+        let first = root.path().join("0.bin");
+        let duplicate = {
+            let memo = memo.clone();
+            tokio::spawn(async move {
+                memo.prepare(&first, &CancellationToken::new(), prepare)
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while memo.shared_attachments.load(Ordering::SeqCst) == attached_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("duplicate attached to existing slot");
+        for (_, release) in gates {
+            release.send(()).expect("release");
+        }
+        let first = jobs.remove(0).await.expect("join").expect("first");
+        let same = duplicate.await.expect("join").expect("same");
+        assert!(std::sync::Arc::ptr_eq(&first, &same));
+        for job in jobs {
+            job.await.expect("join").expect("prepared");
+        }
+        assert_eq!(RUNS.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_provider_waiters_do_not_post_or_abort_a_survivor() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let root = tempfile::tempdir().expect("tmp");
+        let source = root.path().join("recording.wav");
+        let mut writer = crate::audio::WavWriter::new(crate::config::AudioConfig::new());
+        let mut wav = writer.header().expect("header");
+        wav.extend(writer.write_pcm(&vec![1000; 16_000 * 30]).expect("pcm"));
+        let header = writer.finalize().expect("finalize");
+        wav[..header.len()].copy_from_slice(&header);
+        std::fs::write(&source, wav).expect("write");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "ok"})),
+            )
+            .mount(&server)
+            .await;
+        let mistral_config = crate::config::MistralConfig {
+            api_key: "test".into(),
+            url: Some(server.uri()),
+            model: "voxtral-mini-2602".into(),
+            context_bias: None,
+            tts_model: "voxtral-mini-tts-latest".into(),
+            tts_voice: None,
+            tts_voices: None,
+        };
+        let openai_config = crate::config::OpenAIConfig {
+            api_key: "test".into(),
+            url: Some(server.uri()),
+            model: "gpt-transcribe".into(),
+            realtime_model: "gpt-live-transcribe".into(),
+            prompt: None,
+            keywords: None,
+            languages: None,
+            realtime_delay: None,
+        };
+        let first_cancel = CancellationToken::new();
+        let second_cancel = CancellationToken::new();
+        let mut first =
+            MistralOneShotTranscriber::new(mistral_config.clone(), false).expect("mistral");
+        first.set_cancel_token(first_cancel.clone());
+        let mut second = OpenAIOneShotTranscriber::new(openai_config).expect("openai");
+        second.set_cancel_token(second_cancel.clone());
+        let first_path = source.clone();
+        let a = tokio::spawn(async move {
+            first
+                .fetch_transcription(TranscriptionBody::File(first_path))
+                .await
+        });
+        let second_path = source.clone();
+        let b = tokio::spawn(async move {
+            second
+                .fetch_transcription(TranscriptionBody::File(second_path))
+                .await
+        });
+        let survivor = MistralOneShotTranscriber::new(mistral_config, false).expect("survivor");
+        let c = tokio::spawn(async move {
+            survivor
+                .fetch_transcription(TranscriptionBody::File(source))
+                .await
+        });
+        tokio::task::yield_now().await;
+        first_cancel.cancel();
+        second_cancel.cancel();
+        for waiter in [a, b] {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("prompt cancel")
+                .expect("join");
+            assert!(result
+                .expect_err("cancelled")
+                .to_string()
+                .contains("cancelled"));
+        }
+        assert_eq!(c.await.expect("join").expect("result").text, "ok");
+        assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_callers_share_one_preparation_and_survive_a_cancelled_one() {
+        let (runs, prepare) = counting_prepare!(RUNS, 300);
+        let memo = std::sync::Arc::new(UploadPreparations::new(2));
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = std::sync::Arc::new(dir.path().join("memo.ogg"));
+        std::fs::write(&*path, b"audio").expect("write");
+
+        // The first caller starts the preparation, then is cancelled.
+        let first_cancel = CancellationToken::new();
+        let first = {
+            let (memo, path, cancel) = (memo.clone(), path.clone(), first_cancel.clone());
+            tokio::spawn(async move { memo.prepare(&path, &cancel, prepare).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let others: Vec<_> = (0..3)
+            .map(|_| {
+                let (memo, path) = (memo.clone(), path.clone());
+                tokio::spawn(async move {
+                    memo.prepare(&path, &CancellationToken::new(), prepare)
+                        .await
+                })
+            })
+            .collect();
+        first_cancel.cancel();
+        let cancelled = first.await.expect("join");
+        assert!(
+            matches!(&cancelled, Err(TalkError::Transcription(m)) if m.contains("cancelled")),
+            "{cancelled:?}"
+        );
+        for other in others {
+            let prepared = other.await.expect("join").expect("prepared");
+            assert_eq!(*prepared.bytes, b"audio");
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_preparation_is_not_memoised_and_missing_file_errors() {
+        static FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn prepare(_: &Path) -> Result<PreparedUpload, TalkError> {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            if FAIL.swap(false, Ordering::SeqCst) {
+                return Err(TalkError::Transcription("read failed".into()));
+            }
+            Ok(PreparedUpload {
+                bytes: std::sync::Arc::new(b"ok".to_vec()),
+                file_name: "x.ogg".into(),
+            })
+        }
+        let memo = UploadPreparations::new(2);
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("memo.ogg");
+        std::fs::write(&path, b"audio").expect("write");
+        let cancel = CancellationToken::new();
+        assert!(memo.prepare(&path, &cancel, prepare).await.is_err());
+        let ok = memo.prepare(&path, &cancel, prepare).await.expect("retry");
+        assert_eq!(*ok.bytes, b"ok");
+        assert_eq!(RUNS.load(Ordering::SeqCst), 2);
+
+        let err = memo
+            .prepare(&dir.path().join("absent.ogg"), &cancel, prepare)
+            .await
+            .expect_err("missing");
+        assert!(err.to_string().contains("not found"), "{err}");
+        assert_eq!(RUNS.load(Ordering::SeqCst), 2);
+    }
+
+    /// The preparation runs on the blocking pool: a heartbeat on a
+    /// single-worker runtime keeps ticking while a slow one runs.
+    #[test]
+    fn preparation_does_not_block_the_runtime_worker() {
+        let (_, prepare) = counting_prepare!(RUNS, 800);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let max_gap = runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tmp");
+            let path = dir.path().join("memo.ogg");
+            std::fs::write(&path, b"audio").expect("write");
+            let memo = std::sync::Arc::new(UploadPreparations::new(2));
+            let task = tokio::spawn(async move {
+                memo.prepare(&path, &CancellationToken::new(), prepare)
+                    .await
+                    .map(|_| ())
+            });
+            let mut last = std::time::Instant::now();
+            let mut max_gap = std::time::Duration::ZERO;
+            while !task.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let now = std::time::Instant::now();
+                max_gap = max_gap.max(now - last);
+                last = now;
+            }
+            task.await.expect("join").expect("prepared");
+            max_gap
+        });
+        assert!(
+            max_gap < std::time::Duration::from_millis(400),
+            "worker blocked for {max_gap:?}"
+        );
+    }
+}
+
 /// Performance harness, item `upload-normalize-once`: the upload
 /// preparation contract a memoised / provenance-aware implementation
 /// must keep, measured through the public `transcribe_audio` path
@@ -1979,6 +3223,56 @@ mod perf_upload_prepare {
                 (thread_value(Counter::UploadEncodes) - encodes) as f64,
             )],
         );
+    }
+
+    #[tokio::test]
+    async fn changed_source_during_http_is_not_cached_as_the_new_recording() {
+        let _iso = isolate();
+        let dir = tempfile::tempdir().expect("tmp");
+        let input = dir.path().join("moving.wav");
+        write_stereo_wav(&input, &speech(0.1, 48_000, 0.0));
+        let replacement = dir.path().join("replacement.wav");
+        write_stereo_wav(&replacement, &speech(0.2, 48_000, 1.0));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "voxtral-mini-2602"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(move |_: &wiremock::Request| {
+                std::fs::rename(&replacement, &input).expect("replace after upload");
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "old audio"}))
+            })
+            .mount(&server)
+            .await;
+        let audio = dir.path().join("moving.wav");
+        let sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink> =
+            std::sync::Arc::new(crate::telemetry::NoOpSink);
+        let err = transcribe_audio(
+            &audio,
+            &config(dir.path(), &server.uri()),
+            Provider::Mistral,
+            None,
+            false,
+            TranscribeOptions {
+                allow_api: true,
+                ..TranscribeOptions::default()
+            },
+            &sink,
+        )
+        .await
+        .expect_err("replaced audio must not be attributed to current file");
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert!(crate::recording_cache::TranscriptionCache::get(
+            &audio,
+            Provider::Mistral,
+            "voxtral-mini-2602"
+        )
+        .is_none());
     }
 
     /// A 48 kHz recording-profile OGG sitting where a dictation cache

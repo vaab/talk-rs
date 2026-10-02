@@ -259,6 +259,16 @@ transcription: audio sent to the providers is always downsampled to
 16 kHz mono internally (both Voxtral and Whisper operate at 16 kHz),
 so these knobs do not affect transcription accuracy or upload size.
 
+A file is converted to that upload form (16 kHz mono Opus) once while
+its version remains in the process-local preparation cache: a fallback
+chain or the picker can reuse the converted audio for every provider it
+asks.  A changed or evicted file is converted again.  Newly written
+dictation recordings in the cache at exactly that form are uploaded
+unchanged; older unmarked recordings are converted once.  The writer
+records its encoder settings in a standard ~TALK_RS_ENCODER~ OpusTags
+comment, which players ignore.  This metadata is an eligibility hint
+for locally managed cache files, not an authenticity guarantee.
+
 *** Named transcription fallback chains
 
 Add named chains under ~transcription.chains~; ~default_chain~ selects one

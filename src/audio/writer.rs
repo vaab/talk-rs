@@ -43,6 +43,68 @@ fn rand_serial() -> u32 {
         .unwrap_or(42)
 }
 
+/// Name of the `OpusTags` comment in which [`OggOpusWriter`] records
+/// the encoder settings that produced the stream.
+const ENCODER_COMMENT: &str = "TALK_RS_ENCODER";
+
+/// Encoder settings as recorded in the `TALK_RS_ENCODER` comment:
+/// `v1/<application>/<rate>/<channels>/<bitrate>`.
+pub(crate) fn encoder_profile(application: opus::Application, config: &AudioConfig) -> String {
+    let application = match application {
+        opus::Application::Voip => "voip",
+        opus::Application::Audio => "audio",
+        opus::Application::LowDelay => "lowdelay",
+    };
+    format!(
+        "v1/{application}/{}/{}/{}",
+        config.sample_rate, config.channels, config.bitrate
+    )
+}
+
+/// The encoder profile (see [`encoder_profile`]) recorded in an
+/// `OpusTags` packet written by [`OggOpusWriter`]; `None` for streams
+/// written by anything else.
+///
+/// The vendor string must be ours too: a tool that re-encodes a
+/// stream rewrites the vendor, so a comment merely copied along with
+/// the tags is not mistaken for proof of the encoder settings.
+pub(crate) fn opus_tags_encoder(tags: &[u8]) -> Option<&str> {
+    let mut rest = tags.strip_prefix(b"OpusTags")?;
+    if take_field(&mut rest)? != OGG_OPUS_VENDOR {
+        return None;
+    }
+    let count = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?);
+    rest = &rest[4..];
+    let mut profile = None;
+    for _ in 0..count {
+        let comment = take_field(&mut rest)?;
+        if let Some(value) = comment
+            .strip_prefix(ENCODER_COMMENT.as_bytes())
+            .and_then(|v| v.strip_prefix(b"="))
+        {
+            if profile.is_some() {
+                return None;
+            }
+            profile = Some(std::str::from_utf8(value).ok()?);
+        }
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    profile
+}
+
+/// Split one length-prefixed (little-endian `u32`) field off `rest`.
+fn take_field<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let value = rest.get(4..4usize.checked_add(len)?)?;
+    *rest = &rest[4 + len..];
+    Some(value)
+}
+
+/// Vendor string of every stream [`OggOpusWriter`] writes.
+const OGG_OPUS_VENDOR: &[u8] = b"talk-rs";
+
 /// OGG/Opus container writer.
 ///
 /// Encodes PCM input with Opus and wraps the output in OGG pages
@@ -68,6 +130,9 @@ pub struct OggOpusWriter {
     granule_rate_ratio: f64,
     /// Whether header has been written.
     header_written: bool,
+    /// Encoder settings recorded in the `OpusTags` header
+    /// ([`encoder_profile`]).
+    profile: String,
     /// Test-only instrumentation: running total of `i16` samples
     /// relocated by front-drains of `pcm_buffer` inside `write_pcm`.
     ///
@@ -148,6 +213,7 @@ impl OggOpusWriter {
             input_frames: 0,
             granule_rate_ratio: 48000.0 / config.sample_rate as f64,
             header_written: false,
+            profile: encoder_profile(application, &config),
             #[cfg(test)]
             tail_samples_relocated: 0,
         })
@@ -174,10 +240,15 @@ impl AudioWriter for OggOpusWriter {
         // Build OpusTags packet
         let mut tags = Vec::new();
         tags.extend_from_slice(b"OpusTags");
-        let vendor = b"talk-rs";
-        tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
-        tags.extend_from_slice(vendor);
-        tags.extend_from_slice(&0u32.to_le_bytes()); // 0 user comments
+        tags.extend_from_slice(&(OGG_OPUS_VENDOR.len() as u32).to_le_bytes());
+        tags.extend_from_slice(OGG_OPUS_VENDOR);
+        // One comment: the encoder settings, so a later reader can
+        // prove the stream already has a given profile (see
+        // `opus_tags_encoder`).
+        let comment = format!("{ENCODER_COMMENT}={}", self.profile);
+        tags.extend_from_slice(&1u32.to_le_bytes());
+        tags.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+        tags.extend_from_slice(comment.as_bytes());
 
         self.packet_writer
             .write_packet(tags, self.serial, PacketWriteEndInfo::EndPage, 0)
@@ -797,5 +868,72 @@ mod tests {
              for {FRAMES} frames) — did drain(..frame) come back inside the loop?",
             fixed.tail_samples_relocated
         );
+    }
+
+    /// The `OpusTags` packet of a stream written by `writer`.
+    fn tags_packet(mut writer: OggOpusWriter) -> Vec<u8> {
+        let header = writer.header().expect("header");
+        let mut reader = ogg::reading::PacketReader::new(std::io::Cursor::new(header));
+        let _head = reader.read_packet_expected().expect("OpusHead");
+        reader.read_packet_expected().expect("OpusTags").data
+    }
+
+    #[test]
+    fn test_opus_tags_record_the_encoder_profile() {
+        let voip = tags_packet(OggOpusWriter::new(test_config()).expect("writer"));
+        assert_eq!(opus_tags_encoder(&voip), Some("v1/voip/16000/1/32000"));
+        let recording = tags_packet(
+            OggOpusWriter::new_for_recording(AudioConfig {
+                sample_rate: 48_000,
+                channels: 1,
+                bitrate: 64_000,
+            })
+            .expect("writer"),
+        );
+        assert_eq!(
+            opus_tags_encoder(&recording),
+            Some("v1/audio/48000/1/64000")
+        );
+    }
+
+    #[test]
+    fn test_opus_tags_encoder_requires_talk_rs_vendor_and_comment() {
+        fn tags(vendor: &[u8], comments: &[&[u8]]) -> Vec<u8> {
+            let mut t = b"OpusTags".to_vec();
+            t.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+            t.extend_from_slice(vendor);
+            t.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+            for c in comments {
+                t.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                t.extend_from_slice(c);
+            }
+            t
+        }
+        let ours: &[u8] = b"TALK_RS_ENCODER=v1/voip/16000/1/32000";
+        assert_eq!(
+            opus_tags_encoder(&tags(b"talk-rs", &[b"TITLE=x", ours])),
+            Some("v1/voip/16000/1/32000")
+        );
+        // Comment copied by another tool (vendor rewritten).
+        assert_eq!(opus_tags_encoder(&tags(b"libopus 1.4", &[ours])), None);
+        // Older talk-rs streams carried no comment.
+        assert_eq!(opus_tags_encoder(&tags(b"talk-rs", &[])), None);
+        // A prefix of the comment name is not the comment.
+        assert_eq!(
+            opus_tags_encoder(&tags(
+                b"talk-rs",
+                &[b"TALK_RS_ENCODERX=v1/voip/16000/1/32000"]
+            )),
+            None
+        );
+        assert_eq!(opus_tags_encoder(&tags(b"talk-rs", &[ours, ours])), None);
+        let mut trailing = tags(b"talk-rs", &[ours]);
+        trailing.push(0);
+        assert_eq!(opus_tags_encoder(&trailing), None);
+        // Truncated packets never panic.
+        let full = tags(b"talk-rs", &[ours]);
+        for end in 0..full.len() {
+            assert_eq!(opus_tags_encoder(&full[..end]), None, "truncated at {end}");
+        }
     }
 }

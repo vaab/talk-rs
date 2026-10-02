@@ -240,16 +240,16 @@ impl MistralOneShotTranscriber {
     /// response body.
     async fn send_request(
         &self,
-        audio_bytes: Vec<u8>,
+        audio_bytes: std::sync::Arc<Vec<u8>>,
         file_name: &str,
     ) -> Result<TranscriptionResult, TalkError> {
         let file_len = audio_bytes.len() as u64;
         let started = Instant::now();
 
-        // Wrap the audio bytes in `Arc` so the multipart factory
-        // can reuse the same buffer across retries without
-        // cloning the full payload.
-        let audio_arc = std::sync::Arc::new(audio_bytes);
+        // The payload is shared (`Arc`) so the multipart factory can
+        // reuse the same buffer across retries, and across providers
+        // of a chain, without cloning it up front.
+        let audio_arc = audio_bytes;
 
         // Capture the per-form construction inputs by value/clone
         // so the factory closure (called once per retry) is `Fn`
@@ -427,10 +427,13 @@ impl OneShotTranscriber for MistralOneShotTranscriber {
     ) -> Result<TranscriptionResult, TalkError> {
         let (audio_bytes, file_name) = match body {
             TranscriptionBody::File(path) => {
-                // Always normalize to 16 kHz mono OGG before upload —
-                // both providers downsample to 16 kHz mono internally,
-                // so sending anything richer is pure waste.
-                super::normalize_file_for_upload(&path)?
+                // Always upload 16 kHz mono OGG — both providers
+                // downsample to 16 kHz mono internally, so sending
+                // anything richer is pure waste.  Prepared off the
+                // runtime, once per file version (shared with the
+                // other providers of a chain).
+                let prepared = super::prepare_file_upload(&path, &self.cancel_token).await?;
+                (prepared.bytes.clone(), prepared.file_name.clone())
             }
             TranscriptionBody::Pipe { chunks, file_name } => {
                 log::debug!("mistral stream: awaiting audio chunks from encoder");
@@ -452,7 +455,7 @@ impl OneShotTranscriber for MistralOneShotTranscriber {
                     audio_len,
                     collect_start.elapsed().as_millis()
                 );
-                (bytes, file_name)
+                (std::sync::Arc::new(bytes), file_name)
             }
         };
 

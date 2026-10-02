@@ -367,7 +367,7 @@ impl OpenAIOneShotTranscriber {
     /// [`super::transport::http_request`].
     async fn send_request(
         &self,
-        audio_bytes: Vec<u8>,
+        audio_bytes: std::sync::Arc<Vec<u8>>,
         file_name: &str,
     ) -> Result<TranscriptionResult, TalkError> {
         let file_len = audio_bytes.len() as u64;
@@ -388,7 +388,7 @@ impl OpenAIOneShotTranscriber {
             _ => "json",
         };
 
-        let audio_arc = std::sync::Arc::new(audio_bytes);
+        let audio_arc = audio_bytes;
         let model = self.config.model.clone();
         let file_name_owned = file_name.to_string();
         let response_format_owned = response_format.to_string();
@@ -593,10 +593,13 @@ impl OneShotTranscriber for OpenAIOneShotTranscriber {
     ) -> Result<TranscriptionResult, TalkError> {
         let (audio_bytes, file_name) = match body {
             TranscriptionBody::File(path) => {
-                // Always normalize to 16 kHz mono OGG before upload —
-                // both providers downsample to 16 kHz mono internally,
-                // so sending anything richer is pure waste.
-                super::normalize_file_for_upload(&path)?
+                // Always upload 16 kHz mono OGG — both providers
+                // downsample to 16 kHz mono internally, so sending
+                // anything richer is pure waste.  Prepared off the
+                // runtime, once per file version (shared with the
+                // other providers of a chain).
+                let prepared = super::prepare_file_upload(&path, &self.cancel_token).await?;
+                (prepared.bytes.clone(), prepared.file_name.clone())
             }
             TranscriptionBody::Pipe { chunks, file_name } => {
                 validate_openai_hints(
@@ -614,7 +617,7 @@ impl OneShotTranscriber for OpenAIOneShotTranscriber {
                     &self.cancel_token,
                 )
                 .await?;
-                (bytes, file_name)
+                (std::sync::Arc::new(bytes), file_name)
             }
         };
 
@@ -1129,7 +1132,7 @@ mod tests {
         )?;
 
         transcriber
-            .send_request(b"audio".to_vec(), "sample.ogg")
+            .send_request(std::sync::Arc::new(b"audio".to_vec()), "sample.ogg")
             .await?;
         Ok(())
     }
@@ -1156,7 +1159,7 @@ mod tests {
         )?;
 
         transcriber
-            .send_request(b"audio".to_vec(), "sample.ogg")
+            .send_request(std::sync::Arc::new(b"audio".to_vec()), "sample.ogg")
             .await?;
         Ok(())
     }
@@ -1191,7 +1194,7 @@ mod tests {
         )?;
 
         transcriber
-            .send_request(b"audio".to_vec(), "sample.ogg")
+            .send_request(std::sync::Arc::new(b"audio".to_vec()), "sample.ogg")
             .await?;
         Ok(())
     }
@@ -1228,7 +1231,7 @@ mod tests {
                 format!("{}/v1/audio/transcriptions", mock_server.uri()),
             )?;
             let error = transcriber
-                .send_request(b"audio".to_vec(), "sample.ogg")
+                .send_request(std::sync::Arc::new(b"audio".to_vec()), "sample.ogg")
                 .await
                 .expect_err(field);
             assert_eq!(
@@ -1325,7 +1328,7 @@ mod tests {
         )?;
 
         let error = transcriber
-            .send_request(b"audio".to_vec(), "sample.ogg")
+            .send_request(std::sync::Arc::new(b"audio".to_vec()), "sample.ogg")
             .await
             .expect_err("realtime model rejected by batch builder");
         assert_eq!(
