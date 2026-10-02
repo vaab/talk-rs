@@ -6,17 +6,18 @@
 //! collapsible sections: OGG recordings and dictation cache.
 
 use super::entries::{
-    delete_recording, list_cache_recordings, list_ogg_recordings, open_in_file_manager,
-    RecordingEntry,
+    compare_entries_newest_first, delete_recording, has_audio_extension, open_in_file_manager,
+    RecordingCollection, RecordingEntry,
 };
 use super::player::WavPlayer;
 use crate::config::Config;
 use crate::error::TalkError;
-use crate::recording_cache;
 use crate::widgets::audio_player_bar::ButtonFaces;
 use crate::widgets::playback_session::{PlaybackRow, PlaybackSession, RowRef};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc;
 
 /// The plain ▶/■ play button of a row that has a transcript (rows
 /// without one use the full player bar).  Driven by the window's
@@ -66,11 +67,211 @@ impl PlaybackRow for SimplePlayRow {
 /// Window title — also used for single-instance detection.
 const WINDOW_TITLE: &str = "talk-rs — Recordings";
 
-fn basename(path: &str) -> &str {
-    Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(path)
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum Section {
+    Cache,
+    Output,
+}
+
+impl Section {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cache => "Dictation cache",
+            Self::Output => "Recordings",
+        }
+    }
+}
+
+enum WorkerRequest {
+    Start,
+    WatchesReady(PathBuf),
+    Refresh(PathBuf),
+    Sidecar(PathBuf),
+    Subtree(PathBuf),
+    RemovedSubtree(PathBuf),
+}
+
+enum WorkerResult {
+    WatchPaths(Section, PathBuf, Vec<PathBuf>),
+    Initial(Section, Vec<RecordingEntry>),
+    Updated(Section, PathBuf, Option<RecordingEntry>),
+}
+
+/// The initial snapshot remains immutable; updates to unbuilt paths override it.
+/// Materialized paths are looked up in constant time, never walked per new row.
+struct SectionBatch {
+    pending: VecDeque<RecordingEntry>,
+    known: BTreeSet<PathBuf>,
+    overrides: BTreeMap<PathBuf, Option<RecordingEntry>>,
+    built: HashMap<PathBuf, gtk4::ListBoxRow>,
+    order: Vec<PathBuf>,
+    total: usize,
+}
+
+impl SectionBatch {
+    fn new(entries: Vec<RecordingEntry>) -> Self {
+        let total = entries.len();
+        let known = entries.iter().map(|entry| entry.path.clone()).collect();
+        Self {
+            pending: entries.into(),
+            known,
+            overrides: BTreeMap::new(),
+            built: HashMap::new(),
+            order: Vec::new(),
+            total,
+        }
+    }
+
+    fn update(&mut self, path: PathBuf, entry: Option<RecordingEntry>) {
+        let existed = self.known.contains(&path);
+        match (existed, entry.is_some()) {
+            (false, true) => self.total += 1,
+            (true, false) => self.total -= 1,
+            _ => {}
+        }
+        if entry.is_some() {
+            self.known.insert(path.clone());
+        } else {
+            self.known.remove(&path);
+        }
+        self.overrides.insert(path, entry);
+    }
+
+    fn next(&mut self) -> Option<RecordingEntry> {
+        while let Some(entry) = self.pending.pop_front() {
+            let path = &entry.path;
+            if self.built.contains_key(path) {
+                continue;
+            }
+            match self.overrides.remove(path) {
+                Some(Some(new)) => return Some(new),
+                Some(None) => continue,
+                None => return Some(entry),
+            }
+        }
+        None
+    }
+
+    fn finished(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+fn spawn_listing_worker(
+    section: Section,
+    collection: RecordingCollection,
+    results: mpsc::Sender<WorkerResult>,
+) -> mpsc::Sender<WorkerRequest> {
+    let (sender, inbox) = mpsc::channel();
+    std::thread::spawn(move || {
+        let root = collection.root().to_path_buf();
+        let mut known = BTreeSet::<PathBuf>::new();
+        let mut pending = BTreeSet::<PathBuf>::new();
+        let mut sidecars = BTreeSet::<PathBuf>::new();
+        let mut planned = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
+        let mut initial_done = false;
+        let mut ready = false;
+        while let Ok(request) = inbox.recv() {
+            let mut requests = vec![request];
+            for _ in 0..63 {
+                match inbox.try_recv() {
+                    Ok(request) => requests.push(request),
+                    Err(_) => break,
+                }
+            }
+            for request in requests {
+                match request {
+                    WorkerRequest::Start | WorkerRequest::Subtree(_) => {
+                        let dir = match request {
+                            WorkerRequest::Subtree(dir) => dir,
+                            _ => root.clone(),
+                        };
+                        let mut dirs = Vec::new();
+                        if dir.is_dir() && (!dir.is_symlink() || dir == root) {
+                            collect_directories_recursive(&dir, &mut dirs);
+                        }
+                        planned.insert(dir.clone(), dirs.iter().cloned().collect());
+                        if results
+                            .send(WorkerResult::WatchPaths(section, dir, dirs))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    WorkerRequest::WatchesReady(dir) => {
+                        let mut latest = Vec::new();
+                        if dir.is_dir() && (!dir.is_symlink() || dir == root) {
+                            collect_directories_recursive(&dir, &mut latest);
+                        }
+                        let watched = planned.entry(dir.clone()).or_default();
+                        let additional: Vec<_> = latest
+                            .into_iter()
+                            .filter(|path| watched.insert(path.clone()))
+                            .collect();
+                        if !additional.is_empty() {
+                            if results
+                                .send(WorkerResult::WatchPaths(section, dir, additional))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        } else if dir == root {
+                            ready = true;
+                        } else if let Ok(entries) = collection.list_under(&dir) {
+                            pending.extend(entries.into_iter().map(|entry| entry.path));
+                        }
+                    }
+                    WorkerRequest::Refresh(path) => {
+                        pending.insert(path);
+                    }
+                    WorkerRequest::Sidecar(path) => {
+                        sidecars.insert(path);
+                    }
+                    WorkerRequest::RemovedSubtree(dir) => {
+                        pending.extend(known.iter().filter(|path| path.starts_with(&dir)).cloned());
+                    }
+                }
+            }
+            if !ready {
+                continue;
+            }
+            if !initial_done {
+                let entries = match collection.list() {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        log::warn!("record-ui: failed to list {}: {err}", root.display());
+                        Vec::new()
+                    }
+                };
+                known.extend(entries.iter().map(|entry| entry.path.clone()));
+                if results
+                    .send(WorkerResult::Initial(section, entries))
+                    .is_err()
+                {
+                    return;
+                }
+                initial_done = true;
+            }
+            for sidecar in std::mem::take(&mut sidecars) {
+                pending.extend(collection.affected_audio(&sidecar, known.iter()));
+            }
+            for path in std::mem::take(&mut pending) {
+                let entry = collection.entry(&path);
+                if entry.is_some() {
+                    known.insert(path.clone());
+                } else {
+                    known.remove(&path);
+                }
+                if results
+                    .send(WorkerResult::Updated(section, path, entry))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+    sender
 }
 
 fn collect_directories_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -206,7 +407,8 @@ fn show_recordings_window() -> Result<(), TalkError> {
 
     // Monitors must survive the lifetime of the window; the idle
     // callback fills this with gio::FileMonitor instances.
-    let monitors: Rc<RefCell<Vec<gtk4::gio::FileMonitor>>> = Rc::new(RefCell::new(Vec::new()));
+    let monitors: Rc<RefCell<BTreeMap<(Section, PathBuf), gtk4::gio::FileMonitor>>> =
+        Rc::new(RefCell::new(BTreeMap::new()));
 
     {
         /// Build a single row (hbox) for a recording entry with all columns
@@ -477,80 +679,137 @@ fn show_recordings_window() -> Result<(), TalkError> {
         /// `glib::idle_add_local_once` so the GTK main loop stays
         /// responsive between batches.
         fn populate_section(
-            label: &str,
+            label: &'static str,
             recordings: Vec<RecordingEntry>,
             list: &gtk4::ListBox,
             expander: &gtk4::Expander,
             session: &Rc<PlaybackSession>,
             window: &gtk4::Window,
+            state: &Rc<RefCell<Option<SectionBatch>>>,
         ) {
             use gtk4::prelude::*;
-
             const BATCH_SIZE: usize = 20;
-
-            // Remove existing rows.
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
-            }
-
-            let total = recordings.len();
-            expander.set_label(Some(&format!("{} ({})", label, total)));
-
-            // Shared state for incremental batch building.
-            let entries = Rc::new(RefCell::new(recordings));
-            let offset = Rc::new(std::cell::Cell::new(0usize));
-
+            const BUDGET: std::time::Duration = std::time::Duration::from_millis(5);
+            *state.borrow_mut() = Some(SectionBatch::new(recordings));
+            let total = state.borrow().as_ref().map_or(0, |s| s.total);
+            expander.set_label(Some(&format!("{label} ({total})")));
+            let state = Rc::clone(state);
             let list = list.clone();
             let expander = expander.clone();
             let session = Rc::clone(session);
-            let win = window.clone();
-            let label = label.to_string();
-
-            // Schedule first batch; each batch schedules the next
-            // until all entries are built.
-            let build_batch = Rc::new(RefCell::new(None::<Box<dyn Fn()>>));
-            let build_batch_ref = Rc::clone(&build_batch);
-
-            *build_batch.borrow_mut() = Some(Box::new(move || {
-                let start = offset.get();
-                let entries = entries.borrow();
-                let end = (start + BATCH_SIZE).min(entries.len());
-
-                for recording in &entries[start..end] {
-                    let row = build_row(recording, &session, &win, &list, &expander, &label);
-                    list.append(&row);
+            let window = window.clone();
+            glib::idle_add_local(move || {
+                if !window.is_visible() {
+                    return glib::ControlFlow::Break;
                 }
-
-                // Select first row once the first batch is done.
-                if start == 0 {
-                    if let Some(first) = list.row_at_index(0) {
-                        list.select_row(Some(&first));
+                let started = std::time::Instant::now();
+                for _ in 0..BATCH_SIZE {
+                    let entry = state.borrow_mut().as_mut().and_then(SectionBatch::next);
+                    let Some(entry) = entry else { break };
+                    let row = build_row(&entry, &session, &window, &list, &expander, label);
+                    list.append(&row);
+                    if let Some(batch) = state.borrow_mut().as_mut() {
+                        batch.order.push(entry.path.clone());
+                        batch.built.insert(entry.path, row);
+                    }
+                    if started.elapsed() >= BUDGET {
+                        break;
                     }
                 }
-
-                offset.set(end);
-                if end == entries.len() {
+                if state.borrow().as_ref().is_some_and(SectionBatch::finished) {
+                    let extra = state.borrow().as_ref().and_then(|batch| {
+                        batch
+                            .overrides
+                            .iter()
+                            .find(|(path, entry)| {
+                                entry.is_some() && !batch.built.contains_key(*path)
+                            })
+                            .map(|(path, entry)| (path.clone(), entry.clone()))
+                    });
+                    if let Some((path, entry)) = extra {
+                        apply_update(
+                            (path, entry),
+                            &list,
+                            &expander,
+                            label,
+                            &session,
+                            &window,
+                            &state,
+                        );
+                    }
+                }
+                if list.selected_row().is_none() {
+                    if let Some(row) = list.row_at_index(0) {
+                        list.select_row(Some(&row));
+                    }
+                }
+                let done = state.borrow().as_ref().is_none_or(|batch| {
+                    batch.finished()
+                        && !batch
+                            .overrides
+                            .iter()
+                            .any(|(path, entry)| entry.is_some() && !batch.built.contains_key(path))
+                });
+                if done {
                     crate::perf_counters::mark_with(|| {
                         format!("record_ui_rows_built_{}", label.replace(' ', "_"))
                     });
-                }
-                if end < entries.len() {
-                    let next = Rc::clone(&build_batch_ref);
-                    glib::idle_add_local_once(move || {
-                        if let Some(f) = next.borrow().as_ref() {
-                            f();
-                        }
-                    });
-                }
-            }));
-
-            // Kick off the first batch.
-            let kick = Rc::clone(&build_batch);
-            glib::idle_add_local_once(move || {
-                if let Some(f) = kick.borrow().as_ref() {
-                    f();
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
                 }
             });
+        }
+
+        fn apply_update(
+            (path, entry): (PathBuf, Option<RecordingEntry>),
+            list: &gtk4::ListBox,
+            expander: &gtk4::Expander,
+            label: &'static str,
+            session: &Rc<PlaybackSession>,
+            window: &gtk4::Window,
+            state: &Rc<RefCell<Option<SectionBatch>>>,
+        ) {
+            use gtk4::prelude::*;
+            let mut state_ref = state.borrow_mut();
+            let Some(batch) = state_ref.as_mut() else {
+                return;
+            };
+            batch.update(path.clone(), entry.clone());
+            if let Some(old) = batch.built.remove(&path) {
+                batch.overrides.remove(&path);
+                let selected = old.is_selected();
+                let index = old.index();
+                if let Some(entry) = entry {
+                    let row = build_row(&entry, session, window, list, expander, label);
+                    list.insert(&row, index);
+                    if selected {
+                        list.select_row(Some(&row));
+                    }
+                    batch.built.insert(path.clone(), row);
+                } else {
+                    batch.order.retain(|item| item != &path);
+                    if selected {
+                        let adjacent = list
+                            .row_at_index(index + 1)
+                            .or_else(|| list.row_at_index(index - 1));
+                        list.select_row(adjacent.as_ref());
+                    }
+                }
+                list.remove(&old);
+            } else if batch.finished() {
+                if let Some(entry) = entry {
+                    let pos = batch.order.partition_point(|other| {
+                        compare_entries_newest_first(other, &path).is_lt()
+                    });
+                    let row = build_row(&entry, session, window, list, expander, label);
+                    list.insert(&row, pos as i32);
+                    batch.order.insert(pos, path.clone());
+                    batch.built.insert(path.clone(), row);
+                }
+                batch.overrides.remove(&path);
+            }
+            expander.set_label(Some(&format!("{label} ({})", batch.total)));
         }
 
         /// Create an Expander + ListBox pair for a section.
@@ -584,569 +843,212 @@ fn show_recordings_window() -> Result<(), TalkError> {
         let monitors_idle = Rc::clone(&monitors);
         let loaded = std::cell::Cell::new(false);
 
+        fn install_monitor(
+            section: Section,
+            dir: &Path,
+            sender: &mpsc::Sender<WorkerRequest>,
+            monitors: &Rc<RefCell<BTreeMap<(Section, PathBuf), gtk4::gio::FileMonitor>>>,
+        ) {
+            if !dir.is_dir()
+                || monitors
+                    .borrow()
+                    .contains_key(&(section, dir.to_path_buf()))
+            {
+                return;
+            }
+            let file = gtk4::gio::File::for_path(dir);
+            let monitor = match file.monitor_directory(
+                gtk4::gio::FileMonitorFlags::NONE,
+                gtk4::gio::Cancellable::NONE,
+            ) {
+                Ok(monitor) => monitor,
+                Err(err) => {
+                    log::warn!("record-ui: cannot watch {}: {err}", dir.display());
+                    return;
+                }
+            };
+            let sender = sender.clone();
+            let weak_monitors = Rc::downgrade(monitors);
+            monitor.connect_changed(move |_, file, _, event| {
+                use gtk4::gio::FileMonitorEvent;
+                let Some(path) = file.path() else { return };
+                if !matches!(
+                    event,
+                    FileMonitorEvent::Created
+                        | FileMonitorEvent::Deleted
+                        | FileMonitorEvent::ChangesDoneHint
+                ) {
+                    return;
+                }
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if name.ends_with(".wf") || name.ends_with(".wf.tmp") {
+                    return;
+                }
+                let was_dir = weak_monitors.upgrade().is_some_and(|monitors| {
+                    monitors.borrow().contains_key(&(section, path.clone()))
+                });
+                if event == FileMonitorEvent::Created && path.is_dir() && !path.is_symlink() {
+                    let _ = sender.send(WorkerRequest::Subtree(path));
+                } else if event == FileMonitorEvent::Deleted
+                    && (was_dir || (!has_audio_extension(&path) && !name.ends_with(".yml")))
+                {
+                    if let Some(monitors) = weak_monitors.upgrade() {
+                        monitors.borrow_mut().retain(|(owner, watched), monitor| {
+                            let keep = *owner != section || !watched.starts_with(&path);
+                            if !keep {
+                                monitor.cancel();
+                            }
+                            keep
+                        });
+                    }
+                    let _ = sender.send(WorkerRequest::RemovedSubtree(path));
+                } else if name.ends_with(".yml") {
+                    let _ = sender.send(WorkerRequest::Sidecar(path));
+                } else if has_audio_extension(&path) {
+                    let _ = sender.send(WorkerRequest::Refresh(path));
+                }
+            });
+            monitors
+                .borrow_mut()
+                .insert((section, dir.to_path_buf()), monitor);
+        }
+
         window.connect_map(move |_| {
-            // Guard: only load once (map can fire on re-show).
             if loaded.replace(true) {
                 return;
             }
-            let session_idle = Rc::clone(&session_idle);
-            let win_idle = win_idle.clone();
-            let sections_idle = sections_idle.clone();
-            let loading_idle = loading_idle.clone();
-            let monitors_idle = Rc::clone(&monitors_idle);
+            let session = Rc::clone(&session_idle);
+            let win = win_idle.clone();
+            let sections = sections_idle.clone();
+            let loading = loading_idle.clone();
+            let monitors = Rc::clone(&monitors_idle);
             glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
-                let t = std::time::Instant::now();
-
-                // Remove loading indicator immediately so the window
-                // doesn't look frozen while sections are populated.
-                sections_idle.remove(&loading_idle);
-
-                // ── Dictation cache section ──
-                let (wav_expander, wav_list) = create_section("Dictation cache (0)");
-                sections_idle.append(&wav_expander);
-
-                // ── OGG recordings section ──
-                let (ogg_expander, ogg_list) = create_section("Recordings (0)");
-                sections_idle.append(&ogg_expander);
+                sections.remove(&loading);
+                let (cache_expander, cache_list) = create_section("Dictation cache (0)");
+                sections.append(&cache_expander);
+                let (output_expander, output_list) = create_section("Recordings (0)");
+                sections.append(&output_expander);
                 #[cfg(feature = "perf-counters")]
                 super::ui_probe::install(vec![
-                    ("Dictation cache", wav_list.clone()),
-                    ("Recordings", ogg_list.clone()),
+                    ("Dictation cache", cache_list.clone()),
+                    ("Recordings", output_list.clone()),
                 ]);
-
-                // Populate sections via idle callbacks so the GTK
-                // main loop stays responsive between each section.
-                {
-                    let session = Rc::clone(&session_idle);
-                    let win = win_idle.clone();
-                    let wav_list_ref = wav_list.clone();
-                    let wav_exp_ref = wav_expander.clone();
-                    glib::idle_add_local_once(move || {
-                        let wav_recordings = list_cache_recordings().unwrap_or_default();
-                        log::debug!(
-                            "record-ui: list_cache_recordings ({} entries) {:.0?}",
-                            wav_recordings.len(),
-                            t.elapsed(),
-                        );
-                        populate_section(
-                            "Dictation cache",
-                            wav_recordings,
-                            &wav_list_ref,
-                            &wav_exp_ref,
-                            &session,
-                            &win,
-                        );
-                        if wav_list_ref.first_child().is_some() {
-                            wav_list_ref.grab_focus();
-                        }
-                    });
-                }
-
-                {
-                    let session = Rc::clone(&session_idle);
-                    let win = win_idle.clone();
-                    let ogg_list_ref = ogg_list.clone();
-                    let ogg_exp_ref = ogg_expander.clone();
-                    glib::idle_add_local_once(move || {
-                        let ogg_recordings = list_ogg_recordings().unwrap_or_default();
-                        log::debug!(
-                            "record-ui: list_ogg_recordings ({} entries) {:.0?}",
-                            ogg_recordings.len(),
-                            t.elapsed(),
-                        );
-                        populate_section(
-                            "Recordings",
-                            ogg_recordings,
-                            &ogg_list_ref,
-                            &ogg_exp_ref,
-                            &session,
-                            &win,
-                        );
-                    });
-                }
-
-                // ── Inotify via gio::FileMonitor ──
-                /// Shared context passed to [`watch_directory`] to avoid
-                /// exceeding the clippy argument-count limit.
-                struct WatchCtx {
-                    list: gtk4::ListBox,
-                    expander: gtk4::Expander,
-                    session: Rc<PlaybackSession>,
-                    window: gtk4::Window,
-                }
-
-                fn watch_directory(
-                    dir: &Path,
-                    label: &'static str,
-                    ctx: &WatchCtx,
-                    list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
-                    monitors: &Rc<RefCell<Vec<gtk4::gio::FileMonitor>>>,
-                ) {
-                    use gtk4::prelude::*;
-
-                    fn row_index_by_path(list: &gtk4::ListBox, file_path: &str) -> Option<i32> {
-                        let mut idx = 0;
-                        while let Some(row) = list.row_at_index(idx) {
-                            if row.widget_name().as_str() == file_path {
-                                return Some(idx);
-                            }
-                            idx += 1;
-                        }
-                        None
+                let config = match Config::load(None) {
+                    Ok(config) => std::sync::Arc::new(config),
+                    Err(err) => {
+                        log::warn!("record-ui: cannot load configuration: {err}");
+                        return;
                     }
-
-                    fn sorted_insert_pos(list: &gtk4::ListBox, file_path: &str) -> i32 {
-                        let mut insert_pos: i32 = 0;
-                        let mut idx = 0;
-                        while let Some(row) = list.row_at_index(idx) {
-                            if basename(file_path) >= basename(row.widget_name().as_str()) {
-                                break;
-                            }
-                            insert_pos = idx + 1;
-                            idx += 1;
+                };
+                let (result_tx, result_rx) = mpsc::channel();
+                let cache =
+                    match RecordingCollection::dictation_cache(std::sync::Arc::clone(&config)) {
+                        Ok(collection) => Some(collection),
+                        Err(err) => {
+                            log::warn!("record-ui: cache unavailable: {err}");
+                            None
                         }
-                        insert_pos
+                    };
+                let output = RecordingCollection::output_recordings(config);
+                let cache_sender = cache.map(|collection| {
+                    let root = collection.root().to_path_buf();
+                    let sender =
+                        spawn_listing_worker(Section::Cache, collection, result_tx.clone());
+                    install_monitor(Section::Cache, &root, &sender, &monitors);
+                    let _ = sender.send(WorkerRequest::Start);
+                    sender
+                });
+                let output_root = output.root().to_path_buf();
+                let output_sender =
+                    spawn_listing_worker(Section::Output, output, result_tx.clone());
+                install_monitor(Section::Output, &output_root, &output_sender, &monitors);
+                let _ = output_sender.send(WorkerRequest::Start);
+                drop(result_tx);
+                let cache_state: Rc<RefCell<Option<SectionBatch>>> = Rc::new(RefCell::new(None));
+                let output_state: Rc<RefCell<Option<SectionBatch>>> = Rc::new(RefCell::new(None));
+                let mut pending_watches: VecDeque<(Section, PathBuf, VecDeque<PathBuf>)> =
+                    VecDeque::new();
+                glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                    if !win.is_visible() {
+                        return glib::ControlFlow::Break;
                     }
-
-                    /// Refresh the audio row whose stem matches a YAML
-                    /// companion file.  Used for YAML created, changed,
-                    /// and deleted events.
-                    fn update_row_for_yml(
-                        yml_name: &str,
-                        list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
-                        session: &Rc<PlaybackSession>,
-                        window: &gtk4::Window,
-                        list: &gtk4::ListBox,
-                        expander: &gtk4::Expander,
-                        label: &str,
-                    ) {
-                        use gtk4::prelude::*;
-
-                        // Extract stem — matches the audio file's stem.
-                        // Sidecars: `<stem>_<provider>_<model>_<mode>.yml`
-                        // Pick file: `<stem>.pick.yml`
-                        // Pick lock: `<stem>.pick-lock.yml`
-                        let yml_stem = if let Some(s) = yml_name.strip_suffix(".pick-lock.yml") {
-                            s
-                        } else if let Some(s) = yml_name.strip_suffix(".pick.yml") {
-                            s
-                        } else {
-                            yml_name.split('_').next().unwrap_or("")
+                    let start = std::time::Instant::now();
+                    for _ in 0..5 {
+                        if start.elapsed() >= std::time::Duration::from_millis(5) {
+                            break;
+                        }
+                        let result = match result_rx.try_recv() {
+                            Ok(result) => result,
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                return glib::ControlFlow::Break
+                            }
                         };
-                        if yml_stem.is_empty() {
-                            return;
-                        }
-
-                        // Find the matching row by widget_name (audio path).
-                        let mut idx = 0;
-                        while let Some(row) = list.row_at_index(idx) {
-                            let row_name = row.widget_name();
-                            let row_path = std::path::Path::new(row_name.as_str());
-                            let row_stem =
-                                row_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                            if row_stem == yml_stem {
-                                // Rebuild just this row with fresh data.
-                                if let Ok(entries) = list_fn() {
-                                    if let Some(entry) = entries.iter().find(|e| {
-                                        e.path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
-                                            == yml_stem
-                                    }) {
-                                        let new_row =
-                                            build_row(entry, session, window, list, expander, label);
-                                        // Insert new row at same position,
-                                        // then remove the old one.
-                                        list.insert(&new_row, idx);
-                                        list.remove(&row);
+                        match result {
+                            WorkerResult::WatchPaths(section, root, dirs) => {
+                                pending_watches.push_back((section, root, dirs.into()))
+                            }
+                            WorkerResult::Initial(section, entries) => {
+                                let (list, expander, state) = match section {
+                                    Section::Cache => (&cache_list, &cache_expander, &cache_state),
+                                    Section::Output => {
+                                        (&output_list, &output_expander, &output_state)
                                     }
-                                }
-                                return;
-                            }
-                            idx += 1;
-                        }
-                        // Row not found — might be for a different section.
-                    }
-
-                    /// Count `ListBoxRow` children in a `ListBox`.
-                    fn count_list_rows(list: &gtk4::ListBox) -> i32 {
-                        use gtk4::prelude::*;
-                        let mut count = 0;
-                        let mut child = list.first_child();
-                        while let Some(w) = child {
-                            if w.downcast_ref::<gtk4::ListBoxRow>().is_some() {
-                                count += 1;
-                            }
-                            child = w.next_sibling();
-                        }
-                        count
-                    }
-
-                    fn insert_or_refresh_row(
-                        entry: &RecordingEntry,
-                        existing_idx: Option<i32>,
-                        session: &Rc<PlaybackSession>,
-                        window: &gtk4::Window,
-                        list: &gtk4::ListBox,
-                        expander: &gtk4::Expander,
-                        label: &str,
-                    ) {
-                        let new_row = build_row(entry, session, window, list, expander, label);
-
-                        if let Some(old_idx) = existing_idx {
-                            list.insert(&new_row, old_idx);
-                            if let Some(old_row) = list.row_at_index(old_idx + 1) {
-                                list.remove(&old_row);
-                            }
-                        } else {
-                            let file_path = entry.path.to_string_lossy().to_string();
-                            let insert_pos = sorted_insert_pos(list, &file_path);
-                            list.insert(&new_row, insert_pos);
-                        }
-
-                        let count = count_list_rows(list);
-                        expander.set_label(Some(&format!("{} ({})", label, count)));
-                    }
-
-                    fn refresh_rows_under_subtree(
-                        subtree: &Path,
-                        list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
-                        session: &Rc<PlaybackSession>,
-                        window: &gtk4::Window,
-                        list: &gtk4::ListBox,
-                        expander: &gtk4::Expander,
-                        label: &str,
-                    ) {
-                        let entries = match list_fn() {
-                            Ok(entries) => entries,
-                            Err(err) => {
-                                log::warn!(
-                                    "record-ui: watch: failed to list entries for subtree refresh: {}",
-                                    err,
+                                };
+                                populate_section(
+                                    section.label(),
+                                    entries,
+                                    list,
+                                    expander,
+                                    &session,
+                                    &win,
+                                    state,
                                 );
-                                return;
                             }
-                        };
-
-                        for entry in entries.iter().filter(|entry| entry.path.starts_with(subtree)) {
-                            let file_path = entry.path.to_string_lossy().to_string();
-                            if row_index_by_path(list, &file_path).is_none() {
-                                insert_or_refresh_row(
-                                    entry, None, session, window, list, expander, label,
+                            WorkerResult::Updated(section, path, entry) => {
+                                let (list, expander, state) = match section {
+                                    Section::Cache => (&cache_list, &cache_expander, &cache_state),
+                                    Section::Output => {
+                                        (&output_list, &output_expander, &output_state)
+                                    }
+                                };
+                                apply_update(
+                                    (path, entry),
+                                    list,
+                                    expander,
+                                    section.label(),
+                                    &session,
+                                    &win,
+                                    state,
                                 );
                             }
                         }
                     }
-
-                    fn install_monitor(
-                        dir: &Path,
-                        label: &'static str,
-                        ctx: &WatchCtx,
-                        list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
-                        monitors: &Rc<RefCell<Vec<gtk4::gio::FileMonitor>>>,
-                    ) {
-                        let gio_dir = gtk4::gio::File::for_path(dir);
-                        let monitor = match gio_dir.monitor_directory(
-                            gtk4::gio::FileMonitorFlags::NONE,
-                            gtk4::gio::Cancellable::NONE,
-                        ) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                log::warn!("failed to watch {}: {}", dir.display(), e);
-                                return;
-                            }
+                    for _ in 0..5 {
+                        if start.elapsed() >= std::time::Duration::from_millis(5) {
+                            break;
+                        }
+                        let Some((section, root, dirs)) = pending_watches.front_mut() else {
+                            break;
                         };
-
-                        log::debug!("record-ui: watch: installed monitor on {}", dir.display());
-
-                        let list_ref = ctx.list.clone();
-                        let exp_ref = ctx.expander.clone();
-                        let session_ref = Rc::clone(&ctx.session);
-                        let win_ref = ctx.window.clone();
-                        let monitors_weak = Rc::downgrade(monitors);
-
-                        monitor.connect_changed(move |_monitor, file, _other, event| {
-                            use gtk4::gio::FileMonitorEvent;
-
-                            let name = match file.basename() {
-                                Some(n) => n.to_string_lossy().to_string(),
-                                None => return,
-                            };
-
-                            let file_path_buf = file.path();
-
-                            // Ignore waterfall cache files (.wf).
-                            if name.ends_with(".wf") {
-                                return;
+                        let sender = match section {
+                            Section::Cache => cache_sender.as_ref(),
+                            Section::Output => Some(&output_sender),
+                        };
+                        if let Some(dir) = dirs.pop_front() {
+                            if let Some(sender) = sender {
+                                install_monitor(*section, &dir, sender, &monitors);
                             }
-
-                            let is_yml = name.ends_with(".yml");
-                            // Treat every listable audio format as a
-                            // refresh trigger.  Keep the comparison
-                            // case-insensitive so files imported from
-                            // external sources (e.g. `.M4A`) still
-                            // trigger the live-refresh.
-                            let lname = name.to_ascii_lowercase();
-                            let is_audio = lname.ends_with(".wav")
-                                || lname.ends_with(".ogg")
-                                || lname.ends_with(".m4a")
-                                || lname.ends_with(".mp4")
-                                || lname.ends_with(".aac");
-
-                            match event {
-                                // ── Deletion ─────────────────────────────────
-                                FileMonitorEvent::Deleted => {
-                                    if is_yml {
-                                        // Companion YAML deleted — rebuild the
-                                        // matching audio row so transcript is
-                                        // cleared.
-                                        log::debug!(
-                                            "record-ui: watch: yml deleted, refreshing row: {}",
-                                            name,
-                                        );
-                                        update_row_for_yml(
-                                            &name,
-                                            list_fn,
-                                            &session_ref,
-                                            &win_ref,
-                                            &list_ref,
-                                            &exp_ref,
-                                            label,
-                                        );
-                                        return;
-                                    }
-                                    if !is_audio {
-                                        log::debug!(
-                                            "record-ui: watch: non-audio Deleted (ignored): {}",
-                                            name,
-                                        );
-                                        return;
-                                    }
-
-                                    // Audio file deleted → remove matching row.
-                                    let file_path = match &file_path_buf {
-                                        Some(p) => p.to_string_lossy().to_string(),
-                                        None => return,
-                                    };
-
-                                    let mut idx = 0;
-                                    while let Some(row) = list_ref.row_at_index(idx) {
-                                        if row.widget_name().as_str() == file_path {
-                                            // Select adjacent row before removal
-                                            // so scroll position stays stable.
-                                            let next = list_ref.row_at_index(idx + 1).or_else(|| {
-                                                if idx > 0 {
-                                                    list_ref.row_at_index(idx - 1)
-                                                } else {
-                                                    None
-                                                }
-                                            });
-                                            if let Some(ref adj) = next {
-                                                list_ref.select_row(Some(adj));
-                                            }
-                                            list_ref.remove(&row);
-
-                                            let count = count_list_rows(&list_ref);
-                                            exp_ref
-                                                .set_label(Some(&format!("{} ({})", label, count,)));
-                                            log::debug!(
-                                                "record-ui: watch: removed row for deleted audio: {}",
-                                                name,
-                                            );
-                                            return;
-                                        }
-                                        idx += 1;
-                                    }
-                                    // Row not found — already removed by the
-                                    // delete button before inotify fired.
-                                    log::debug!(
-                                        "record-ui: watch: Deleted audio row not found \
-                                         (already removed?): {}",
-                                        name,
-                                    );
-                                }
-
-                                // ── Creation / write-complete ────────────────
-                                FileMonitorEvent::Created | FileMonitorEvent::ChangesDoneHint => {
-                                    if matches!(event, FileMonitorEvent::Created)
-                                        && file_path_buf.as_ref().is_some_and(|path| path.is_dir())
-                                    {
-                                        let Some(dir_path) = file_path_buf.as_ref() else {
-                                            return;
-                                        };
-                                        log::debug!(
-                                            "record-ui: watch: new subdir {}, installing recursive watcher and refreshing rows",
-                                            dir_path.display(),
-                                        );
-                                        if let Some(monitors_rc) = monitors_weak.upgrade() {
-                                            watch_directory(
-                                                dir_path,
-                                                label,
-                                                &WatchCtx {
-                                                    list: list_ref.clone(),
-                                                    expander: exp_ref.clone(),
-                                                    session: Rc::clone(&session_ref),
-                                                    window: win_ref.clone(),
-                                                },
-                                                list_fn,
-                                                &monitors_rc,
-                                            );
-                                        }
-                                        refresh_rows_under_subtree(
-                                            dir_path,
-                                            list_fn,
-                                            &session_ref,
-                                            &win_ref,
-                                            &list_ref,
-                                            &exp_ref,
-                                            label,
-                                        );
-                                        return;
-                                    }
-
-                                    if is_yml {
-                                        log::debug!(
-                                            "record-ui: watch: yml {:?}, refreshing row: {}",
-                                            event,
-                                            name,
-                                        );
-                                        update_row_for_yml(
-                                            &name,
-                                            list_fn,
-                                            &session_ref,
-                                            &win_ref,
-                                            &list_ref,
-                                            &exp_ref,
-                                            label,
-                                        );
-                                        return;
-                                    }
-                                    if !is_audio {
-                                        log::debug!(
-                                            "record-ui: watch: non-audio {:?} (ignored): {}",
-                                            event,
-                                            name,
-                                        );
-                                        return;
-                                    }
-
-                                    // Audio file appeared or finished writing →
-                                    // add a new row or refresh an existing one.
-                                    let file_path = match &file_path_buf {
-                                        Some(p) => p.to_string_lossy().to_string(),
-                                        None => return,
-                                    };
-
-                                    // Check if a row already exists (e.g.
-                                    // Created followed by ChangesDoneHint).
-                                    let existing_idx = row_index_by_path(&list_ref, &file_path);
-
-                                    let entries = match list_fn() {
-                                        Ok(e) => e,
-                                        Err(e) => {
-                                            log::warn!(
-                                                "record-ui: watch: failed to list entries: {}",
-                                                e,
-                                            );
-                                            return;
-                                        }
-                                    };
-
-                                    let entry = match entries
-                                        .iter()
-                                        .find(|e| e.path.to_string_lossy() == file_path)
-                                    {
-                                        Some(e) => e,
-                                        None => {
-                                            log::debug!(
-                                                "record-ui: watch: {:?} file not in listing: {}",
-                                                event,
-                                                name,
-                                            );
-                                            return;
-                                        }
-                                    };
-
-                                    insert_or_refresh_row(
-                                        entry,
-                                        existing_idx,
-                                        &session_ref,
-                                        &win_ref,
-                                        &list_ref,
-                                        &exp_ref,
-                                        label,
-                                    );
-
-                                    if existing_idx.is_some() {
-                                        log::debug!(
-                                            "record-ui: watch: refreshed existing row: {}",
-                                            name,
-                                        );
-                                    } else {
-                                        let insert_pos = row_index_by_path(&list_ref, &file_path)
-                                            .unwrap_or_default();
-                                        log::debug!(
-                                            "record-ui: watch: inserted new row at {}: {}",
-                                            insert_pos,
-                                            name,
-                                        );
-                                    }
-                                }
-
-                                // ── Unhandled events ─────────────────────────
-                                other => {
-                                    log::debug!(
-                                        "record-ui: watch: unhandled event {:?} for: {}",
-                                        other,
-                                        name,
-                                    );
-                                }
+                        }
+                        if dirs.is_empty() {
+                            if let Some(sender) = sender {
+                                let _ = sender.send(WorkerRequest::WatchesReady(root.clone()));
                             }
-                        });
-
-                        monitors.borrow_mut().push(monitor);
+                            pending_watches.pop_front();
+                        }
                     }
-
-                    let mut dirs = Vec::new();
-                    collect_directories_recursive(dir, &mut dirs);
-                    for watched_dir in dirs {
-                        install_monitor(&watched_dir, label, ctx, list_fn, monitors);
-                    }
-                }
-
-                // Watch dictation cache directory
-                if let Ok(wav_dir) = recording_cache::recordings_dir() {
-                    let ctx = WatchCtx {
-                        list: wav_list,
-                        expander: wav_expander,
-                        session: Rc::clone(&session_idle),
-                        window: win_idle.clone(),
-                    };
-                    watch_directory(
-                        &wav_dir,
-                        "Dictation cache",
-                        &ctx,
-                        list_cache_recordings,
-                        &monitors_idle,
-                    );
-                }
-
-                // Watch OGG output directory
-                if let Ok(config) = Config::load(None) {
-                    let ctx = WatchCtx {
-                        list: ogg_list,
-                        expander: ogg_expander,
-                        session: Rc::clone(&session_idle),
-                        window: win_idle.clone(),
-                    };
-                    watch_directory(
-                        &config.output_dir,
-                        "Recordings",
-                        &ctx,
-                        list_ogg_recordings,
-                        &monitors_idle,
-                    );
-                }
-
-                log::debug!("record-ui: data loaded + watches {:.0?}", t.elapsed());
+                    glib::ControlFlow::Continue
+                });
             });
         });
     }
@@ -1206,9 +1108,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
         let session_init = Rc::clone(&session);
         glib::idle_add_local_once(move || match WavPlayer::new() {
             Ok(p) => session_init.set_player(p),
-            Err(e) => {
-                log::warn!("audio output unavailable, play disabled: {}", e);
-            }
+            Err(e) => log::warn!("audio output unavailable, play disabled: {}", e),
         });
     }
 
@@ -1223,7 +1123,153 @@ fn show_recordings_window() -> Result<(), TalkError> {
 mod tests {
     use super::super::audio::{ogg_duration_secs, wav_duration_secs};
     use super::super::entries::{format_duration, format_size};
-    use super::{basename, collect_directories_recursive};
+    use super::{
+        collect_directories_recursive, spawn_listing_worker, Section, SectionBatch, WorkerRequest,
+        WorkerResult,
+    };
+
+    #[test]
+    fn pending_snapshot_obeys_latest_pick_and_deletion_without_row_walk() {
+        let a = std::path::PathBuf::from("/tmp/a.ogg");
+        let b = std::path::PathBuf::from("/tmp/b.ogg");
+        let entry = |path: &std::path::Path, text: &str| super::RecordingEntry {
+            path: path.to_path_buf(),
+            date_label: String::new(),
+            duration_label: String::new(),
+            size_label: String::new(),
+            transcript_full: text.into(),
+            transcript_preview: text.into(),
+            status: crate::recording_cache::TranscriptStatus::Available(text.into()),
+        };
+        let mut batch = SectionBatch::new(vec![entry(&a, "old"), entry(&b, "old")]);
+        batch.update(a.clone(), None);
+        batch.update(b.clone(), Some(entry(&b, "latest")));
+        assert_eq!(batch.total, 1);
+        assert_eq!(
+            batch.next().map(|e| e.transcript_full),
+            Some("latest".into())
+        );
+        assert!(batch.finished());
+        assert!(batch.built.is_empty());
+    }
+
+    #[test]
+    fn worker_waits_for_watches_and_publishes_event_after_snapshot() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("voice.ogg");
+        std::fs::write(&audio, b"audio").expect("audio");
+        let config = serde_yaml::from_str(&format!(
+            "output_dir: {}\nproviders:\n  mistral:\n    api_key: fake\n",
+            temp.path().display()
+        ))
+        .expect("config");
+        let collection = super::RecordingCollection::output_recordings(Arc::new(config));
+        let (tx, rx) = mpsc::channel();
+        let worker = spawn_listing_worker(Section::Output, collection, tx);
+        worker.send(WorkerRequest::Start).expect("start");
+        let WorkerResult::WatchPaths(_, root, _) =
+            rx.recv_timeout(Duration::from_secs(5)).expect("watch plan")
+        else {
+            panic!("watch plan first")
+        };
+        worker
+            .send(WorkerRequest::Refresh(audio.clone()))
+            .expect("queued refresh");
+        assert!(
+            rx.try_recv().is_err(),
+            "no scan before watch acknowledgment"
+        );
+        worker
+            .send(WorkerRequest::WatchesReady(root))
+            .expect("ready");
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).expect("initial"),
+            WorkerResult::Initial(Section::Output, _)
+        ));
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).expect("update"), WorkerResult::Updated(Section::Output, path, Some(_)) if path == audio)
+        );
+    }
+
+    #[test]
+    fn directory_created_during_watch_installation_is_discovered_before_scan() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = serde_yaml::from_str(&format!(
+            "output_dir: {}\nproviders:\n  mistral:\n    api_key: fake\n",
+            temp.path().display()
+        ))
+        .expect("config");
+        let collection = super::RecordingCollection::output_recordings(Arc::new(config));
+        let (tx, rx) = mpsc::channel();
+        let worker = spawn_listing_worker(Section::Output, collection, tx);
+        worker.send(WorkerRequest::Start).expect("start");
+        let WorkerResult::WatchPaths(_, root, _) =
+            rx.recv_timeout(Duration::from_secs(5)).expect("watch plan")
+        else {
+            panic!("watch plan first")
+        };
+        let new_dir = root.join("new/month");
+        std::fs::create_dir_all(&new_dir).expect("new subtree");
+        worker
+            .send(WorkerRequest::WatchesReady(root.clone()))
+            .expect("first acknowledgment");
+        let WorkerResult::WatchPaths(_, recheck_root, additional) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("new watch plan")
+        else {
+            panic!("new watches must precede scan")
+        };
+        assert_eq!(recheck_root, root);
+        assert!(additional.contains(&new_dir));
+        worker
+            .send(WorkerRequest::WatchesReady(root))
+            .expect("second acknowledgment");
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).expect("initial"),
+            WorkerResult::Initial(Section::Output, _)
+        ));
+    }
+
+    #[test]
+    fn missing_initial_directory_still_allows_later_entry_refresh() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("missing");
+        let config = serde_yaml::from_str(&format!(
+            "output_dir: {}\nproviders:\n  mistral:\n    api_key: fake\n",
+            root.display()
+        ))
+        .expect("config");
+        let collection = super::RecordingCollection::output_recordings(Arc::new(config));
+        let (tx, rx) = mpsc::channel();
+        let worker = spawn_listing_worker(Section::Output, collection, tx);
+        worker.send(WorkerRequest::Start).expect("start");
+        let WorkerResult::WatchPaths(_, watch_root, _) =
+            rx.recv_timeout(Duration::from_secs(5)).expect("watch plan")
+        else {
+            panic!("watch plan first")
+        };
+        worker
+            .send(WorkerRequest::WatchesReady(watch_root))
+            .expect("ready");
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).expect("empty initial"), WorkerResult::Initial(Section::Output, rows) if rows.is_empty())
+        );
+        std::fs::create_dir_all(&root).expect("root appeared");
+        let audio = root.join("voice.ogg");
+        std::fs::write(&audio, b"audio").expect("recording");
+        worker
+            .send(WorkerRequest::Refresh(audio.clone()))
+            .expect("refresh");
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)).expect("recovered"), WorkerResult::Updated(Section::Output, path, Some(_)) if path == audio)
+        );
+    }
 
     #[test]
     fn test_format_duration_seconds() {
@@ -1259,18 +1305,6 @@ mod tests {
     fn test_format_size_megabytes() {
         assert_eq!(format_size(1_000_000), "1.0 MB");
         assert_eq!(format_size(15_500_000), "15.5 MB");
-    }
-
-    #[test]
-    fn test_basename_ignores_parent_directories() {
-        assert_eq!(
-            basename("/tmp/2026/04/2026-04-11T12-00-00.ogg"),
-            "2026-04-11T12-00-00.ogg"
-        );
-        assert_eq!(
-            basename("2026-04-11T12-00-00.ogg"),
-            "2026-04-11T12-00-00.ogg"
-        );
     }
 
     #[test]

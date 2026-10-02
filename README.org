@@ -104,7 +104,11 @@ happening.
   Play, delete, open in the file manager, or transcribe on demand.
   A waterfall spectrogram is shown for every recording, even those
   without transcripts; sections auto-refresh via inotify when files
-  change externally. Large libraries load their waveforms on bounded
+  change externally. Directory scans and changed-entry metadata reads run
+  on background workers; the browser builds rows in small GTK idle slices
+  and retains live changes that arrive while the list is loading. The
+  configured default model is captured when the browser opens; reopen it
+  after changing that setting. Large libraries load their waveforms on bounded
   background workers; Play remains responsive while a long recording
   decodes. A refreshed row for the same recording keeps playback active,
   and collapsing a section does not stop it.

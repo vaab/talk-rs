@@ -330,6 +330,25 @@ impl RecordingMetadata {
 pub struct TranscriptionCache;
 
 impl TranscriptionCache {
+    /// Match the same candidate names that the cache reader probes, including legacy aliases.
+    pub(crate) fn is_sidecar_for(
+        audio: &Path,
+        sidecar: &Path,
+        provider: Provider,
+        model: &str,
+    ) -> bool {
+        if audio.parent() != sidecar.parent() {
+            return false;
+        }
+        let (Some(stem), Some(name)) = (
+            audio.file_stem().and_then(|s| s.to_str()),
+            sidecar.file_name().and_then(|s| s.to_str()),
+        ) else {
+            return false;
+        };
+        sidecar_names(stem, provider, model).any(|candidate| candidate == name)
+    }
+
     /// Look up a cached transcription for the given audio file,
     /// provider, and model. Old sidecars without a size/mtime fingerprint
     /// remain valid for existing audio files (backward compatibility).
@@ -337,25 +356,15 @@ impl TranscriptionCache {
         let audio_meta = fs::metadata(audio_path).ok()?;
         let dir = audio_path.parent()?;
         let stem = audio_path.file_stem()?.to_str()?;
-        // `oneshot` is the current mode token; `batch` is the legacy
-        // alias kept in the read list so pre-rename sidecars written
-        // before the batch->one-shot vocabulary change are still found.
-        for mode in &["oneshot", "batch", "realtime"] {
-            let encoded = encode_model(model);
-            let legacy = model.replace(['/', ' '], "-");
-            for safe_model in [encoded.as_str(), legacy.as_str()] {
-                // Legacy filenames can collide; the stored model field
-                // decides ownership, including on the fallback path.
-                let filename = format!("{}_{}_{}_{}.yml", stem, provider, safe_model, mode);
-                let path = dir.join(&filename);
-                if !path.exists() {
-                    continue;
-                }
-                match Self::read_sidecar(&path, &audio_meta, model, provider) {
-                    Ok(result) => return Some(result),
-                    Err(e) => {
-                        log::warn!("failed to read cached sidecar {}: {}", path.display(), e);
-                    }
+        for filename in sidecar_names(stem, provider, model) {
+            let path = dir.join(filename);
+            if !path.exists() {
+                continue;
+            }
+            match Self::read_sidecar(&path, &audio_meta, model, provider) {
+                Ok(result) => return Some(result),
+                Err(e) => {
+                    log::warn!("failed to read cached sidecar {}: {}", path.display(), e);
                 }
             }
         }
@@ -494,6 +503,20 @@ impl TranscriptionCache {
         }
         Ok(meta.into_transcription_result())
     }
+}
+
+fn sidecar_names(stem: &str, provider: Provider, model: &str) -> impl Iterator<Item = String> {
+    let stem = stem.to_owned();
+    let encoded = encode_model(model);
+    let legacy = model.replace(['/', ' '], "-");
+    ["oneshot", "batch", "realtime"]
+        .into_iter()
+        .flat_map(move |mode| {
+            let stem = stem.clone();
+            [encoded.clone(), legacy.clone()]
+                .into_iter()
+                .map(move |safe| format!("{stem}_{provider}_{safe}_{mode}.yml"))
+        })
 }
 
 fn system_time_ns(time: std::time::SystemTime) -> Option<u128> {
@@ -2187,6 +2210,35 @@ mod tests {
         assert!(!belongs_to_recording(
             "2026-09-04T18-57-41+0200-1.pick.yml",
             stem
+        ));
+    }
+
+    #[test]
+    fn sidecar_event_identity_uses_reader_names_and_parent_directory() {
+        let audio = Path::new("/library/april/voice_with_underscores.ogg");
+        for name in [
+            "voice_with_underscores_mistral_model%2Fname%20v2_oneshot.yml",
+            "voice_with_underscores_mistral_model-name-v2_batch.yml",
+            "voice_with_underscores_mistral_model%2Fname%20v2_realtime.yml",
+        ] {
+            assert!(TranscriptionCache::is_sidecar_for(
+                audio,
+                &audio.with_file_name(name),
+                Provider::Mistral,
+                "model/name v2"
+            ));
+        }
+        assert!(!TranscriptionCache::is_sidecar_for(
+            audio,
+            Path::new("/library/may/voice_with_underscores_mistral_model-name-v2_batch.yml"),
+            Provider::Mistral,
+            "model/name v2"
+        ));
+        assert!(!TranscriptionCache::is_sidecar_for(
+            audio,
+            Path::new("/library/april/voice_mistral_model-name-v2_batch.yml"),
+            Provider::Mistral,
+            "model/name v2"
         ));
     }
 

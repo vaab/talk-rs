@@ -5,10 +5,11 @@ use crate::config::Config;
 use crate::error::TalkError;
 use crate::recording_cache;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// File extensions that the recordings browser considers playable
 /// audio.  Used both by [`collect_audio_recursive`] and by
-/// [`list_cache_recordings`] so listing and cache stay in sync.
+/// [`RecordingCollection::list`] so listing and cache stay in sync.
 ///
 /// Currently:
 /// * `ogg` — talk-rs's own Opus output (and dictation cache).
@@ -26,7 +27,7 @@ const AUDIO_EXTENSIONS: &[&str] = &["ogg", "m4a", "mp4", "aac"];
 /// listable audio recording.  Comparison is case-insensitive to be
 /// kind to files imported from external sources (e.g. `.M4A` from a
 /// camera).
-fn has_audio_extension(path: &Path) -> bool {
+pub(super) fn has_audio_extension(path: &Path) -> bool {
     let ext = match path.extension().and_then(|e| e.to_str()) {
         Some(e) => e.to_ascii_lowercase(),
         None => return false,
@@ -55,6 +56,7 @@ fn audio_duration_secs(path: &Path) -> Option<f64> {
 }
 
 /// Entry for one cached recording.
+#[derive(Clone)]
 pub(super) struct RecordingEntry {
     pub(super) path: PathBuf,
     pub(super) date_label: String,
@@ -146,7 +148,7 @@ pub(super) fn format_size(bytes: u64) -> String {
 /// Recursively collect every supported audio file (see
 /// [`AUDIO_EXTENSIONS`]) under `dir` into `out`.
 ///
-/// Used by [`list_ogg_recordings`] so the recordings browser still works
+/// Used by [`RecordingCollection::list`] so the recordings browser still works
 /// after the archival directory was namespaced into `YYYY/MM/`
 /// subdirectories.  Flat top-level files (pre-migration or user-placed)
 /// are also picked up, so the reader tolerates both layouts at once.
@@ -212,6 +214,160 @@ fn collect_audio_flat(dir: &Path) -> Result<Vec<PathBuf>, TalkError> {
 /// Sort timestamp-bearing recording basenames newest-first.
 fn sort_recording_paths_newest_first(audio: &mut [PathBuf]) {
     audio.sort_by(|a, b| recording_cache::compare_recording_paths(b, a));
+}
+
+pub(super) fn compare_entries_newest_first(a: &Path, b: &Path) -> std::cmp::Ordering {
+    recording_cache::compare_recording_paths(b, a)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    Flat,
+    Recursive,
+}
+
+/// A browser section's membership and metadata, independent of GTK.
+#[derive(Clone)]
+pub(super) struct RecordingCollection {
+    root: PathBuf,
+    layout: Layout,
+    config: Arc<Config>,
+}
+
+impl RecordingCollection {
+    pub(super) fn for_root(root: PathBuf, recursive: bool, config: Arc<Config>) -> Self {
+        Self {
+            root,
+            layout: if recursive {
+                Layout::Recursive
+            } else {
+                Layout::Flat
+            },
+            config,
+        }
+    }
+
+    pub(super) fn dictation_cache(config: Arc<Config>) -> Result<Self, TalkError> {
+        Ok(Self::for_root(
+            recording_cache::recordings_dir()?,
+            false,
+            config,
+        ))
+    }
+
+    pub(super) fn output_recordings(config: Arc<Config>) -> Self {
+        Self::for_root(config.output_dir.clone(), true, config)
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) fn list(&self) -> Result<Vec<RecordingEntry>, TalkError> {
+        self.list_under(&self.root)
+    }
+
+    pub(super) fn list_under(&self, dir: &Path) -> Result<Vec<RecordingEntry>, TalkError> {
+        crate::perf_counters::incr(crate::perf_counters::Counter::ListCalls);
+        if !dir.exists()
+            || !dir.starts_with(&self.root)
+            || (self.layout == Layout::Flat && dir != self.root)
+            || self.has_symlinked_parent(dir)
+        {
+            return Ok(Vec::new());
+        }
+        let mut audio = if self.layout == Layout::Flat {
+            collect_audio_flat(dir)?
+        } else {
+            let mut audio = Vec::new();
+            collect_audio_recursive(dir, &mut audio)?;
+            audio
+        };
+        sort_recording_paths_newest_first(&mut audio);
+        Ok(audio
+            .into_iter()
+            .filter_map(|path| self.load_entry(&path))
+            .collect())
+    }
+
+    fn has_symlinked_parent(&self, dir: &Path) -> bool {
+        let Ok(relative) = dir.strip_prefix(&self.root) else {
+            return true;
+        };
+        let mut parent = self.root.clone();
+        for part in relative.components() {
+            parent.push(part);
+            if parent.is_symlink() || !parent.is_dir() {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(super) fn entry(&self, path: &Path) -> Option<RecordingEntry> {
+        let parent = path.parent()?;
+        if !path.starts_with(&self.root)
+            || (self.layout == Layout::Flat && parent != self.root)
+            || self.has_symlinked_parent(parent)
+        {
+            return None;
+        }
+        self.load_entry(path)
+    }
+
+    fn load_entry(&self, path: &Path) -> Option<RecordingEntry> {
+        if !has_audio_extension(path) {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return None;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let status = crate::transcription::cached_transcript_status(path, &self.config);
+        let (transcript_full, transcript_preview) = match &status {
+            recording_cache::TranscriptStatus::Available(text) => transcript_variants(text),
+            _ => (String::new(), String::new()),
+        };
+        Some(RecordingEntry {
+            path: path.to_path_buf(),
+            date_label: date_label_from_stem(stem),
+            duration_label: audio_duration_secs(path)
+                .map(format_duration)
+                .unwrap_or_else(|| "?:??".into()),
+            size_label: format_size(metadata.len()),
+            transcript_full,
+            transcript_preview,
+            status,
+        })
+    }
+
+    pub(super) fn affected_audio<'a>(
+        &self,
+        sidecar: &Path,
+        known: impl Iterator<Item = &'a PathBuf>,
+    ) -> Vec<PathBuf> {
+        let Some(name) = sidecar.file_name().and_then(|s| s.to_str()) else {
+            return Vec::new();
+        };
+        known
+            .filter(|path| path.parent() == sidecar.parent())
+            .filter(|path| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|stem| {
+                        name == format!("{stem}.pick.yml")
+                            || name == format!("{stem}.pick-lock.yml")
+                            || crate::transcription::is_default_cached_sidecar_for(
+                                path,
+                                sidecar,
+                                &self.config,
+                            )
+                    })
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -299,155 +455,21 @@ pub(crate) fn recording_navigation(
 /// `.m4a` / `.mp4` / `.aac` files dropped into the directory (e.g.
 /// iPhone voice memos imported manually), so they can be played and
 /// transcribed alongside native recordings.
-pub(super) fn list_ogg_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
-    let t = std::time::Instant::now();
-    let config = Config::load(None)?;
-    log::debug!("list_audio: config load {:.0?}", t.elapsed());
-    list_ogg_recordings_in_dir(&config.output_dir, &config)
-}
-
+#[cfg(test)]
 fn list_ogg_recordings_in_dir(
     dir: &Path,
     config: &Config,
 ) -> Result<Vec<RecordingEntry>, TalkError> {
-    crate::perf_counters::incr(crate::perf_counters::Counter::ListCalls);
-    let t = std::time::Instant::now();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut audio: Vec<PathBuf> = Vec::new();
-    collect_audio_recursive(dir, &mut audio)?;
-
-    // Sort by file name (the timestamp-bearing basename) rather than by
-    // full path.  This keeps chronological ordering correct when flat
-    // (`<dir>/2026-04-05T…`) and nested (`<dir>/2026/04/2026-04-10T…`)
-    // files coexist during a transition: path-based sorting would place
-    // `2026-04-05T…` before `2026/04/2026-04-10T…` because `-` < `/` in
-    // ASCII, producing an out-of-order result.  Sorting by file name
-    // alone ignores the directory prefix and yields the right order.
-    sort_recording_paths_newest_first(&mut audio);
-
-    let mut result = Vec::with_capacity(audio.len());
-    for audio_path in audio {
-        let stem = audio_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let date_label = date_label_from_stem(stem);
-
-        let duration_label = audio_duration_secs(&audio_path)
-            .map(format_duration)
-            .unwrap_or_else(|| "?:??".to_string());
-
-        let size_label = std::fs::metadata(&audio_path)
-            .map(|m| format_size(m.len()))
-            .unwrap_or_else(|_| "?".to_string());
-
-        // Read transcript via the waterfall: pick file first, then
-        // default-provider/model sidecar (no API call).  Keeps the
-        // pick-lock state visible separately so the UI can still
-        // show "transcription ongoing".
-        let status = match crate::recording_cache::get_transcript(&audio_path) {
-            status @ crate::recording_cache::TranscriptStatus::InProgress => status,
-            _ => match crate::transcription::read_cached_transcript(&audio_path, config) {
-                Some(text) => crate::recording_cache::TranscriptStatus::Available(text),
-                None => crate::recording_cache::TranscriptStatus::NotAvailable,
-            },
-        };
-        let (transcript_full, transcript_preview) = match &status {
-            crate::recording_cache::TranscriptStatus::Available(text) => transcript_variants(text),
-            _ => (String::new(), String::new()),
-        };
-
-        result.push(RecordingEntry {
-            path: audio_path,
-            date_label,
-            duration_label,
-            size_label,
-            transcript_full,
-            transcript_preview,
-            status,
-        });
-    }
-
-    log::debug!(
-        "list_audio: {} entries, total {:.0?}",
-        result.len(),
-        t.elapsed(),
-    );
-    Ok(result)
+    RecordingCollection::for_root(dir.to_path_buf(), true, Arc::new(config.clone())).list()
 }
 
 /// Gather dictation cache entries (with companion YML), sorted newest-first.
-pub(super) fn list_cache_recordings() -> Result<Vec<RecordingEntry>, TalkError> {
-    let config = Config::load(None)?;
-    let dir = recording_cache::recordings_dir()?;
-    list_cache_recordings_in_dir(&dir, &config)
-}
-
+#[cfg(test)]
 fn list_cache_recordings_in_dir(
     dir: &Path,
     config: &Config,
 ) -> Result<Vec<RecordingEntry>, TalkError> {
-    crate::perf_counters::incr(crate::perf_counters::Counter::ListCalls);
-    let t = std::time::Instant::now();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    // The cache is intentionally flat and symlinks such as
-    // `last_recording.ogg` are not separate browser entries.
-    let mut audio = collect_audio_flat(dir)?;
-    sort_recording_paths_newest_first(&mut audio);
-
-    let mut result = Vec::with_capacity(audio.len());
-    for audio_path in audio {
-        let stem = audio_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let date_label = date_label_from_stem(stem);
-
-        let duration_label = audio_duration_secs(&audio_path)
-            .map(format_duration)
-            .unwrap_or_else(|| "?:??".to_string());
-
-        let size_label = std::fs::metadata(&audio_path)
-            .map(|m| format_size(m.len()))
-            .unwrap_or_else(|_| "?".to_string());
-
-        // Read transcript via the waterfall: pick → default-model
-        // sidecar (no API call).
-        let status = match recording_cache::get_transcript(&audio_path) {
-            status @ recording_cache::TranscriptStatus::InProgress => status,
-            _ => match crate::transcription::read_cached_transcript(&audio_path, config) {
-                Some(text) => recording_cache::TranscriptStatus::Available(text),
-                None => recording_cache::TranscriptStatus::NotAvailable,
-            },
-        };
-        let (transcript_full, transcript_preview) = match &status {
-            recording_cache::TranscriptStatus::Available(text) => transcript_variants(text),
-            _ => (String::new(), String::new()),
-        };
-
-        result.push(RecordingEntry {
-            path: audio_path,
-            date_label,
-            duration_label,
-            size_label,
-            transcript_full,
-            transcript_preview,
-            status,
-        });
-    }
-
-    log::debug!(
-        "list_cache: {} entries, total {:.0?}",
-        result.len(),
-        t.elapsed(),
-    );
-    Ok(result)
+    RecordingCollection::for_root(dir.to_path_buf(), false, Arc::new(config.clone())).list()
 }
 
 /// Delete a recording and its companion metadata YAML files.
@@ -530,6 +552,68 @@ mod tests {
     use crate::config::{MistralConfig, ProvidersConfig};
     use crate::recording_cache::TranscriptionCache;
     use crate::transcription::TranscriptionResult;
+
+    #[test]
+    fn collection_reload_matches_listing_and_reads_pick_once() {
+        use crate::perf_counters::{thread_value, Counter};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("voice_with_under_score.ogg");
+        std::fs::write(&audio, b"audio").expect("audio");
+        recording_cache::write_pick(&audio, "mistral", "model", false, "new\nwords").expect("pick");
+        let collection = RecordingCollection::output_recordings(std::sync::Arc::new(
+            listing_config(temp.path()),
+        ));
+        let before = thread_value(Counter::PickReads);
+        let entry = collection.entry(&audio).expect("one entry");
+        assert_eq!(thread_value(Counter::PickReads) - before, 1);
+        assert_eq!(entry.transcript_full, "new words");
+        assert_eq!(
+            collection.list().expect("list")[0].transcript_full,
+            entry.transcript_full
+        );
+    }
+
+    #[test]
+    fn collection_rejects_nested_cache_and_symlinked_ancestors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let audio = nested.join("voice.ogg");
+        std::fs::write(&audio, b"audio").expect("audio");
+        let config = std::sync::Arc::new(listing_config(&root));
+        let output = RecordingCollection::output_recordings(config.clone());
+        assert!(output.entry(&audio).is_some());
+        std::os::unix::fs::symlink(&nested, root.join("link")).expect("link");
+        assert!(output.entry(&root.join("link/voice.ogg")).is_none());
+        let cache = RecordingCollection::for_root(root.clone(), false, config);
+        assert!(cache.list_under(&nested).expect("nested list").is_empty());
+        assert!(cache.entry(&audio).is_none());
+    }
+
+    #[test]
+    fn sidecar_events_match_exact_parent_stem_and_default_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("month");
+        std::fs::create_dir_all(&parent).expect("month");
+        let audio = parent.join("voice_with_under_score.ogg");
+        let other = parent.join("voice.ogg");
+        let duplicate = temp.path().join("voice_with_under_score.ogg");
+        let collection = RecordingCollection::output_recordings(std::sync::Arc::new(
+            listing_config(temp.path()),
+        ));
+        let known = [audio.clone(), other, duplicate];
+        let pick = parent.join("voice_with_under_score.pick.yml");
+        assert_eq!(
+            collection.affected_audio(&pick, known.iter()),
+            vec![audio.clone()]
+        );
+        let sidecar = parent.join("voice_with_under_score_mistral_voxtral-mini-2507_batch.yml");
+        assert_eq!(
+            collection.affected_audio(&sidecar, known.iter()),
+            vec![audio]
+        );
+    }
 
     fn listing_config(root: &Path) -> Config {
         Config {

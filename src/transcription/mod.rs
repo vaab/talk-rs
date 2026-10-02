@@ -1139,7 +1139,7 @@ fn override_openai_batch_model(
 /// This function is synchronous because every step is a local
 /// filesystem read.  It never calls the transcription API.
 pub fn read_cached_transcript(audio_path: &std::path::Path, config: &Config) -> Option<String> {
-    use crate::recording_cache::{get_transcript, TranscriptStatus, TranscriptionCache};
+    use crate::recording_cache::{get_transcript, TranscriptStatus};
 
     // Layer 1: pick file (authoritative).
     match get_transcript(audio_path) {
@@ -1148,15 +1148,48 @@ pub fn read_cached_transcript(audio_path: &std::path::Path, config: &Config) -> 
         TranscriptStatus::InProgress | TranscriptStatus::NotAvailable => {}
     }
 
-    // Layer 3: per-model sidecar cache for the default
-    // provider/model.  Synchronous file read, no API call.
+    default_sidecar_transcript(audio_path, config)
+}
+
+/// Resolve lock, pick, then default-model sidecar without rereading the pick.
+pub(crate) fn cached_transcript_status(
+    audio_path: &std::path::Path,
+    config: &Config,
+) -> crate::recording_cache::TranscriptStatus {
+    use crate::recording_cache::{get_transcript, TranscriptStatus};
+    match get_transcript(audio_path) {
+        TranscriptStatus::NotAvailable => default_sidecar_transcript(audio_path, config)
+            .map(TranscriptStatus::Available)
+            .unwrap_or(TranscriptStatus::NotAvailable),
+        status => status,
+    }
+}
+
+fn default_sidecar_transcript(audio_path: &std::path::Path, config: &Config) -> Option<String> {
     let provider = config
         .transcription
         .as_ref()
         .map(|t| t.default_provider)
         .unwrap_or(Provider::Mistral);
     let effective_model = resolve_effective_model(config, provider, None);
-    TranscriptionCache::get(audio_path, provider, &effective_model).map(|r| r.text)
+    crate::recording_cache::TranscriptionCache::get(audio_path, provider, &effective_model)
+        .map(|r| r.text)
+}
+
+pub(crate) fn is_default_cached_sidecar_for(
+    audio_path: &std::path::Path,
+    sidecar: &std::path::Path,
+    config: &Config,
+) -> bool {
+    let provider = config
+        .transcription
+        .as_ref()
+        .map(|t| t.default_provider)
+        .unwrap_or(Provider::Mistral);
+    let model = resolve_effective_model(config, provider, None);
+    crate::recording_cache::TranscriptionCache::is_sidecar_for(
+        audio_path, sidecar, provider, &model,
+    )
 }
 
 /// Produce the authoritative transcript for a recording (Layer 2).

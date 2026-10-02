@@ -163,11 +163,18 @@ impl WaterfallLoader {
         }
     }
 
-    /// Apply every result that has arrived; returns how many were
-    /// applied.  Results whose interest was dropped are discarded.
+    /// Apply a short slice of ready results; the timer drains the rest later.
+    /// Results whose interest was dropped are discarded.
     pub(crate) fn deliver_ready(&self) -> usize {
+        let started = std::time::Instant::now();
         let mut applied = 0;
-        while let Ok((id, result)) = self.inner.results.try_recv() {
+        for _ in 0..4 {
+            if started.elapsed() >= std::time::Duration::from_millis(5) {
+                break;
+            }
+            let Ok((id, result)) = self.inner.results.try_recv() else {
+                break;
+            };
             let apply = self.inner.pending.borrow_mut().remove(&id);
             if let Some(apply) = apply {
                 apply(result);
@@ -285,6 +292,33 @@ mod tests {
 
     fn columns(tag: f32) -> WfColumns {
         (vec![vec![tag; 2]], tag)
+    }
+
+    #[test]
+    fn completed_waveforms_yield_to_gtk_in_bounded_slices() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let work: Work = {
+            let finished = Arc::clone(&finished);
+            Arc::new(move |_| {
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok(columns(0.0))
+            })
+        };
+        let loader = WaterfallLoader::new(1, work);
+        let _interests: Vec<_> = (0..12)
+            .map(|i| loader.request(Path::new(&format!("{i}.ogg")), Box::new(|_| {})))
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while finished.load(Ordering::SeqCst) < 12 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(finished.load(Ordering::SeqCst), 12);
+        let first = loader.deliver_ready();
+        assert!(
+            (1..12).contains(&first),
+            "one GTK turn must yield before draining all results"
+        );
+        assert_eq!(first + drain(&loader, 12 - first), 12);
     }
 
     /// Drain the loader until `n` results were applied or 5 s pass.
