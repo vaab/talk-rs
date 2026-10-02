@@ -45,10 +45,14 @@ pub(crate) mod http;
 pub(crate) mod validate_cache;
 pub(crate) mod ws;
 
+#[cfg(test)]
+mod client_tests;
+
 use crate::config::Provider;
 use crate::error::{NetworkKind, PipelineFailure, PipelineFailureKind, TimerLabel};
 use crate::telemetry::{TelemetrySink, TranscriptionEvent};
-use std::sync::{Arc, OnceLock};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -317,7 +321,7 @@ pub enum ConnectionEvent {
 ///    fresh connection-phase loop.  Emits [`RetryKind::Data`].
 ///
 /// 2. **Connection retry** — inner loop, attempts indexed against
-///    [`CONNECTION_BUDGETS_SECS`].  Each attempt builds a fresh
+///    [`CONNECTION_BUDGETS_SECS`].  Each attempt obtains a shared
 ///    reqwest client with the current per-attempt connect timeout
 ///    and tries once.  On a connect-class failure (DNS, ECONNREFUSED,
 ///    TCP/TLS timeout) the loop emits [`RetryKind::Connection`] and
@@ -633,9 +637,16 @@ async fn run_single_http_attempt(
     data_attempt: u32,
     max_data_attempts: u32,
 ) -> SingleAttempt {
-    // ── Build a per-attempt client with the right connect timeout ──
-    let client = match build_client_with_connect_timeout(connect_budget) {
+    // Client policy is shared; headers, body and wall-clock cap remain request-local.
+    let client = match http_client(connect_budget, cancel).await {
         Ok(c) => c,
+        Err(_e) if cancel.is_cancelled() => {
+            return SingleAttempt::Cancelled(build_cancellation_failure(
+                req,
+                attempt_num,
+                max_attempts,
+            ));
+        }
         Err(e) => {
             return SingleAttempt::Permanent(PipelineFailure::new(
                 req.provider_name.clone(),
@@ -822,13 +833,154 @@ async fn run_single_http_attempt(
     }
 }
 
-/// Build a [`reqwest::Client`] with the given per-attempt connect
-/// timeout.  Other client settings (TCP keepalive, user_timeout)
-/// match the shared client builder in [`http::build_client`].
+const MAX_HTTP_CLIENT_POLICIES: usize = 16;
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct HttpClients {
+    by_budget: BTreeMap<Duration, reqwest::Client>,
+    recent: VecDeque<Duration>,
+}
+
+impl HttpClients {
+    fn get(&mut self, budget: Duration) -> Option<reqwest::Client> {
+        let client = self.by_budget.get(&budget)?.clone();
+        self.recent.retain(|key| *key != budget);
+        self.recent.push_back(budget);
+        Some(client)
+    }
+
+    #[cfg(test)]
+    fn client(&mut self, budget: Duration) -> Result<reqwest::Client, String> {
+        self.client_with_builder(budget, build_client_with_connect_timeout)
+    }
+
+    #[cfg(test)]
+    fn client_with_builder(
+        &mut self,
+        budget: Duration,
+        builder: fn(Duration) -> Result<reqwest::Client, String>,
+    ) -> Result<reqwest::Client, String> {
+        if let Some(client) = self.get(budget) {
+            return Ok(client);
+        }
+        let client = builder(budget)?;
+        Ok(self.insert_built(budget, client))
+    }
+
+    fn insert_built(&mut self, budget: Duration, client: reqwest::Client) -> reqwest::Client {
+        if let Some(existing) = self.get(budget) {
+            return existing;
+        }
+        if self.by_budget.len() >= MAX_HTTP_CLIENT_POLICIES {
+            // The default first attempt is the socket warmed during dictation.
+            // Do not let unrelated custom budgets evict it mid-recording.
+            let protected = Duration::from_secs(CONNECTION_BUDGETS_SECS[0]);
+            if let Some(position) = self.recent.iter().position(|key| *key != protected) {
+                if let Some(oldest) = self.recent.remove(position) {
+                    self.by_budget.remove(&oldest);
+                }
+            }
+        }
+        self.by_budget.insert(budget, client.clone());
+        self.recent.push_back(budget);
+        client
+    }
+}
+
+fn clients() -> &'static Mutex<HttpClients> {
+    static CLIENTS: OnceLock<Mutex<HttpClients>> = OnceLock::new();
+    CLIENTS.get_or_init(|| Mutex::new(HttpClients::default()))
+}
+
+fn lock_clients() -> std::sync::MutexGuard<'static, HttpClients> {
+    // A panic while updating retention metadata cannot invalidate a reqwest client;
+    // rebuild the recency list from actual keys if a previous holder poisoned it.
+    match clients().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.recent = guard.by_budget.keys().copied().collect();
+            guard
+        }
+    }
+}
+
+/// Cold certificate-store setup runs off the async worker. Cancellation
+/// drops the waiting future, while an already-running build may finish in
+/// the blocking pool and retain the reusable client for later calls.
+async fn http_client(
+    budget: Duration,
+    cancel: &CancellationToken,
+) -> Result<reqwest::Client, String> {
+    http_client_with_builder(budget, cancel, build_client_with_connect_timeout).await
+}
+
+async fn http_client_with_builder(
+    budget: Duration,
+    cancel: &CancellationToken,
+    builder: fn(Duration) -> Result<reqwest::Client, String>,
+) -> Result<reqwest::Client, String> {
+    if let Some(client) = lock_clients().get(budget) {
+        return Ok(client);
+    }
+    let build = tokio::task::spawn_blocking(move || {
+        let constructed = builder(budget)?;
+        Ok::<_, String>(lock_clients().insert_built(budget, constructed))
+    });
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("HTTP client construction cancelled".into()),
+        result = build => result.map_err(|e| format!("HTTP client build task failed: {e}"))?,
+    }
+}
+
+/// Best-effort unauthenticated connection setup while an encoded pipe is
+/// collected. A completed HEAD can return a socket to the same pool as POST.
+pub(crate) async fn prewarm_http(
+    endpoint: &str,
+    schedule: &RetrySchedule,
+    cancel: &CancellationToken,
+) {
+    let Some(&budget) = schedule.connection_budgets.first() else {
+        return;
+    };
+    if cancel.is_cancelled() {
+        return;
+    }
+    let warmup = async {
+        let client = http_client(budget, cancel).await?;
+        let response = client
+            .head(endpoint)
+            .timeout(budget)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        response.bytes().await.map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {}
+        result = tokio::time::timeout(budget, warmup) => match result {
+            Ok(Ok(())) => log::debug!("HTTP connection warmup completed for {endpoint}"),
+            Ok(Err(e)) => log::debug!("HTTP connection warmup unavailable for {endpoint}: {e}"),
+            Err(_) => log::debug!("HTTP connection warmup timed out for {endpoint}"),
+        }
+    }
+}
+
+/// Build a [`reqwest::Client`] for one exact per-attempt connect budget.
 fn build_client_with_connect_timeout(connect_timeout: Duration) -> Result<reqwest::Client, String> {
     crate::perf_counters::incr(crate::perf_counters::Counter::HttpClientBuilds);
     let builder = reqwest::Client::builder()
         .connect_timeout(connect_timeout)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
+        .http2_keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
+        .http2_keep_alive_while_idle(true)
         .tcp_keepalive(Duration::from_secs(5))
         .tcp_keepalive_interval(Duration::from_secs(1))
         .tcp_keepalive_retries(3);

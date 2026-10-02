@@ -17,9 +17,7 @@ use std::time::{Duration, Instant};
 
 // `CONNECT_TIMEOUT` and `build_client` were deleted in Step 9 of
 // transport-consolidation.  The unified `transport::http_request`
-// builds a fresh reqwest client per attempt with the right
-// per-attempt connect budget via
-// `transport::build_client_with_connect_timeout`.
+// shares clients by exact per-attempt connect budget via the transport pool.
 //
 // `TCP_USER_TIMEOUT`, `TCP_KEEPALIVE`, `TCP_KEEPALIVE_INTERVAL`,
 // `TCP_KEEPALIVE_RETRIES` survive (private) because
@@ -57,6 +55,31 @@ const REQUEST_TIMEOUT_FLOOR_SECS: u64 = 3;
 /// processing, tight enough to catch application-layer hangs within
 /// seconds for typical short dictations.
 const REQUEST_TIMEOUT_KB_DIVISOR: u64 = 10;
+
+/// Collect encoded audio while racing a droppable, speculative HEAD.
+/// EOF and cancellation take priority over the warmup, never awaiting it.
+pub(crate) async fn collect_upload(
+    mut chunks: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    endpoint: &str,
+    schedule: &super::RetrySchedule,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<u8>, TalkError> {
+    let warmup = super::prewarm_http(endpoint, schedule, cancel);
+    tokio::pin!(warmup);
+    let mut warming = true;
+    let mut bytes = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(TalkError::Transcription("cancelled by caller".into())),
+            chunk = chunks.recv() => match chunk {
+                Some(chunk) => bytes.extend_from_slice(&chunk),
+                None => return Ok(bytes),
+            },
+            _ = &mut warmup, if warming => warming = false,
+        }
+    }
+}
 
 /// Compute a per-request wall-clock timeout proportional to the audio
 /// payload size.
@@ -299,6 +322,7 @@ pub(crate) struct ProgressBody {
     /// once, even if `poll_next` is called again after returning
     /// `None` (rare but legal).
     emitted_complete: bool,
+    created_at: Instant,
 }
 
 impl ProgressBody {
@@ -318,6 +342,7 @@ impl ProgressBody {
             sink,
             emitted_connection: false,
             emitted_complete: false,
+            created_at: Instant::now(),
         }
     }
 
@@ -342,6 +367,10 @@ impl Stream for ProgressBody {
         // asking for bytes".  Emitted exactly once per stream.
         if !self.emitted_connection {
             self.emitted_connection = true;
+            log::debug!(
+                "upload connection ready (first body poll) after {}ms",
+                self.created_at.elapsed().as_millis()
+            );
             self.sink
                 .emit(TranscriptionEvent::ConnectionEstablished { t: Instant::now() });
         }

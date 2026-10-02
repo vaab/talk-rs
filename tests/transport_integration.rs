@@ -149,6 +149,51 @@ fn refused_loopback_url(scheme: &str) -> String {
     format!("{scheme}://127.0.0.1:{port}/v1/models")
 }
 
+#[test]
+fn pooled_client_survives_successive_request_runtimes() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let (url_tx, url_rx) = std::sync::mpsc::sync_channel(1);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("server runtime");
+        runtime.block_on(async move {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/models"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(2)
+                .mount(&server)
+                .await;
+            url_tx.send(server.uri()).expect("url");
+            stop_rx.await.expect("stop");
+            server.verify().await;
+        });
+    });
+    let url = format!("{}/v1/models", url_rx.recv().expect("server started"));
+    for _ in 0..2 {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("request runtime");
+        runtime.block_on(async {
+            let sink: Arc<dyn TelemetrySink> = Arc::new(CapturingSink::new());
+            http_request(
+                make_request(&url, PipelinePhase::Validate),
+                &sink,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("request across runtime boundary");
+        });
+    }
+    stop_tx.send(()).expect("stop server");
+    server_thread.join().expect("server thread");
+}
+
 // ── §3 Step 1 tests ─────────────────────────────────────────────────
 //
 // These tests assert the POST-Step-2 spec.  Pre-Step-2 they fail

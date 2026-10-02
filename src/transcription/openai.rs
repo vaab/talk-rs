@@ -598,23 +598,22 @@ impl OneShotTranscriber for OpenAIOneShotTranscriber {
                 // so sending anything richer is pure waste.
                 super::normalize_file_for_upload(&path)?
             }
-            TranscriptionBody::Pipe {
-                mut chunks,
-                file_name,
-            } => {
-                let mut bytes = Vec::new();
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = self.cancel_token.cancelled() => {
-                            return Err(TalkError::Transcription("cancelled by caller".into()));
-                        }
-                        chunk = chunks.recv() => match chunk {
-                            Some(chunk) => bytes.extend_from_slice(&chunk),
-                            None => break,
-                        }
-                    }
-                }
+            TranscriptionBody::Pipe { chunks, file_name } => {
+                validate_openai_hints(
+                    OpenAITranscriptionMode::Batch,
+                    &self.config.model,
+                    self.config.prompt.as_deref(),
+                    self.config.keywords.as_deref(),
+                    self.config.languages.as_deref(),
+                    None,
+                )?;
+                let bytes = transport::http::collect_upload(
+                    chunks,
+                    &self.endpoint,
+                    &self.retry_schedule,
+                    &self.cancel_token,
+                )
+                .await?;
                 (bytes, file_name)
             }
         };
@@ -631,6 +630,37 @@ mod tests {
     use tempfile::NamedTempFile;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Match, Mock, MockServer, Request as WiremockRequest, ResponseTemplate};
+
+    #[tokio::test]
+    async fn invalid_pipe_hints_make_no_network_request() {
+        let server = MockServer::start().await;
+        let config = OpenAIConfig {
+            api_key: "sk-test-key".into(),
+            url: None,
+            model: "whisper-1".into(),
+            realtime_model: "gpt-live-transcribe".into(),
+            prompt: None,
+            keywords: Some(vec!["forbidden".into()]),
+            languages: None,
+            realtime_delay: None,
+        };
+        let transcriber = OpenAIOneShotTranscriber::with_endpoint(
+            config,
+            format!("{}/v1/audio/transcriptions", server.uri()),
+        )
+        .expect("transcriber");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let result = transcriber
+            .fetch_transcription(TranscriptionBody::Pipe {
+                chunks: rx,
+                file_name: "audio.ogg".into(),
+            })
+            .await;
+        assert!(
+            matches!(result, Err(TalkError::Config(message)) if message.contains("does not support field 'keywords'"))
+        );
+        assert_eq!(server.received_requests().await.expect("requests").len(), 0);
+    }
 
     #[tokio::test]
     async fn pipe_collection_stops_on_cancellation() {

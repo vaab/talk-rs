@@ -572,6 +572,19 @@ In the interactive picker, a connected request has no per-request
 wall-clock cap: slow server processing does not cause the same paid
 transcription POST to be sent again.
 
+Within one process, HTTP requests with the same connect budget share a
+client and may reuse an eligible socket. While collecting encoded audio
+for a cloud one-shot dictation (including file replay), talk-rs attempts
+one unauthenticated ~HEAD~ to the selected transcription endpoint. It
+sends no audio or credentials, does not validate the model, and never
+holds the upload for an unfinished warmup: EOF or cancellation drops it.
+The client retains idle sockets for up to 30 minutes and sends HTTP/2
+keepalive pings, but a server or network may close them sooner. A closed
+socket reconnects normally; no connection is shared across processes.
+At ~-vv~, logs report warmup completion and the time until the upload's
+first body poll, which is a connection-ready proxy, not proof that a
+particular socket was reused.
+
 If all seven single-model attempts fail the recording is kept in the cache;
 re-run ~transcribe~ on the ~.ogg~ (or ~dictate --retry-last~) once
 the provider has recovered.

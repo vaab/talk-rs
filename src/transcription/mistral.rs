@@ -432,25 +432,16 @@ impl OneShotTranscriber for MistralOneShotTranscriber {
                 // so sending anything richer is pure waste.
                 super::normalize_file_for_upload(&path)?
             }
-            TranscriptionBody::Pipe {
-                mut chunks,
-                file_name,
-            } => {
+            TranscriptionBody::Pipe { chunks, file_name } => {
                 log::debug!("mistral stream: awaiting audio chunks from encoder");
                 let collect_start = Instant::now();
-                let mut bytes = Vec::new();
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = self.cancel_token.cancelled() => {
-                            return Err(TalkError::Transcription("cancelled by caller".into()));
-                        }
-                        chunk = chunks.recv() => match chunk {
-                            Some(chunk) => bytes.extend_from_slice(&chunk),
-                            None => break,
-                        }
-                    }
-                }
+                let bytes = transport::http::collect_upload(
+                    chunks,
+                    &self.endpoint,
+                    &self.retry_schedule,
+                    &self.cancel_token,
+                )
+                .await?;
                 let audio_len = bytes.len() as u64;
                 log::info!(
                     "upload: collected {} bytes for Mistral one-shot request",
