@@ -15,7 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +43,9 @@ const SESSION_CREATED_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Interval between WebSocket ping frames for keepalive.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+const FINAL_SETTLE: Duration = Duration::from_millis(250);
+const STOP_COMMIT_EVENT_ID: &str = "talk-rs-stop-commit";
 
 /// Sample rate expected by the OpenAI Realtime API for PCM16.
 const OPENAI_SAMPLE_RATE: u32 = 24000;
@@ -833,7 +836,8 @@ async fn sender_loop<S>(
 
     // Audio channel closed — commit any remaining audio in the buffer.
     let commit_msg = serde_json::json!({
-        "type": "input_audio_buffer.commit"
+        "type": "input_audio_buffer.commit",
+        "event_id": STOP_COMMIT_EVENT_ID
     });
     log::debug!("sending input_audio_buffer.commit");
     if let Err(e) = ws_sink.send(Message::Text(commit_msg.to_string())).await {
@@ -850,10 +854,151 @@ async fn sender_loop<S>(
     // remaining transcription events.  Just drop the sink.
 }
 
-/// Receiver loop: reads WebSocket messages, parses events, forwards
-/// to the event channel.
-///
-/// Once audio ends, accepts late events for a fixed final deadline.
+#[derive(Default)]
+struct ObservedItem {
+    announced: bool,
+    previous: Option<String>,
+    parts: BTreeMap<u64, Option<String>>,
+}
+
+#[derive(Default)]
+struct FinalItems {
+    items: BTreeMap<String, ObservedItem>,
+    committed: HashSet<String>,
+    before_end: usize,
+    after_end: Vec<String>,
+    speech_stopped: usize,
+    stop_empty: bool,
+    uncertain: bool,
+    last_activity: Option<tokio::time::Instant>,
+}
+
+impl FinalItems {
+    fn observe(&mut self, event: &TranscriptionEvent, raw: &str, ended: bool) -> bool {
+        let now = tokio::time::Instant::now();
+        match event {
+            TranscriptionEvent::ItemCreated {
+                item_id,
+                previous_item_id,
+            } => {
+                let item = self.items.entry(item_id.clone()).or_default();
+                let changed =
+                    !item.announced || (item.previous.is_none() && previous_item_id.is_some());
+                item.announced = true;
+                if let Some(previous) = previous_item_id {
+                    item.previous = Some(previous.clone());
+                }
+                item.parts.entry(0).or_insert(None);
+                if changed {
+                    self.last_activity = Some(now);
+                }
+                if serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .is_some_and(|value| value["type"] == "input_audio_buffer.committed")
+                    && self.committed.insert(item_id.clone())
+                {
+                    if ended {
+                        self.after_end.push(item_id.clone());
+                    } else {
+                        self.before_end += 1;
+                    }
+                }
+            }
+            TranscriptionEvent::ItemTextDelta {
+                item_id,
+                content_index,
+                ..
+            } => {
+                self.items
+                    .entry(item_id.clone())
+                    .or_default()
+                    .parts
+                    .insert(*content_index, None);
+                self.last_activity = Some(now);
+            }
+            TranscriptionEvent::ItemTextCompleted {
+                item_id,
+                content_index,
+                transcript,
+            } => {
+                let part = self
+                    .items
+                    .entry(item_id.clone())
+                    .or_default()
+                    .parts
+                    .entry(*content_index)
+                    .or_insert(None);
+                if part.as_deref() == Some(transcript) {
+                    return false;
+                }
+                *part = Some(transcript.clone());
+                self.last_activity = Some(now);
+            }
+            TranscriptionEvent::Unknown {
+                event_type: Some(kind),
+                ..
+            } => match kind.as_str() {
+                "input_audio_buffer.speech_stopped" => self.speech_stopped += 1,
+                "input_audio_buffer.committed"
+                | "conversation.item.input_audio_transcription.completed" => self.uncertain = true,
+                _ => {}
+            },
+            _ => {}
+        }
+        true
+    }
+
+    fn complete(&self, require_announcement: bool) -> bool {
+        !self.items.is_empty()
+            && self.items.values().all(|item| {
+                (!require_announcement || item.announced)
+                    && !item.parts.is_empty()
+                    && item
+                        .parts
+                        .iter()
+                        .enumerate()
+                        .all(|(index, (part, text))| *part == index as u64 && text.is_some())
+                    && item.previous.as_ref().is_none_or(|previous| {
+                        self.items.get(previous).is_some_and(|prior| {
+                            (!require_announcement || prior.announced)
+                                && !prior.parts.is_empty()
+                                && prior.parts.values().all(Option::is_some)
+                        })
+                    })
+            })
+    }
+
+    fn stop_item(&self) -> Option<&str> {
+        let vad_pending = self.speech_stopped.saturating_sub(self.before_end);
+        if self.uncertain {
+            return None;
+        }
+        self.after_end.get(vad_pending).map(String::as_str)
+    }
+
+    fn finish_at(&self, end: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        if !self.complete(true)
+            || self.uncertain
+            || self.after_end.len() < self.speech_stopped.saturating_sub(self.before_end)
+            || (!self.stop_empty && self.stop_item().is_none())
+        {
+            return None;
+        }
+        Some(self.last_activity.unwrap_or(end).max(end) + FINAL_SETTLE)
+    }
+
+    fn empty_stop_error(raw: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return false;
+        };
+        value["type"] == "error"
+            && value["error"]["code"] == "input_audio_buffer_commit_empty"
+            && value["error"]["event_id"] == STOP_COMMIT_EVENT_ID
+    }
+}
+
+/// Receiver owns the session terminal decision; text ordering stays with
+/// `OrderedItemTranscript`. Unknown stop outcomes keep the 15-second fallback.
 async fn receiver_loop<S>(
     mut ws_source: S,
     event_tx: mpsc::Sender<TranscriptionEvent>,
@@ -864,30 +1009,23 @@ async fn receiver_loop<S>(
 ) where
     S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    let mut saw_final = false;
+    let mut items = FinalItems::default();
     loop {
         let end = *audio_end.borrow();
+        let finish_at = end
+            .and_then(|end| items.finish_at(end))
+            .filter(|at| end.is_some_and(|end| *at < end + final_deadline));
         tokio::select! {
+            biased;
             changed = audio_end.changed(), if end.is_none() => {
                 if changed.is_err() { return; }
-            }
-            _ = async {
-                if let Some(end) = end {
-                    tokio::time::sleep_until(end + final_deadline).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                log::warn!("OpenAI final transcription deadline reached after {}s; keeping accumulated text", final_deadline.as_secs());
-                let _ = event_tx.send(TranscriptionEvent::Done).await;
-                return;
             }
             msg_opt = ws_source.next() => {
                 let msg_result = match msg_opt {
                     Some(r) => r,
                     None => {
-                        log::warn!("OpenAI WebSocket stream ended unexpectedly");
-                        let _ = event_tx.send(if audio_done.load(Ordering::Acquire) && saw_final {
+                        log::debug!("realtime: close/EOF ({} ms after stop)", end.map_or(0, |t| t.elapsed().as_millis()));
+                        let _ = event_tx.send(if audio_done.load(Ordering::Acquire) && items.complete(false) {
                             TranscriptionEvent::Done
                         } else {
                             TranscriptionEvent::Error { message: "WebSocket closed before final transcription".to_string() }
@@ -900,56 +1038,72 @@ async fn receiver_loop<S>(
                     Ok(m) => m,
                     Err(e) => {
                         log::error!("OpenAI WebSocket receive error: {}", e);
-                        let _ = event_tx
-                            .send(TranscriptionEvent::Error {
-                                message: format!("WebSocket error: {}", e),
-                            })
-                            .await;
+                        let _ = event_tx.send(TranscriptionEvent::Error { message: format!("WebSocket error: {}", e) }).await;
                         cancel.cancel();
                         return;
                     }
                 };
-
                 match msg {
                     Message::Text(text) => {
                         log::trace!("received OpenAI WS text: {}", text);
+                        if audio_end.borrow().is_some() && FinalItems::empty_stop_error(&text) {
+                            items.stop_empty = true;
+                            items.last_activity = Some(tokio::time::Instant::now());
+                            log::debug!("realtime: stop commit rejected as empty");
+                            continue;
+                        }
                         let event = parse_openai_event(&text);
-
-                        // Log unknown events at debug level.
-                        if let TranscriptionEvent::Unknown {
-                            event_type: Some(ref t),
-                            ..
-                        } = event
-                        {
-                            log::debug!("OpenAI event: {}", t);
+                        if let TranscriptionEvent::Unknown { event_type: Some(ref kind), .. } = event {
+                            log::debug!("OpenAI event: {}", kind);
+                            if kind == "conversation.item.input_audio_transcription.failed" {
+                                let message = serde_json::from_str::<serde_json::Value>(&text).ok()
+                                    .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                                    .unwrap_or_else(|| "item transcription failed".into());
+                                let _ = event_tx.send(TranscriptionEvent::Error { message }).await;
+                                return;
+                            }
                         }
-
                         let is_error = matches!(event, TranscriptionEvent::Error { .. });
-                        saw_final |= matches!(event, TranscriptionEvent::ItemTextCompleted { .. });
-                        if event_tx.send(event).await.is_err() {
-                            cancel.cancel();
-                            return;
-                        }
-                        if is_error {
-                            return;
-                        }
+                        if items.observe(&event, &text, audio_end.borrow().is_some())
+                            && event_tx.send(event).await.is_err() {
+                                cancel.cancel();
+                                return;
+                            }
+                        if is_error { return; }
                     }
                     Message::Close(frame) => {
-                        log::debug!("received OpenAI WS Close frame: {:?}", frame);
-                        let _ = event_tx.send(if audio_done.load(Ordering::Acquire) && saw_final {
+                        log::debug!("realtime: close/EOF ({} ms after stop), frame: {:?}", end.map_or(0, |t| t.elapsed().as_millis()), frame);
+                        let _ = event_tx.send(if audio_done.load(Ordering::Acquire) && items.complete(false) {
                             TranscriptionEvent::Done
                         } else {
                             TranscriptionEvent::Error { message: "WebSocket closed before final transcription".to_string() }
                         }).await;
                         return;
                     }
-                    Message::Pong(_) => {
-                        log::trace!("received OpenAI WS Pong");
-                    }
-                    _ => {
-                        // Ignore binary frames.
-                    }
+                    Message::Pong(_) => log::trace!("received OpenAI WS Pong"),
+                    _ => {}
                 }
+            }
+            _ = async {
+                if let Some(at) = finish_at { tokio::time::sleep_until(at).await; }
+                else { std::future::pending::<()>().await; }
+            } => {
+                log::debug!("realtime: finished early after stop commit {} final ({} ms after stop)",
+                    if items.stop_empty { "empty" } else { items.stop_item().unwrap_or("unknown") },
+                    end.map_or(0, |t| t.elapsed().as_millis()));
+                let _ = event_tx.send(TranscriptionEvent::Done).await;
+                return;
+            }
+            _ = async {
+                if let Some(end) = end {
+                    tokio::time::sleep_until(end + final_deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                log::warn!("realtime: final deadline ({} s) reached; keeping accumulated text, which may be incomplete ({} ms after stop)", final_deadline.as_secs(), end.map_or(0, |t| t.elapsed().as_millis()));
+                let _ = event_tx.send(TranscriptionEvent::Done).await;
+                return;
             }
             _ = cancel.cancelled() => {
                 return;
@@ -1136,7 +1290,7 @@ mod tests {
         assert_eq!(second, pcm_to_bytes(&[800, 1200, 2400]));
         assert_eq!(
             frames[2],
-            serde_json::json!({"type": "input_audio_buffer.commit"})
+            serde_json::json!({"type": "input_audio_buffer.commit", "event_id": STOP_COMMIT_EVENT_ID})
         );
         assert!(audio_done.load(Ordering::Acquire));
         assert!(end_rx.borrow().is_some());
@@ -1317,6 +1471,330 @@ mod tests {
             Some(TranscriptionEvent::ItemTextCompleted { .. })
         ));
         assert!(matches!(rx.recv().await, Some(TranscriptionEvent::Done)));
+    }
+
+    async fn final_session(script: Vec<(i64, Message)>) -> (u128, String) {
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        let (msg_tx, msg_rx) = mpsc::channel(32);
+        let (tx, mut rx) = mpsc::channel(32);
+        let done = Arc::new(AtomicBool::new(false));
+        let receiver = tokio::spawn(receiver_loop(
+            tokio_stream::wrappers::ReceiverStream::new(msg_rx),
+            tx,
+            CancellationToken::new(),
+            Arc::clone(&done),
+            end_rx,
+            super::super::realtime::FINAL_TRANSCRIPT_DEADLINE,
+        ));
+        let lead = script.iter().map(|(t, _)| (-t).max(0)).max().unwrap_or(0);
+        let end = tokio::time::Instant::now() + Duration::from_millis(lead as u64);
+        let driver = tokio::spawn(async move {
+            let mut ended = false;
+            for (ms, message) in script {
+                let at = if ms < 0 {
+                    end - Duration::from_millis(ms.unsigned_abs())
+                } else {
+                    end + Duration::from_millis(ms as u64)
+                };
+                if !ended && at >= end {
+                    tokio::time::sleep_until(end).await;
+                    done.store(true, Ordering::Release);
+                    end_tx.send_replace(Some(end));
+                    ended = true;
+                }
+                tokio::time::sleep_until(at).await;
+                if msg_tx.send(Ok(message)).await.is_err() {
+                    return;
+                }
+            }
+            if !ended {
+                tokio::time::sleep_until(end).await;
+                done.store(true, Ordering::Release);
+                end_tx.send_replace(Some(end));
+            }
+            let _keep_open = (msg_tx, end_tx);
+            std::future::pending::<()>().await;
+        });
+        let mut transcript = super::super::realtime::OrderedItemTranscript::default();
+        let elapsed = loop {
+            match rx.recv().await {
+                Some(TranscriptionEvent::ItemCreated {
+                    item_id,
+                    previous_item_id,
+                }) => {
+                    transcript.item_created(&item_id, previous_item_id.as_deref());
+                }
+                Some(TranscriptionEvent::ItemTextDelta {
+                    item_id,
+                    content_index,
+                    text,
+                }) => {
+                    transcript.append_delta(&item_id, content_index, &text);
+                }
+                Some(TranscriptionEvent::ItemTextCompleted {
+                    item_id,
+                    content_index,
+                    transcript: text,
+                }) => {
+                    transcript.complete(&item_id, content_index, &text);
+                }
+                Some(TranscriptionEvent::Done) => {
+                    break tokio::time::Instant::now().duration_since(end).as_millis()
+                }
+                Some(TranscriptionEvent::Error { message }) => {
+                    panic!("unexpected error: {message}")
+                }
+                Some(_) => {}
+                None => panic!("closed without Done"),
+            }
+        };
+        receiver.await.expect("receiver joins");
+        assert!(rx.recv().await.is_none(), "exactly one terminal event");
+        driver.abort();
+        (elapsed, transcript.drain_terminal().join(" "))
+    }
+
+    fn final_frame(item: &str, text: &str) -> Message {
+        Message::Text(format!(
+            r#"{{"type":"conversation.item.input_audio_transcription.completed","item_id":"{item}","content_index":0,"transcript":"{text}"}}"#
+        ))
+    }
+
+    fn commit_frame(item: &str, previous: Option<&str>) -> Message {
+        let previous = previous.map_or("null".to_string(), |p| format!("\"{p}\""));
+        Message::Text(format!(
+            r#"{{"type":"input_audio_buffer.committed","item_id":"{item}","previous_item_id":{previous}}}"#
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_waits_for_delayed_stop_commit_after_earlier_final() {
+        let (ms, text) = final_session(vec![
+            (-300, commit_frame("first", None)),
+            (-100, final_frame("first", "earlier")),
+            (5_000, commit_frame("second", Some("first"))),
+            (5_200, final_frame("second", "tail")),
+        ])
+        .await;
+        assert_eq!((ms, text.as_str()), (5_200 + 250, "earlier tail"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_waits_for_pending_vad_commit_before_stop_commit() {
+        let (ms, text) = final_session(vec![
+            (
+                -50,
+                Message::Text(r#"{"type":"input_audio_buffer.speech_stopped"}"#.into()),
+            ),
+            (40, commit_frame("vad", None)),
+            (100, final_frame("vad", "first")),
+            (600, commit_frame("stop", Some("vad"))),
+            (900, final_frame("stop", "second")),
+        ])
+        .await;
+        assert_eq!((ms, text.as_str()), (900 + 250, "first second"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_correction_reopens_completed_item() {
+        let (ms, text) = final_session(vec![
+            (20, commit_frame("one", None)),
+            (100, final_frame("one", "old")),
+            (300, Message::Text(r#"{"type":"conversation.item.input_audio_transcription.delta","item_id":"one","content_index":0,"delta":"new"}"#.into())),
+            (800, final_frame("one", "new")),
+        ]).await;
+        assert_eq!((ms, text.as_str()), (800 + 250, "new"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_stop_ack_keeps_fifteen_second_deadline() {
+        let (ms, text) = final_session(vec![
+            (-300, commit_frame("one", None)),
+            (-100, final_frame("one", "all said")),
+        ])
+        .await;
+        assert_eq!((ms, text.as_str()), (15_000, "all said"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn correlated_empty_stop_rejection_finishes_without_replay() {
+        let (ms, text) = final_session(vec![
+            (-300, commit_frame("one", None)),
+            (-100, final_frame("one", "all said")),
+            (120, Message::Text(r#"{"type":"error","error":{"code":"input_audio_buffer_commit_empty","event_id":"talk-rs-stop-commit","message":"empty buffer"}}"#.into())),
+        ]).await;
+        assert_eq!((ms, text.as_str()), (120 + 250, "all said"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn correlated_empty_stop_waits_for_pending_vad_final() {
+        let (ms, text) = final_session(vec![
+            (-350, Message::Text(r#"{"type":"input_audio_buffer.speech_stopped"}"#.into())),
+            (-300, commit_frame("first", None)),
+            (-100, final_frame("first", "earlier")),
+            (-25, Message::Text(r#"{"type":"input_audio_buffer.speech_stopped"}"#.into())),
+            (100, Message::Text(r#"{"type":"error","error":{"code":"input_audio_buffer_commit_empty","event_id":"talk-rs-stop-commit","message":"empty buffer"}}"#.into())),
+            (620, commit_frame("vad", Some("first"))),
+            (700, final_frame("vad", "later")),
+        ]).await;
+        assert_eq!((ms, text.as_str()), (700 + 250, "earlier later"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn correlated_empty_stop_with_unknown_commit_keeps_deadline() {
+        let (ms, text) = final_session(vec![
+            (-300, commit_frame("first", None)),
+            (-100, final_frame("first", "earlier")),
+            (40, Message::Text(r#"{"type":"input_audio_buffer.committed"}"#.into())),
+            (100, Message::Text(r#"{"type":"error","error":{"code":"input_audio_buffer_commit_empty","event_id":"talk-rs-stop-commit","message":"empty buffer"}}"#.into())),
+        ]).await;
+        assert_eq!((ms, text.as_str()), (15_000, "earlier"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn correlated_empty_stop_with_accounted_vad_finishes_early() {
+        let (ms, text) = final_session(vec![
+            (-350, Message::Text(r#"{"type":"input_audio_buffer.speech_stopped"}"#.into())),
+            (-300, commit_frame("vad", None)),
+            (-100, final_frame("vad", "all said")),
+            (100, Message::Text(r#"{"type":"error","error":{"code":"input_audio_buffer_commit_empty","event_id":"talk-rs-stop-commit","message":"empty buffer"}}"#.into())),
+        ]).await;
+        assert_eq!((ms, text.as_str()), (100 + 250, "all said"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_final_and_unrelated_frames_do_not_delay_completion() {
+        let (ms, text) = final_session(vec![
+            (20, commit_frame("one", None)),
+            (100, final_frame("one", "text")),
+            (200, final_frame("one", "text")),
+            (220, commit_frame("one", None)),
+            (240, Message::Ping(Vec::new())),
+            (
+                260,
+                Message::Text(r#"{"type":"rate_limits.updated"}"#.into()),
+            ),
+        ])
+        .await;
+        assert_eq!((ms, text.as_str()), (350, "text"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_commit_identity_preserves_deadline() {
+        let (ms, text) = final_session(vec![
+            (
+                20,
+                Message::Text(r#"{"type":"input_audio_buffer.committed"}"#.into()),
+            ),
+            (100, final_frame("one", "text")),
+        ])
+        .await;
+        assert_eq!((ms, text.as_str()), (15_000, "text"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unseen_predecessor_blocks_early_finish() {
+        let (ms, text) = final_session(vec![
+            (20, commit_frame("second", Some("first"))),
+            (100, final_frame("second", "second")),
+            (
+                700,
+                Message::Text(
+                    r#"{"type":"conversation.item.created","item":{"id":"first"}}"#.into(),
+                ),
+            ),
+            (800, final_frame("first", "first")),
+        ])
+        .await;
+        assert_eq!((ms, text.as_str()), (1_050, "first second"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_empty_error_remains_terminal() {
+        for raw in [
+            r#"{"type":"error","error":{"code":"input_audio_buffer_commit_empty","message":"not our commit"}}"#,
+            r#"{"type":"error","error":{"event_id":"talk-rs-stop-commit","code":"other","message":"other failure"}}"#,
+        ] {
+            let (tx, mut rx) = mpsc::channel(4);
+            receiver_loop(
+                futures::stream::iter([Ok(Message::Text(raw.into()))]),
+                tx,
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(true)),
+                tokio::sync::watch::channel(Some(tokio::time::Instant::now())).1,
+                Duration::from_secs(15),
+            )
+            .await;
+            assert!(matches!(
+                rx.recv().await,
+                Some(TranscriptionEvent::Error { .. })
+            ));
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn item_transcription_failure_is_not_successful_done() {
+        let (tx, mut rx) = mpsc::channel(4);
+        receiver_loop(
+            futures::stream::iter([
+                Ok(commit_frame("one", None)),
+                Ok(Message::Text(r#"{"type":"conversation.item.input_audio_transcription.failed","item_id":"one","content_index":0,"error":{"message":"cannot transcribe"}}"#.into())),
+            ]),
+            tx, CancellationToken::new(), Arc::new(AtomicBool::new(true)),
+            tokio::sync::watch::channel(Some(tokio::time::Instant::now())).1,
+            Duration::from_secs(15),
+        ).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(TranscriptionEvent::ItemCreated { .. })
+        ));
+        match rx.recv().await {
+            Some(TranscriptionEvent::Error { message }) => assert_eq!(message, "cannot transcribe"),
+            other => panic!("expected item failure, got {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn incomplete_item_on_close_or_eof_is_an_error() {
+        for close in [Some(Message::Close(None)), None] {
+            let mut frames = vec![
+                Ok(commit_frame("first", None)),
+                Ok(commit_frame("second", Some("first"))),
+                Ok(final_frame("second", "last")),
+            ];
+            if let Some(close) = close {
+                frames.push(Ok(close));
+            }
+            let (tx, mut rx) = mpsc::channel(8);
+            receiver_loop(
+                futures::stream::iter(frames),
+                tx,
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(true)),
+                tokio::sync::watch::channel(None).1,
+                Duration::from_secs(15),
+            )
+            .await;
+            assert!(matches!(
+                rx.recv().await,
+                Some(TranscriptionEvent::ItemCreated { .. })
+            ));
+            assert!(matches!(
+                rx.recv().await,
+                Some(TranscriptionEvent::ItemCreated { .. })
+            ));
+            assert!(matches!(
+                rx.recv().await,
+                Some(TranscriptionEvent::ItemTextCompleted { .. })
+            ));
+            assert!(matches!(
+                rx.recv().await,
+                Some(TranscriptionEvent::Error { .. })
+            ));
+            assert!(rx.recv().await.is_none());
+        }
     }
 
     fn openai_config(model: &str) -> OpenAIConfig {

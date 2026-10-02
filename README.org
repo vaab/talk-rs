@@ -494,6 +494,10 @@ target window, before the first segment; later segments append. If a
 reconnected provider revises an already-pasted segment, the cached
 transcript records the correction without pasting a duplicate. After
 audio ends, realtime providers wait at most 15 seconds for final text.
+OpenAI realtime may finish sooner once the stop commit's item and all
+observed items are complete. Unknown commit outcomes and outstanding
+corrections retain the 15-second fallback; an explicitly correlated
+empty-buffer stop rejection does not replay the recording.
 
 *** Record
 
