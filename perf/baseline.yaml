@@ -229,7 +229,9 @@ results:
       list-calls: 2
       pick-reads: 2600
       pick-read-attempts: 2990
-      gtk-stall-max-ms: 5624
+      # The full-row probe snapshot caused the old stall. Re-measured 2026-10-02
+      # on perf/harness plus probe fix 83b0e4a, with production code unchanged.
+      gtk-stall-max-ms: 1839
     list-library-1500:
       recordings: 1500
       recordings-with-pick: 1300
