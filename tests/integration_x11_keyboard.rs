@@ -10,9 +10,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    ConnectionExt as _, CreateWindowAux, EventMask, InputFocus, WindowClass,
+    AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, InputFocus, PropMode, WindowClass,
 };
 use x11rb::protocol::Event;
+use x11rb::wrapper::ConnectionExt as _;
 
 const CTRL_L: u32 = 0xffe3;
 const CTRL_R: u32 = 0xffe4;
@@ -170,6 +171,7 @@ enum ObservedKeyEvent {
 struct Observer {
     conn: x11rb::rust_connection::RustConnection,
     root: u32,
+    window: u32,
 }
 
 impl Observer {
@@ -206,9 +208,101 @@ impl Observer {
             .expect("focus synchronization request")
             .reply()
             .expect("focus synchronization reply");
-        let mut observer = Self { conn, root };
+        let mut observer = Self { conn, root, window };
         observer.drain_events();
         observer
+    }
+
+    fn active_atom(&self) -> u32 {
+        self.conn
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+            .expect("intern active-window atom")
+            .reply()
+            .expect("active-window atom reply")
+            .atom
+    }
+
+    fn set_active_window(&self, window: u32) {
+        self.conn
+            .change_property32(
+                PropMode::REPLACE,
+                self.root,
+                self.active_atom(),
+                AtomEnum::WINDOW,
+                &[window],
+            )
+            .expect("set EWMH active window")
+            .check()
+            .expect("server accepted EWMH active window");
+        self.round_trip();
+        assert_eq!(talk_rs::x11::x11_get_active_window(), Some(window));
+    }
+
+    fn create_other_window(&self) -> u32 {
+        let window = self.conn.generate_id().expect("allocate target window id");
+        self.conn
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                self.root,
+                120,
+                0,
+                100,
+                100,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new(),
+            )
+            .expect("create other target window")
+            .check()
+            .expect("server accepted other target window");
+        self.conn
+            .map_window(window)
+            .expect("map other target window")
+            .check()
+            .expect("server mapped other target window");
+        self.round_trip();
+        window
+    }
+
+    fn watch_focus_requests(&mut self) {
+        self.conn
+            .change_window_attributes(
+                self.root,
+                &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
+                    .event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
+            )
+            .expect("select root substructure notifications")
+            .check()
+            .expect("server selected root substructure notifications");
+        self.round_trip();
+        self.drain_events();
+    }
+
+    fn focus_requests(&mut self) -> Vec<u32> {
+        self.round_trip();
+        let mut windows = Vec::new();
+        while let Some(event) = self.conn.poll_for_event().expect("poll root event") {
+            if let Event::ClientMessage(message) = event {
+                assert_eq!(
+                    message.type_,
+                    self.active_atom(),
+                    "unexpected ClientMessage"
+                );
+                windows.push(message.window);
+            }
+        }
+        windows
+    }
+
+    fn input_focus(&self) -> u32 {
+        self.conn
+            .get_input_focus()
+            .expect("query input focus")
+            .reply()
+            .expect("input focus reply")
+            .focus
     }
 
     fn keycode(&self, keysym: u32) -> u8 {
@@ -476,6 +570,76 @@ fn run_isolated_contract() {
         .flat_map(|_| expected_sequence(&repeated_keycodes))
         .collect();
     assert_eq!(key_sequence(&observer.events(expected.len())), expected);
+
+    already_active_target_skips_focus_request(&mut observer);
+    unconfirmed_target_aborts_before_key_injection(&mut observer);
+}
+
+fn already_active_target_skips_focus_request(observer: &mut Observer) {
+    observer.set_active_window(observer.window);
+    assert_eq!(observer.input_focus(), observer.window);
+    observer.watch_focus_requests();
+    let runtime = tokio::runtime::Runtime::new().expect("create isolated paste runtime");
+    #[cfg(feature = "perf-counters")]
+    let sleeps_before = focus_sleeps();
+    runtime
+        .block_on(talk_rs::paste::ensure_focus(&observer.window.to_string()))
+        .expect("already-active target must be confirmed");
+    #[cfg(feature = "perf-counters")]
+    assert_eq!(focus_sleeps() - sleeps_before, 0);
+    assert_eq!(talk_rs::x11::x11_get_active_window(), Some(observer.window));
+    assert_eq!(observer.focus_requests(), Vec::<u32>::new());
+    assert_eq!(observer.input_focus(), observer.window);
+    assert_eq!(observer.available_events(), Vec::new());
+}
+
+fn unconfirmed_target_aborts_before_key_injection(observer: &mut Observer) {
+    let target = observer.create_other_window();
+    observer.set_active_window(observer.window);
+    assert_eq!(observer.input_focus(), observer.window);
+    observer.watch_focus_requests();
+    let target_id = target.to_string();
+    let root = talk_rs::paste::default_root(true);
+    let runtime = tokio::runtime::Runtime::new().expect("create isolated paste runtime");
+    #[cfg(feature = "perf-counters")]
+    let sleeps_before = focus_sleeps();
+    let error = runtime
+        .block_on(talk_rs::paste::paste_with_root(
+            root.as_ref(),
+            Some(&target_id),
+            "must not paste",
+            3,
+            None,
+            &talk_rs::telemetry::NoOpSink,
+            talk_rs::paste::PasteTiming::default(),
+            None,
+        ))
+        .expect_err("unconfirmed target must abort before replacement or paste");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Clipboard error: could not focus target window {target_id} after 5 attempts \
+             — aborting to avoid sending keys to the wrong window"
+        )
+    );
+    assert_eq!(talk_rs::x11::x11_get_active_window(), Some(observer.window));
+    #[cfg(feature = "perf-counters")]
+    assert_eq!(focus_sleeps() - sleeps_before, 5);
+    // Delivered ClientMessages are not a reliable attempt count; the
+    // feature-enabled sleep counter pins the number of attempts.
+    let requests = observer.focus_requests();
+    assert_eq!(requests, vec![target; requests.len()]);
+    assert_eq!(observer.input_focus(), observer.window);
+    assert_eq!(observer.available_events(), Vec::new());
+}
+
+#[cfg(feature = "perf-counters")]
+fn focus_sleeps() -> u64 {
+    talk_rs::perf_counters::snapshot()
+        .into_iter()
+        .find(|(name, _)| name == "focus_sleeps")
+        .expect("focus sleep counter must be present")
+        .1
 }
 
 #[test]

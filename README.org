@@ -684,6 +684,14 @@ injecting into an ambiguous state. CapsLock and NumLock remain
 unchanged; pressing either lock key during the wait also defers the
 shortcut. A failed target window refocus aborts the retry attempt.
 
+When a target window is known, =talk-rs= first reads the active window.
+If it already names the target, the focus-settle wait is skipped; otherwise
+the target is refocused and =talk-rs= waits 50 ms, doubling on each retry,
+before checking again. Only a positive match confirms focus; after five
+unconfirmed requests the paste aborts. A zero-fetch clipboard retry always
+re-sends the focus request before trying the shortcut again. Clipboard and
+keyboard safety checks still apply before keys are sent.
+
 When a target window is known, chunked clipboard pastes retry a shortcut
 only if that target has not fetched the chunk at all. If it fetched the
 chunk fewer times than expected, pasting aborts rather than risking a

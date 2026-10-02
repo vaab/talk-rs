@@ -57,10 +57,10 @@ pub fn log_preview(text: &str) -> String {
     format!("{char_count} chars: \"{escaped}{ellipsis}\"")
 }
 
-/// Maximum number of attempts to focus the target window.
+/// Maximum number of focus requests sent to the target window.
 const FOCUS_MAX_RETRIES: u32 = 5;
 
-/// Initial delay between focus retry attempts (doubles each retry).
+/// Settle wait after the first focus request (doubles each retry).
 const FOCUS_INITIAL_DELAY_MS: u64 = 50;
 
 /// Timing knobs for the paste pipeline (defined with the config
@@ -77,21 +77,48 @@ pub use crate::paste_config::PasteTiming;
 /// that collapse large pastes into an opaque block.
 pub const PASTE_CHUNK_CHARS: usize = 150;
 
-/// Attempt to focus the target window and verify the active window
-/// matches.  Retries with exponential backoff to give the window
-/// manager time to settle after destroying a transient window (e.g.
-/// the GTK picker).
+/// Confirm the target is active before pasting. Skip the focus request and
+/// settle wait when the active-window property already names the target.
+/// Otherwise request focus and verify after each bounded settle wait.
 ///
-/// Returns `Ok(())` when the target window is confirmed active, or
-/// `Err` if focus could not be established after all retries.
+/// A positive property match is not an atomic guarantee about where later
+/// XTest keys land: focus can change between this check and injection.
 pub async fn ensure_focus(window_id: &str) -> Result<(), TalkError> {
     ensure_focus_with(window_id, focus_window, get_active_window).await
+}
+
+/// Re-assert focus after a clipboard shortcut fetched nothing. Unlike the
+/// initial paste check, retry recovery always sends an activation request.
+pub(crate) async fn refocus(window_id: &str) -> Result<(), TalkError> {
+    refocus_with(window_id, focus_window, get_active_window).await
 }
 
 /// [`ensure_focus`] with the X11 focus request and active-window query
 /// injected, so the focus/backoff policy can be exercised without an
 /// X server (see the `ensure_focus_*` tests).
 async fn ensure_focus_with<'w, F, FFut, A, AFut>(
+    window_id: &'w str,
+    focus: F,
+    active_window: A,
+) -> Result<(), TalkError>
+where
+    F: Fn(&'w str) -> FFut,
+    FFut: std::future::Future<Output = bool>,
+    A: Fn() -> AFut,
+    AFut: std::future::Future<Output = Option<String>>,
+{
+    match active_window().await {
+        Some(active) if active == window_id => {
+            log::debug!("target window {} already active", window_id);
+            return Ok(());
+        }
+        other => log::debug!("focus pre-check: expected {}, got {:?}", window_id, other),
+    }
+    refocus_with(window_id, focus, active_window).await
+}
+
+/// Shared request, settle, verify ladder for initial mismatch and forced retry.
+async fn refocus_with<'w, F, FFut, A, AFut>(
     window_id: &'w str,
     focus: F,
     active_window: A,
@@ -295,10 +322,12 @@ pub async fn paste_with_root(
     );
 
     if let Some(wid) = target_window {
-        log::debug!("refocusing target window: {}", wid);
+        log::debug!("confirming focus of target window: {}", wid);
         ensure_focus(wid).await?;
-        if let Some(active) = get_active_window().await {
-            log::trace!("paste: active window after focus = {}", active);
+        if log::log_enabled!(log::Level::Trace) {
+            if let Some(active) = get_active_window().await {
+                log::trace!("paste: active window after focus = {}", active);
+            }
         }
     }
 
@@ -565,6 +594,150 @@ pub async fn simulate_backspace(count: usize) -> Result<(), TalkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_focus_already_active_returns_without_refocusing() {
+        let queries = std::cell::Cell::new(0);
+        let requests = std::cell::Cell::new(0);
+        let sleeps = crate::perf_counters::thread_value(crate::perf_counters::Counter::FocusSleeps);
+        let started = tokio::time::Instant::now();
+        let result = ensure_focus_with(
+            "4242",
+            |_| {
+                requests.set(requests.get() + 1);
+                std::future::ready(true)
+            },
+            || {
+                queries.set(queries.get() + 1);
+                std::future::ready(Some("4242".to_string()))
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "confirmed target must succeed: {result:?}");
+        assert_eq!(queries.get(), 1);
+        assert_eq!(requests.get(), 0);
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(
+            crate::perf_counters::thread_value(crate::perf_counters::Counter::FocusSleeps) - sleeps,
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_focus_unknown_query_recovers_after_settling() {
+        let requests = std::cell::Cell::new(0);
+        let queries = std::cell::RefCell::new(Vec::new());
+        let started = tokio::time::Instant::now();
+        let result = ensure_focus_with(
+            "4242",
+            |window| {
+                assert_eq!(window, "4242");
+                requests.set(requests.get() + 1);
+                std::future::ready(true)
+            },
+            || {
+                queries.borrow_mut().push(started.elapsed().as_millis());
+                std::future::ready((requests.get() > 0).then(|| "4242".to_string()))
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "recovered target must succeed: {result:?}");
+        assert_eq!(requests.get(), 1);
+        assert_eq!(*queries.borrow(), vec![0, 50]);
+        assert_eq!(started.elapsed().as_millis(), 50);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_focus_requires_exact_window_id() {
+        let requests = std::cell::Cell::new(0);
+        let result = ensure_focus_with(
+            "4242",
+            |_| {
+                requests.set(requests.get() + 1);
+                std::future::ready(true)
+            },
+            || {
+                std::future::ready(Some(
+                    if requests.get() == 0 { "42420" } else { "4242" }.into(),
+                ))
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "exact match after refocus: {result:?}");
+        assert_eq!(requests.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_focus_unconfirmed_target_keeps_bounded_backoff() {
+        for (initial, after_request, request_succeeds) in [
+            (Some("7"), Some("7"), true),
+            (None, None, true),
+            (Some("7"), None, false),
+        ] {
+            let requests = std::cell::RefCell::new(Vec::new());
+            let queries = std::cell::RefCell::new(Vec::new());
+            let sleeps =
+                crate::perf_counters::thread_value(crate::perf_counters::Counter::FocusSleeps);
+            let started = tokio::time::Instant::now();
+            let result = ensure_focus_with(
+                "4242",
+                |window| {
+                    assert_eq!(window, "4242");
+                    requests.borrow_mut().push(started.elapsed().as_millis());
+                    std::future::ready(request_succeeds)
+                },
+                || {
+                    queries.borrow_mut().push(started.elapsed().as_millis());
+                    let active = if requests.borrow().is_empty() {
+                        initial
+                    } else {
+                        after_request
+                    };
+                    std::future::ready(active.map(str::to_string))
+                },
+            )
+            .await;
+            match result {
+                Err(TalkError::Clipboard(message)) => assert_eq!(
+                    message,
+                    "could not focus target window 4242 after 5 attempts \
+                     — aborting to avoid sending keys to the wrong window"
+                ),
+                other => panic!("unconfirmed target must abort: {other:?}"),
+            }
+            assert_eq!(*requests.borrow(), vec![0, 50, 150, 350, 750]);
+            assert_eq!(*queries.borrow(), vec![0, 50, 150, 350, 750, 1550]);
+            assert_eq!(started.elapsed().as_millis(), 1550);
+            assert_eq!(
+                crate::perf_counters::thread_value(crate::perf_counters::Counter::FocusSleeps)
+                    - sleeps,
+                5
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refocus_requests_activation_even_when_target_is_already_active() {
+        let requests = std::cell::Cell::new(0);
+        let queries = std::cell::RefCell::new(Vec::new());
+        let started = tokio::time::Instant::now();
+        let result = refocus_with(
+            "4242",
+            |_| {
+                requests.set(requests.get() + 1);
+                std::future::ready(true)
+            },
+            || {
+                queries.borrow_mut().push(started.elapsed().as_millis());
+                std::future::ready(Some("4242".to_string()))
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "retry refocus must succeed: {result:?}");
+        assert_eq!(requests.get(), 1);
+        assert_eq!(*queries.borrow(), vec![50]);
+        assert_eq!(started.elapsed().as_millis(), 50);
+    }
 
     #[test]
     fn test_chunk_short_text_fits_in_one() {

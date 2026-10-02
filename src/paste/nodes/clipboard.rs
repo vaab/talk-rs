@@ -168,7 +168,7 @@ impl PasteNode for ClipboardNode {
 
             let injection_result = if attempt > 0 {
                 if let Some(wid) = ctx.target_window {
-                    focus_then_inject(crate::paste::ensure_focus(wid), || {
+                    focus_then_inject(crate::paste::refocus(wid), || {
                         self.serve_and_simulate(clipboard, text)
                     })
                     .await

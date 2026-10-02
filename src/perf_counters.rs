@@ -46,7 +46,7 @@ pub enum Counter {
     PickReads,
     /// Full recordings-browser directory listings.
     ListCalls,
-    /// Settle sleeps performed by `ensure_focus` before checking focus.
+    /// Settle sleeps performed after focus requests, before verifying focus.
     FocusSleeps,
     /// Invocations of recordings-browser playback-progress tick callbacks.
     PlayerTickCallbacks,
