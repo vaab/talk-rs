@@ -30,8 +30,15 @@
 
 use gtk4::glib;
 use gtk4::prelude::*;
+use std::cell::Cell;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+const SNAPSHOT_ROWS_PER_SLICE: usize = 32;
+const SNAPSHOT_SLICE_BUDGET: Duration = Duration::from_millis(5);
 
 /// Install the probe on the given section lists.  No-op when the
 /// environment variable is absent.
@@ -41,57 +48,124 @@ pub(super) fn install(sections: Vec<(&'static str, gtk4::ListBox)>) {
     };
     let _ = std::fs::create_dir_all(&dir);
     let mut snapshot_seq = 0u32;
+    let mut queued = VecDeque::new();
+    let snapshot_pending = Rc::new(Cell::new(false));
     glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-        let commands = dir.join("commands");
-        let Ok(text) = std::fs::read_to_string(&commands) else {
-            return glib::ControlFlow::Continue;
-        };
-        // Writers publish commands by rename; an empty read is a writer
-        // that does not, caught mid-write: leave it for the next poll.
-        if text.trim().is_empty() {
+        if snapshot_pending.get() {
             return glib::ControlFlow::Continue;
         }
-        let _ = std::fs::remove_file(&commands);
-        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let reply = run(line, &sections, &dir, &mut snapshot_seq);
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("replies"))
-            {
-                // One write per reply so a reader never sees half a line.
-                let _ = f.write_all(format!("{line} => {reply}\n").as_bytes());
+        if queued.is_empty() {
+            let commands = dir.join("commands");
+            let Ok(text) = std::fs::read_to_string(&commands) else {
+                return glib::ControlFlow::Continue;
+            };
+            // Writers publish commands by rename; an empty read is a writer
+            // that does not, caught mid-write: leave it for the next poll.
+            if text.trim().is_empty() {
+                return glib::ControlFlow::Continue;
             }
+            let _ = std::fs::remove_file(&commands);
+            queued.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        while let Some(line) = queued.pop_front() {
+            if line == "snapshot" {
+                snapshot_seq += 1;
+                let path = dir.join(format!("snapshot-{snapshot_seq}.tsv"));
+                let mut snapshot = Snapshot::new(path, sections.clone());
+                let reply_dir = dir.clone();
+                let pending = snapshot_pending.clone();
+                pending.set(true);
+                glib::idle_add_local(move || {
+                    if snapshot.advance() {
+                        let reply = match std::fs::write(&snapshot.path, &snapshot.out) {
+                            Ok(()) => format!("ok {}", snapshot.path.display()),
+                            Err(e) => format!("error {e}"),
+                        };
+                        write_reply(&reply_dir, "snapshot", &reply);
+                        pending.set(false);
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                });
+                break;
+            }
+            write_reply(&dir, &line, &run(&line, &sections));
         }
         glib::ControlFlow::Continue
     });
 }
 
-fn run(
-    line: &str,
-    sections: &[(&'static str, gtk4::ListBox)],
-    dir: &std::path::Path,
-    seq: &mut u32,
-) -> String {
+fn write_reply(dir: &std::path::Path, command: &str, reply: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("replies"))
+    {
+        // One write per reply so a reader never sees half a line.
+        let _ = f.write_all(format!("{command} => {reply}\n").as_bytes());
+    }
+}
+
+struct Snapshot {
+    path: PathBuf,
+    sections: Vec<(&'static str, gtk4::ListBox)>,
+    section: usize,
+    row: i32,
+    out: String,
+}
+
+impl Snapshot {
+    fn new(path: PathBuf, sections: Vec<(&'static str, gtk4::ListBox)>) -> Self {
+        Self {
+            path,
+            sections,
+            section: 0,
+            row: 0,
+            out: String::new(),
+        }
+    }
+
+    fn advance(&mut self) -> bool {
+        snapshot_slice(|| {
+            while let Some((label, list)) = self.sections.get(self.section) {
+                if let Some(row) = list.row_at_index(self.row) {
+                    self.out.push_str(&describe_row(label, &row));
+                    self.out.push('\n');
+                    self.row += 1;
+                    return true;
+                }
+                self.section += 1;
+                self.row = 0;
+            }
+            false
+        })
+    }
+}
+
+// Return true only when the entire walk is complete. An idle callback
+// yields before the next slice so the GTK heartbeat and product work run.
+fn snapshot_slice(mut next_row: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    for _ in 0..SNAPSHOT_ROWS_PER_SLICE {
+        if !next_row() {
+            return true;
+        }
+        if start.elapsed() >= SNAPSHOT_SLICE_BUDGET {
+            return false;
+        }
+    }
+    false
+}
+
+fn run(line: &str, sections: &[(&'static str, gtk4::ListBox)]) -> String {
     let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
     match verb {
-        "snapshot" => {
-            *seq += 1;
-            let path = dir.join(format!("snapshot-{seq}.tsv"));
-            let mut out = String::new();
-            for (label, list) in sections {
-                let mut idx = 0;
-                while let Some(row) = list.row_at_index(idx) {
-                    out.push_str(&describe_row(label, &row));
-                    out.push('\n');
-                    idx += 1;
-                }
-            }
-            match std::fs::write(&path, out) {
-                Ok(()) => format!("ok {}", path.display()),
-                Err(e) => format!("error {e}"),
-            }
-        }
         "row" => match sections
             .iter()
             .find_map(|(label, list)| find_in(list, arg).map(|row| (label, row)))
@@ -201,4 +275,31 @@ fn describe_row(section: &str, row: &gtk4::ListBoxRow) -> String {
         waveform.unwrap_or("-"),
         u8::from(row.is_selected()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn snapshot_yields_between_bounded_batches() {
+        let mut visited = 0;
+        let complete = super::snapshot_slice(|| {
+            if visited == 1500 {
+                return false;
+            }
+            visited += 1;
+            true
+        });
+        assert!(!complete);
+        assert!(visited > 0);
+        assert!(visited <= 32, "one GTK callback must not walk the library");
+
+        while !super::snapshot_slice(|| {
+            if visited == 1500 {
+                return false;
+            }
+            visited += 1;
+            true
+        }) {}
+        assert_eq!(visited, 1500, "no row is skipped between batches");
+    }
 }

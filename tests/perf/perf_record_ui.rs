@@ -267,6 +267,11 @@ async fn perf_record_ui_library_1500() {
     )
     .await;
     let rows_ms = t_open.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(
+        rows.len(),
+        order.len(),
+        "snapshot includes every row exactly once"
+    );
     assert_library_rows(&rows, &expected, &order);
     wait_rows(
         &mut b.probe,
