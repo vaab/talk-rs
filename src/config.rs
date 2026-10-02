@@ -976,6 +976,17 @@ pub enum VizMode {
     Spectrum,
 }
 
+impl VizMode {
+    /// Whether this visualizer draws from an FFT magnitude spectrum.
+    /// Amplitude only uses the frame RMS, so the badge skips the FFT.
+    pub fn needs_spectrum(self) -> bool {
+        match self {
+            VizMode::Waterfall | VizMode::Spectrum => true,
+            VizMode::Amplitude => false,
+        }
+    }
+}
+
 impl std::fmt::Display for VizMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1808,6 +1819,14 @@ mod tests {
     use std::io::Write;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::NamedTempFile;
+
+    /// Only visualizers that draw a frequency spectrum need the FFT.
+    #[test]
+    fn viz_mode_needs_spectrum_only_for_spectral_modes() {
+        assert!(VizMode::Waterfall.needs_spectrum());
+        assert!(VizMode::Spectrum.needs_spectrum());
+        assert!(!VizMode::Amplitude.needs_spectrum());
+    }
 
     #[test]
     fn chain_config_accepts_short_and_long_entries() -> Result<(), Box<dyn Error>> {

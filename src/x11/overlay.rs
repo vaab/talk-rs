@@ -12,9 +12,13 @@
 //! During **transcribing**, the badge is a static PNG (unchanged).
 
 use super::render_util::{
-    apply_rounded_shape, blit_glyph_at, compute_spectrum, map_spectrum_to_column, rasterise_glyphs,
-    rms, PixelBuffer, RingBuffer, FFT_SIZE, FREQ_MAX, FREQ_NOISE_FLOOR, PEAK_DECAY, PEAK_FLOOR,
+    apply_rounded_shape, blit_glyph_at, map_spectrum_to_column, rasterise_glyphs, rms, PixelBuffer,
+    RingBuffer, SpectrumAnalyzer, FFT_SIZE, FREQ_MAX, FREQ_NOISE_FLOOR, PEAK_DECAY, PEAK_FLOOR,
 };
+// The frozen reference loop in `perf_frame_analysis` computes one-shot
+// spectra, as the render loop did before it kept a `SpectrumAnalyzer`.
+#[cfg(test)]
+use super::render_util::compute_spectrum;
 use crate::error::TalkError;
 use crate::telemetry::TranscriptionEvent;
 use std::collections::HashMap;
@@ -391,7 +395,12 @@ struct FrameEffects {
 struct FrameAnalysis {
     frame_rms: f32,
     frame_stuck_at_rail: bool,
-    magnitudes: Vec<f32>,
+    /// FFT workspace and the current frame's magnitudes.  Computed
+    /// only for spectral visualizers (see [`VizMode::needs_spectrum`]);
+    /// without one its magnitudes are cleared to prevent stale output.
+    ///
+    /// [`VizMode::needs_spectrum`]: crate::config::VizMode::needs_spectrum
+    spectrum: SpectrumAnalyzer,
     rms_peak: f32,
     dead_signal_frames: u32,
     no_sound_active: bool,
@@ -414,7 +423,7 @@ impl FrameAnalysis {
         Self {
             frame_rms: 0.0,
             frame_stuck_at_rail: false,
-            magnitudes: Vec::new(),
+            spectrum: SpectrumAnalyzer::new(),
             rms_peak: PEAK_FLOOR,
             dead_signal_frames: 0,
             no_sound_active: false,
@@ -433,15 +442,29 @@ impl FrameAnalysis {
     }
 
     /// Reset for a new recording session (the column counter keeps
-    /// running, as it always has).
+    /// running, as it always has; the FFT workspace is kept, but its
+    /// magnitudes are cleared until the next spectral frame.
     fn reset(&mut self) {
         let column_frame_counter = self.column_frame_counter;
+        let mut spectrum = std::mem::take(&mut self.spectrum);
+        spectrum.clear();
         *self = Self::new();
         self.column_frame_counter = column_frame_counter;
+        self.spectrum = spectrum;
+    }
+
+    /// Magnitude spectrum of the current frame (empty unless the
+    /// visualizer is spectral).
+    fn magnitudes(&self) -> &[f32] {
+        self.spectrum.magnitudes()
     }
 
     /// Analyse one render frame of `samples` (the ring buffer's latest
     /// `FFT_SIZE.max(rms_chunk)` samples).
+    ///
+    /// The detectors (RMS, stuck-at-rail, auto-pause, live audio) run
+    /// on every frame whatever the visualizer; the FFT runs once per
+    /// frame only when `viz` draws a spectrum.
     fn analyze(
         &mut self,
         samples: &[f32],
@@ -460,7 +483,11 @@ impl FrameAnalysis {
         // digital silence from Bluetooth HFP mics as a dead device.
         self.frame_stuck_at_rail =
             is_stuck_at_rail(rms_slice, DEAD_SIGNAL_RAIL_FLOOR, DEAD_SIGNAL_FLAT_EPS);
-        self.magnitudes = compute_spectrum(samples);
+        if viz.is_some_and(|mode| mode.needs_spectrum()) {
+            self.spectrum.compute(samples);
+        } else {
+            self.spectrum.clear();
+        }
         let frame_rms = self.frame_rms;
 
         // Update RMS peak (fast attack, slow decay).
@@ -541,8 +568,9 @@ impl FrameAnalysis {
                     VizMode::Waterfall => {
                         // Dynamic frequency scaling.
                         let nyquist = sample_rate as f32 / 2.0;
-                        let n_mag = self.magnitudes.len();
-                        for (i, &mag) in self.magnitudes.iter().enumerate().rev() {
+                        let magnitudes = self.spectrum.magnitudes();
+                        let n_mag = magnitudes.len();
+                        for (i, &mag) in magnitudes.iter().enumerate().rev() {
                             if mag > FREQ_NOISE_FLOOR {
                                 let freq = (i as f32 / n_mag as f32) * nyquist;
                                 if freq > self.effective_freq_max {
@@ -552,7 +580,7 @@ impl FrameAnalysis {
                             }
                         }
                         // All-time peak for opacity normalization.
-                        let frame_spec_max = self.magnitudes.iter().copied().fold(0.0f32, f32::max);
+                        let frame_spec_max = magnitudes.iter().copied().fold(0.0f32, f32::max);
                         if frame_spec_max > self.spec_peak {
                             self.spec_peak = frame_spec_max;
                         }
@@ -564,7 +592,12 @@ impl FrameAnalysis {
                     }
                     VizMode::Spectrum => {
                         self.spectrum_peak *= PEAK_DECAY;
-                        let frame_peak = self.magnitudes.iter().copied().fold(0.0f32, f32::max);
+                        let frame_peak = self
+                            .spectrum
+                            .magnitudes()
+                            .iter()
+                            .copied()
+                            .fold(0.0f32, f32::max);
                         if frame_peak > self.spectrum_peak {
                             self.spectrum_peak = frame_peak;
                         }
@@ -615,7 +648,7 @@ impl FrameAnalysis {
                         vec![0.0f32; SPEC_H]
                     } else {
                         map_spectrum_to_column(
-                            &self.magnitudes,
+                            self.spectrum.magnitudes(),
                             SPEC_H,
                             sample_rate,
                             self.effective_freq_max,
@@ -2716,7 +2749,7 @@ fn overlay_thread(
         let spec_peak = analysis.spec_peak;
         let amp_peak = analysis.amp_peak;
         let spectrum_peak = analysis.spectrum_peak;
-        let magnitudes: &Vec<f32> = &analysis.magnitudes;
+        let magnitudes: &[f32] = analysis.magnitudes();
         let spectrogram_history: &Vec<Vec<f32>> = &analysis.spectrogram_history;
         let amp_history: &Vec<f32> = &analysis.amp_history;
 
@@ -3237,6 +3270,8 @@ fn destroy_current(conn: &impl Connection, window: &mut Option<u32>, gc: &mut Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::VizMode;
+    use crate::perf_counters::{thread_value, Counter};
 
     // ── Dead-signal (stuck-at-rail) detection ────────────────────────
     //
@@ -3245,6 +3280,87 @@ mod tests {
     // emits constant i16::MIN (-32768) → -1.0.
     const RAIL_FLOOR: f32 = 0.9;
     const FLAT_EPS: f32 = 1e-6;
+
+    // ── Frame analysis: FFT only for spectral visualizers ────────────
+
+    fn speech_frame(n: usize) -> Vec<f32> {
+        (0..FFT_SIZE)
+            .map(|i| {
+                let t = (n * 800 + i) as f32 / 48_000.0;
+                0.3 * (t * 220.0 * std::f32::consts::TAU).sin()
+            })
+            .collect()
+    }
+
+    /// Analyse `frames` speech frames; return (FFTs, workspace
+    /// allocations) performed by the calling thread.
+    fn fft_work(analysis: &mut FrameAnalysis, viz: Option<VizMode>, frames: usize) -> (u64, u64) {
+        let ffts = thread_value(Counter::FftCalls);
+        let allocs = thread_value(Counter::SpectrumAllocs);
+        for n in 0..frames {
+            analysis.analyze(&speech_frame(n), 800, viz, 48_000, true);
+            analysis.advance_column(viz, 48_000, false);
+        }
+        (
+            thread_value(Counter::FftCalls) - ffts,
+            thread_value(Counter::SpectrumAllocs) - allocs,
+        )
+    }
+
+    /// No visualizer and the amplitude visualizer never read a spectrum:
+    /// the badge computes no FFT for them, while the detectors still run.
+    #[test]
+    fn frame_analysis_skips_fft_without_spectral_viz() {
+        for viz in [None, Some(VizMode::Amplitude)] {
+            let mut analysis = FrameAnalysis::new();
+            assert_eq!(fft_work(&mut analysis, viz, 30), (0, 0), "{viz:?}");
+            assert!(analysis.magnitudes().is_empty(), "{viz:?}");
+            assert!(analysis.frame_rms > AUTOPAUSE_RMS_THRESHOLD, "{viz:?}");
+        }
+    }
+
+    /// Spectral visualizers keep one FFT per frame, on one workspace
+    /// that survives a new recording session.
+    #[test]
+    fn frame_analysis_spectral_viz_fft_every_frame_one_workspace() {
+        for viz in [VizMode::Waterfall, VizMode::Spectrum] {
+            let mut analysis = FrameAnalysis::new();
+            assert_eq!(fft_work(&mut analysis, Some(viz), 30), (30, 3), "{viz:?}");
+            assert_eq!(analysis.magnitudes().len(), FFT_SIZE / 2, "{viz:?}");
+            analysis.reset();
+            assert_eq!(fft_work(&mut analysis, Some(viz), 10), (10, 0), "{viz:?}");
+        }
+    }
+
+    #[test]
+    fn frame_analysis_mode_switch_discards_old_spectrum_without_skipping_detectors() {
+        let mut analysis = FrameAnalysis::new();
+        let before = thread_value(Counter::FftCalls);
+        let first = speech_frame(0);
+        analysis.analyze(&first, 800, Some(VizMode::Spectrum), 48_000, false);
+        assert_eq!(analysis.magnitudes(), compute_spectrum(&first));
+
+        for viz in [None, Some(VizMode::Amplitude)] {
+            analysis.analyze(&speech_frame(1), 800, viz, 48_000, false);
+            assert!(analysis.magnitudes().is_empty(), "{viz:?}");
+            assert!(analysis.frame_rms > AUTOPAUSE_RMS_THRESHOLD, "{viz:?}");
+        }
+        let waterfall = speech_frame(2);
+        analysis.analyze(&waterfall, 800, Some(VizMode::Waterfall), 48_000, false);
+        assert_eq!(analysis.magnitudes(), compute_spectrum(&waterfall));
+        let spectrum = speech_frame(3);
+        analysis.analyze(&spectrum, 800, Some(VizMode::Spectrum), 48_000, false);
+        assert_eq!(analysis.magnitudes(), compute_spectrum(&spectrum));
+        // The three independent reference calls above also count as FFTs.
+        assert_eq!(thread_value(Counter::FftCalls) - before, 6);
+
+        analysis.reset();
+        assert!(analysis.magnitudes().is_empty());
+        assert_eq!(analysis.frame_rms, 0.0);
+        assert_eq!(analysis.spectrum_peak, PEAK_FLOOR);
+        analysis.analyze(&speech_frame(4), 800, None, 48_000, false);
+        assert!(analysis.magnitudes().is_empty());
+    }
 
     #[test]
     fn stuck_at_rail_detects_disconnected_device() {

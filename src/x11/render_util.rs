@@ -128,24 +128,109 @@ pub fn fft_in_place(buf: &mut [Complex]) {
     }
 }
 
+fn hann_weight(i: usize, n: usize) -> f32 {
+    0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
+}
+
+/// Reusable FFT workspace: Hann window coefficients, complex scratch
+/// buffer and magnitude output, sized for one window length.
+///
+/// Callers computing many spectra of the same length (the recording
+/// badge every frame, the waterfall generator every column) keep one
+/// analyzer so the window cosines are computed only when its length
+/// changes, and buffers grow only when needed instead of on every FFT.
+/// The output is bit-identical to a fresh [`compute_spectrum`] call:
+/// the same window expression, products, FFT and magnitudes, in order.
+#[derive(Clone, Default)]
+pub struct SpectrumAnalyzer {
+    /// Window length the buffers are sized for (`None` until first use).
+    len: Option<usize>,
+    window: Vec<f32>,
+    scratch: Vec<Complex>,
+    magnitudes: Vec<f32>,
+}
+
+impl std::fmt::Debug for SpectrumAnalyzer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpectrumAnalyzer")
+            .field("len", &self.len)
+            .field("magnitudes", &self.magnitudes.len())
+            .finish()
+    }
+}
+
+impl SpectrumAnalyzer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Magnitudes of the last [`Self::compute`] (empty before the first).
+    pub fn magnitudes(&self) -> &[f32] {
+        &self.magnitudes
+    }
+
+    /// Discard the previous frame's output without releasing warm storage.
+    pub fn clear(&mut self) {
+        self.magnitudes.clear();
+    }
+
+    /// Apply the Hann window to `samples` and compute the FFT magnitude
+    /// spectrum (positive frequencies only, `samples.len() / 2` bins).
+    ///
+    /// Window coefficients are refreshed only when the length changes;
+    /// backing buffers retain capacity across smaller windows.
+    pub fn compute(&mut self, samples: &[f32]) -> &[f32] {
+        crate::perf_counters::incr(crate::perf_counters::Counter::FftCalls);
+        let n = samples.len();
+        if self.len != Some(n) {
+            if self.window.capacity() < n {
+                self.window.reserve_exact(n - self.window.len());
+                crate::perf_counters::incr(crate::perf_counters::Counter::SpectrumAllocs);
+            }
+            self.len = Some(n);
+            self.window.clear();
+            self.window.extend((0..n).map(|i| hann_weight(i, n)));
+        }
+        if self.scratch.capacity() < n {
+            self.scratch.reserve_exact(n - self.scratch.len());
+            crate::perf_counters::incr(crate::perf_counters::Counter::SpectrumAllocs);
+        }
+        if self.magnitudes.capacity() < n / 2 {
+            self.magnitudes.reserve_exact(n / 2 - self.magnitudes.len());
+            crate::perf_counters::incr(crate::perf_counters::Counter::SpectrumAllocs);
+        }
+
+        self.scratch.clear();
+        self.scratch.extend(
+            samples
+                .iter()
+                .zip(&self.window)
+                .map(|(&s, &w)| Complex::new(s * w, 0.0)),
+        );
+
+        fft_in_place(&mut self.scratch);
+
+        self.magnitudes.clear();
+        self.magnitudes
+            .extend(self.scratch[..n / 2].iter().map(|c| c.magnitude()));
+        &self.magnitudes
+    }
+}
+
 /// Apply Hann window and compute FFT magnitude spectrum (positive
-/// frequencies only).
+/// frequencies only). Keep an analyzer instead when computing many spectra.
+/// The one-shot form does not allocate a coefficient table it cannot reuse.
 pub fn compute_spectrum(samples: &[f32]) -> Vec<f32> {
     crate::perf_counters::incr(crate::perf_counters::Counter::FftCalls);
-    // Each call allocates its complex work buffer and output vector.
     crate::perf_counters::incr(crate::perf_counters::Counter::SpectrumAllocs);
     let n = samples.len();
     let mut buf: Vec<Complex> = samples
         .iter()
         .enumerate()
-        .map(|(i, &s)| {
-            let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos());
-            Complex::new(s * w, 0.0)
-        })
+        .map(|(i, &s)| Complex::new(s * hann_weight(i, n), 0.0))
         .collect();
-
     fft_in_place(&mut buf);
-
+    crate::perf_counters::incr(crate::perf_counters::Counter::SpectrumAllocs);
     buf[..n / 2].iter().map(|c| c.magnitude()).collect()
 }
 
@@ -790,19 +875,20 @@ pub fn generate_waterfall_columns(samples: &[i16], sample_rate: u32) -> (Vec<Vec
 
     let mut columns = Vec::with_capacity(num_columns);
     let mut global_peak: f32 = 0.0;
+    let mut analyzer = SpectrumAnalyzer::new();
 
     for col in 0..num_columns {
         let start = (col * hop).min(padded.len().saturating_sub(FFT_SIZE));
         let window = &padded[start..start + FFT_SIZE];
 
-        let magnitudes = compute_spectrum(window);
+        let magnitudes = analyzer.compute(window);
 
         let frame_peak = magnitudes.iter().copied().fold(0.0f32, f32::max);
         if frame_peak > global_peak {
             global_peak = frame_peak;
         }
 
-        let column = map_spectrum_to_column(&magnitudes, WATERFALL_ROWS, sample_rate, FREQ_MAX);
+        let column = map_spectrum_to_column(magnitudes, WATERFALL_ROWS, sample_rate, FREQ_MAX);
         columns.push(column);
     }
 
@@ -926,6 +1012,118 @@ mod tests {
         let samples = vec![0.0f32; 256];
         let mags = compute_spectrum(&samples);
         assert_eq!(mags.len(), 128);
+    }
+
+    /// The per-call allocating spectrum (window computed inline), as it
+    /// was before the workspace became reusable: the reference output.
+    fn reference_spectrum(samples: &[f32]) -> Vec<u32> {
+        let n = samples.len();
+        let mut buf: Vec<Complex> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos());
+                Complex::new(s * w, 0.0)
+            })
+            .collect();
+        fft_in_place(&mut buf);
+        buf[..n / 2]
+            .iter()
+            .map(|c| c.magnitude().to_bits())
+            .collect()
+    }
+
+    fn signal(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| (i as f32 * 0.37 * seed).sin() * 0.5 + (i as f32 * 0.011).cos() * 0.2)
+            .collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|m| m.to_bits()).collect()
+    }
+
+    /// A reused analyzer yields, for every successive input (and after
+    /// a window-length change), exactly the bits of a fresh spectrum.
+    #[test]
+    fn spectrum_analyzer_reuse_is_bit_identical() {
+        let mut analyzer = SpectrumAnalyzer::new();
+        assert!(analyzer.magnitudes().is_empty());
+        for (n, seed) in [
+            (FFT_SIZE, 1.0),
+            (FFT_SIZE, 2.5),
+            (256, 3.0),
+            (FFT_SIZE, 0.7),
+        ] {
+            let samples = signal(n, seed);
+            let expected = reference_spectrum(&samples);
+            assert_eq!(
+                bits(analyzer.compute(&samples)),
+                expected,
+                "n={n} seed={seed}"
+            );
+            assert_eq!(bits(analyzer.magnitudes()), expected);
+            assert_eq!(bits(&compute_spectrum(&samples)), expected);
+        }
+    }
+
+    /// A smaller window and return to the original size reuse all three
+    /// backing buffers while recomputing the length-specific coefficients.
+    #[test]
+    fn spectrum_analyzer_reuses_capacity_across_window_lengths() {
+        use crate::perf_counters::{thread_value, Counter};
+        let ffts = thread_value(Counter::FftCalls);
+        let allocs = thread_value(Counter::SpectrumAllocs);
+        let mut analyzer = SpectrumAnalyzer::new();
+        for i in 0..10 {
+            analyzer.compute(&signal(FFT_SIZE, i as f32));
+        }
+        analyzer.compute(&signal(256, 1.0));
+        analyzer.compute(&signal(256, 2.0));
+        analyzer.compute(&signal(FFT_SIZE, 3.0));
+        assert_eq!(thread_value(Counter::FftCalls) - ffts, 13);
+        assert_eq!(thread_value(Counter::SpectrumAllocs) - allocs, 3);
+    }
+
+    /// Empty, short, exact and multi-window recordings keep the original
+    /// padding, replication, frequency mapping and peak magnitude.
+    #[test]
+    fn waterfall_columns_match_per_column_spectra() {
+        for (pcm, rate) in [
+            (Vec::new(), 16_000),
+            (vec![1234; 200], 48_000),
+            (vec![0; FFT_SIZE], 16_000),
+            (
+                signal(FFT_SIZE * 3, 1.3)
+                    .iter()
+                    .map(|&s| (s * 20000.0) as i16)
+                    .collect(),
+                48_000,
+            ),
+        ] {
+            let (columns, peak) = generate_waterfall_columns(&pcm, rate);
+            let mut padded: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+            padded.resize(padded.len().max(FFT_SIZE), 0.0);
+            let hop = (padded.len() - FFT_SIZE) / (WATERFALL_COLUMNS - 1);
+            let mut expected_peak = 0.0f32;
+            assert_eq!(columns.len(), WATERFALL_COLUMNS);
+            for (col, column) in columns.iter().enumerate() {
+                let start = (col * hop).min(padded.len() - FFT_SIZE);
+                let mags = reference_spectrum(&padded[start..start + FFT_SIZE]);
+                let expected_mags: Vec<f32> = mags.iter().map(|&b| f32::from_bits(b)).collect();
+                expected_peak =
+                    expected_peak.max(expected_mags.iter().copied().fold(0.0, f32::max));
+                let expected =
+                    map_spectrum_to_column(&expected_mags, WATERFALL_ROWS, rate, FREQ_MAX);
+                assert_eq!(
+                    bits(column),
+                    bits(&expected),
+                    "len={} column {col}",
+                    pcm.len()
+                );
+            }
+            assert_eq!(peak.to_bits(), expected_peak.to_bits(), "len={}", pcm.len());
+        }
     }
 
     // ── Pixel buffer ─────────────────────────────────────────────────

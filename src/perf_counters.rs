@@ -34,7 +34,7 @@ pub enum Counter {
     NormalizeCalls,
     /// Opus frames encoded by `OggOpusWriter` (all writers, all paths).
     OpusFramesEncoded,
-    /// `compute_spectrum` calls (overlay frames and waterfall columns).
+    /// Spectra computed (badge frames, waterfall columns or one-shot calls).
     FftCalls,
     /// Overlay render-loop frames (denominator for per-frame FFT cost).
     OverlayFrames,
@@ -70,7 +70,9 @@ pub enum Counter {
     WaterfallJobsApplied,
     /// Audio player bars built by the recordings browser.
     PlayerBarsBuilt,
-    /// Spectrum scratch buffers allocated (one per FFT today).
+    /// Individual FFT buffer-capacity growth events (Hann coefficients,
+    /// complex scratch or magnitudes). The historical baseline counted
+    /// allocating calls, not individual backing buffers.
     SpectrumAllocs,
 }
 
