@@ -104,7 +104,10 @@ happening.
   Play, delete, open in the file manager, or transcribe on demand.
   A waterfall spectrogram is shown for every recording, even those
   without transcripts; sections auto-refresh via inotify when files
-  change externally.
+  change externally. Large libraries load their waveforms on bounded
+  background workers; Play remains responsive while a long recording
+  decodes. A refreshed row for the same recording keeps playback active,
+  and collapsing a section does not stop it.
 - *Per-segment timing export* -- ~--output-yaml~ includes per-segment
   start/end timestamps in the metadata sidecar, suitable for
   subtitles and post-processing.

@@ -13,7 +13,55 @@ use super::player::WavPlayer;
 use crate::config::Config;
 use crate::error::TalkError;
 use crate::recording_cache;
+use crate::widgets::audio_player_bar::ButtonFaces;
+use crate::widgets::playback_session::{PlaybackRow, PlaybackSession, RowRef};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+/// The plain ▶/■ play button of a row that has a transcript (rows
+/// without one use the full player bar).  Driven by the window's
+/// [`PlaybackSession`] like any other row: one shared tick, decode
+/// off the GTK thread, released when another row plays.
+struct SimplePlayRow {
+    button: gtk4::glib::WeakRef<gtk4::Button>,
+    faces: ButtonFaces<gtk4::Label>,
+}
+
+impl SimplePlayRow {
+    fn new(button: &gtk4::Button) -> Self {
+        use gtk4::prelude::*;
+        let faces = ButtonFaces::install(
+            button,
+            gtk4::Label::new(Some("▶")),
+            gtk4::Label::new(Some("■")),
+        );
+        button.set_tooltip_text(Some("Play recording"));
+        Self {
+            button: button.downgrade(),
+            faces,
+        }
+    }
+
+    fn show_playing(&self) {
+        use gtk4::prelude::*;
+        self.faces.set_active(true);
+        if let Some(button) = self.button.upgrade() {
+            button.set_tooltip_text(Some("Stop playback"));
+        }
+    }
+}
+
+impl PlaybackRow for SimplePlayRow {
+    fn set_idle(&self, _finished: bool) {
+        use gtk4::prelude::*;
+        self.faces.set_active(false);
+        if let Some(button) = self.button.upgrade() {
+            button.set_tooltip_text(Some("Play recording"));
+        }
+    }
+
+    fn set_progress(&self, _fraction: f64) {}
+}
 
 /// Window title — also used for single-instance detection.
 const WINDOW_TITLE: &str = "talk-rs — Recordings";
@@ -87,7 +135,6 @@ fn show_recordings_window() -> Result<(), TalkError> {
     use gtk4::glib;
     use gtk4::prelude::*;
     use std::cell::RefCell;
-    use std::rc::Rc;
 
     let t0 = std::time::Instant::now();
 
@@ -138,68 +185,11 @@ fn show_recordings_window() -> Result<(), TalkError> {
 
     let main_loop = glib::MainLoop::new(None, false);
 
-    // Native audio player (cpal), initialized in background after the
-    // window is presented to avoid blocking the UI on device probing.
-    let player: Rc<RefCell<Option<WavPlayer>>> = Rc::new(RefCell::new(None));
-    // Track which button is currently in "stop" mode.
-    let active_play_btn: Rc<RefCell<Option<gtk4::Button>>> = Rc::new(RefCell::new(None));
-
-    /// Stop any active playback and reset the corresponding button.
-    fn stop_playback(
-        player: &Rc<RefCell<Option<WavPlayer>>>,
-        btn_ref: &Rc<RefCell<Option<gtk4::Button>>>,
-    ) {
-        if let Some(ref p) = *player.borrow() {
-            p.stop();
-        }
-        if let Some(prev_btn) = btn_ref.borrow_mut().take() {
-            prev_btn.set_label("▶");
-            prev_btn.set_tooltip_text(Some("Play recording"));
-        }
-    }
-
-    /// Start playback of an audio file, updating button state.
-    fn start_playback(
-        audio_path: &std::path::Path,
-        btn: &gtk4::Button,
-        player: &Rc<RefCell<Option<WavPlayer>>>,
-        btn_ref: &Rc<RefCell<Option<gtk4::Button>>>,
-    ) {
-        stop_playback(player, btn_ref);
-
-        let player_guard = player.borrow();
-        let Some(ref p) = *player_guard else { return };
-        if let Err(e) = p.play(audio_path) {
-            log::warn!("failed to play {}: {}", audio_path.display(), e);
-            return;
-        }
-
-        btn.set_label("■");
-        btn.set_tooltip_text(Some("Stop playback"));
-        *btn_ref.borrow_mut() = Some(btn.clone());
-
-        // Poll for playback completion to reset button
-        let player_poll = Rc::clone(player);
-        let btn_poll = Rc::clone(btn_ref);
-        let btn_widget = btn.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-            let finished = player_poll
-                .borrow()
-                .as_ref()
-                .is_none_or(|p| p.is_finished());
-            if finished {
-                btn_widget.set_label("▶");
-                btn_widget.set_tooltip_text(Some("Play recording"));
-                let is_active = btn_poll.borrow().as_ref().is_some_and(|b| *b == btn_widget);
-                if is_active {
-                    *btn_poll.borrow_mut() = None;
-                }
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
-            }
-        });
-    }
+    // Playback shared by every row: the native audio player (cpal,
+    // installed in background after the window is presented to avoid
+    // blocking the UI on device probing), the row that owns it and the
+    // one progress tick.
+    let session = PlaybackSession::new();
 
     // Container inside the scrolled window for both sections.
     let sections_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -223,8 +213,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
         /// and buttons.
         fn build_row(
             recording: &RecordingEntry,
-            player: &Rc<RefCell<Option<WavPlayer>>>,
-            active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
+            session: &Rc<PlaybackSession>,
             window: &gtk4::Window,
             list: &gtk4::ListBox,
             expander: &gtk4::Expander,
@@ -270,19 +259,21 @@ fn show_recordings_window() -> Result<(), TalkError> {
             // Transcript preview, in-progress indicator, or audio
             // player bar — driven by the pick-file status.
             use crate::recording_cache::TranscriptStatus;
+            let mut playback_row: Option<RowRef> = None;
             match &recording.status {
                 TranscriptStatus::NotAvailable => {
                     // No pick yet — show the shared audio player bar
                     // with waterfall spectrogram, cursor, drag-to-seek,
                     // and play/pause/rewind controls.
-                    let player_bar = crate::widgets::audio_player_bar::build_audio_player_bar(
-                        &recording.path,
-                        player,
-                        active_play_btn,
-                        None, // waterfall computed in background by the widget
-                        28,
-                    );
+                    let (player_bar, row) =
+                        crate::widgets::audio_player_bar::build_audio_player_bar(
+                            &recording.path,
+                            session,
+                            None, // waterfall queued on the bounded loader
+                            28,
+                        );
                     hbox.append(&player_bar);
+                    playback_row = Some(row);
                 }
                 TranscriptStatus::InProgress => {
                     let label = gtk4::Label::new(None);
@@ -347,19 +338,23 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 recording.status,
                 crate::recording_cache::TranscriptStatus::NotAvailable
             ) {
-                let play_btn = gtk4::Button::with_label("▶");
-                play_btn.set_tooltip_text(Some("Play recording"));
+                let play_btn = gtk4::Button::new();
                 play_btn.add_css_class("play-btn");
+                let simple = Rc::new(SimplePlayRow::new(&play_btn));
+                let row_ref: RowRef = simple.clone();
+                if session.adopt(Rc::clone(&row_ref), &recording.path) {
+                    simple.show_playing();
+                }
+                playback_row = Some(Rc::clone(&row_ref));
                 {
                     let audio_path = recording.path.clone();
-                    let player_ref = Rc::clone(player);
-                    let active_btn_ref = Rc::clone(active_play_btn);
-                    play_btn.connect_clicked(move |btn| {
-                        let is_playing = active_btn_ref.borrow().as_ref().is_some_and(|b| b == btn);
-                        if is_playing {
-                            stop_playback(&player_ref, &active_btn_ref);
-                        } else {
-                            start_playback(&audio_path, btn, &player_ref, &active_btn_ref);
+                    let session = Rc::clone(session);
+                    let row: RowRef = Rc::clone(&simple) as RowRef;
+                    play_btn.connect_clicked(move |_| {
+                        if session.is_active(&row) {
+                            session.stop();
+                        } else if session.play(Rc::clone(&row), &audio_path, None) {
+                            simple.show_playing();
                         }
                     });
                 }
@@ -462,6 +457,14 @@ fn show_recordings_window() -> Result<(), TalkError> {
 
             let row = gtk4::ListBoxRow::new();
             row.set_child(Some(&hbox));
+            if let Some(playback_row) = playback_row {
+                let session = Rc::clone(session);
+                row.connect_parent_notify(move |widget| {
+                    if widget.parent().is_none() {
+                        session.release_if_active(&playback_row);
+                    }
+                });
+            }
             // Tag with audio path so FileMonitor can find rows by path.
             row.set_widget_name(&recording.path.to_string_lossy());
             row
@@ -473,14 +476,12 @@ fn show_recordings_window() -> Result<(), TalkError> {
         /// Rows are built in batches of `BATCH_SIZE` via
         /// `glib::idle_add_local_once` so the GTK main loop stays
         /// responsive between batches.
-        #[allow(clippy::too_many_arguments)]
         fn populate_section(
             label: &str,
             recordings: Vec<RecordingEntry>,
             list: &gtk4::ListBox,
             expander: &gtk4::Expander,
-            player: &Rc<RefCell<Option<WavPlayer>>>,
-            active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
+            session: &Rc<PlaybackSession>,
             window: &gtk4::Window,
         ) {
             use gtk4::prelude::*;
@@ -501,8 +502,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
 
             let list = list.clone();
             let expander = expander.clone();
-            let player = Rc::clone(player);
-            let btn = Rc::clone(active_play_btn);
+            let session = Rc::clone(session);
             let win = window.clone();
             let label = label.to_string();
 
@@ -517,7 +517,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 let end = (start + BATCH_SIZE).min(entries.len());
 
                 for recording in &entries[start..end] {
-                    let row = build_row(recording, &player, &btn, &win, &list, &expander, &label);
+                    let row = build_row(recording, &session, &win, &list, &expander, &label);
                     list.append(&row);
                 }
 
@@ -577,8 +577,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
         // timeout from there — this ensures at least one frame is
         // drawn (showing "Loading recordings…") before the data
         // loading grabs the GTK thread.
-        let player_idle = Rc::clone(&player);
-        let btn_idle = Rc::clone(&active_play_btn);
+        let session_idle = Rc::clone(&session);
         let win_idle = window.clone();
         let sections_idle = sections_box.clone();
         let loading_idle = loading_label.clone();
@@ -590,8 +589,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
             if loaded.replace(true) {
                 return;
             }
-            let player_idle = Rc::clone(&player_idle);
-            let btn_idle = Rc::clone(&btn_idle);
+            let session_idle = Rc::clone(&session_idle);
             let win_idle = win_idle.clone();
             let sections_idle = sections_idle.clone();
             let loading_idle = loading_idle.clone();
@@ -619,8 +617,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 // Populate sections via idle callbacks so the GTK
                 // main loop stays responsive between each section.
                 {
-                    let player = Rc::clone(&player_idle);
-                    let btn = Rc::clone(&btn_idle);
+                    let session = Rc::clone(&session_idle);
                     let win = win_idle.clone();
                     let wav_list_ref = wav_list.clone();
                     let wav_exp_ref = wav_expander.clone();
@@ -636,8 +633,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                             wav_recordings,
                             &wav_list_ref,
                             &wav_exp_ref,
-                            &player,
-                            &btn,
+                            &session,
                             &win,
                         );
                         if wav_list_ref.first_child().is_some() {
@@ -647,8 +643,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 }
 
                 {
-                    let player = Rc::clone(&player_idle);
-                    let btn = Rc::clone(&btn_idle);
+                    let session = Rc::clone(&session_idle);
                     let win = win_idle.clone();
                     let ogg_list_ref = ogg_list.clone();
                     let ogg_exp_ref = ogg_expander.clone();
@@ -664,8 +659,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                             ogg_recordings,
                             &ogg_list_ref,
                             &ogg_exp_ref,
-                            &player,
-                            &btn,
+                            &session,
                             &win,
                         );
                     });
@@ -677,8 +671,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                 struct WatchCtx {
                     list: gtk4::ListBox,
                     expander: gtk4::Expander,
-                    player: Rc<RefCell<Option<WavPlayer>>>,
-                    active_play_btn: Rc<RefCell<Option<gtk4::Button>>>,
+                    session: Rc<PlaybackSession>,
                     window: gtk4::Window,
                 }
 
@@ -718,12 +711,10 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     /// Refresh the audio row whose stem matches a YAML
                     /// companion file.  Used for YAML created, changed,
                     /// and deleted events.
-                    #[allow(clippy::too_many_arguments)]
                     fn update_row_for_yml(
                         yml_name: &str,
                         list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
-                        player: &Rc<RefCell<Option<WavPlayer>>>,
-                        active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
+                        session: &Rc<PlaybackSession>,
                         window: &gtk4::Window,
                         list: &gtk4::ListBox,
                         expander: &gtk4::Expander,
@@ -760,15 +751,8 @@ fn show_recordings_window() -> Result<(), TalkError> {
                                         e.path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
                                             == yml_stem
                                     }) {
-                                        let new_row = build_row(
-                                            entry,
-                                            player,
-                                            active_play_btn,
-                                            window,
-                                            list,
-                                            expander,
-                                            label,
-                                        );
+                                        let new_row =
+                                            build_row(entry, session, window, list, expander, label);
                                         // Insert new row at same position,
                                         // then remove the old one.
                                         list.insert(&new_row, idx);
@@ -796,26 +780,16 @@ fn show_recordings_window() -> Result<(), TalkError> {
                         count
                     }
 
-                    #[allow(clippy::too_many_arguments)]
                     fn insert_or_refresh_row(
                         entry: &RecordingEntry,
                         existing_idx: Option<i32>,
-                        player: &Rc<RefCell<Option<WavPlayer>>>,
-                        active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
+                        session: &Rc<PlaybackSession>,
                         window: &gtk4::Window,
                         list: &gtk4::ListBox,
                         expander: &gtk4::Expander,
                         label: &str,
                     ) {
-                        let new_row = build_row(
-                            entry,
-                            player,
-                            active_play_btn,
-                            window,
-                            list,
-                            expander,
-                            label,
-                        );
+                        let new_row = build_row(entry, session, window, list, expander, label);
 
                         if let Some(old_idx) = existing_idx {
                             list.insert(&new_row, old_idx);
@@ -832,12 +806,10 @@ fn show_recordings_window() -> Result<(), TalkError> {
                         expander.set_label(Some(&format!("{} ({})", label, count)));
                     }
 
-                    #[allow(clippy::too_many_arguments)]
                     fn refresh_rows_under_subtree(
                         subtree: &Path,
                         list_fn: fn() -> Result<Vec<RecordingEntry>, TalkError>,
-                        player: &Rc<RefCell<Option<WavPlayer>>>,
-                        active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
+                        session: &Rc<PlaybackSession>,
                         window: &gtk4::Window,
                         list: &gtk4::ListBox,
                         expander: &gtk4::Expander,
@@ -858,14 +830,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                             let file_path = entry.path.to_string_lossy().to_string();
                             if row_index_by_path(list, &file_path).is_none() {
                                 insert_or_refresh_row(
-                                    entry,
-                                    None,
-                                    player,
-                                    active_play_btn,
-                                    window,
-                                    list,
-                                    expander,
-                                    label,
+                                    entry, None, session, window, list, expander, label,
                                 );
                             }
                         }
@@ -894,8 +859,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
 
                         let list_ref = ctx.list.clone();
                         let exp_ref = ctx.expander.clone();
-                        let player_ref = Rc::clone(&ctx.player);
-                        let btn_ref = Rc::clone(&ctx.active_play_btn);
+                        let session_ref = Rc::clone(&ctx.session);
                         let win_ref = ctx.window.clone();
                         let monitors_weak = Rc::downgrade(monitors);
 
@@ -941,8 +905,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                                         update_row_for_yml(
                                             &name,
                                             list_fn,
-                                            &player_ref,
-                                            &btn_ref,
+                                            &session_ref,
                                             &win_ref,
                                             &list_ref,
                                             &exp_ref,
@@ -1020,8 +983,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                                                 &WatchCtx {
                                                     list: list_ref.clone(),
                                                     expander: exp_ref.clone(),
-                                                    player: Rc::clone(&player_ref),
-                                                    active_play_btn: Rc::clone(&btn_ref),
+                                                    session: Rc::clone(&session_ref),
                                                     window: win_ref.clone(),
                                                 },
                                                 list_fn,
@@ -1031,8 +993,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                                         refresh_rows_under_subtree(
                                             dir_path,
                                             list_fn,
-                                            &player_ref,
-                                            &btn_ref,
+                                            &session_ref,
                                             &win_ref,
                                             &list_ref,
                                             &exp_ref,
@@ -1050,8 +1011,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                                         update_row_for_yml(
                                             &name,
                                             list_fn,
-                                            &player_ref,
-                                            &btn_ref,
+                                            &session_ref,
                                             &win_ref,
                                             &list_ref,
                                             &exp_ref,
@@ -1108,8 +1068,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                                     insert_or_refresh_row(
                                         entry,
                                         existing_idx,
-                                        &player_ref,
-                                        &btn_ref,
+                                        &session_ref,
                                         &win_ref,
                                         &list_ref,
                                         &exp_ref,
@@ -1158,8 +1117,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     let ctx = WatchCtx {
                         list: wav_list,
                         expander: wav_expander,
-                        player: Rc::clone(&player_idle),
-                        active_play_btn: Rc::clone(&btn_idle),
+                        session: Rc::clone(&session_idle),
                         window: win_idle.clone(),
                     };
                     watch_directory(
@@ -1176,8 +1134,7 @@ fn show_recordings_window() -> Result<(), TalkError> {
                     let ctx = WatchCtx {
                         list: ogg_list,
                         expander: ogg_expander,
-                        player: Rc::clone(&player_idle),
-                        active_play_btn: Rc::clone(&btn_idle),
+                        session: Rc::clone(&session_idle),
                         window: win_idle.clone(),
                     };
                     watch_directory(
@@ -1198,12 +1155,11 @@ fn show_recordings_window() -> Result<(), TalkError> {
     {
         let ml = main_loop.clone();
         let win = window.clone();
-        let player_ref = Rc::clone(&player);
-        let btn_ref = Rc::clone(&active_play_btn);
+        let session_ref = Rc::clone(&session);
         let key_ctl = gtk4::EventControllerKey::new();
         key_ctl.connect_key_pressed(move |_, key, _, _| {
             if key == gtk4::gdk::Key::Escape {
-                stop_playback(&player_ref, &btn_ref);
+                session_ref.stop();
                 win.set_visible(false);
                 ml.quit();
                 glib::Propagation::Stop
@@ -1218,10 +1174,9 @@ fn show_recordings_window() -> Result<(), TalkError> {
     {
         let ml = main_loop.clone();
         let win = window.clone();
-        let player_ref = Rc::clone(&player);
-        let btn_ref = Rc::clone(&active_play_btn);
+        let session_ref = Rc::clone(&session);
         close_btn.connect_clicked(move |_| {
-            stop_playback(&player_ref, &btn_ref);
+            session_ref.stop();
             win.set_visible(false);
             ml.quit();
         });
@@ -1230,10 +1185,9 @@ fn show_recordings_window() -> Result<(), TalkError> {
     // Window close
     {
         let ml = main_loop.clone();
-        let player_ref = Rc::clone(&player);
-        let btn_ref = Rc::clone(&active_play_btn);
+        let session_ref = Rc::clone(&session);
         window.connect_close_request(move |win| {
-            stop_playback(&player_ref, &btn_ref);
+            session_ref.stop();
             win.set_visible(false);
             ml.quit();
             glib::Propagation::Proceed
@@ -1249,11 +1203,9 @@ fn show_recordings_window() -> Result<(), TalkError> {
     // Initialize the audio player after the window is presented so it
     // appears instantly instead of blocking on cpal device probing.
     {
-        let player_init = Rc::clone(&player);
+        let session_init = Rc::clone(&session);
         glib::idle_add_local_once(move || match WavPlayer::new() {
-            Ok(p) => {
-                *player_init.borrow_mut() = Some(p);
-            }
+            Ok(p) => session_init.set_player(p),
             Err(e) => {
                 log::warn!("audio output unavailable, play disabled: {}", e);
             }

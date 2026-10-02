@@ -49,6 +49,8 @@ enum OutputStream {
     Device(cpal::Stream),
     #[cfg(feature = "perf-counters")]
     Capture(perf_sink::CaptureSink),
+    #[cfg(test)]
+    Test,
 }
 
 /// The output callback body, shared by every output backend so that
@@ -159,14 +161,33 @@ impl AudioPlayer {
     /// or use [`play_pcm_blocking`](AudioPlayer::play_pcm_blocking)
     /// which resamples for them.
     pub fn load_f32(&self, samples: Vec<f32>) {
+        self.load_f32_at(samples, 0.0, false);
+    }
+
+    /// Publish samples, initial position and pause state in one callback-visible update.
+    pub(crate) fn load_f32_at(&self, samples: Vec<f32>, fraction: f64, paused: bool) {
         crate::perf_counters::gauge_set(
             crate::perf_counters::Gauge::PlayerRetainedSamples,
             samples.len() as i64,
         );
         if let Ok(mut guard) = self.state.lock() {
+            let position = (fraction.clamp(0.0, 1.0) * samples.len() as f64) as usize;
             guard.samples = samples;
-            guard.position = 0;
-            guard.paused = false;
+            guard.position = position;
+            guard.paused = paused;
+        }
+    }
+
+    #[cfg(test)]
+    fn test_state() -> Self {
+        Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(PlaybackState {
+                samples: Vec::new(),
+                position: 0,
+                paused: false,
+            })),
+            device_sample_rate: 48_000,
+            _stream: OutputStream::Test,
         }
     }
 
@@ -429,6 +450,17 @@ fn resample_linear_mono(mono: &[f32], src_rate: u32, target_rate: u32) -> Vec<f3
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_pause_and_seek_are_visible_atomically_to_output() {
+        let state = super::AudioPlayer::test_state();
+        state.load_f32_at(vec![0.1, 0.2, 0.3, 0.4], 0.5, true);
+        let mut output = [1.0; 2];
+        assert_eq!(super::fill_output(&state.state, &mut output, 1), 0);
+        assert_eq!(output, [0.0, 0.0]);
+        state.resume();
+        assert_eq!(super::fill_output(&state.state, &mut output, 1), 2);
+        assert_eq!(output, [0.3, 0.4]);
+    }
     use super::*;
 
     #[test]

@@ -1,16 +1,147 @@
 //! Shared audio player bar widget with waterfall spectrogram,
 //! cursor overlay, drag-to-seek, and play/pause/rewind controls.
 //!
-//! Used by the picker UI and the record UI.
+//! Used by the record UI.  A bar owns no background work of its own:
+//! its waterfall comes from the bounded [`waterfall_loader`] and its
+//! playback (decode, progress tick, release when another row plays)
+//! from the window's [`PlaybackSession`], so a thousand bars cost no
+//! more timers or threads than one.
 
-use crate::record::player::WavPlayer;
+use super::playback_session::{PlaybackRow, PlaybackSession, RowRef};
+use super::waterfall_loader::{self, Interest};
 use gtk4::glib;
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-/// Waterfall column data: (columns, peak).
-pub(crate) type WfColumns = (Vec<Vec<f32>>, f32);
+pub(crate) use super::waterfall_loader::WfColumns;
+
+/// The bar's waterfall: its columns once known, and until then the
+/// row's interest in the queued computation (dropped with the bar,
+/// which cancels a computation nobody will see).
+struct Waterfall {
+    data: Option<WfColumns>,
+    interest: Option<Interest>,
+}
+
+/// A button face with two looks (idle / active) that switches by
+/// opacity instead of swapping the button's child.
+///
+/// Replacing a button's child (`set_icon_name`, `set_label`) queues a
+/// relayout of the whole window; in a list of a thousand rows that
+/// costs the GTK thread hundreds of milliseconds per click.  Both
+/// looks are built once and stacked in an overlay; changing opacity
+/// only queues a redraw of the button.
+pub(crate) struct ButtonFaces<W: glib::object::IsA<gtk4::Widget>> {
+    idle: W,
+    active: W,
+}
+
+impl<W: glib::object::IsA<gtk4::Widget>> ButtonFaces<W> {
+    /// Install `idle` (shown) and `active` (hidden) as `button`'s face.
+    pub(crate) fn install(button: &gtk4::Button, idle: W, active: W) -> Self {
+        use gtk4::prelude::*;
+        active.set_opacity(0.0);
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&idle));
+        overlay.add_overlay(&active);
+        button.set_child(Some(&overlay));
+        Self { idle, active }
+    }
+
+    /// Show the active look (`true`) or the idle one.
+    pub(crate) fn set_active(&self, active: bool) {
+        use gtk4::prelude::*;
+        self.idle.set_opacity(if active { 0.0 } else { 1.0 });
+        self.active.set_opacity(if active { 1.0 } else { 0.0 });
+    }
+}
+
+/// The play/pause button of a bar: an icon button whose two looks
+/// never trigger a relayout.
+struct PlayButton {
+    button: glib::WeakRef<gtk4::Button>,
+    faces: ButtonFaces<gtk4::Image>,
+}
+
+impl PlayButton {
+    fn new() -> (Self, gtk4::Button) {
+        use gtk4::prelude::*;
+        let button = gtk4::Button::new();
+        button.add_css_class("image-button");
+        button.add_css_class("play-btn");
+        let faces = ButtonFaces::install(
+            &button,
+            gtk4::Image::from_icon_name("media-playback-start-symbolic"),
+            gtk4::Image::from_icon_name("media-playback-pause-symbolic"),
+        );
+        let this = Self {
+            button: button.downgrade(),
+            faces,
+        };
+        this.show_idle();
+        (this, button)
+    }
+
+    fn show_idle(&self) {
+        use gtk4::prelude::*;
+        self.faces.set_active(false);
+        if let Some(button) = self.button.upgrade() {
+            button.set_tooltip_text(Some("Play recording"));
+        }
+    }
+
+    fn show_playing(&self) {
+        use gtk4::prelude::*;
+        self.faces.set_active(true);
+        if let Some(button) = self.button.upgrade() {
+            button.set_tooltip_text(Some("Pause playback"));
+        }
+    }
+
+    fn show_paused(&self) {
+        use gtk4::prelude::*;
+        self.faces.set_active(false);
+        if let Some(button) = self.button.upgrade() {
+            button.set_tooltip_text(Some("Resume playback"));
+        }
+    }
+}
+
+/// The widgets the session drives while this bar owns playback.
+struct BarRow {
+    play: Rc<PlayButton>,
+    rewind_btn: glib::WeakRef<gtk4::Button>,
+    cursor_pos: Rc<RefCell<f64>>,
+    cursor_area: glib::WeakRef<gtk4::DrawingArea>,
+}
+
+impl PlaybackRow for BarRow {
+    fn set_idle(&self, finished: bool) {
+        use gtk4::prelude::*;
+        self.play.show_idle();
+        if finished {
+            *self.cursor_pos.borrow_mut() = 0.0;
+            if let Some(button) = self.rewind_btn.upgrade() {
+                button.set_sensitive(false);
+            }
+            if let Some(area) = self.cursor_area.upgrade() {
+                area.queue_draw();
+            }
+        }
+    }
+
+    fn set_progress(&self, fraction: f64) {
+        use gtk4::prelude::*;
+        *self.cursor_pos.borrow_mut() = fraction;
+        if let Some(button) = self.rewind_btn.upgrade() {
+            button.set_sensitive(fraction > 0.0);
+        }
+        if let Some(area) = self.cursor_area.upgrade() {
+            area.queue_draw();
+        }
+    }
+}
 
 /// Build an interactive audio player bar widget.
 ///
@@ -18,26 +149,21 @@ pub(crate) type WfColumns = (Vec<Vec<f32>>, f32);
 /// - Waterfall spectrogram with playback cursor overlay
 /// - Drag-to-seek gesture on the waterfall
 /// - Rewind and play/pause buttons
-/// - 16 ms progress poller with interpolation
 ///
 /// # Arguments
 ///
 /// * `audio_path` — audio file for playback (WAV or OGG)
-/// * `player` — shared cpal audio player
-/// * `active_play_btn` — tracks which play button is currently active
-///   across multiple bars; when a new bar starts playing, the previous
-///   bar's button is reset
-/// * `waterfall_data` — pre-computed columns, or `None` to compute in
-///   a background thread
+/// * `session` — the window's shared playback (player, active row,
+///   progress tick)
+/// * `waterfall_data` — pre-computed columns, or `None` to queue the
+///   computation on the bounded waterfall loader
 /// * `height` — content height for the waterfall DrawingArea (pixels)
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_audio_player_bar(
     audio_path: &Path,
-    player: &Rc<RefCell<Option<WavPlayer>>>,
-    active_play_btn: &Rc<RefCell<Option<gtk4::Button>>>,
+    session: &Rc<PlaybackSession>,
     waterfall_data: Option<WfColumns>,
     height: i32,
-) -> gtk4::Box {
+) -> (gtk4::Box, RowRef) {
     use gtk4::prelude::*;
 
     let play_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -51,18 +177,22 @@ pub(crate) fn build_audio_player_bar(
     waterfall_area.set_content_height(height);
     waterfall_area.add_css_class("waterfall");
 
-    let wf_data: Rc<RefCell<Option<WfColumns>>> = Rc::new(RefCell::new(waterfall_data));
+    let ready = waterfall_data.is_some();
+    let waterfall: Rc<RefCell<Waterfall>> = Rc::new(RefCell::new(Waterfall {
+        data: waterfall_data,
+        interest: None,
+    }));
 
     {
-        let data_ref = Rc::clone(&wf_data);
+        let data_ref = Rc::clone(&waterfall);
         waterfall_area.set_draw_func(move |_area, cr, width, height| {
             let w = width as usize;
             let h = height as usize;
             if w == 0 || h == 0 {
                 return;
             }
-            let data = data_ref.borrow();
-            if let Some((ref columns, peak)) = *data {
+            let waterfall = data_ref.borrow();
+            if let Some((ref columns, peak)) = waterfall.data {
                 if peak > 0.0 && !columns.is_empty() {
                     if let Ok(mut surface) = gtk4::cairo::ImageSurface::create(
                         gtk4::cairo::Format::ARgb32,
@@ -121,6 +251,9 @@ pub(crate) fn build_audio_player_bar(
     {
         let pos_ref = Rc::clone(&cursor_pos);
         cursor_area.set_draw_func(move |_area, cr, width, height| {
+            if width <= 0 || height <= 0 {
+                return;
+            }
             let pos = *pos_ref.borrow();
             if pos > 0.0 {
                 let cx = (pos * width as f64).clamp(0.0, width as f64 - 1.0);
@@ -140,57 +273,53 @@ pub(crate) fn build_audio_player_bar(
     wf_overlay.set_hexpand(true);
 
     #[cfg(feature = "perf-counters")]
-    if wf_data.borrow().is_some() {
+    if ready {
         waterfall_area.add_css_class("wf-ready");
     }
 
-    // If no waterfall data provided, compute in background thread.
-    if wf_data.borrow().is_none() {
-        let (wf_tx, wf_rx) = std::sync::mpsc::channel::<WfColumns>();
-        let wf_audio_path = audio_path.to_path_buf();
-        crate::perf_counters::incr(crate::perf_counters::Counter::WaterfallJobsRequested);
-        std::thread::spawn(move || {
-            use crate::perf_counters::{gauge_dec, gauge_inc, Gauge};
-            gauge_inc(Gauge::WaterfallWorkersInflight);
-            // Try cache first.
-            match crate::record::audio::load_waterfall(&wf_audio_path) {
-                Ok(result) => {
-                    let _ = wf_tx.send(result);
+    // No waterfall data yet: queue it.  The result is applied to this
+    // bar if it is still alive; a bar removed meanwhile drops its
+    // interest, cancelling the job.
+    if !ready {
+        let waterfall_weak = Rc::downgrade(&waterfall);
+        let area_weak = waterfall_area.downgrade();
+        let path = audio_path.to_path_buf();
+        let interest = waterfall_loader::request(
+            audio_path,
+            Box::new(move |result| {
+                let (Some(waterfall), Some(area)) = (waterfall_weak.upgrade(), area_weak.upgrade())
+                else {
+                    return;
+                };
+                match result {
+                    Ok(columns) => {
+                        let mut wf = waterfall.borrow_mut();
+                        wf.data = Some(columns);
+                        wf.interest = None;
+                        drop(wf);
+                        area.queue_draw();
+                        // Harness-only marker the recordings-browser
+                        // probe reads to see which rows show their
+                        // waveform.
+                        #[cfg(feature = "perf-counters")]
+                        area.add_css_class("wf-ready");
+                        crate::perf_counters::incr(
+                            crate::perf_counters::Counter::WaterfallJobsApplied,
+                        );
+                    }
+                    Err(e) => log::warn!("waterfall: {}: {}", path.display(), e),
                 }
-                Err(e) => {
-                    log::warn!("waterfall: {}: {}", wf_audio_path.display(), e);
-                }
-            }
-            gauge_dec(Gauge::WaterfallWorkersInflight);
-        });
-
-        let wf_data_ref = Rc::clone(&wf_data);
-        let wf_area_ref = waterfall_area.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            match wf_rx.try_recv() {
-                Ok(result) => {
-                    *wf_data_ref.borrow_mut() = Some(result);
-                    wf_area_ref.queue_draw();
-                    // Harness-only marker the recordings-browser probe
-                    // reads to see which rows show their waveform.
-                    #[cfg(feature = "perf-counters")]
-                    wf_area_ref.add_css_class("wf-ready");
-                    crate::perf_counters::incr(crate::perf_counters::Counter::WaterfallJobsApplied);
-                    glib::ControlFlow::Break
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-            }
-        });
+            }),
+        );
+        waterfall.borrow_mut().interest = Some(interest);
     }
 
     play_bar.append(&wf_overlay);
 
     // ── Play/Pause button (created early so rewind can reference it) ──
-    let play_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
-    play_btn.set_tooltip_text(Some("Play recording"));
-    play_btn.add_css_class("play-btn");
-    if player.borrow().is_none() {
+    let (play, play_btn) = PlayButton::new();
+    let play = Rc::new(play);
+    if !session.has_player() {
         play_btn.set_sensitive(false);
     }
 
@@ -200,164 +329,64 @@ pub(crate) fn build_audio_player_bar(
     rewind_btn.add_css_class("play-btn");
     rewind_btn.set_sensitive(false);
 
+    let row: RowRef = Rc::new(BarRow {
+        play: Rc::clone(&play),
+        rewind_btn: rewind_btn.downgrade(),
+        cursor_pos: Rc::clone(&cursor_pos),
+        cursor_area: cursor_area.downgrade(),
+    });
+    if session.adopt(Rc::clone(&row), audio_path) {
+        if session.is_paused() {
+            play.show_paused();
+        } else {
+            play.show_playing();
+        }
+    }
+
     {
-        let player_ref = Rc::clone(player);
+        let session = Rc::clone(session);
+        let row = Rc::clone(&row);
         let pos_ref = Rc::clone(&cursor_pos);
-        let cursor_ref = cursor_area.clone();
-        let active_ref = Rc::clone(active_play_btn);
-        let play_btn_ref = play_btn.clone();
+        let cursor_ref = cursor_area.downgrade();
         rewind_btn.connect_clicked(move |btn| {
             // Only seek the shared player if this bar owns it.
-            let is_active = active_ref
-                .borrow()
-                .as_ref()
-                .is_some_and(|b| b == &play_btn_ref);
-            if is_active {
-                if let Some(ref p) = *player_ref.borrow() {
-                    p.seek(0.0);
-                }
+            if session.is_active(&row) {
+                session.seek(0.0);
             }
             *pos_ref.borrow_mut() = 0.0;
             btn.set_sensitive(false);
-            cursor_ref.queue_draw();
+            if let Some(area) = cursor_ref.upgrade() {
+                area.queue_draw();
+            }
         });
     }
 
     play_bar.append(&rewind_btn);
 
-    let playing_flag: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-
     {
-        let player_ref = Rc::clone(player);
+        let session = Rc::clone(session);
+        let row = Rc::clone(&row);
+        let play = Rc::clone(&play);
         let audio = audio_path.to_path_buf();
         let pos_ref = Rc::clone(&cursor_pos);
-        let flag = Rc::clone(&playing_flag);
-        let active_ref = Rc::clone(active_play_btn);
-        play_btn.connect_clicked(move |btn| {
-            let player_guard = player_ref.borrow();
-            let Some(ref p) = *player_guard else {
-                return;
-            };
-
-            if *flag.borrow() {
-                // Pause
-                p.pause();
-                *flag.borrow_mut() = false;
-                btn.set_icon_name("media-playback-start-symbolic");
-                btn.set_tooltip_text(Some("Resume playback"));
-            } else if p.is_paused() || (p.has_audio() && !p.is_finished()) {
-                // Check if this is the active button — if not, start fresh
-                let is_active = active_ref.borrow().as_ref().is_some_and(|b| b == btn);
-                if is_active {
-                    // Resume
-                    p.resume();
-                    *flag.borrow_mut() = true;
-                    btn.set_icon_name("media-playback-pause-symbolic");
-                    btn.set_tooltip_text(Some("Pause playback"));
+        play_btn.connect_clicked(move |_| {
+            if session.is_active(&row) {
+                if session.is_paused() {
+                    session.resume();
+                    play.show_playing();
                 } else {
-                    // Different row — start fresh
-                    reset_previous_play_btn(&active_ref);
-                    let pos = *pos_ref.borrow();
-                    if let Err(e) = p.play(&audio) {
-                        log::warn!("failed to play audio: {}", e);
-                        return;
-                    }
-                    if pos > 0.0 && pos < 1.0 {
-                        p.seek(pos);
-                    }
-                    *flag.borrow_mut() = true;
-                    *active_ref.borrow_mut() = Some(btn.clone());
-                    btn.set_icon_name("media-playback-pause-symbolic");
-                    btn.set_tooltip_text(Some("Pause playback"));
+                    session.pause();
+                    play.show_paused();
                 }
             } else {
-                // Start fresh
-                reset_previous_play_btn(&active_ref);
-                let pos = *pos_ref.borrow();
-                if let Err(e) = p.play(&audio) {
-                    log::warn!("failed to play audio: {}", e);
-                    return;
+                // Start fresh (from the cursor, if it was moved); the
+                // decode runs on a worker and the session's tick loads
+                // it when ready.
+                let from = *pos_ref.borrow();
+                if session.play(Rc::clone(&row), &audio, Some(from)) {
+                    play.show_playing();
                 }
-                if pos > 0.0 && pos < 1.0 {
-                    p.seek(pos);
-                }
-                *flag.borrow_mut() = true;
-                *active_ref.borrow_mut() = Some(btn.clone());
-                btn.set_icon_name("media-playback-pause-symbolic");
-                btn.set_tooltip_text(Some("Pause playback"));
             }
-        });
-    }
-
-    // Playback progress poller (16 ms = ~60 fps cursor).
-    {
-        let player_poll = Rc::clone(player);
-        let btn_poll = play_btn.clone();
-        let rewind_poll = rewind_btn.clone();
-        let pos_poll = Rc::clone(&cursor_pos);
-        let cursor_poll = cursor_area.clone();
-        let flag_poll = Rc::clone(&playing_flag);
-        let active_poll = Rc::clone(active_play_btn);
-
-        let interp: Rc<RefCell<(f64, std::time::Instant)>> =
-            Rc::new(RefCell::new((0.0, std::time::Instant::now())));
-
-        // The source is never removed (the callback always returns
-        // `Continue`), so the live gauge is only ever raised here.
-        crate::perf_counters::gauge_inc(crate::perf_counters::Gauge::PlayerTickSourcesLive);
-        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-            crate::perf_counters::incr(crate::perf_counters::Counter::PlayerTickCallbacks);
-            // Only poll if this bar's play button is the active one.
-            let is_active = active_poll
-                .borrow()
-                .as_ref()
-                .is_some_and(|b| b == &btn_poll);
-            if !is_active && *flag_poll.borrow() {
-                // Another bar took over — reset our state.
-                *flag_poll.borrow_mut() = false;
-                btn_poll.set_icon_name("media-playback-start-symbolic");
-                btn_poll.set_tooltip_text(Some("Play recording"));
-                return glib::ControlFlow::Continue;
-            }
-
-            let player_guard = player_poll.borrow();
-            let Some(ref p) = *player_guard else {
-                return glib::ControlFlow::Continue;
-            };
-            if *flag_poll.borrow() {
-                if p.is_finished() {
-                    *pos_poll.borrow_mut() = 0.0;
-                    *flag_poll.borrow_mut() = false;
-                    *interp.borrow_mut() = (0.0, std::time::Instant::now());
-                    btn_poll.set_icon_name("media-playback-start-symbolic");
-                    btn_poll.set_tooltip_text(Some("Play recording"));
-                    rewind_poll.set_sensitive(false);
-                } else {
-                    let raw = p.progress();
-                    let now = std::time::Instant::now();
-                    let mut st = interp.borrow_mut();
-                    if (raw - st.0).abs() > 1e-9 {
-                        *st = (raw, now);
-                    }
-                    let dur = p.duration_secs();
-                    let interpolated = if dur > 0.0 {
-                        let elapsed = now.duration_since(st.1).as_secs_f64();
-                        (st.0 + elapsed / dur).min(1.0)
-                    } else {
-                        raw
-                    };
-                    drop(st);
-
-                    *pos_poll.borrow_mut() = interpolated;
-                    rewind_poll.set_sensitive(interpolated > 0.0);
-                }
-                cursor_poll.queue_draw();
-            } else if is_active && p.has_audio() && !p.is_finished() {
-                let progress = p.progress();
-                rewind_poll.set_sensitive(progress > 0.0);
-                *interp.borrow_mut() = (progress, std::time::Instant::now());
-            }
-            glib::ControlFlow::Continue
         });
     }
 
@@ -365,100 +394,91 @@ pub(crate) fn build_audio_player_bar(
 
     // ── Drag-to-seek on the waterfall ────────────────────────
     {
-        let player_drag = Rc::clone(player);
         let pos_drag = Rc::clone(&cursor_pos);
-        let cursor_drag = cursor_area.clone();
-        let btn_drag = play_btn.clone();
-        let rewind_drag = rewind_btn.clone();
-        let flag_drag = Rc::clone(&playing_flag);
-        let active_drag = Rc::clone(active_play_btn);
+        let cursor_drag = cursor_area.downgrade();
+        let rewind_drag = rewind_btn.downgrade();
         let audio_drag = audio_path.to_path_buf();
         let was_playing = Rc::new(RefCell::new(false));
 
         let drag = gtk4::GestureDrag::new();
 
         {
-            let player_ref = Rc::clone(&player_drag);
+            let session = Rc::clone(session);
+            let row = Rc::clone(&row);
             let pos_ref = Rc::clone(&pos_drag);
             let cursor_ref = cursor_drag.clone();
-            let btn_ref = btn_drag.clone();
-            let flag_ref = Rc::clone(&flag_drag);
+            let play = Rc::clone(&play);
             let was_ref = Rc::clone(&was_playing);
-            let active_ref = Rc::clone(&active_drag);
             let audio_ref = audio_drag.clone();
             drag.connect_drag_begin(move |gesture, x, _y| {
-                let player_guard = player_ref.borrow();
-                let Some(ref p) = *player_guard else {
+                if !session.has_player() {
                     return;
-                };
-                // If no audio is loaded for this file, load it now.
-                if !p.has_audio() {
-                    if let Err(e) = p.play(&audio_ref) {
-                        log::warn!("failed to load audio for seek: {}", e);
+                }
+                // If this bar does not own the player, load its audio
+                // now (paused) so the seek has something to act on.
+                if !session.is_active(&row) {
+                    if !session.play(Rc::clone(&row), &audio_ref, None) {
                         return;
                     }
-                    p.pause();
-                    *active_ref.borrow_mut() = Some(btn_ref.clone());
+                    session.pause();
                 }
-                let playing = *flag_ref.borrow() && !p.is_finished();
+                let playing = session.is_playing();
                 *was_ref.borrow_mut() = playing;
                 if playing {
-                    p.pause();
-                    *flag_ref.borrow_mut() = false;
-                    btn_ref.set_icon_name("media-playback-start-symbolic");
-                    btn_ref.set_tooltip_text(Some("Resume playback"));
+                    session.pause();
+                    play.show_paused();
                 }
                 if let Some(area) = gesture.widget().downcast_ref::<gtk4::DrawingArea>() {
                     let w = area.width() as f64;
                     if w > 0.0 {
                         let frac = (x / w).clamp(0.0, 1.0);
-                        p.seek(frac);
+                        session.seek(frac);
                         *pos_ref.borrow_mut() = frac;
-                        cursor_ref.queue_draw();
+                        if let Some(area) = cursor_ref.upgrade() {
+                            area.queue_draw();
+                        }
                     }
                 }
             });
         }
 
         {
-            let player_ref = Rc::clone(&player_drag);
+            let session = Rc::clone(session);
+            let row = Rc::clone(&row);
             let pos_ref = Rc::clone(&pos_drag);
             let cursor_ref = cursor_drag.clone();
             let rewind_ref = rewind_drag.clone();
             drag.connect_drag_update(move |gesture, offset_x, _offset_y| {
-                let player_guard = player_ref.borrow();
-                let Some(ref p) = *player_guard else {
+                if !session.is_active(&row) {
                     return;
-                };
+                }
                 if let Some(area) = gesture.widget().downcast_ref::<gtk4::DrawingArea>() {
                     let w = area.width() as f64;
                     if w > 0.0 {
                         let (start_x, _) = gesture.start_point().unwrap_or((0.0, 0.0));
                         let frac = ((start_x + offset_x) / w).clamp(0.0, 1.0);
-                        p.seek(frac);
+                        session.seek(frac);
                         *pos_ref.borrow_mut() = frac;
-                        rewind_ref.set_sensitive(frac > 0.0);
-                        cursor_ref.queue_draw();
+                        if let Some(button) = rewind_ref.upgrade() {
+                            button.set_sensitive(frac > 0.0);
+                        }
+                        if let Some(area) = cursor_ref.upgrade() {
+                            area.queue_draw();
+                        }
                     }
                 }
             });
         }
 
         {
-            let player_ref = Rc::clone(&player_drag);
-            let btn_ref = btn_drag;
-            let flag_ref = Rc::clone(&flag_drag);
+            let session = Rc::clone(session);
+            let row = Rc::clone(&row);
+            let play = Rc::clone(&play);
             let was_ref = Rc::clone(&was_playing);
             drag.connect_drag_end(move |_gesture, _offset_x, _offset_y| {
-                let player_guard = player_ref.borrow();
-                let Some(ref p) = *player_guard else {
-                    return;
-                };
-                if *was_ref.borrow() {
-                    p.resume();
-                    *flag_ref.borrow_mut() = true;
-                    btn_ref.set_icon_name("media-playback-pause-symbolic");
-                    btn_ref.set_tooltip_text(Some("Pause playback"));
+                if *was_ref.borrow() && session.is_active(&row) {
+                    session.resume();
+                    play.show_playing();
                 }
             });
         }
@@ -466,14 +486,54 @@ pub(crate) fn build_audio_player_bar(
         cursor_area.add_controller(drag);
     }
 
-    play_bar
+    (play_bar, row)
 }
 
-/// Reset the previously active play button to its default state.
-fn reset_previous_play_btn(active: &Rc<RefCell<Option<gtk4::Button>>>) {
+#[cfg(all(test, feature = "perf-counters"))]
+#[path = "../../tests/perf/support/display.rs"]
+mod isolated_display;
+
+#[cfg(all(test, feature = "perf-counters"))]
+#[test]
+#[ignore = "runs only with the harness's isolated GTK display"]
+fn detached_bar_releases_play_and_cursor_widgets() {
     use gtk4::prelude::*;
-    if let Some(prev) = active.borrow_mut().take() {
-        prev.set_icon_name("media-playback-start-symbolic");
-        prev.set_tooltip_text(Some("Play recording"));
+    let display = isolated_display::IsolatedDisplay::start().expect("isolated display");
+    assert!(display.log_dir().exists());
+    let prior = std::env::var_os("DISPLAY");
+    std::env::set_var("DISPLAY", &display.display);
+    std::env::set_var("GDK_BACKEND", "x11");
+    gtk4::init().expect("GTK init");
+    let session = PlaybackSession::new();
+    let (bar, row) = build_audio_player_bar(
+        Path::new("unused.ogg"),
+        &session,
+        Some((
+            vec![vec![0.0; crate::x11::render_util::WATERFALL_ROWS]],
+            1.0,
+        )),
+        28,
+    );
+    let play = bar
+        .last_child()
+        .and_downcast::<gtk4::Button>()
+        .expect("play button");
+    let play_weak = play.downgrade();
+    let bar_weak = bar.downgrade();
+    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    root.append(&bar);
+    root.remove(&bar);
+    drop(row);
+    drop(play);
+    drop(bar);
+    assert!(
+        play_weak.upgrade().is_none(),
+        "play button must be reclaimed"
+    );
+    assert!(bar_weak.upgrade().is_none(), "bar must be reclaimed");
+    if let Some(value) = prior {
+        std::env::set_var("DISPLAY", value);
+    } else {
+        std::env::remove_var("DISPLAY");
     }
 }

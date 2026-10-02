@@ -487,9 +487,41 @@ fn waterfall_cache_path(audio_path: &std::path::Path) -> std::path::PathBuf {
     audio_path.with_extension("wf")
 }
 
+#[cfg(feature = "ui")]
+fn audio_identity(path: &std::path::Path) -> Result<[u8; 40], TalkError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| TalkError::Config(format!("audio metadata {}: {e}", path.display())))?;
+    let mut identity = [0; 40];
+    for (slot, value) in [
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime() as u64,
+        meta.mtime_nsec() as u64,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        identity[slot * 8..(slot + 1) * 8].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(identity)
+}
+
+#[cfg(feature = "ui")]
+struct CacheTemp(std::path::PathBuf);
+
+#[cfg(feature = "ui")]
+impl Drop for CacheTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Write waterfall data to a binary `.wf` cache file.
 ///
 /// Format (all little-endian):
+///   [u8; 8] version marker, [u8; 40] source identity
 ///   u32  num_columns
 ///   u32  num_rows
 ///   f32  peak
@@ -499,14 +531,33 @@ fn write_waterfall_cache(
     audio_path: &std::path::Path,
     columns: &[Vec<f32>],
     peak: f32,
+    identity: [u8; 40],
 ) -> Result<(), TalkError> {
     use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
 
     let cache = waterfall_cache_path(audio_path);
-    let num_cols = columns.len() as u32;
-    let num_rows = columns.first().map_or(0, |c| c.len()) as u32;
+    let num_cols = u32::try_from(columns.len())
+        .map_err(|_| TalkError::Config("wf cache column count overflow".into()))?;
+    let num_rows = u32::try_from(columns.first().map_or(0, |c| c.len()))
+        .map_err(|_| TalkError::Config("wf cache row count overflow".into()))?;
+    if columns
+        .iter()
+        .any(|col| col.len() != num_rows as usize || col.iter().any(|v| !v.is_finite()))
+        || !peak.is_finite()
+    {
+        return Err(TalkError::Config("wf cache invalid columns".into()));
+    }
 
-    let mut buf = Vec::with_capacity(12 + (num_cols * num_rows * 4) as usize);
+    let size = columns
+        .len()
+        .checked_mul(num_rows as usize)
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| n.checked_add(60))
+        .ok_or_else(|| TalkError::Config("wf cache dimensions overflow".into()))?;
+    let mut buf = Vec::with_capacity(size);
+    buf.extend_from_slice(b"TALKWF02");
+    buf.extend_from_slice(&identity);
     buf.write_all(&num_cols.to_le_bytes())
         .map_err(|e| TalkError::Config(format!("wf cache write: {e}")))?;
     buf.write_all(&num_rows.to_le_bytes())
@@ -519,8 +570,41 @@ fn write_waterfall_cache(
                 .map_err(|e| TalkError::Config(format!("wf cache write: {e}")))?;
         }
     }
-    std::fs::write(&cache, &buf)
-        .map_err(|e| TalkError::Config(format!("wf cache write {}: {e}", cache.display())))?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp =
+        CacheTemp(cache.with_extension(format!("wf.{}.{}.partial", std::process::id(), sequence)));
+    use std::fs::OpenOptions;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp.0)
+        .map_err(|e| TalkError::Config(format!("wf cache create {}: {e}", temp.0.display())))?;
+    file.write_all(&buf)
+        .map_err(|e| TalkError::Config(format!("wf cache write {}: {e}", temp.0.display())))?;
+    file.sync_all()
+        .map_err(|e| TalkError::Config(format!("wf cache sync {}: {e}", temp.0.display())))?;
+    drop(file);
+    if audio_identity(audio_path)? != identity {
+        return Err(TalkError::Config(format!(
+            "audio changed during waterfall: {}",
+            audio_path.display()
+        )));
+    }
+    let published_inode = std::fs::metadata(&temp.0)
+        .map_err(|e| TalkError::Config(format!("wf cache metadata: {e}")))?
+        .ino();
+    std::fs::rename(&temp.0, &cache)
+        .map_err(|e| TalkError::Config(format!("wf cache publish {}: {e}", cache.display())))?;
+    if audio_identity(audio_path)? != identity {
+        if std::fs::metadata(&cache).is_ok_and(|meta| meta.ino() == published_inode) {
+            let _ = std::fs::remove_file(&cache);
+        }
+        return Err(TalkError::Config(format!(
+            "audio changed while publishing waterfall: {}",
+            audio_path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -540,27 +624,35 @@ fn read_waterfall_cache(audio_path: &std::path::Path) -> Option<(Vec<Vec<f32>>, 
     }
 
     let data = std::fs::read(&cache).ok()?;
-    if data.len() < 12 {
+    if data.len() < 60
+        || &data[..8] != b"TALKWF02"
+        || data[8..48] != audio_identity(audio_path).ok()?
+    {
         return None;
     }
 
-    let num_cols = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-    let num_rows = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
-    let peak = f32::from_le_bytes(data[8..12].try_into().ok()?);
+    let num_cols = u32::from_le_bytes(data[48..52].try_into().ok()?) as usize;
+    let num_rows = u32::from_le_bytes(data[52..56].try_into().ok()?) as usize;
+    let peak = f32::from_le_bytes(data[56..60].try_into().ok()?);
 
-    let expected = 12 + num_cols * num_rows * 4;
-    if data.len() < expected || num_cols == 0 || num_rows == 0 {
+    let expected = num_cols
+        .checked_mul(num_rows)?
+        .checked_mul(4)?
+        .checked_add(60)?;
+    if data.len() != expected || num_cols == 0 || num_rows == 0 || !peak.is_finite() {
         return None;
     }
 
     let mut columns = Vec::with_capacity(num_cols);
-    let mut offset = 12;
+    let mut offset = 60;
     for _ in 0..num_cols {
         let mut col = Vec::with_capacity(num_rows);
         for _ in 0..num_rows {
-            col.push(f32::from_le_bytes(
-                data[offset..offset + 4].try_into().ok()?,
-            ));
+            let value = f32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+            if !value.is_finite() {
+                return None;
+            }
+            col.push(value);
             offset += 4;
         }
         columns.push(col);
@@ -576,14 +668,29 @@ fn read_waterfall_cache(audio_path: &std::path::Path) -> Option<(Vec<Vec<f32>>, 
 pub(crate) fn load_waterfall(
     audio_path: &std::path::Path,
 ) -> Result<(Vec<Vec<f32>>, f32), TalkError> {
+    let identity = audio_identity(audio_path)?;
     if let Some(cached) = read_waterfall_cache(audio_path) {
-        return Ok(cached);
+        if audio_identity(audio_path)? == identity {
+            return Ok(cached);
+        }
     }
     crate::perf_counters::incr(crate::perf_counters::Counter::WaterfallDecodes);
     let samples = read_audio_as_i16(audio_path)?;
     let result = crate::x11::render_util::generate_waterfall_columns(&samples, 16_000);
-    if let Err(e) = write_waterfall_cache(audio_path, &result.0, result.1) {
+    if audio_identity(audio_path)? != identity {
+        return Err(TalkError::Config(format!(
+            "audio changed during waterfall: {}",
+            audio_path.display()
+        )));
+    }
+    if let Err(e) = write_waterfall_cache(audio_path, &result.0, result.1, identity) {
         log::warn!("waterfall cache write: {}", e);
+    }
+    if audio_identity(audio_path)? != identity {
+        return Err(TalkError::Config(format!(
+            "audio changed before waterfall delivery: {}",
+            audio_path.display()
+        )));
     }
     Ok(result)
 }
@@ -668,6 +775,38 @@ mod tests {
             load_waterfall(&audio).expect("recover truncated payload"),
             expected
         );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn oversized_waterfall_dimensions_are_recomputed() {
+        let (_temp, audio) = waterfall_fixture();
+        let expected = load_waterfall(&audio).expect("fresh columns");
+        let mut corrupt = Vec::new();
+        corrupt.extend(u32::MAX.to_le_bytes());
+        corrupt.extend(u32::MAX.to_le_bytes());
+        corrupt.extend(1.0f32.to_le_bytes());
+        std::fs::write(waterfall_cache_path(&audio), corrupt).expect("corrupt cache");
+        assert_eq!(load_waterfall(&audio).expect("recompute"), expected);
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn replaced_audio_with_preserved_mtime_never_reuses_prior_waveform() {
+        let (_temp, audio) = waterfall_fixture();
+        let old = load_waterfall(&audio).expect("first waveform");
+        let meta = std::fs::metadata(&audio).expect("audio metadata");
+        let replacement = audio.with_extension("replacement");
+        let mut bytes = std::fs::read(&audio).expect("audio bytes");
+        bytes[44..].fill(0);
+        std::fs::write(&replacement, bytes).expect("replacement audio");
+        std::fs::File::open(&replacement)
+            .expect("replacement file")
+            .set_modified(meta.modified().expect("mtime"))
+            .expect("preserve mtime");
+        std::fs::rename(&replacement, &audio).expect("replace audio");
+        let new = load_waterfall(&audio).expect("replacement waveform");
+        assert_ne!(old, new);
     }
 
     #[cfg(feature = "ui")]
