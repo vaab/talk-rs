@@ -676,36 +676,68 @@ listed format.
 
 ** GNOME keyboard shortcut
 
-Bind ~talk-rs dictate --toggle~ to a key (e.g. =Super+/=):
+Bind the main commands to keys:
+
+| Key             | Command                                                    | Effect                                |
+|-----------------+------------------------------------------------------------+---------------------------------------|
+| =Super+/=       | ~talk-rs dictate --toggle --viz waterfall~                 | Start / stop dictation                |
+| =Shift+Super+/= | ~talk-rs dictate --retry-last --pick --replace-last-paste~ | Open the picker on the last dictation |
+| =Super+.=       | ~talk-rs record --toggle --viz waterfall~                  | Start / stop a standalone recording   |
+| =Shift+Super+.= | ~talk-rs record --ui~                                      | Open the recordings browser           |
 
 #+begin_src sh
 BASE="org.gnome.settings-daemon.plugins.media-keys"
 BPATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings"
 
-CURRENT=$(gsettings get "$BASE" custom-keybindings)
-N=0
-while echo "$CURRENT" | grep -q "custom${N}/"; do
-  N=$((N + 1))
-done
-SLOT="${BPATH}/custom${N}/"
-SCHEMA="${BASE}.custom-keybinding:${SLOT}"
+add_binding() {
+  CURRENT=$(gsettings get "$BASE" custom-keybindings)
+  N=0
+  while echo "$CURRENT" | grep -q "custom${N}/"; do
+    N=$((N + 1))
+  done
+  SLOT="${BPATH}/custom${N}/"
+  SCHEMA="${BASE}.custom-keybinding:${SLOT}"
 
-if [ "$CURRENT" = "@as []" ]; then
-  gsettings set "$BASE" custom-keybindings "['${SLOT}']"
-else
-  gsettings set "$BASE" custom-keybindings "$(echo "$CURRENT" | sed "s|]$|, '${SLOT}']|")"
-fi
+  if [ "$CURRENT" = "@as []" ]; then
+    gsettings set "$BASE" custom-keybindings "['${SLOT}']"
+  else
+    gsettings set "$BASE" custom-keybindings "$(echo "$CURRENT" | sed "s|]$|, '${SLOT}']|")"
+  fi
 
-gsettings set "$SCHEMA" name    'talk-rs dictate'
-gsettings set "$SCHEMA" command 'talk-rs dictate --toggle --viz waterfall'
-gsettings set "$SCHEMA" binding '<Super>slash'
+  gsettings set "$SCHEMA" name    "$1"
+  gsettings set "$SCHEMA" command "$2"
+  gsettings set "$SCHEMA" binding "$3"
+}
+
+add_binding 'talk-rs dictate'     'talk-rs dictate --toggle --viz waterfall'                  '<Super>slash'
+add_binding 'talk-rs picker'      'talk-rs dictate --retry-last --pick --replace-last-paste' '<Shift><Super>slash'
+add_binding 'talk-rs record'      'talk-rs record --toggle --viz waterfall'                   '<Super>period'
+add_binding 'talk-rs recordings'  'talk-rs record --ui'                                       '<Shift><Super>period'
 #+end_src
 
-First press starts recording, second press stops, transcribes, and
-pastes into the focused application.
+Dictation: the first press starts recording; the second stops,
+transcribes, and pastes into the focused application.
 
-To change the key, replace ~<Super>slash~ with the desired binding
-(e.g. ~<Super>semicolon~, ~<Super>d~). Add ~--realtime~ to use
+Picker: re-opens the last dictation recording in the multi-candidate
+picker without speaking again.  Use it when the pasted text came out
+wrong: pick another model's result or edit the text, then confirm
+with =Enter= (or double-click) to paste it; =Escape= cancels.  With
+~--replace-last-paste~, the confirmed text replaces the previous
+dictation's paste when the focused window is the one that received
+it; in any other window it is simply pasted.
+
+Record: the first press starts a standalone recording into
+~output_dir~; the second stops and finalizes it.  The recordings
+browser lists those recordings and the dictation cache.
+
+GNOME runs the command directly, not through a shell, so =~= is not
+expanded.  If ~talk-rs~ is not found, use an absolute path (e.g.
+~/home/you/.local/bin/talk-rs~).  Global options go before the
+subcommand, e.g.
+~talk-rs --log-file /home/you/.cache/talk-rs/talk-rs.log dictate --toggle~.
+
+To change a key, replace its binding (e.g. ~<Super>semicolon~,
+~<Super>d~). Add ~--realtime~ to the dictation command to use
 streaming transcription instead of batch mode.
 
 *** Automatic paste keyboard safety
