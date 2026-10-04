@@ -67,5 +67,8 @@ ignore_regexps = [
 ]
 
 
-## Use markdown output format for crates.io README
-output_engine = mustache("markdown")
+## Use markdown output format for crates.io README.  The changelog is
+## appended to ``README.md`` below its ``##`` sections, so the template
+## is the stock ``markdown`` one with every heading one level deeper.
+## The path is relative to the repository root, where ``autogen.sh`` runs.
+output_engine = mustache(".package.d/changelog.tpl")

@@ -20,6 +20,12 @@ exclude = [
     "CLAUDE.md",
     "doc/",
     "sample-metadata*.yml",
+    # Developer performance tooling: scripts, their shell tests and the
+    # measured baseline/targets.  Anchored so ``tests/perf/`` (the Rust
+    # perf tests, needed by ``cargo test`` on the packaged crate) stays.
+    "/bin/",
+    "/perf/",
+    "/test/",
 ]
 
 # docs.rs builds without `capture`: its build image lacks the
