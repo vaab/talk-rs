@@ -8,6 +8,7 @@ mod keyboard;
 pub use keyboard::KeyComboError;
 pub mod monitor;
 pub mod overlay;
+pub mod placement;
 pub mod render_util;
 pub mod visualizer;
 

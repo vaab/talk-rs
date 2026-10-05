@@ -254,11 +254,38 @@ sections, fail configuration loading with an error naming the key.
 | ~indicators.visual_overlay~        | ~true~                    | Show X11 overlay badge             |
 | ~indicators.viz~                   | /none/                    | In-badge visualizer: ~waterfall~, ~amplitude~, or ~spectrum~ (also ~--viz~; env ~TALK_RS_INDICATORS_VIZ~) |
 | ~indicators.mono~                  | ~false~                   | Monochrome visualizer (env ~TALK_RS_INDICATORS_MONO~; ~--mono~ forces it on) |
+| ~indicators.badge.scale~           | ~1.0~                     | Badge zoom (recording, downloading and transcribing); finite, greater than 0 and at most 20; 1.0 is 273×52 physical pixels |
+| ~indicators.badge.position~        | ~top~                     | Badge location: ~top~, ~bottom~, ~left~, ~right~, ~center~ or corners such as ~bottom-right~; alternatively ~{x: '30%', y: bottom}~ |
+| ~indicators.badge.monitor~         | ~largest~                 | Relative monitor choice: ~largest~, ~smallest~, ~leftmost~, ~rightmost~ |
+| ~indicators.no_sound.scale~        | ~1.0~                     | Zoom for the large NO SOUND warning; at 1.0 its height is 5% of monitor height (minimum 50 px) |
+| ~indicators.no_sound.position~     | ~center~                  | Same aliases or ~{x: ..., y: ...}~ map as badge position |
+| ~indicators.no_sound.monitor~      | ~largest~                 | Independently choose the NO SOUND monitor using the same relative selectors |
 | ~paste.chunk_chars~                | ~150~                     | Max Unicode characters per paste chunk; original whitespace is preserved, and an overlong word may exceed the limit (~0~ disables chunking; also ~--no-chunk-paste~) |
 | ~audio.bt_auto_switch~             | ~true~                    | Auto-switch a connected Bluetooth headset to HFP for the duration of a recording, then restore (also ~--no-bt-auto-switch~; env ~TALK_RS_AUDIO_BT_AUTO_SWITCH~) |
 | ~recording.sample_rate~            | ~48000~                   | Sample rate (Hz) of the ~record~ command's ~.ogg~ output (env ~TALK_RS_RECORDING_SAMPLE_RATE~) |
 | ~recording.channels~               | ~1~                       | Channels for ~record~ output: only ~1~ mono or ~2~ stereo (env ~TALK_RS_RECORDING_CHANNELS~) |
 | ~recording.bitrate~                | ~128000~                  | Opus bitrate (bps) of the ~record~ command's ~.ogg~ output (env ~TALK_RS_RECORDING_BITRATE~) |
+
+Position map axes default to ~center~ when omitted. The ~x~ axis accepts
+~left~, ~center~, ~right~ or a quoted percentage between ~0%~ and
+~100%~; ~y~ accepts ~top~, ~center~, ~bottom~ or a quoted percentage.
+Percentages travel over the free space between monitor edges and the
+overlay window (with a 4 px margin times scale), so ~0%~ and ~100%~
+stay on-screen. The transcription text panel follows the badge's monitor,
+scale and horizontal position, sitting above badges in the monitor's
+bottom half and below them otherwise. For example:
+
+#+begin_src yaml
+indicators:
+  badge:
+    scale: 5.0
+    position: center
+    monitor: rightmost
+  no_sound:
+    scale: 0.5
+    position: {x: '30%', y: center}
+    monitor: smallest
+#+end_src
 
 The ~recording.*~ settings control the quality of recordings meant
 for a *human* to listen to or share.  They are independent of

@@ -229,6 +229,16 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
         suppress_boop: None,
         #[cfg(feature = "ui")]
         overlay: RecordingOverlayOptions {
+            badge: config_for_bt
+                .as_ref()
+                .and_then(|c| c.indicators.as_ref())
+                .map(|i| i.badge)
+                .unwrap_or_default(),
+            no_sound: config_for_bt
+                .as_ref()
+                .and_then(|c| c.indicators.as_ref())
+                .map(|i| i.no_sound)
+                .unwrap_or_else(|| crate::config::IndicatorsConfig::default().no_sound),
             silence_tx: None,
             auto_pause: true,
             telemetry_rx: None,

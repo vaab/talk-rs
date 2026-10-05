@@ -20,13 +20,8 @@ use x11rb::COPY_DEPTH_FROM_PARENT;
 
 // ── Layout constants ─────────────────────────────────────────────────
 
-/// Vertical offset from the monitor top edge (matches badge placement).
-const TOP_OFFSET: i16 = 4;
 /// Target frames per second for the render loop.
 const FPS: u32 = 60;
-
-/// Height of the recording badge (must match overlay.rs BADGE_H).
-const BADGE_H: u16 = 52;
 
 /// Width of the text overlay in pixels.
 const TEXT_W: u16 = 1200;
@@ -69,8 +64,9 @@ fn load_viz_font() -> Option<fontdue::Font> {
 fn viz_rasterise_glyphs(
     text: &str,
     font: &fontdue::Font,
+    size: f32,
 ) -> (Vec<(fontdue::Metrics, Vec<u8>)>, usize) {
-    rasterise_glyphs(text, font, TEXT_FONT_SIZE)
+    rasterise_glyphs(text, font, size)
 }
 
 /// Compute per-dot brightness for a pulsing wave animation.
@@ -95,7 +91,13 @@ fn dot_wave(frame: u64) -> [f32; 3] {
 /// stay visible.  The three dots always occupy the same fixed width,
 /// and each dot's brightness is controlled by `dot_brightnesses`
 /// (0.0 = dim, 1.0 = bright).
-fn render_text(pb: &mut PixelBuffer, text: &str, font: &fontdue::Font, dot_brightnesses: [f32; 3]) {
+fn render_text(
+    pb: &mut PixelBuffer,
+    text: &str,
+    font: &fontdue::Font,
+    dot_brightnesses: [f32; 3],
+    font_size: f32,
+) {
     let w = pb.width;
     let h = pb.height;
     let baseline = (h as i32 * 3) / 4;
@@ -105,13 +107,13 @@ fn render_text(pb: &mut PixelBuffer, text: &str, font: &fontdue::Font, dot_brigh
     let (text_glyphs, text_w) = if text.is_empty() {
         (Vec::new(), 0)
     } else {
-        viz_rasterise_glyphs(text, font)
+        viz_rasterise_glyphs(text, font, font_size)
     };
 
     // ── Compute fixed dot area width ─────────────────────────────────
 
-    let (dot_metrics, dot_bitmap) = font.rasterize('●', TEXT_FONT_SIZE);
-    let space_metrics = font.metrics(' ', TEXT_FONT_SIZE);
+    let (dot_metrics, dot_bitmap) = font.rasterize('●', font_size);
+    let space_metrics = font.metrics(' ', font_size);
     let space_adv = space_metrics.advance_width as usize;
     let dot_adv = dot_metrics.advance_width as usize;
     // Layout: " ● ● ●"  =  space + dot + space + dot + space + dot
@@ -186,13 +188,14 @@ fn render_text_status(
     font: &fontdue::Font,
     color: [u8; 4],
     opacity: f32,
+    font_size: f32,
 ) {
     let w = pb.width;
 
     let (glyphs, text_w) = if text.is_empty() {
         return;
     } else {
-        viz_rasterise_glyphs(text, font)
+        viz_rasterise_glyphs(text, font, font_size)
     };
 
     // Centre horizontally; clip leading chars on overflow.
@@ -335,15 +338,15 @@ impl VisualizerHandle {
     /// * `_text` — reserved for future use; text panel is always active.
     ///
     /// Returns `Err` if X11 is unreachable.
-    pub fn new(_text: bool) -> Result<Self, TalkError> {
-        let geom = super::monitor::primary_monitor_geometry()?;
+    pub fn new(_text: bool, badge: crate::config::OverlaySettings) -> Result<Self, TalkError> {
+        let geom = super::monitor::monitor_geometry(badge.monitor)?;
 
         let (tx, rx) = std::sync::mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("visualizer".into())
             .spawn(move || {
-                if let Err(e) = visualizer_thread(rx, geom) {
+                if let Err(e) = visualizer_thread(rx, geom, badge) {
                     log::error!("visualizer thread error: {}", e);
                 }
             })
@@ -356,7 +359,7 @@ impl VisualizerHandle {
     }
 
     /// Show the text panel.
-    pub fn show(&self, _badge_width: u16) {
+    pub fn show(&self) {
         let _ = self.tx.send(VizCommand::Show);
     }
 
@@ -417,6 +420,7 @@ impl Drop for VisualizerHandle {
 fn visualizer_thread(
     rx: std::sync::mpsc::Receiver<VizCommand>,
     geom: super::monitor::MonitorGeometry,
+    badge: crate::config::OverlaySettings,
 ) -> Result<(), TalkError> {
     // ── X11 connection ───────────────────────────────────────────────
 
@@ -427,7 +431,22 @@ fn visualizer_thread(
     let root = screen.root;
     let depth = screen.root_depth;
 
-    let (mon_x, mon_y, mon_w, _mon_h) = geom;
+    let layout = super::overlay::BadgeLayout::new(badge.scale);
+    let badge_xy = super::placement::resolve_rect(
+        geom,
+        layout.width,
+        layout.height,
+        badge.position,
+        (4.0 * badge.scale).round() as u16,
+    );
+    let badge_rect = (badge_xy.0, badge_xy.1, layout.width, layout.height);
+    let text_w = (TEXT_W as f32 * badge.scale)
+        .round()
+        .max(1.0)
+        .min(geom.2 as f32) as u16;
+    let text_line_h = (TEXT_LINE_H as f32 * badge.scale).round().max(1.0) as u16;
+    let text_gap = (TEXT_GAP as f32 * badge.scale).round() as u16;
+    let text_corner_radius = (TEXT_CORNER_RADIUS as f32 * badge.scale).round() as usize;
 
     // ── Persistent text window (lives for the entire thread) ────────
     //
@@ -435,8 +454,13 @@ fn visualizer_thread(
     // The render loop maps/unmaps it on demand based on whether there
     // are messages to display.
 
-    let text_x = mon_x + (mon_w as i16 / 2) - (TEXT_W as i16 / 2);
-    let text_y = mon_y + TOP_OFFSET + BADGE_H as i16 + TEXT_GAP;
+    let (text_x, text_y) = super::placement::adjacent_panel_rect(
+        geom,
+        badge_rect,
+        text_w,
+        text_line_h * MAX_TEXT_LINES,
+        text_gap,
+    );
 
     let text_win = {
         let values = CreateWindowAux::new()
@@ -455,8 +479,8 @@ fn visualizer_thread(
             root,
             text_x,
             text_y,
-            TEXT_W,
-            TEXT_LINE_H * MAX_TEXT_LINES,
+            text_w,
+            text_line_h * MAX_TEXT_LINES,
             0,
             WindowClass::INPUT_OUTPUT,
             0,
@@ -464,7 +488,7 @@ fn visualizer_thread(
         )
         .map_err(|e| TalkError::Config(format!("X11 create text win: {}", e)))?;
 
-        apply_rounded_shape(&conn, win, TEXT_W, TEXT_LINE_H, TEXT_CORNER_RADIUS)?;
+        apply_rounded_shape(&conn, win, text_w, text_line_h, text_corner_radius)?;
 
         win
     };
@@ -480,7 +504,7 @@ fn visualizer_thread(
 
     // ── Pixel buffer ─────────────────────────────────────────────────
 
-    let mut text_pb = PixelBuffer::new(TEXT_W as usize, TEXT_LINE_H as usize);
+    let mut text_pb = PixelBuffer::new(text_w as usize, text_line_h as usize);
 
     // ── Font (loaded in background to avoid blocking startup) ────────
 
@@ -617,12 +641,17 @@ fn visualizer_thread(
         {
             let want_visible = n_lines > 0;
             if want_visible && n_lines != prev_text_lines {
-                let new_h = n_lines.max(1) * TEXT_LINE_H;
+                let new_h = n_lines.max(1) * text_line_h;
+                let (_, adjacent_y) = super::placement::adjacent_panel_rect(
+                    geom, badge_rect, text_w, new_h, text_gap,
+                );
                 let _ = conn.configure_window(
                     text_win,
-                    &x11rb::protocol::xproto::ConfigureWindowAux::new().height(u32::from(new_h)),
+                    &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                        .height(u32::from(new_h))
+                        .y(i32::from(adjacent_y)),
                 );
-                let _ = apply_rounded_shape(&conn, text_win, TEXT_W, new_h, TEXT_CORNER_RADIUS);
+                let _ = apply_rounded_shape(&conn, text_win, text_w, new_h, text_corner_radius);
                 prev_text_lines = n_lines;
             }
             if want_visible && !text_is_mapped {
@@ -641,26 +670,37 @@ fn visualizer_thread(
         // with animated dots.
         if let Some(ref f) = font {
             let dot_br = dot_wave(frame_counter);
+            let font_size = TEXT_FONT_SIZE * badge.scale;
             for (i, line) in text_lines.iter().enumerate() {
-                text_pb.clear_rounded(BG, TEXT_CORNER_RADIUS);
+                text_pb.clear_rounded(BG, text_corner_radius);
                 match line.kind {
-                    LineKind::Pinned => {
-                        render_text_status(&mut text_pb, line.text, f, PINNED_COLOR, line.alpha)
-                    }
-                    LineKind::Status => {
-                        render_text_status(&mut text_pb, line.text, f, ERROR_COLOR, line.alpha)
-                    }
-                    LineKind::Live => render_text(&mut text_pb, line.text, f, dot_br),
+                    LineKind::Pinned => render_text_status(
+                        &mut text_pb,
+                        line.text,
+                        f,
+                        PINNED_COLOR,
+                        line.alpha,
+                        font_size,
+                    ),
+                    LineKind::Status => render_text_status(
+                        &mut text_pb,
+                        line.text,
+                        f,
+                        ERROR_COLOR,
+                        line.alpha,
+                        font_size,
+                    ),
+                    LineKind::Live => render_text(&mut text_pb, line.text, f, dot_br, font_size),
                 }
 
                 let _ = conn.put_image(
                     ImageFormat::Z_PIXMAP,
                     text_win,
                     text_gc,
-                    TEXT_W,
-                    TEXT_LINE_H,
+                    text_w,
+                    text_line_h,
                     0,
-                    i as i16 * TEXT_LINE_H as i16,
+                    i as i16 * text_line_h as i16,
                     0,
                     depth,
                     &text_pb.data,
@@ -696,7 +736,13 @@ mod tests {
         if let Some(font) = super::super::render_util::test_latin_font() {
             let mut pb = PixelBuffer::new(600, 36);
             pb.clear(BG);
-            render_text(&mut pb, "Hello world", font, [0.5, 0.5, 0.5]);
+            render_text(
+                &mut pb,
+                "Hello world",
+                font,
+                [0.5, 0.5, 0.5],
+                TEXT_FONT_SIZE,
+            );
 
             let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
             assert!(non_bg > 0, "text should produce non-background pixels");
@@ -709,7 +755,7 @@ mod tests {
         if let Some(font) = super::super::render_util::test_latin_font() {
             let mut pb = PixelBuffer::new(600, 36);
             pb.clear(BG);
-            render_text(&mut pb, "", font, [1.0, 1.0, 1.0]);
+            render_text(&mut pb, "", font, [1.0, 1.0, 1.0], TEXT_FONT_SIZE);
 
             let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
             assert!(non_bg > 0, "dots alone should produce pixels");
@@ -721,7 +767,7 @@ mod tests {
         if let Some(font) = super::super::render_util::test_latin_font() {
             let mut pb = PixelBuffer::new(600, 36);
             pb.clear(BG);
-            render_text(&mut pb, "", font, [0.0, 0.0, 0.0]);
+            render_text(&mut pb, "", font, [0.0, 0.0, 0.0], TEXT_FONT_SIZE);
 
             // Even at brightness 0.0, DOT_LO (#333333) is not BG (#000000)
             let non_bg = pb.data.chunks_exact(4).filter(|p| *p != BG).count();
@@ -800,6 +846,7 @@ mod tests {
                 &format!("{} end", "W".repeat(40)),
                 font,
                 [0.8, 0.5, 0.2],
+                TEXT_FONT_SIZE,
             );
 
             let mut shorter = PixelBuffer::new(80, 36);
@@ -809,6 +856,7 @@ mod tests {
                 &format!("{} end", "W".repeat(20)),
                 font,
                 [0.8, 0.5, 0.2],
+                TEXT_FONT_SIZE,
             );
             assert_eq!(
                 long.data, shorter.data,

@@ -190,6 +190,22 @@ indicators:
   # Also settable via TALK_RS_INDICATORS_MONO env var; --mono forces it on.
   # mono: false
 
+  # Badge (recording, downloading and transcribing) defaults to 273x52 px,
+  # top-center on the largest monitor. Scale is >0 and <=20.
+  # Uncomment to centre a 5x badge on the rightmost monitor.
+  # badge:
+  #   scale: 5.0
+  #   position: center
+  #   monitor: rightmost
+
+  # Large NO SOUND warning defaults to scale 1, centered on the largest.
+  # Axes accept left|center|right (x), top|center|bottom (y), or
+  # quoted percentages from '0%' to '100%'; omitted axes mean center.
+  # no_sound:
+  #   scale: 0.5
+  #   position: {x: '30%', y: center}
+  #   monitor: smallest
+
 # Optional: Paste Behaviour
 # Configure how transcribed text is pasted into the target application.
 #

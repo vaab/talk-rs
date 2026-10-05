@@ -1013,10 +1013,259 @@ impl std::str::FromStr for VizMode {
     }
 }
 
+/// Relative monitor choice, independent of connector names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorSelector {
+    /// Greatest physical-pixel area, preserving GDK order on a tie.
+    #[default]
+    Largest,
+    /// Least physical-pixel area.
+    Smallest,
+    /// Minimum left edge, then minimum top edge.
+    Leftmost,
+    /// Maximum left edge, then minimum top edge.
+    Rightmost,
+}
+
+/// Percentage of available travel along one monitor axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AxisPosition {
+    /// Inclusive 0 through 100; aliases are converted to these values.
+    Percent(f32),
+}
+
+/// Named anchor or independent x/y percentages within the monitor's free span.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OverlayPosition {
+    /// Horizontally centered at the top.
+    Top,
+    /// Horizontally centered at the bottom.
+    Bottom,
+    /// Vertically centered at the left.
+    Left,
+    /// Vertically centered at the right.
+    Right,
+    /// Centered on both axes.
+    Center,
+    /// At the top-left inset.
+    TopLeft,
+    /// At the top-right inset.
+    TopRight,
+    /// At the bottom-left inset.
+    BottomLeft,
+    /// At the bottom-right inset.
+    BottomRight,
+    /// Independently selected x and y anchors.
+    Axes { x: AxisPosition, y: AxisPosition },
+}
+
+impl OverlayPosition {
+    /// Convert aliases and map form to x/y free-span percentages.
+    pub fn percentages(self) -> (f32, f32) {
+        match self {
+            Self::Top => (50.0, 0.0),
+            Self::Bottom => (50.0, 100.0),
+            Self::Left => (0.0, 50.0),
+            Self::Right => (100.0, 50.0),
+            Self::Center => (50.0, 50.0),
+            Self::TopLeft => (0.0, 0.0),
+            Self::TopRight => (100.0, 0.0),
+            Self::BottomLeft => (0.0, 100.0),
+            Self::BottomRight => (100.0, 100.0),
+            Self::Axes {
+                x: AxisPosition::Percent(x),
+                y: AxisPosition::Percent(y),
+            } => (x, y),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OverlayPosition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, Visitor};
+        struct PositionVisitor;
+        impl<'de> Visitor<'de> for PositionVisitor {
+            type Value = OverlayPosition;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a position alias or {x: alias|N%, y: alias|N%}")
+            }
+
+            fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "top" => Ok(OverlayPosition::Top),
+                    "bottom" => Ok(OverlayPosition::Bottom),
+                    "left" => Ok(OverlayPosition::Left),
+                    "right" => Ok(OverlayPosition::Right),
+                    "center" => Ok(OverlayPosition::Center),
+                    "top-left" => Ok(OverlayPosition::TopLeft),
+                    "top-right" => Ok(OverlayPosition::TopRight),
+                    "bottom-left" => Ok(OverlayPosition::BottomLeft),
+                    "bottom-right" => Ok(OverlayPosition::BottomRight),
+                    _ => Err(E::custom(format!("invalid position '{value}' (expected top, bottom, left, right, center, or a corner)"))),
+                }
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut x = None;
+                let mut y = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "x" => {
+                            if x.is_some() {
+                                return Err(M::Error::custom("duplicate x position"));
+                            }
+                            let value = map.next_value::<String>().map_err(|_| {
+                                M::Error::custom(
+                                    "x position must be left, center, right, or N% string",
+                                )
+                            })?;
+                            x = Some(parse_axis(&value, true).map_err(M::Error::custom)?);
+                        }
+                        "y" => {
+                            if y.is_some() {
+                                return Err(M::Error::custom("duplicate y position"));
+                            }
+                            let value = map.next_value::<String>().map_err(|_| {
+                                M::Error::custom(
+                                    "y position must be top, center, bottom, or N% string",
+                                )
+                            })?;
+                            y = Some(parse_axis(&value, false).map_err(M::Error::custom)?);
+                        }
+                        _ => {
+                            return Err(M::Error::custom(format!(
+                                "unknown position axis '{key}' (expected x or y)"
+                            )))
+                        }
+                    }
+                }
+                Ok(OverlayPosition::Axes {
+                    x: x.unwrap_or(AxisPosition::Percent(50.0)),
+                    y: y.unwrap_or(AxisPosition::Percent(50.0)),
+                })
+            }
+        }
+        deserializer.deserialize_any(PositionVisitor)
+    }
+}
+
+fn parse_axis(value: &str, horizontal: bool) -> Result<AxisPosition, String> {
+    let axis = if horizontal { "x" } else { "y" };
+    let alias = match (horizontal, value) {
+        (true, "left") | (false, "top") => Some(0.0),
+        (_, "center") => Some(50.0),
+        (true, "right") | (false, "bottom") => Some(100.0),
+        _ => None,
+    };
+    if let Some(pct) = alias {
+        return Ok(AxisPosition::Percent(pct));
+    }
+    if let Some(number) = value.strip_suffix('%') {
+        if let Ok(pct) = number.parse::<f32>() {
+            if pct.is_finite() && (0.0..=100.0).contains(&pct) {
+                return Ok(AxisPosition::Percent(pct));
+            }
+        }
+    }
+    Err(format!(
+        "invalid {axis} position '{value}' (expected axis alias or percentage from 0% to 100%)"
+    ))
+}
+
+fn deserialize_overlay_scale<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f32, D::Error> {
+    use serde::de::Error;
+    let scale = f32::deserialize(deserializer)?;
+    if !scale.is_finite() || scale <= 0.0 || scale > 20.0 {
+        return Err(D::Error::custom(
+            "overlay scale must be finite and > 0 and <= 20",
+        ));
+    }
+    Ok(scale)
+}
+
+/// Per-indicator scale, monitor, and position settings.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OverlaySettings {
+    /// Finite zoom factor above zero, no greater than twenty.
+    #[serde(
+        default = "default_overlay_scale",
+        deserialize_with = "deserialize_overlay_scale"
+    )]
+    pub scale: f32,
+    /// Where the indicator is anchored within the selected monitor.
+    #[serde(default = "default_badge_position")]
+    pub position: OverlayPosition,
+    /// Which relative monitor to use when displays change.
+    #[serde(default)]
+    pub monitor: MonitorSelector,
+}
+
+fn default_overlay_scale() -> f32 {
+    1.0
+}
+fn default_badge_position() -> OverlayPosition {
+    OverlayPosition::Top
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            position: OverlayPosition::Top,
+            monitor: MonitorSelector::Largest,
+        }
+    }
+}
+
+fn default_no_sound_settings() -> OverlaySettings {
+    OverlaySettings {
+        position: OverlayPosition::Center,
+        ..OverlaySettings::default()
+    }
+}
+
+fn deserialize_no_sound_settings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<OverlaySettings, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Raw {
+        #[serde(
+            default = "default_overlay_scale",
+            deserialize_with = "deserialize_overlay_scale"
+        )]
+        scale: f32,
+        #[serde(default)]
+        position: Option<OverlayPosition>,
+        #[serde(default)]
+        monitor: MonitorSelector,
+    }
+    let raw = Raw::deserialize(deserializer)?;
+    Ok(OverlaySettings {
+        scale: raw.scale,
+        position: raw.position.unwrap_or(OverlayPosition::Center),
+        monitor: raw.monitor,
+    })
+}
+
 /// Indicator configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndicatorsConfig {
+    /// Recording, downloading, and transcribing badge geometry.
+    #[serde(default)]
+    pub badge: OverlaySettings,
+    /// Independent large no-sound warning geometry.
+    #[serde(
+        default = "default_no_sound_settings",
+        deserialize_with = "deserialize_no_sound_settings"
+    )]
+    pub no_sound: OverlaySettings,
     /// Interval between boop sounds in milliseconds.
     #[serde(default = "default_boop_interval_ms")]
     pub boop_interval_ms: u64,
@@ -1038,6 +1287,8 @@ pub struct IndicatorsConfig {
 impl Default for IndicatorsConfig {
     fn default() -> Self {
         Self {
+            badge: OverlaySettings::default(),
+            no_sound: default_no_sound_settings(),
             boop_interval_ms: default_boop_interval_ms(),
             visual_overlay: default_visual_overlay(),
             viz: None,
@@ -1819,6 +2070,94 @@ mod tests {
     use std::io::Write;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn indicator_overlay_defaults_match_legacy() -> Result<(), Box<dyn Error>> {
+        let indicators: IndicatorsConfig = serde_yaml::from_str("{}")?;
+        assert_eq!(indicators.badge.scale, 1.0);
+        assert_eq!(indicators.badge.position, OverlayPosition::Top);
+        assert_eq!(indicators.badge.monitor, MonitorSelector::Largest);
+        assert_eq!(indicators.no_sound.scale, 1.0);
+        assert_eq!(indicators.no_sound.position, OverlayPosition::Center);
+        assert_eq!(indicators.no_sound.monitor, MonitorSelector::Largest);
+        Ok(())
+    }
+
+    #[test]
+    fn indicator_overlay_accepts_aliases_axes_percentages_and_scales() -> Result<(), Box<dyn Error>>
+    {
+        let indicators: IndicatorsConfig = serde_yaml::from_str(indoc! {"
+            badge:
+              scale: 5.0
+              position: {x: '30%', y: bottom}
+              monitor: rightmost
+            no_sound:
+              scale: 0.5
+              position: top-left
+              monitor: smallest
+        "})?;
+        assert_eq!(indicators.badge.scale, 5.0);
+        assert_eq!(
+            indicators.badge.position,
+            OverlayPosition::Axes {
+                x: AxisPosition::Percent(30.0),
+                y: AxisPosition::Percent(100.0),
+            }
+        );
+        assert_eq!(indicators.badge.monitor, MonitorSelector::Rightmost);
+        assert_eq!(indicators.no_sound.position, OverlayPosition::TopLeft);
+        assert_eq!(indicators.no_sound.monitor, MonitorSelector::Smallest);
+        let partial: IndicatorsConfig = serde_yaml::from_str("badge: {position: {y: '70%'}}")?;
+        assert_eq!(
+            partial.badge.position,
+            OverlayPosition::Axes {
+                x: AxisPosition::Percent(50.0),
+                y: AxisPosition::Percent(70.0),
+            }
+        );
+        let no_sound_partial: IndicatorsConfig = serde_yaml::from_str("no_sound: {scale: 5}")?;
+        assert_eq!(no_sound_partial.no_sound.position, OverlayPosition::Center);
+        for (name, coords) in [
+            ("top", (50.0, 0.0)),
+            ("bottom", (50.0, 100.0)),
+            ("left", (0.0, 50.0)),
+            ("right", (100.0, 50.0)),
+            ("center", (50.0, 50.0)),
+            ("top-left", (0.0, 0.0)),
+            ("top-right", (100.0, 0.0)),
+            ("bottom-left", (0.0, 100.0)),
+            ("bottom-right", (100.0, 100.0)),
+        ] {
+            let position: OverlayPosition = serde_yaml::from_str(name)?;
+            assert_eq!(position.percentages(), coords, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indicator_overlay_rejects_invalid_configuration_at_deserialization() {
+        for (yaml, expected) in [
+            ("badge: {scale: 0}", "scale"),
+            ("badge: {scale: -1}", "scale"),
+            ("badge: {scale: .nan}", "scale"),
+            ("badge: {scale: 21}", "scale"),
+            ("badge: {position: {x: top}}", "x position"),
+            ("badge: {position: {y: left}}", "y position"),
+            ("badge: {position: {x: '101%'}}", "x position"),
+            ("badge: {position: {x: 30}}", "x position"),
+            ("badge: {position: {y: '-1%'}}", "y position"),
+            ("badge: {position: {z: '30%'}}", "position axis"),
+            ("no_sound: {scale: 0}", "scale"),
+            ("badge: {position: diagonal}", "position"),
+            ("badge: {monitor: desk}", "monitor"),
+        ] {
+            let error = serde_yaml::from_str::<IndicatorsConfig>(yaml)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(error.contains(expected), "{yaml}: {error}");
+        }
+    }
 
     /// Only visualizers that draw a frequency spectrum need the FFT.
     #[test]

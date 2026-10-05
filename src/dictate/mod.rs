@@ -696,6 +696,16 @@ async fn dictate_loaded(
         pause_audio: true,
         suppress_boop: Some(suppress_boop.clone()),
         overlay: RecordingOverlayOptions {
+            badge: config
+                .indicators
+                .as_ref()
+                .map(|i| i.badge)
+                .unwrap_or_default(),
+            no_sound: config
+                .indicators
+                .as_ref()
+                .map(|i| i.no_sound)
+                .unwrap_or_else(|| crate::config::IndicatorsConfig::default().no_sound),
             silence_tx: Some(silence_tx),
             auto_pause: !opts.no_auto_pause,
             telemetry_rx: Some(broker.subscribe()),
@@ -720,7 +730,14 @@ async fn dictate_loaded(
     // Initialize visualizer (text panel for status messages / live
     // transcription text).  Audio visualization has moved into the
     // overlay badge itself — the visualizer thread only handles text.
-    let visualizer = match VisualizerHandle::new(opts.realtime) {
+    let visualizer = match VisualizerHandle::new(
+        opts.realtime,
+        config
+            .indicators
+            .as_ref()
+            .map(|i| i.badge)
+            .unwrap_or_default(),
+    ) {
         Ok(h) => {
             log::debug!("visualizer text panel initialized");
             Some(h)
@@ -920,7 +937,7 @@ async fn dictate_loaded(
     feedback.show_recording_badge();
     if let Some(ref viz) = visualizer {
         log::debug!("showing visualizer text panel");
-        viz.show(crate::x11::overlay::BADGE_W);
+        viz.show();
         // A chain whose primary model sits in outage memory starts on a
         // fallback: say so for the whole dictation, not just in the log.
         if let Some(notice) = chain

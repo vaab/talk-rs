@@ -9,6 +9,7 @@
 //! **Must** be called from a thread where GTK4 has been initialised
 //! (or after `gtk4::init()`).
 
+use crate::config::MonitorSelector;
 use crate::error::TalkError;
 use gtk4::prelude::*;
 
@@ -22,6 +23,11 @@ pub type MonitorGeometry = (i16, i16, u16, u16);
 /// multiplied by the monitor's scale factor to yield physical pixels
 /// suitable for raw X11 positioning.
 pub fn primary_monitor_geometry() -> Result<MonitorGeometry, TalkError> {
+    monitor_geometry(MonitorSelector::Largest)
+}
+
+/// Query GDK monitors in physical pixels, then apply the shared selector.
+pub fn monitor_geometry(selector: MonitorSelector) -> Result<MonitorGeometry, TalkError> {
     let display = gtk4::gdk::Display::default()
         .ok_or_else(|| TalkError::Config("no GDK display available".to_string()))?;
 
@@ -32,8 +38,7 @@ pub fn primary_monitor_geometry() -> Result<MonitorGeometry, TalkError> {
         return Err(TalkError::Config("no monitors detected by GDK".to_string()));
     }
 
-    // Pick the monitor with the largest physical pixel area.
-    let mut best: Option<(gtk4::gdk::Monitor, i64)> = None;
+    let mut geometries = Vec::with_capacity(count as usize);
     for i in 0..count {
         let Some(obj) = monitors.item(i) else {
             continue;
@@ -43,23 +48,14 @@ pub fn primary_monitor_geometry() -> Result<MonitorGeometry, TalkError> {
         };
         let geo = mon.geometry();
         let scale = mon.scale_factor() as i64;
-        let area = geo.width() as i64 * scale * geo.height() as i64 * scale;
-        if best.as_ref().is_none_or(|(_, a)| area > *a) {
-            best = Some((mon, area));
-        }
+        geometries.push((
+            (i64::from(geo.x()) * scale) as i16,
+            (i64::from(geo.y()) * scale) as i16,
+            (i64::from(geo.width()) * scale) as u16,
+            (i64::from(geo.height()) * scale) as u16,
+        ));
     }
 
-    let monitor = best
-        .map(|(m, _)| m)
-        .ok_or_else(|| TalkError::Config("no usable monitor found".to_string()))?;
-
-    let geo = monitor.geometry();
-    let scale = monitor.scale_factor() as i16;
-
-    Ok((
-        geo.x() as i16 * scale,
-        geo.y() as i16 * scale,
-        (geo.width() as i16 * scale) as u16,
-        (geo.height() as i16 * scale) as u16,
-    ))
+    super::placement::select_monitor(&geometries, selector)
+        .ok_or_else(|| TalkError::Config("no usable monitor found".to_string()))
 }

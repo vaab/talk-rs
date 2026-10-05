@@ -22,6 +22,8 @@ use crate::x11::overlay::OverlayHandle;
 /// policies such as auto-pause, dead-audio notification, and telemetry.
 #[cfg(feature = "ui")]
 pub struct RecordingOverlayOptions {
+    pub badge: crate::config::OverlaySettings,
+    pub no_sound: crate::config::OverlaySettings,
     pub silence_tx: Option<std::sync::mpsc::Sender<bool>>,
     pub auto_pause: bool,
     pub telemetry_rx: Option<tokio::sync::broadcast::Receiver<TranscriptionEvent>>,
@@ -76,6 +78,8 @@ pub struct RecordingFeedback {
 
 #[cfg(feature = "ui")]
 struct PendingOverlay {
+    badge: crate::config::OverlaySettings,
+    no_sound: crate::config::OverlaySettings,
     enabled: bool,
     viz: Option<VizMode>,
     mono: bool,
@@ -123,6 +127,8 @@ impl RecordingFeedback {
             overlay: None,
             #[cfg(feature = "ui")]
             pending_overlay: Some(PendingOverlay {
+                badge: options.overlay.badge,
+                no_sound: options.overlay.no_sound,
                 enabled: !options.no_overlay,
                 viz: options.viz,
                 mono: options.mono,
@@ -292,6 +298,8 @@ impl RecordingFeedback {
             Arc::clone(&self.pause_flag),
             options.auto_pause,
             options.telemetry_rx,
+            options.badge,
+            options.no_sound,
         ) {
             Ok(overlay) => {
                 log::debug!(

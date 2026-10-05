@@ -79,9 +79,76 @@ const SPEC_RIGHT: usize = 269;
 /// Bottom edge of the spectrogram area (padding from badge bottom).
 const SPEC_BOTTOM: usize = 48;
 /// Spectrogram width in pixels (time columns).
+#[cfg(test)]
 const SPEC_W: usize = SPEC_RIGHT - SPEC_LEFT;
 /// Spectrogram height in pixels (frequency rows).
+#[cfg(test)]
 const SPEC_H: usize = SPEC_BOTTOM - SPEC_TOP;
+
+/// Physical badge dimensions and drawing coordinates from one logical design.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BadgeLayout {
+    pub width: u16,
+    pub height: u16,
+    pub spec_left: usize,
+    pub spec_top: usize,
+    pub spec_w: usize,
+    pub spec_h: usize,
+    pub dot_cx: usize,
+    pub dot_cy: usize,
+    pub dot_radius_max: f32,
+    pub dot_radius_min: f32,
+    pub dot_gap: f32,
+    pub prohibit_icon_radius: f32,
+    pub corner_radius: usize,
+    pub border_width: f32,
+    pub phase_line_height: usize,
+    pub track_height: usize,
+    pub spectrum_inset_top: usize,
+    pub spectrum_inset_bottom: usize,
+    pub retry_inset: usize,
+    pub badge_font_size: f32,
+    pub retry_font_size: f32,
+    pub prohibit_stroke: f32,
+    pub pause_minimum: f32,
+}
+
+impl BadgeLayout {
+    pub(crate) fn new(scale: f32) -> Self {
+        let dimension = |value: usize| ((value as f32 * scale).round() as usize).max(1);
+        let width = dimension(BADGE_W as usize) as u16;
+        let height = dimension(BADGE_H as usize) as u16;
+        let spec_left = dimension(SPEC_LEFT);
+        let spec_top = dimension(SPEC_TOP);
+        let spec_right = dimension(SPEC_RIGHT).min(width as usize);
+        let spec_bottom = dimension(SPEC_BOTTOM).min(height as usize);
+        Self {
+            width,
+            height,
+            spec_left,
+            spec_top,
+            spec_w: spec_right.saturating_sub(spec_left),
+            spec_h: spec_bottom.saturating_sub(spec_top),
+            dot_cx: dimension(DOT_CX),
+            dot_cy: dimension(DOT_CY),
+            dot_radius_max: DOT_RADIUS_MAX * scale,
+            dot_radius_min: DOT_RADIUS_MIN * scale,
+            dot_gap: DOT_GAP * scale,
+            prohibit_icon_radius: PROHIBIT_ICON_RADIUS * scale,
+            corner_radius: dimension(CORNER_RADIUS),
+            border_width: BORDER_WIDTH * scale,
+            phase_line_height: dimension(PHASE_LINE_HEIGHT),
+            track_height: dimension(TRACK_HEIGHT_PX),
+            spectrum_inset_top: dimension(4),
+            spectrum_inset_bottom: dimension(2),
+            retry_inset: dimension(2),
+            badge_font_size: 24.0 * scale,
+            retry_font_size: RETRY_COUNTER_FONT_SIZE * scale,
+            prohibit_stroke: 2.0 * scale,
+            pause_minimum: 2.0 * scale,
+        }
+    }
+}
 
 /// Target frames per second for the recording render loop.
 const FPS: u32 = 60;
@@ -224,8 +291,15 @@ impl OverlayHandle {
         pause_flag: Arc<std::sync::atomic::AtomicBool>,
         auto_pause: bool,
         telemetry_rx: Option<tokio::sync::broadcast::Receiver<TranscriptionEvent>>,
+        badge: crate::config::OverlaySettings,
+        no_sound: crate::config::OverlaySettings,
     ) -> Result<Self, TalkError> {
-        let geom = super::monitor::primary_monitor_geometry()?;
+        let geom = super::monitor::monitor_geometry(badge.monitor)?;
+        let no_sound_geom = if badge.monitor == no_sound.monitor {
+            geom
+        } else {
+            super::monitor::monitor_geometry(no_sound.monitor)?
+        };
 
         // Resolve monochrome palette up front (D-Bus on main thread).
         let mono_palette = if mono {
@@ -247,6 +321,9 @@ impl OverlayHandle {
                 if let Err(e) = overlay_thread(
                     rx,
                     geom,
+                    no_sound_geom,
+                    badge,
+                    no_sound,
                     viz,
                     mono_palette,
                     audio_ring,
@@ -305,6 +382,30 @@ struct RgbaImage {
     height: u32,
     /// Row-major RGBA pixels (4 bytes per pixel).
     data: Vec<u8>,
+}
+
+fn scale_static_image(img: RgbaImage, scale: f32) -> RgbaImage {
+    if scale == 1.0 {
+        return img;
+    }
+    let width = (img.width as f32 * scale).round().max(1.0) as u32;
+    let height = (img.height as f32 * scale).round().max(1.0) as u32;
+    let mut data = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let src_x = (x as f32 / scale) as u32;
+            let src_y = (y as f32 / scale) as u32;
+            let source =
+                ((src_y.min(img.height - 1) * img.width + src_x.min(img.width - 1)) * 4) as usize;
+            let dest = ((y * width + x) * 4) as usize;
+            data[dest..dest + 4].copy_from_slice(&img.data[source..source + 4]);
+        }
+    }
+    RgbaImage {
+        width,
+        height,
+        data,
+    }
 }
 
 /// Return `true` when `samples` carry the "stuck at the rail"
@@ -393,6 +494,7 @@ struct FrameEffects {
 /// must leave every detector and history trace unchanged.
 #[derive(Debug, Clone)]
 struct FrameAnalysis {
+    layout: BadgeLayout,
     frame_rms: f32,
     frame_stuck_at_rail: bool,
     /// FFT workspace and the current frame's magnitudes.  Computed
@@ -418,9 +520,15 @@ struct FrameAnalysis {
 }
 
 impl FrameAnalysis {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_layout(BadgeLayout::new(1.0))
+    }
+
+    fn with_layout(layout: BadgeLayout) -> Self {
         let amp_max_frames = (FPS as f32 * AMP_WINDOW_SECS) as usize;
         Self {
+            layout,
             frame_rms: 0.0,
             frame_stuck_at_rail: false,
             spectrum: SpectrumAnalyzer::new(),
@@ -448,7 +556,7 @@ impl FrameAnalysis {
         let column_frame_counter = self.column_frame_counter;
         let mut spectrum = std::mem::take(&mut self.spectrum);
         spectrum.clear();
-        *self = Self::new();
+        *self = Self::with_layout(self.layout);
         self.column_frame_counter = column_frame_counter;
         self.spectrum = spectrum;
     }
@@ -645,18 +753,18 @@ impl FrameAnalysis {
                         // Empty column → no visible content, but the
                         // column still advances so the time axis
                         // keeps moving.
-                        vec![0.0f32; SPEC_H]
+                        vec![0.0f32; self.layout.spec_h]
                     } else {
                         map_spectrum_to_column(
                             self.spectrum.magnitudes(),
-                            SPEC_H,
+                            self.layout.spec_h,
                             sample_rate,
                             self.effective_freq_max,
                         )
                     };
                     self.spectrogram_history.push(column);
-                    if self.spectrogram_history.len() > SPEC_W {
-                        let excess = self.spectrogram_history.len() - SPEC_W;
+                    if self.spectrogram_history.len() > self.layout.spec_w {
+                        let excess = self.spectrogram_history.len() - self.layout.spec_w;
                         self.spectrogram_history.drain(..excess);
                     }
                 }
@@ -877,6 +985,7 @@ fn render_spectrum_badge(
     h: usize,
     mono: Option<([u8; 4], [u8; 4])>,
     dim: f32,
+    layout: &BadgeLayout,
 ) {
     if magnitudes.is_empty() || peak < PEAK_FLOOR {
         return;
@@ -906,9 +1015,9 @@ fn render_spectrum_badge(
         let norm = (avg / peak).clamp(0.0, 1.0);
         let log_norm = (1.0 + norm * 9.0).log10();
 
-        let bar_height = (log_norm * (h.saturating_sub(4)) as f32) as usize;
+        let bar_height = (log_norm * (h.saturating_sub(layout.spectrum_inset_top)) as f32) as usize;
         let bar_x = x0 + bar;
-        let bar_y = y0 + h - 2 - bar_height;
+        let bar_y = y0 + h - layout.spectrum_inset_bottom - bar_height;
 
         let base = if let Some((fg, bg)) = mono {
             super::render_util::lerp_color(bg, fg, log_norm)
@@ -1187,6 +1296,7 @@ fn render_phase_line(
     y0: usize,
     w: usize,
     phase_history: &[Option<([u8; 4], f32)>],
+    layout: &BadgeLayout,
 ) {
     let n = phase_history.len();
     if n == 0 || w == 0 {
@@ -1207,7 +1317,7 @@ fn render_phase_line(
             continue;
         }
 
-        for dy in 0..PHASE_LINE_HEIGHT {
+        for dy in 0..layout.phase_line_height {
             let y = y0 + dy;
             if y >= pb.height {
                 continue;
@@ -1253,12 +1363,19 @@ fn backoff_remaining_fraction(
 /// column pushed during the wait (so the timeline shows how long the
 /// provider stayed busy), while the band on top gives the live
 /// "how much longer" reading.
-fn render_backoff_bar(pb: &mut PixelBuffer, x0: usize, y0: usize, w: usize, fraction: f32) {
+fn render_backoff_bar(
+    pb: &mut PixelBuffer,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    fraction: f32,
+    layout: &BadgeLayout,
+) {
     let filled = (w as f32 * fraction.clamp(0.0, 1.0)).round() as usize;
     if filled == 0 {
         return;
     }
-    pb.fill_rect(x0, y0, filled.min(w), PHASE_LINE_HEIGHT, PHASE_AMBER);
+    pb.fill_rect(x0, y0, filled.min(w), layout.phase_line_height, PHASE_AMBER);
 }
 
 /// Centre badge text shown while a server backoff runs.  Names the
@@ -1271,6 +1388,7 @@ fn backoff_badge_label(attempt: u32, max: u32) -> String {
 /// Render the backoff badge text in amber, centred in the SPEC area
 /// (same path as `TRANSCRIBING` / `LISTENING`).  `retry` is the
 /// `(attempt, max)` pair from the last `RetryScheduled`.
+#[allow(clippy::too_many_arguments)] // Keep the explicit font size alongside the existing region coordinates.
 fn render_backoff_text(
     pb: &mut PixelBuffer,
     font: &fontdue::Font,
@@ -1279,9 +1397,10 @@ fn render_backoff_text(
     y0: usize,
     w: usize,
     h: usize,
+    font_size: f32,
 ) {
     let label = backoff_badge_label(retry.0, retry.1);
-    render_badge_text(pb, font, &label, PHASE_AMBER, x0, y0, w, h);
+    render_badge_text(pb, font, &label, PHASE_AMBER, x0, y0, w, h, font_size);
 }
 
 /// Pixel budget for each individual throughput track.  Each of the
@@ -1314,6 +1433,7 @@ fn render_throughput_tracks(
     upload_peak: u64,
     download_peak: u64,
     paste_peak: u64,
+    layout: &BadgeLayout,
 ) {
     if w == 0 || h == 0 {
         return;
@@ -1328,8 +1448,8 @@ fn render_throughput_tracks(
         return;
     }
 
-    let track_h = TRACK_HEIGHT_PX.min(h / 3) as f32;
-    let bar_zone_top = y0 + PHASE_LINE_HEIGHT;
+    let track_h = layout.track_height.min(h / 3) as f32;
+    let bar_zone_top = y0 + layout.phase_line_height;
     let bar_zone_bottom = y0 + h - 1;
     let bar_zone_center = y0 + h / 2;
 
@@ -1618,19 +1738,19 @@ fn draw_prohibit_icon_with_stroke(
 ///
 /// Wrapper around [`draw_prohibit_icon_with_stroke`] with the original
 /// stroke width that matches [`PROHIBIT_ICON_RADIUS`].
-fn draw_prohibit_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32) {
-    draw_prohibit_icon_with_stroke(pb, cx, cy, radius, 2.0);
+fn draw_prohibit_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32, stroke: f32) {
+    draw_prohibit_icon_with_stroke(pb, cx, cy, radius, stroke);
 }
 
 /// Draw a pause icon (two vertical bars ⏸) in yellow.
 ///
 /// Replaces the pulsing red dot when auto-pause is active.
-fn draw_pause_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32) {
+fn draw_pause_icon(pb: &mut PixelBuffer, cx: usize, cy: usize, radius: f32, minimum: f32) {
     // Warm yellow, BGRA
     let color: [u8; 4] = [0x00, 0xC0, 0xFF, 0xFF];
     let bar_h = (radius * 1.4) as i32;
-    let bar_w = (radius * 0.35).max(2.0) as i32;
-    let gap = (radius * 0.35).max(2.0) as i32;
+    let bar_w = (radius * 0.35).max(minimum) as i32;
+    let gap = (radius * 0.35).max(minimum) as i32;
 
     let cx = cx as i32;
     let cy = cy as i32;
@@ -1668,8 +1788,8 @@ fn render_badge_text(
     y0: usize,
     w: usize,
     h: usize,
+    font_size: f32,
 ) {
-    let font_size = 24.0f32;
     let (glyphs, text_w) = rasterise_glyphs(text, font, font_size);
 
     let start_x = x0 as i32 + (w as i32 - text_w as i32) / 2;
@@ -1694,9 +1814,10 @@ fn render_no_sound_text(
     y0: usize,
     w: usize,
     h: usize,
+    font_size: f32,
 ) {
     let color: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF]; // bright red BGRA
-    render_badge_text(pb, font, "NO SOUND", color, x0, y0, w, h);
+    render_badge_text(pb, font, "NO SOUND", color, x0, y0, w, h, font_size);
 }
 
 /// Render "LISTENING" text in yellow, centred in the SPEC area.
@@ -1707,9 +1828,10 @@ fn render_listening_text(
     y0: usize,
     w: usize,
     h: usize,
+    font_size: f32,
 ) {
     let color: [u8; 4] = [0x00, 0xC0, 0xFF, 0xFF]; // warm yellow BGRA
-    render_badge_text(pb, font, "LISTENING", color, x0, y0, w, h);
+    render_badge_text(pb, font, "LISTENING", color, x0, y0, w, h, font_size);
 }
 
 /// Render "TRANSCRIBING" text in light blue, centred in the SPEC area.
@@ -1720,9 +1842,10 @@ fn render_transcribing_text(
     y0: usize,
     w: usize,
     h: usize,
+    font_size: f32,
 ) {
     let color: [u8; 4] = [0xFF, 0xCC, 0x66, 0xFF]; // light blue BGRA
-    render_badge_text(pb, font, "TRANSCRIBING", color, x0, y0, w, h);
+    render_badge_text(pb, font, "TRANSCRIBING", color, x0, y0, w, h, font_size);
 }
 
 /// Render "DOWNLOADING MODEL" text, centred in the SPEC area.
@@ -1739,9 +1862,20 @@ fn render_downloading_text(
     y0: usize,
     w: usize,
     h: usize,
+    font_size: f32,
 ) {
     let color: [u8; 4] = [0xFF, 0xCC, 0x66, 0xFF]; // light blue BGRA
-    render_badge_text(pb, font, "DOWNLOADING MODEL", color, x0, y0, w, h);
+    render_badge_text(
+        pb,
+        font,
+        "DOWNLOADING MODEL",
+        color,
+        x0,
+        y0,
+        w,
+        h,
+        font_size,
+    );
 }
 
 /// Font size for the retry-attempt counter.  Smaller than the
@@ -1762,6 +1896,7 @@ const RETRY_COUNTER_FONT_SIZE: f32 = 14.0;
 /// `opacity` is the current [`Phase::opacity`], allowing the
 /// counter to dim during validation and pop back to full opacity
 /// during transcription retries.
+#[allow(clippy::too_many_arguments)] // The font size comes from BadgeLayout, not from the buffer dimensions.
 fn render_retry_counter(
     pb: &mut PixelBuffer,
     font: &fontdue::Font,
@@ -1770,6 +1905,7 @@ fn render_retry_counter(
     attempt: u32,
     _max: u32,
     opacity: f32,
+    font_size: f32,
 ) {
     if attempt == 0 {
         return;
@@ -1780,14 +1916,14 @@ fn render_retry_counter(
     // [`super::transport::retry::MAX_RETRIES`] is 5 and the
     // validate-cache schedule has 5 entries — both single-digit.
     let text = format!("{}", attempt);
-    let (glyphs, _) = rasterise_glyphs(&text, font, RETRY_COUNTER_FONT_SIZE);
+    let (glyphs, _) = rasterise_glyphs(&text, font, font_size);
 
     let buf_w = pb.width;
     let buf_h = pb.height;
     let mut cursor_x = x0 as i32;
     // Baseline a few pixels below the top of the SPEC area so the
     // glyph sits just under the phase-line stripe.
-    let baseline = y0 as i32 + RETRY_COUNTER_FONT_SIZE as i32;
+    let baseline = y0 as i32 + font_size as i32;
     for (metrics, bitmap) in &glyphs {
         blit_glyph_at(
             pb,
@@ -1811,12 +1947,17 @@ fn render_retry_counter(
 /// Layout (two rows):
 ///   Row 1 (upper ~60%): prohibit icon + "NO SOUND" side by side, centred as a unit
 ///   Row 2 (lower ~40%): subtitle text centred across full width
-fn render_centered_no_sound(pb: &mut PixelBuffer, font: &fontdue::Font, bg: [u8; 4]) {
+fn render_centered_no_sound_scaled(
+    pb: &mut PixelBuffer,
+    font: &fontdue::Font,
+    bg: [u8; 4],
+    radius: usize,
+) {
     let w = pb.width;
     let h = pb.height;
 
     // Fill background with rounded corners.
-    pb.clear_rounded(bg, CENTERED_CORNER_RADIUS);
+    pb.clear_rounded(bg, radius);
 
     // ── Row 1: icon + "NO SOUND" centred together ────────────
     let row1_cy = (h as f32 * 0.36) as usize; // vertical centre of top row
@@ -2030,6 +2171,9 @@ fn draw_image(
 fn overlay_thread(
     rx: mpsc::Receiver<Command>,
     geom: super::monitor::MonitorGeometry,
+    no_sound_geom: super::monitor::MonitorGeometry,
+    badge: crate::config::OverlaySettings,
+    no_sound: crate::config::OverlaySettings,
     viz: Option<crate::config::VizMode>,
     mono_palette: Option<([u8; 4], [u8; 4])>,
     ring: Arc<Mutex<RingBuffer>>,
@@ -2068,9 +2212,17 @@ fn overlay_thread(
     let depth = argb_ctx.as_ref().map_or(screen.root_depth, |c| c.depth);
 
     // Pre-decode the transcribing indicator image.
-    let transcribing_img = decode_png(TRANSCRIBING_PNG)?;
+    let transcribing_img = scale_static_image(decode_png(TRANSCRIBING_PNG)?, badge.scale);
 
-    let (mon_x, mon_y, mon_w, mon_h) = geom;
+    let (_, _, no_sound_mon_w, no_sound_mon_h) = no_sound_geom;
+    let layout = BadgeLayout::new(badge.scale);
+    let badge_xy = super::placement::resolve_rect(
+        geom,
+        layout.width,
+        layout.height,
+        badge.position,
+        (4.0 * badge.scale).round() as u16,
+    );
 
     // Audio ring buffer and sample rate are now provided externally
     // via the audio tee task (no independent CPAL capture).
@@ -2091,10 +2243,21 @@ fn overlay_thread(
     // ── Centered "no sound" overlay ─────────────────────────────────
     // Pre-compute dimensions and pre-render the content so the window
     // can be shown/hidden instantly on no-sound state transitions.
-    let centered_h = (mon_h as f32 * CENTERED_HEIGHT_FRACTION) as u16;
-    let centered_h = centered_h.max(CENTERED_MIN_HEIGHT);
-    let centered_w = (centered_h as f32 * CENTERED_ASPECT_RATIO) as u16;
-    let centered_w = centered_w.min(mon_w); // don't exceed monitor width
+    let base_h =
+        ((no_sound_mon_h as f32 * CENTERED_HEIGHT_FRACTION) as u16).max(CENTERED_MIN_HEIGHT);
+    let centered_h = (base_h as f32 * no_sound.scale).round().max(1.0) as u16;
+    let base_w = ((base_h as f32 * CENTERED_ASPECT_RATIO) as u16).min(no_sound_mon_w);
+    let centered_w = (base_w as f32 * no_sound.scale)
+        .round()
+        .max(1.0)
+        .min(no_sound_mon_w as f32) as u16;
+    let centered_xy = super::placement::resolve_rect(
+        no_sound_geom,
+        centered_w,
+        centered_h,
+        no_sound.position,
+        (4.0 * no_sound.scale).round() as u16,
+    );
     let centered_font = badge_font.clone();
     let centered_bg = if argb_ctx.is_some() {
         CENTERED_BG_ARGB
@@ -2104,7 +2267,12 @@ fn overlay_thread(
     // Pre-render the centered overlay content into a pixel buffer.
     let centered_pb = if let Some(ref font) = centered_font {
         let mut pb = PixelBuffer::new(centered_w as usize, centered_h as usize);
-        render_centered_no_sound(&mut pb, font, centered_bg);
+        render_centered_no_sound_scaled(
+            &mut pb,
+            font,
+            centered_bg,
+            (CENTERED_CORNER_RADIUS as f32 * no_sound.scale).round() as usize,
+        );
         Some(pb)
     } else {
         log::warn!("no font for centered no-sound overlay");
@@ -2146,8 +2314,8 @@ fn overlay_thread(
     let mut current_gc: Option<Gcontext> = None;
     let mut is_recording = false;
 
-    let mut pb = PixelBuffer::new(BADGE_W as usize, BADGE_H as usize);
-    let mut analysis = FrameAnalysis::new();
+    let mut pb = PixelBuffer::new(layout.width as usize, layout.height as usize);
+    let mut analysis = FrameAnalysis::with_layout(layout);
 
     // ── Phase overlay state ──────────────────────��───────────────
     //
@@ -2234,22 +2402,45 @@ fn overlay_thread(
                     destroy_current(&conn, &mut current_window, &mut current_gc);
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
 
-                    let badge_x = mon_x + (mon_w as i16 / 2) - (BADGE_W as i16 / 2);
-                    let badge_y = mon_y + 4;
+                    let (badge_x, badge_y) = badge_xy;
 
                     let win = if let Some(ref ctx) = argb_ctx {
                         // 32-bit ARGB window with shape mask for rounded corners.
                         let w = create_argb_overlay_window(
-                            &conn, root, ctx, badge_x, badge_y, BADGE_W, BADGE_H,
+                            &conn,
+                            root,
+                            ctx,
+                            badge_x,
+                            badge_y,
+                            layout.width,
+                            layout.height,
                         )?;
-                        apply_rounded_shape(&conn, w, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+                        apply_rounded_shape(
+                            &conn,
+                            w,
+                            layout.width,
+                            layout.height,
+                            layout.corner_radius,
+                        )?;
                         w
                     } else {
                         // Fallback: opaque window with shape mask.
                         let w = create_overlay_window(
-                            &conn, screen, root, badge_x, badge_y, BADGE_W, BADGE_H,
+                            &conn,
+                            screen,
+                            root,
+                            badge_x,
+                            badge_y,
+                            layout.width,
+                            layout.height,
                         )?;
-                        apply_rounded_shape(&conn, w, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+                        apply_rounded_shape(
+                            &conn,
+                            w,
+                            layout.width,
+                            layout.height,
+                            layout.corner_radius,
+                        )?;
                         w
                     };
 
@@ -2304,9 +2495,9 @@ fn overlay_thread(
                         screen,
                         root,
                         &transcribing_img,
-                        mon_x,
-                        mon_y,
-                        mon_w,
+                        geom,
+                        badge.position,
+                        (4.0 * badge.scale).round() as u16,
                         &mut current_window,
                     )?;
                 }
@@ -2322,22 +2513,45 @@ fn overlay_thread(
                     destroy_current(&conn, &mut current_window, &mut current_gc);
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
 
-                    let badge_x = mon_x + (mon_w as i16 / 2) - (BADGE_W as i16 / 2);
-                    let badge_y = mon_y + 4;
+                    let (badge_x, badge_y) = badge_xy;
 
                     let win = if let Some(ref ctx) = argb_ctx {
                         // 32-bit ARGB window with shape mask for rounded corners.
                         let w = create_argb_overlay_window(
-                            &conn, root, ctx, badge_x, badge_y, BADGE_W, BADGE_H,
+                            &conn,
+                            root,
+                            ctx,
+                            badge_x,
+                            badge_y,
+                            layout.width,
+                            layout.height,
                         )?;
-                        apply_rounded_shape(&conn, w, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+                        apply_rounded_shape(
+                            &conn,
+                            w,
+                            layout.width,
+                            layout.height,
+                            layout.corner_radius,
+                        )?;
                         w
                     } else {
                         // Fallback: opaque window with shape mask.
                         let w = create_overlay_window(
-                            &conn, screen, root, badge_x, badge_y, BADGE_W, BADGE_H,
+                            &conn,
+                            screen,
+                            root,
+                            badge_x,
+                            badge_y,
+                            layout.width,
+                            layout.height,
                         )?;
-                        apply_rounded_shape(&conn, w, BADGE_W, BADGE_H, CORNER_RADIUS)?;
+                        apply_rounded_shape(
+                            &conn,
+                            w,
+                            layout.width,
+                            layout.height,
+                            layout.corner_radius,
+                        )?;
                         w
                     };
 
@@ -2615,8 +2829,7 @@ fn overlay_thread(
             // Transition to no-sound: show the centered overlay.
             if let Some(ref cpb) = centered_pb {
                 if centered_window.is_none() {
-                    let cx = mon_x + (mon_w as i16 / 2) - (centered_w as i16 / 2);
-                    let cy = mon_y + (mon_h as i16 / 2) - (centered_h as i16 / 2);
+                    let (cx, cy) = centered_xy;
                     let win = if let Some(ref ctx) = argb_ctx {
                         create_argb_overlay_window(&conn, root, ctx, cx, cy, centered_w, centered_h)
                     } else {
@@ -2628,7 +2841,7 @@ fn overlay_thread(
                             w,
                             centered_w,
                             centered_h,
-                            CENTERED_CORNER_RADIUS,
+                            (CENTERED_CORNER_RADIUS as f32 * no_sound.scale).round() as usize,
                         );
                         let _ = conn.map_window(w);
                         let _ = conn.sync();
@@ -2704,8 +2917,8 @@ fn overlay_thread(
             // spectrogram column so the phase overlay line stays
             // perfectly aligned with the waterfall time axis.
             phase_history.push(current_phase.color());
-            if phase_history.len() > SPEC_W {
-                phase_history.drain(..phase_history.len() - SPEC_W);
+            if phase_history.len() > layout.spec_w {
+                phase_history.drain(..phase_history.len() - layout.spec_w);
             }
 
             // Record per-column deltas for all three throughput tracks.
@@ -2715,8 +2928,8 @@ fn overlay_thread(
                 upload_peak_delta = up_delta;
             }
             upload_history.push(up_delta);
-            if upload_history.len() > SPEC_W {
-                upload_history.drain(..upload_history.len() - SPEC_W);
+            if upload_history.len() > layout.spec_w {
+                upload_history.drain(..upload_history.len() - layout.spec_w);
             }
 
             let dl_delta = current_download_bytes.saturating_sub(prev_download_bytes);
@@ -2725,8 +2938,8 @@ fn overlay_thread(
                 download_peak_delta = dl_delta;
             }
             download_history.push(dl_delta);
-            if download_history.len() > SPEC_W {
-                download_history.drain(..download_history.len() - SPEC_W);
+            if download_history.len() > layout.spec_w {
+                download_history.drain(..download_history.len() - layout.spec_w);
             }
 
             let paste_delta = current_paste_chars.saturating_sub(prev_paste_chars);
@@ -2735,8 +2948,8 @@ fn overlay_thread(
                 paste_peak_delta = paste_delta;
             }
             paste_history.push(paste_delta);
-            if paste_history.len() > SPEC_W {
-                paste_history.drain(..paste_history.len() - SPEC_W);
+            if paste_history.len() > layout.spec_w {
+                paste_history.drain(..paste_history.len() - layout.spec_w);
             }
         }
 
@@ -2754,7 +2967,12 @@ fn overlay_thread(
         let amp_history: &Vec<f32> = &analysis.amp_history;
 
         pb.clear(BG_COLOR);
-        draw_rounded_border(&mut pb, BORDER_COLOR, CORNER_RADIUS as f32, BORDER_WIDTH);
+        draw_rounded_border(
+            &mut pb,
+            BORDER_COLOR,
+            layout.corner_radius as f32,
+            layout.border_width,
+        );
 
         // Transcribing (and the mutually-exclusive "downloading model"
         // sibling) takes priority over the dead-signal (NO SOUND)
@@ -2777,10 +2995,10 @@ fn overlay_thread(
                         render_spectrogram(
                             &mut pb,
                             spectrogram_history,
-                            SPEC_LEFT,
-                            SPEC_TOP,
-                            SPEC_W,
-                            SPEC_H,
+                            layout.spec_left,
+                            layout.spec_top,
+                            layout.spec_w,
+                            layout.spec_h,
                             spec_peak,
                             mono_palette,
                             DIM_FACTOR_PAUSED,
@@ -2791,10 +3009,10 @@ fn overlay_thread(
                             &mut pb,
                             amp_history,
                             amp_peak,
-                            SPEC_LEFT,
-                            SPEC_TOP,
-                            SPEC_W,
-                            SPEC_H,
+                            layout.spec_left,
+                            layout.spec_top,
+                            layout.spec_w,
+                            layout.spec_h,
                             mono_palette,
                             DIM_FACTOR_PAUSED,
                         );
@@ -2804,42 +3022,57 @@ fn overlay_thread(
                             &mut pb,
                             magnitudes,
                             spectrum_peak,
-                            SPEC_LEFT,
-                            SPEC_TOP,
-                            SPEC_W,
-                            SPEC_H,
+                            layout.spec_left,
+                            layout.spec_top,
+                            layout.spec_w,
+                            layout.spec_h,
                             mono_palette,
                             DIM_FACTOR_PAUSED,
+                            &layout,
                         );
                     }
                 }
             }
             render_time_grid(
                 &mut pb,
-                SPEC_LEFT,
-                SPEC_TOP,
-                SPEC_W,
-                SPEC_H,
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                layout.spec_h,
                 columns_pushed_total.saturating_sub(spectrogram_history.len() as u64),
                 spectrogram_history.len(),
                 COLUMNS_PER_GRID_MARK,
             );
-            render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            render_phase_line(
+                &mut pb,
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                &phase_history,
+                &layout,
+            );
             // Server-backoff countdown over the phase line: a solid
             // amber band draining right-to-left across the wait.
             if current_phase == Phase::WaitingRetry {
                 if let Some((started, delay)) = current_backoff {
                     let fraction =
                         backoff_remaining_fraction(std::time::Instant::now(), started, delay);
-                    render_backoff_bar(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, fraction);
+                    render_backoff_bar(
+                        &mut pb,
+                        layout.spec_left,
+                        layout.spec_top,
+                        layout.spec_w,
+                        fraction,
+                        &layout,
+                    );
                 }
             }
             render_throughput_tracks(
                 &mut pb,
-                SPEC_LEFT,
-                SPEC_TOP,
-                SPEC_W,
-                SPEC_H,
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                layout.spec_h,
                 &upload_history,
                 &download_history,
                 &paste_history,
@@ -2847,6 +3080,7 @@ fn overlay_thread(
                 upload_peak_delta,
                 download_peak_delta,
                 paste_peak_delta,
+                &layout,
             );
             // "TRANSCRIBING" / "DOWNLOADING MODEL" text over the
             // dimmed waterfall (same pattern as "LISTENING" during
@@ -2855,7 +3089,15 @@ fn overlay_thread(
             // exclusive; only one static-badge text fires here.
             if let Some(ref f) = badge_font {
                 if is_downloading {
-                    render_downloading_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+                    render_downloading_text(
+                        &mut pb,
+                        f,
+                        layout.spec_left,
+                        layout.spec_top,
+                        layout.spec_w,
+                        layout.spec_h,
+                        layout.badge_font_size,
+                    );
                 } else if let (Phase::WaitingRetry, Some((attempt, max))) =
                     (current_phase, current_retry)
                 {
@@ -2866,13 +3108,22 @@ fn overlay_thread(
                         &mut pb,
                         f,
                         (attempt, max),
-                        SPEC_LEFT,
-                        SPEC_TOP,
-                        SPEC_W,
-                        SPEC_H,
+                        layout.spec_left,
+                        layout.spec_top,
+                        layout.spec_w,
+                        layout.spec_h,
+                        layout.badge_font_size,
                     );
                 } else {
-                    render_transcribing_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+                    render_transcribing_text(
+                        &mut pb,
+                        f,
+                        layout.spec_left,
+                        layout.spec_top,
+                        layout.spec_w,
+                        layout.spec_h,
+                        layout.badge_font_size,
+                    );
                     // Retry-attempt indicator (1, 2, 3, …) drawn
                     // small at the top-left of the SPEC area so it
                     // doesn't collide with the centered TRANSCRIBING
@@ -2885,11 +3136,12 @@ fn overlay_thread(
                         render_retry_counter(
                             &mut pb,
                             f,
-                            SPEC_LEFT + 2,
-                            SPEC_TOP + PHASE_LINE_HEIGHT,
+                            layout.spec_left + layout.retry_inset,
+                            layout.spec_top + layout.phase_line_height,
                             attempt,
                             max,
                             current_phase.opacity(),
+                            layout.retry_font_size,
                         );
                     }
                 }
@@ -2897,10 +3149,29 @@ fn overlay_thread(
         } else if no_sound_active {
             // ── NO SOUND mode: prohibit icon + red text ──────
             if let Some(ref f) = badge_font {
-                render_no_sound_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+                render_no_sound_text(
+                    &mut pb,
+                    f,
+                    layout.spec_left,
+                    layout.spec_top,
+                    layout.spec_w,
+                    layout.spec_h,
+                    layout.badge_font_size,
+                );
             }
-            clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
-            draw_prohibit_icon(&mut pb, DOT_CX, DOT_CY, PROHIBIT_ICON_RADIUS);
+            clear_dot_gap(
+                &mut pb,
+                layout.dot_cx,
+                layout.dot_cy,
+                layout.dot_radius_max + layout.dot_gap,
+            );
+            draw_prohibit_icon(
+                &mut pb,
+                layout.dot_cx,
+                layout.dot_cy,
+                layout.prohibit_icon_radius,
+                layout.prohibit_stroke,
+            );
         } else if auto_paused {
             // ── AUTO-PAUSE mode: dimmed waterfall + LISTENING ─
             //
@@ -2916,10 +3187,10 @@ fn overlay_thread(
                         render_spectrogram(
                             &mut pb,
                             spectrogram_history,
-                            SPEC_LEFT,
-                            SPEC_TOP,
-                            SPEC_W,
-                            SPEC_H,
+                            layout.spec_left,
+                            layout.spec_top,
+                            layout.spec_w,
+                            layout.spec_h,
                             spec_peak,
                             mono_palette,
                             DIM_FACTOR_PAUSED,
@@ -2930,10 +3201,10 @@ fn overlay_thread(
                             &mut pb,
                             amp_history,
                             amp_peak,
-                            SPEC_LEFT,
-                            SPEC_TOP,
-                            SPEC_W,
-                            SPEC_H,
+                            layout.spec_left,
+                            layout.spec_top,
+                            layout.spec_w,
+                            layout.spec_h,
                             mono_palette,
                             DIM_FACTOR_PAUSED,
                         );
@@ -2943,12 +3214,13 @@ fn overlay_thread(
                             &mut pb,
                             magnitudes,
                             spectrum_peak,
-                            SPEC_LEFT,
-                            SPEC_TOP,
-                            SPEC_W,
-                            SPEC_H,
+                            layout.spec_left,
+                            layout.spec_top,
+                            layout.spec_w,
+                            layout.spec_h,
                             mono_palette,
                             DIM_FACTOR_PAUSED,
+                            &layout,
                         );
                     }
                 }
@@ -2959,30 +3231,44 @@ fn overlay_thread(
             // how long the silent window has been growing.
             render_time_grid(
                 &mut pb,
-                SPEC_LEFT,
-                SPEC_TOP,
-                SPEC_W,
-                SPEC_H,
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                layout.spec_h,
                 columns_pushed_total.saturating_sub(spectrogram_history.len() as u64),
                 spectrogram_history.len(),
                 COLUMNS_PER_GRID_MARK,
             );
-            render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            render_phase_line(
+                &mut pb,
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                &phase_history,
+                &layout,
+            );
             // Server-backoff countdown over the phase line: a solid
             // amber band draining right-to-left across the wait.
             if current_phase == Phase::WaitingRetry {
                 if let Some((started, delay)) = current_backoff {
                     let fraction =
                         backoff_remaining_fraction(std::time::Instant::now(), started, delay);
-                    render_backoff_bar(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, fraction);
+                    render_backoff_bar(
+                        &mut pb,
+                        layout.spec_left,
+                        layout.spec_top,
+                        layout.spec_w,
+                        fraction,
+                        &layout,
+                    );
                 }
             }
             render_throughput_tracks(
                 &mut pb,
-                SPEC_LEFT,
-                SPEC_TOP,
-                SPEC_W,
-                SPEC_H,
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                layout.spec_h,
                 &upload_history,
                 &download_history,
                 &paste_history,
@@ -2990,12 +3276,32 @@ fn overlay_thread(
                 upload_peak_delta,
                 download_peak_delta,
                 paste_peak_delta,
+                &layout,
             );
             if let Some(ref f) = badge_font {
-                render_listening_text(&mut pb, f, SPEC_LEFT, SPEC_TOP, SPEC_W, SPEC_H);
+                render_listening_text(
+                    &mut pb,
+                    f,
+                    layout.spec_left,
+                    layout.spec_top,
+                    layout.spec_w,
+                    layout.spec_h,
+                    layout.badge_font_size,
+                );
             }
-            clear_dot_gap(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX + DOT_GAP);
-            draw_pause_icon(&mut pb, DOT_CX, DOT_CY, DOT_RADIUS_MAX);
+            clear_dot_gap(
+                &mut pb,
+                layout.dot_cx,
+                layout.dot_cy,
+                layout.dot_radius_max + layout.dot_gap,
+            );
+            draw_pause_icon(
+                &mut pb,
+                layout.dot_cx,
+                layout.dot_cy,
+                layout.dot_radius_max,
+                layout.pause_minimum,
+            );
         } else {
             // ── Normal mode: visualization + pulsing dot ─────
             if let Some(mode) = viz {
@@ -3005,10 +3311,10 @@ fn overlay_thread(
                         render_spectrogram(
                             &mut pb,
                             spectrogram_history,
-                            SPEC_LEFT,
-                            SPEC_TOP,
-                            SPEC_W,
-                            SPEC_H,
+                            layout.spec_left,
+                            layout.spec_top,
+                            layout.spec_w,
+                            layout.spec_h,
                             spec_peak,
                             mono_palette,
                             1.0,
@@ -3019,10 +3325,10 @@ fn overlay_thread(
                             &mut pb,
                             amp_history,
                             amp_peak,
-                            SPEC_LEFT,
-                            SPEC_TOP,
-                            SPEC_W,
-                            SPEC_H,
+                            layout.spec_left,
+                            layout.spec_top,
+                            layout.spec_w,
+                            layout.spec_h,
                             mono_palette,
                             1.0,
                         );
@@ -3032,12 +3338,13 @@ fn overlay_thread(
                             &mut pb,
                             magnitudes,
                             spectrum_peak,
-                            SPEC_LEFT,
-                            SPEC_TOP,
-                            SPEC_W,
-                            SPEC_H,
+                            layout.spec_left,
+                            layout.spec_top,
+                            layout.spec_w,
+                            layout.spec_h,
                             mono_palette,
                             1.0,
+                            &layout,
                         );
                     }
                 }
@@ -3048,30 +3355,44 @@ fn overlay_thread(
             // with the spectrogram colors beneath each dot.
             render_time_grid(
                 &mut pb,
-                SPEC_LEFT,
-                SPEC_TOP,
-                SPEC_W,
-                SPEC_H,
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                layout.spec_h,
                 columns_pushed_total.saturating_sub(spectrogram_history.len() as u64),
                 spectrogram_history.len(),
                 COLUMNS_PER_GRID_MARK,
             );
-            render_phase_line(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, &phase_history);
+            render_phase_line(
+                &mut pb,
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                &phase_history,
+                &layout,
+            );
             // Server-backoff countdown over the phase line: a solid
             // amber band draining right-to-left across the wait.
             if current_phase == Phase::WaitingRetry {
                 if let Some((started, delay)) = current_backoff {
                     let fraction =
                         backoff_remaining_fraction(std::time::Instant::now(), started, delay);
-                    render_backoff_bar(&mut pb, SPEC_LEFT, SPEC_TOP, SPEC_W, fraction);
+                    render_backoff_bar(
+                        &mut pb,
+                        layout.spec_left,
+                        layout.spec_top,
+                        layout.spec_w,
+                        fraction,
+                        &layout,
+                    );
                 }
             }
             render_throughput_tracks(
                 &mut pb,
-                SPEC_LEFT,
-                SPEC_TOP,
-                SPEC_W,
-                SPEC_H,
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                layout.spec_h,
                 &upload_history,
                 &download_history,
                 &paste_history,
@@ -3079,6 +3400,7 @@ fn overlay_thread(
                 upload_peak_delta,
                 download_peak_delta,
                 paste_peak_delta,
+                &layout,
             );
 
             let vol_norm = if rms_peak > PEAK_FLOOR {
@@ -3086,10 +3408,22 @@ fn overlay_thread(
             } else {
                 0.0
             };
-            let dot_radius = DOT_RADIUS_MIN + (DOT_RADIUS_MAX - DOT_RADIUS_MIN) * vol_norm;
+            let dot_radius =
+                layout.dot_radius_min + (layout.dot_radius_max - layout.dot_radius_min) * vol_norm;
             let dot_brightness = DOT_MIN_BRIGHTNESS + (1.0 - DOT_MIN_BRIGHTNESS) * vol_norm;
-            clear_dot_gap(&mut pb, DOT_CX, DOT_CY, dot_radius + DOT_GAP);
-            draw_pulsing_dot(&mut pb, DOT_CX, DOT_CY, dot_radius, dot_brightness);
+            clear_dot_gap(
+                &mut pb,
+                layout.dot_cx,
+                layout.dot_cy,
+                dot_radius + layout.dot_gap,
+            );
+            draw_pulsing_dot(
+                &mut pb,
+                layout.dot_cx,
+                layout.dot_cy,
+                dot_radius,
+                dot_brightness,
+            );
         }
 
         // ── Blit to X11 window ───────────────────────────────
@@ -3099,8 +3433,8 @@ fn overlay_thread(
                 ImageFormat::Z_PIXMAP,
                 win,
                 gc,
-                BADGE_W,
-                BADGE_H,
+                layout.width,
+                layout.height,
                 0,
                 0,
                 0,
@@ -3229,15 +3563,14 @@ fn show_transcribing(
     screen: &Screen,
     root: u32,
     img: &RgbaImage,
-    mon_x: i16,
-    mon_y: i16,
-    mon_w: u16,
+    geom: super::monitor::MonitorGeometry,
+    position: crate::config::OverlayPosition,
+    margin: u16,
     current_window: &mut Option<u32>,
 ) -> Result<(), TalkError> {
     let w = img.width as u16;
     let h = img.height as u16;
-    let x = mon_x + (mon_w as i16 / 2) - (w as i16 / 2);
-    let y = mon_y + 4;
+    let (x, y) = super::placement::resolve_rect(geom, w, h, position, margin);
 
     let win = create_overlay_window(conn, screen, root, x, y, w, h)?;
     apply_alpha_shape_mask(conn, win, img, w, h)?;
@@ -3272,6 +3605,96 @@ mod tests {
     use super::*;
     use crate::config::VizMode;
     use crate::perf_counters::{thread_value, Counter};
+
+    #[test]
+    fn badge_layout_at_one_is_exact_legacy_geometry() {
+        let layout = BadgeLayout::new(1.0);
+        assert_eq!((layout.width, layout.height), (273, 52));
+        assert_eq!(
+            (
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                layout.spec_h
+            ),
+            (4, 4, 265, 44)
+        );
+        assert_eq!(
+            (layout.dot_cx, layout.dot_cy, layout.dot_radius_max),
+            (26, 26, 16.0)
+        );
+        assert_eq!(
+            (
+                layout.corner_radius,
+                layout.border_width,
+                layout.phase_line_height
+            ),
+            (13, 2.0, 2)
+        );
+    }
+
+    #[test]
+    fn scaled_badge_layout_stays_inside_render_bounds() {
+        for scale in [0.5, 5.0] {
+            let layout = BadgeLayout::new(scale);
+            assert!(
+                layout.dot_cx as f32 + layout.dot_radius_max + layout.dot_gap < layout.width as f32
+            );
+            assert!(layout.dot_cy as f32 + layout.dot_radius_max <= layout.height as f32);
+            assert!(layout.spec_left + layout.spec_w <= layout.width as usize);
+            assert!(layout.spec_top + layout.spec_h <= layout.height as usize);
+            assert_eq!(layout.spec_w, layout.width as usize - 2 * layout.spec_left);
+        }
+    }
+
+    #[test]
+    fn scaled_badge_render_smoke_is_nonempty_without_display() {
+        for scale in [0.5, 5.0] {
+            let layout = BadgeLayout::new(scale);
+            let mut pb = PixelBuffer::new(layout.width as usize, layout.height as usize);
+            pb.clear(BG_COLOR);
+            draw_rounded_border(
+                &mut pb,
+                BORDER_COLOR,
+                layout.corner_radius as f32,
+                layout.border_width,
+            );
+            draw_pulsing_dot(
+                &mut pb,
+                layout.dot_cx,
+                layout.dot_cy,
+                layout.dot_radius_max,
+                1.0,
+            );
+            let column = vec![1.0; layout.spec_h];
+            render_spectrogram(
+                &mut pb,
+                &[column],
+                layout.spec_left,
+                layout.spec_top,
+                layout.spec_w,
+                layout.spec_h,
+                1.0,
+                None,
+                1.0,
+            );
+            let off = (layout.spec_top * pb.width + layout.spec_left + layout.spec_w - 1) * 4;
+            assert_ne!(&pb.data[off..off + 4], &BG_COLOR);
+            assert!(pb
+                .data
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0));
+        }
+    }
+
+    #[test]
+    fn scaled_transcribing_image_preserves_native_at_one_and_resizes_both_ways() {
+        for (scale, width, height) in [(1.0, 210, 52), (0.5, 105, 26), (5.0, 1050, 260)] {
+            let image = scale_static_image(decode_png(TRANSCRIBING_PNG).expect("PNG"), scale);
+            assert_eq!((image.width, image.height), (width, height));
+            assert!(image.data.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        }
+    }
 
     // ── Dead-signal (stuck-at-rail) detection ────────────────────────
     //
@@ -4194,7 +4617,7 @@ mod tests {
     #[test]
     fn render_backoff_bar_fills_left_portion_proportionally() {
         let mut pb = PixelBuffer::new(120, 20);
-        render_backoff_bar(&mut pb, 10, 5, 100, 0.5);
+        render_backoff_bar(&mut pb, 10, 5, 100, 0.5, &BadgeLayout::new(1.0));
         assert_eq!(pixel(&pb, 10, 5), PHASE_AMBER, "left edge amber");
         assert_eq!(pixel(&pb, 59, 6), PHASE_AMBER, "last filled column amber");
         assert_eq!(
@@ -4208,6 +4631,19 @@ mod tests {
             [0, 0, 0, 0],
             "below the band untouched"
         );
+    }
+
+    #[test]
+    fn backoff_band_uses_layout_not_buffer_height_at_both_scales() {
+        for scale in [0.5, 5.0] {
+            let layout = BadgeLayout::new(scale);
+            let mut pb = PixelBuffer::new(120, 80);
+            render_backoff_bar(&mut pb, 10, 5, 100, 0.5, &layout);
+            for y in 5..5 + layout.phase_line_height {
+                assert_eq!(pixel(&pb, 10, y), PHASE_AMBER, "scale {scale}, row {y}");
+            }
+            assert_eq!(pixel(&pb, 10, 5 + layout.phase_line_height), [0, 0, 0, 0]);
+        }
     }
 
     /// Spec: the centre badge text during a server backoff names
@@ -4243,7 +4679,16 @@ mod tests {
         let mut pb = PixelBuffer::new(SPEC_W, SPEC_H);
         // Pre-fill so any change is detectable.
         pb.clear([0, 0, 0, 0]);
-        render_retry_counter(&mut pb, font, 2, 4, 0, 5, 1.0);
+        render_retry_counter(
+            &mut pb,
+            font,
+            2,
+            4,
+            0,
+            5,
+            1.0,
+            BadgeLayout::new(1.0).retry_font_size,
+        );
         let any_painted = pb.data.iter().any(|&b| b != 0);
         assert!(!any_painted, "attempt=0 must not paint anything");
     }
@@ -4259,7 +4704,16 @@ mod tests {
         };
         let mut pb = PixelBuffer::new(SPEC_W, SPEC_H);
         pb.clear([0, 0, 0, 0]);
-        render_retry_counter(&mut pb, font, 2, 4, 1, 5, 1.0);
+        render_retry_counter(
+            &mut pb,
+            font,
+            2,
+            4,
+            1,
+            5,
+            1.0,
+            BadgeLayout::new(1.0).retry_font_size,
+        );
         let any_painted = pb.data.iter().any(|&b| b != 0);
         assert!(any_painted, "attempt>=1 must produce visible pixels");
     }
@@ -4277,8 +4731,26 @@ mod tests {
         full.clear([0, 0, 0, 0]);
         let mut half = PixelBuffer::new(SPEC_W, SPEC_H);
         half.clear([0, 0, 0, 0]);
-        render_retry_counter(&mut full, font, 2, 4, 1, 5, 1.0);
-        render_retry_counter(&mut half, font, 2, 4, 1, 5, 0.5);
+        render_retry_counter(
+            &mut full,
+            font,
+            2,
+            4,
+            1,
+            5,
+            1.0,
+            BadgeLayout::new(1.0).retry_font_size,
+        );
+        render_retry_counter(
+            &mut half,
+            font,
+            2,
+            4,
+            1,
+            5,
+            0.5,
+            BadgeLayout::new(1.0).retry_font_size,
+        );
 
         let full_brightness: u64 = full.data.iter().map(|&b| b as u64).sum();
         let half_brightness: u64 = half.data.iter().map(|&b| b as u64).sum();

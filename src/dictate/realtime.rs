@@ -958,6 +958,8 @@ mod tests {
                 pause_audio: false,
                 suppress_boop: None,
                 overlay: crate::audio::recording_feedback::RecordingOverlayOptions {
+                    badge: crate::config::OverlaySettings::default(),
+                    no_sound: crate::config::IndicatorsConfig::default().no_sound,
                     silence_tx: None,
                     auto_pause: false,
                     telemetry_rx: None,
@@ -1036,6 +1038,8 @@ mod tests {
                 pause_audio: false,
                 suppress_boop: None,
                 overlay: crate::audio::recording_feedback::RecordingOverlayOptions {
+                    badge: crate::config::OverlaySettings::default(),
+                    no_sound: crate::config::IndicatorsConfig::default().no_sound,
                     silence_tx: None,
                     auto_pause: false,
                     telemetry_rx: None,
@@ -1148,6 +1152,8 @@ mod tests {
                 pause_audio: false,
                 suppress_boop: None,
                 overlay: crate::audio::recording_feedback::RecordingOverlayOptions {
+                    badge: crate::config::OverlaySettings::default(),
+                    no_sound: crate::config::IndicatorsConfig::default().no_sound,
                     silence_tx: None,
                     auto_pause: false,
                     telemetry_rx: None,
