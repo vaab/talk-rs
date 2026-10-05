@@ -28,6 +28,11 @@ const WARMUP_SECS: f64 = 0.20;
 /// actually emits the final audio before we move on.
 const DRAIN_SECS: f64 = 0.15;
 
+/// Error limit on waiting for the device-reported emission instant of a
+/// sound.  Indicator tones are never a capture gate, so exceeding it only
+/// shortens the wait; it is not a readiness assumption.
+const EMISSION_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 // ── Tone parameters ──────────────────────────────────────────────────
 
 /// Base frequency for indicator tones (Hz).
@@ -162,6 +167,13 @@ struct PlaybackState {
     samples: Vec<f32>,
     /// Read position within the buffer.
     position: usize,
+    /// Wall-clock instant at which the output device reported it would
+    /// emit the last frame of the current sound.  Set by the output
+    /// callback when the sound's final sample is written AND the backend
+    /// reported a playback timestamp; `None` otherwise.
+    emission_end: Option<std::time::Instant>,
+    /// Device output latency reported with `emission_end` (diagnostic).
+    output_latency: Option<std::time::Duration>,
 }
 
 impl PlaybackState {
@@ -169,6 +181,8 @@ impl PlaybackState {
         Self {
             samples: Vec::new(),
             position: 0,
+            emission_end: None,
+            output_latency: None,
         }
     }
 
@@ -176,6 +190,8 @@ impl PlaybackState {
     fn replace(&mut self, samples: Vec<f32>) {
         self.samples = samples;
         self.position = 0;
+        self.emission_end = None;
+        self.output_latency = None;
     }
 
     /// Fill `output` with mono samples, advancing the read position.
@@ -195,6 +211,42 @@ impl PlaybackState {
 
 // ── Output callback ──────────────────────────────────────────────────
 
+/// Timing of one output callback, as reported by the audio backend.
+#[derive(Debug, Clone, Copy)]
+struct CallbackTiming {
+    /// Wall-clock instant at which the callback ran.
+    wall: std::time::Instant,
+    /// Delay between the callback and the moment the first frame of
+    /// this buffer is played by the device (`playback - callback`).
+    /// `None` when the backend gave no usable timestamp.
+    latency: Option<std::time::Duration>,
+    /// Output sample rate (frames per second).
+    sample_rate: u32,
+}
+
+/// Wall-clock instant at which the device emits the end of the frame
+/// numbered `frames_into_buffer` (counted from the buffer start).
+///
+/// The first frame of the buffer is played `latency` after the callback;
+/// each further frame adds one sample period.  Returns `None` without a
+/// reported latency: emission time is then unknown, never guessed here.
+fn emission_end(
+    callback_wall: std::time::Instant,
+    latency: Option<std::time::Duration>,
+    frames_into_buffer: usize,
+    sample_rate: u32,
+) -> Option<std::time::Instant> {
+    // No output device has zero latency: a zero delay means the backend
+    // (e.g. ALSA through pipewire-alsa) did not really report one.
+    let latency = latency.filter(|latency| !latency.is_zero())?;
+    if sample_rate == 0 {
+        return None;
+    }
+    let frames =
+        std::time::Duration::from_secs_f64(frames_into_buffer as f64 / f64::from(sample_rate));
+    Some(callback_wall + latency + frames)
+}
+
 /// Fill an output buffer from the playback state.
 ///
 /// Reads mono samples from `state`, duplicates them across `channels`,
@@ -209,10 +261,12 @@ fn fill_output_buffer(
     channels: usize,
     state: &Mutex<PlaybackState>,
     frames_output: &AtomicU64,
+    timing: Option<CallbackTiming>,
 ) {
     let frames = output.len() / channels;
 
     if let Ok(mut guard) = state.try_lock() {
+        let unfinished = guard.position < guard.samples.len();
         for frame in 0..frames {
             let sample = if guard.position < guard.samples.len() {
                 let s = guard.samples[guard.position];
@@ -223,6 +277,14 @@ fn fill_output_buffer(
             };
             for ch in 0..channels {
                 output[frame * channels + ch] = sample;
+            }
+            if unfinished && guard.position == guard.samples.len() && guard.emission_end.is_none() {
+                // The sound's last frame was written at `frame` in this
+                // buffer: record when the device will actually emit it.
+                if let Some(t) = timing {
+                    guard.emission_end = emission_end(t.wall, t.latency, frame + 1, t.sample_rate);
+                    guard.output_latency = t.latency;
+                }
             }
         }
     } else {
@@ -262,13 +324,35 @@ async fn wait_for_playback(state: &Mutex<PlaybackState>, sample_rate: u32, targe
     loop {
         let consumed = state.lock().map(|g| g.position).unwrap_or(target_len);
         if consumed >= target_len {
-            // Callback consumed everything — drain for pipeline latency.
-            tokio::time::sleep(std::time::Duration::from_secs_f64(DRAIN_SECS)).await;
-            log::debug!(
-                "play_and_wait: playback complete ({} samples), drained {:.0}ms",
-                target_len,
-                DRAIN_SECS * 1000.0,
-            );
+            let reported = state
+                .lock()
+                .ok()
+                .and_then(|g| g.emission_end.map(|end| (end, g.output_latency)));
+            match reported {
+                Some((end, latency)) => {
+                    // Wait for the instant the device itself reported it
+                    // emits the last frame (buffer playback timestamp plus
+                    // frame offset), bounded by an error limit.
+                    let now = std::time::Instant::now();
+                    let wait = end.saturating_duration_since(now).min(EMISSION_WAIT_LIMIT);
+                    tokio::time::sleep(wait).await;
+                    log::debug!(
+                        "play_and_wait: {} samples emitted (device output latency {:?}, waited {:.0}ms after last write)",
+                        target_len,
+                        latency,
+                        wait.as_secs_f64() * 1000.0,
+                    );
+                }
+                None => {
+                    // The backend reported no playback timestamp: emission
+                    // time is unknown; fall back to the bounded drain.
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(DRAIN_SECS)).await;
+                    log::warn!(
+                        "play_and_wait: no device playback timestamp; assumed emitted after {:.0}ms drain",
+                        DRAIN_SECS * 1000.0,
+                    );
+                }
+            }
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -343,8 +427,22 @@ impl SoundPlayer {
                     sample_rate: config.sample_rate(),
                     buffer_size: cpal::BufferSize::Default,
                 },
-                move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    fill_output_buffer(output, channels, &state_cb, &frames_output_cb);
+                move |output: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    let timing = CallbackTiming {
+                        wall: std::time::Instant::now(),
+                        latency: {
+                            let ts = info.timestamp();
+                            ts.playback.duration_since(&ts.callback)
+                        },
+                        sample_rate,
+                    };
+                    fill_output_buffer(
+                        output,
+                        channels,
+                        &state_cb,
+                        &frames_output_cb,
+                        Some(timing),
+                    );
                 },
                 |err| {
                     log::error!("audio output error: {}", err);
@@ -758,6 +856,59 @@ mod tests {
         assert_eq!(out, [1.0, 0.0, 0.0]);
     }
 
+    // ── emission timing tests ────────────────────────────────────────
+
+    #[test]
+    fn emission_end_adds_device_latency_and_frame_offset() {
+        let wall = std::time::Instant::now();
+        let latency = std::time::Duration::from_millis(180);
+        let end = emission_end(wall, Some(latency), 480, 48_000);
+        assert_eq!(
+            end,
+            Some(wall + latency + std::time::Duration::from_millis(10))
+        );
+    }
+
+    #[test]
+    fn emission_end_is_unknown_without_reported_latency() {
+        let wall = std::time::Instant::now();
+        assert_eq!(emission_end(wall, None, 480, 48_000), None);
+        assert_eq!(
+            emission_end(wall, Some(std::time::Duration::ZERO), 480, 48_000),
+            None,
+            "a zero delay is not a reported latency"
+        );
+        assert_eq!(
+            emission_end(wall, Some(std::time::Duration::ZERO), 1, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn fill_records_emission_of_the_last_sound_frame() {
+        let state = Arc::new(Mutex::new(PlaybackState::new()));
+        state.lock().expect("lock").replace(vec![0.5; 6]);
+        let frames_output = AtomicU64::new(0);
+        let wall = std::time::Instant::now();
+        let latency = std::time::Duration::from_millis(200);
+        let timing = CallbackTiming {
+            wall,
+            latency: Some(latency),
+            sample_rate: 1_000,
+        };
+        // First buffer: 4 of the 6 frames, sound not finished.
+        let mut out = vec![0.0; 4];
+        fill_output_buffer(&mut out, 1, &state, &frames_output, Some(timing));
+        assert_eq!(state.lock().expect("lock").emission_end, None);
+        // Second buffer: the last sound frame is its 2nd frame.
+        let mut out = vec![0.0; 4];
+        fill_output_buffer(&mut out, 1, &state, &frames_output, Some(timing));
+        assert_eq!(
+            state.lock().expect("lock").emission_end,
+            Some(wall + latency + std::time::Duration::from_millis(2))
+        );
+    }
+
     // ── fill_output_buffer tests ─────────────────────────────────────
 
     #[test]
@@ -768,7 +919,7 @@ mod tests {
         state.lock().unwrap().replace(vec![0.5, -0.3, 0.7]);
 
         let mut output = vec![0.0f32; 4]; // 4 frames, mono
-        fill_output_buffer(&mut output, 1, &state, &frames_output);
+        fill_output_buffer(&mut output, 1, &state, &frames_output, None);
 
         assert_eq!(output, [0.5, -0.3, 0.7, 0.0]);
         assert_eq!(state.lock().unwrap().position, 3);
@@ -783,7 +934,7 @@ mod tests {
 
         // 2 frames × 2 channels = 4 samples in output buffer
         let mut output = vec![0.0f32; 4];
-        fill_output_buffer(&mut output, 2, &state, &frames_output);
+        fill_output_buffer(&mut output, 2, &state, &frames_output, None);
 
         // Each mono sample duplicated to both channels
         assert_eq!(output, [0.5, 0.5, -0.3, -0.3]);
@@ -797,12 +948,12 @@ mod tests {
         let frames_output = Arc::new(AtomicU64::new(0));
 
         let mut output = vec![0.0f32; 8]; // 8 frames, mono
-        fill_output_buffer(&mut output, 1, &state, &frames_output);
+        fill_output_buffer(&mut output, 1, &state, &frames_output, None);
         assert_eq!(frames_output.load(Ordering::Acquire), 8);
 
         // Another call accumulates
         let mut output2 = vec![0.0f32; 4];
-        fill_output_buffer(&mut output2, 1, &state, &frames_output);
+        fill_output_buffer(&mut output2, 1, &state, &frames_output, None);
         assert_eq!(frames_output.load(Ordering::Acquire), 12);
     }
 
@@ -817,7 +968,7 @@ mod tests {
         let _guard = state.lock().unwrap();
 
         let mut output = vec![0.0f32; 3];
-        fill_output_buffer(&mut output, 1, &state, &frames_output);
+        fill_output_buffer(&mut output, 1, &state, &frames_output, None);
 
         // Should be all silence because lock was contended
         assert_eq!(output, [0.0, 0.0, 0.0]);
@@ -833,7 +984,7 @@ mod tests {
         state.lock().unwrap().replace(vec![1.0]);
 
         let mut output = vec![0.0f32; 4];
-        fill_output_buffer(&mut output, 1, &state, &frames_output);
+        fill_output_buffer(&mut output, 1, &state, &frames_output, None);
 
         assert_eq!(output, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(state.lock().unwrap().position, 1);
@@ -865,7 +1016,7 @@ mod tests {
                 let mut captured = Vec::new();
                 while !stop_cb.load(Ordering::Acquire) {
                     let mut buffer = vec![0.0f32; frames_per_callback * channels];
-                    fill_output_buffer(&mut buffer, channels, &state, &frames_output);
+                    fill_output_buffer(&mut buffer, channels, &state, &frames_output, None);
                     captured.extend_from_slice(&buffer);
                     std::thread::sleep(interval);
                 }
@@ -917,7 +1068,7 @@ mod tests {
         let mut contended = vec![-1.0; 256];
         {
             let held = state.lock().unwrap();
-            fill_output_buffer(&mut contended, 1, &state, &frames_output);
+            fill_output_buffer(&mut contended, 1, &state, &frames_output, None);
             assert_eq!(contended, vec![0.0; 256]);
             assert_eq!(held.position, 0);
         }
@@ -928,7 +1079,7 @@ mod tests {
             let mut output = contended;
             for _ in 0..target_len.div_ceil(256) {
                 let mut buffer = vec![0.0; 256];
-                fill_output_buffer(&mut buffer, 1, &callback_state, &callback_frames);
+                fill_output_buffer(&mut buffer, 1, &callback_state, &callback_frames, None);
                 output.extend(buffer);
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }

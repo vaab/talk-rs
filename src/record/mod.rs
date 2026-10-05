@@ -143,36 +143,7 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
     // Parse arguments
     let output_path = parse_args(&opts.args)?;
 
-    // Bluetooth headset profile auto-switching.  Resolution order:
-    // CLI flag `--no-bt-auto-switch` wins; otherwise config
-    // `audio.bt_auto_switch` (default `true`).  When enabled we
-    // recover any stale profile from a prior unclean termination,
-    // then switch the headset to HFP for microphone capture.  The
-    // returned guard restores the original profile on Drop (normal
-    // return, panic, SIGINT).  Failures are logged but non-fatal.
     let config_for_bt = Config::load(None).ok();
-    let bt_auto_switch_enabled = !opts.no_bt_auto_switch
-        && config_for_bt
-            .as_ref()
-            .and_then(|c| c.audio.as_ref())
-            .map(|a| a.bt_auto_switch_enabled())
-            .unwrap_or(true);
-    let mut bt_guard = if !bt_auto_switch_enabled {
-        log::debug!("bt_profile: auto-switching disabled by config/flag");
-        bt_profile::HeadsetGuard::new(None)
-    } else {
-        if let Err(err) = bt_profile::recover_stale_profile() {
-            log::warn!("bt_profile: stale-recovery failed (non-fatal): {}", err);
-        }
-        let saved = match bt_profile::activate_headset() {
-            Ok(s) => s,
-            Err(err) => {
-                log::warn!("bt_profile: activate_headset failed (non-fatal): {}", err);
-                None
-            }
-        };
-        bt_profile::HeadsetGuard::new(saved)
-    };
 
     // Resolve the human-facing recording quality (sample rate /
     // channels / bitrate).  This is intentionally NOT `AudioConfig::new()`
@@ -190,19 +161,6 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
         audio_config.channels,
         audio_config.bitrate
     );
-
-    // Initialize audio capture.  Use PipeWire for both mic-only and
-    // mic+monitor: it negotiates the requested rate/channels with the
-    // device (duplicating a mono source to stereo when asked), which
-    // makes a 48 kHz stereo request robust even on mono-only mics —
-    // unlike the strict exact-match CpalCapture used previously.
-    let mut capture: Box<dyn AudioCapture> = if opts.monitor {
-        log::info!("recording with mic+monitor (PipeWire)");
-        Box::new(MonitorCapture::new(audio_config.clone()))
-    } else {
-        log::info!("recording with mic (PipeWire)");
-        Box::new(PipeWireCapture::new(audio_config.clone()))
-    };
 
     let viz_mode = opts.viz.or_else(|| {
         config_for_bt
@@ -244,6 +202,64 @@ pub async fn record(opts: RecordOpts) -> Result<(), TalkError> {
             telemetry_rx: None,
         },
     });
+    // Neutral "starting" badge first: instant acknowledgement, never the
+    // recording cue (that waits for proven capture, see
+    // `start_capture_with_feedback`).
+    feedback.prepare_recording();
+
+    // Bluetooth headset profile auto-switching.  Resolution order:
+    // CLI flag `--no-bt-auto-switch` wins; otherwise config
+    // `audio.bt_auto_switch` (default `true`).  When enabled we
+    // recover any stale profile from a prior unclean termination,
+    // then switch the headset to HFP for microphone capture.  The
+    // returned guard restores the original profile on Drop (normal
+    // return, panic, SIGINT).  Failures are logged but non-fatal.
+    let bt_auto_switch_enabled = !opts.no_bt_auto_switch
+        && config_for_bt
+            .as_ref()
+            .and_then(|c| c.audio.as_ref())
+            .map(|a| a.bt_auto_switch_enabled())
+            .unwrap_or(true);
+    let mut bt_guard = if !bt_auto_switch_enabled {
+        log::debug!("bt_profile: auto-switching disabled by config/flag");
+        bt_profile::HeadsetGuard::new(None)
+    } else {
+        if let Err(err) = bt_profile::recover_stale_profile() {
+            log::warn!("bt_profile: stale-recovery failed (non-fatal): {}", err);
+        }
+        let saved = match bt_profile::activate_headset() {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!("bt_profile: activate_headset failed (non-fatal): {}", err);
+                None
+            }
+        };
+        bt_profile::HeadsetGuard::new(saved)
+    };
+
+    // Capture is explicitly targeted at the resolved microphone (the
+    // headset's HFP source once it exists); a missing source is fatal.
+    let source = match bt_profile::resolve_capture_source(bt_auto_switch_enabled) {
+        Ok(source) => source,
+        Err(error) => {
+            feedback.teardown_recording(RecordingBadgeTeardown::Hide);
+            return Err(error);
+        }
+    };
+
+    // Initialize audio capture.  Use PipeWire for both mic-only and
+    // mic+monitor: it negotiates the requested rate/channels with the
+    // device (duplicating a mono source to stereo when asked), which
+    // makes a 48 kHz stereo request robust even on mono-only mics —
+    // unlike the strict exact-match CpalCapture used previously.
+    let mut capture: Box<dyn AudioCapture> = if opts.monitor {
+        log::info!("recording with mic+monitor (PipeWire)");
+        Box::new(MonitorCapture::new(audio_config.clone(), source))
+    } else {
+        log::info!("recording with mic (PipeWire)");
+        Box::new(PipeWireCapture::new(audio_config.clone(), source))
+    };
+
     record_audio_to_file(
         &output_path,
         audio_config,
@@ -408,13 +424,23 @@ async fn start_capture_with_feedback(
     feedback: &mut RecordingFeedback,
     capture: &mut dyn AudioCapture,
 ) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
-    // Badge first (instant visual acknowledgement), then the awaited tone,
-    // then capture so the tone never enters the recording.
-    feedback.prepare_recording();
-    feedback.play_start().await;
+    // Capture starts first and is routed into the pipeline at once, so
+    // nothing it delivers can be lost while we wait.  The red badge and
+    // tone ("speak now") follow only the capture's readiness proof.
     let raw_audio = capture.start()?;
-    feedback.start_boop();
-    Ok(feedback.route_audio(raw_audio))
+    let routed = feedback.route_audio(raw_audio);
+    let proof = capture
+        .readiness()
+        .wait(crate::audio::CAPTURE_READY_LIMIT)
+        .await;
+    if let Err(error) = feedback.announce_recording(proof).await {
+        feedback.teardown_recording(RecordingBadgeTeardown::Hide);
+        if let Err(stop_error) = capture.stop() {
+            log::warn!("failed to stop capture after readiness failure: {stop_error}");
+        }
+        return Err(error);
+    }
+    Ok(routed)
 }
 
 #[cfg(feature = "capture")]
@@ -453,6 +479,11 @@ mod tests {
     }
 
     impl AudioCapture for FiniteCapture {
+        /// Produces its own samples: no device start-up to prove.
+        fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+            crate::audio::CaptureReadiness::NotApplicable
+        }
+
         fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             tx.try_send(self.samples.clone())
@@ -584,6 +615,11 @@ mod tests {
     }
 
     impl AudioCapture for OrderedCapture {
+        /// Produces its own samples: no device start-up to prove.
+        fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+            crate::audio::CaptureReadiness::NotApplicable
+        }
+
         fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
             if let Ok(mut events) = self.events.lock() {
                 events.push("capture-start");
@@ -611,6 +647,7 @@ mod tests {
             events: Arc::clone(&events),
         };
 
+        feedback.prepare_recording();
         let _rx = start_capture_with_feedback(&mut feedback, &mut capture)
             .await
             .expect("start should succeed");
@@ -630,9 +667,12 @@ mod tests {
                 .map(|events| events.clone())
                 .unwrap_or_default(),
             vec![
-                "badge-show",
-                "start-tone",
+                "badge-arming",
                 "capture-start",
+                "capture-ready",
+                "start-tone",
+                "tone-emitted",
+                "badge-recording",
                 "boop-start",
                 "boop-cancel",
                 "badge-hide",
@@ -642,6 +682,127 @@ mod tests {
                 "stop-tone",
             ]
         );
+    }
+
+    /// Live-like capture: its device needs an arbitrary start-up delay
+    /// before delivering its first buffer, and only then proves readiness.
+    struct DelayedCapture {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        startup: std::time::Duration,
+        chunks: Vec<Vec<i16>>,
+        ready_rx: Option<crate::audio::CaptureReadyReceiver>,
+    }
+
+    impl AudioCapture for DelayedCapture {
+        fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+            match self.ready_rx.take() {
+                Some(rx) => crate::audio::CaptureReadiness::Pending(rx),
+                None => crate::audio::CaptureReadiness::NotApplicable,
+            }
+        }
+
+        fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            self.ready_rx = Some(ready_rx);
+            let events = Arc::clone(&self.events);
+            let startup = self.startup;
+            let chunks = self.chunks.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(startup).await;
+                let mut ready_tx = Some(ready_tx);
+                for chunk in chunks {
+                    if let Some(ready_tx) = ready_tx.take() {
+                        if let Ok(mut events) = events.lock() {
+                            events.push("first-buffer");
+                        }
+                        let _ = ready_tx.send(Ok(crate::audio::CaptureReady {
+                            source: "test.mic".into(),
+                            first_buffer_at: std::time::Instant::now(),
+                        }));
+                    }
+                    if tx.send(chunk).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            });
+            Ok(rx)
+        }
+
+        fn stop(&mut self) -> Result<(), TalkError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recording_cue_waits_for_first_buffer_and_keeps_every_sample() {
+        for startup_ms in [0u64, 350, 2_700] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&events), true);
+            let chunks: Vec<Vec<i16>> = (0..40)
+                .map(|index| (0..8).map(|offset| index * 8 + offset).collect())
+                .collect();
+            let mut capture = DelayedCapture {
+                events: Arc::clone(&events),
+                startup: std::time::Duration::from_millis(startup_ms),
+                chunks: chunks.clone(),
+                ready_rx: None,
+            };
+
+            feedback.prepare_recording();
+            let mut rx = start_capture_with_feedback(&mut feedback, &mut capture)
+                .await
+                .expect("readiness is proven by the first buffer");
+            let mut received = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                received.push(chunk);
+            }
+
+            let log = events.lock().map(|e| e.clone()).unwrap_or_default();
+            let first = log.iter().position(|e| *e == "first-buffer");
+            let cue = log.iter().position(|e| *e == "badge-recording");
+            assert_eq!(
+                log.first(),
+                Some(&"badge-arming"),
+                "{startup_ms}ms: {log:?}"
+            );
+            assert!(
+                matches!((first, cue), (Some(f), Some(c)) if f < c),
+                "{startup_ms}ms: cue must follow the first buffer: {log:?}"
+            );
+            assert_eq!(
+                received, chunks,
+                "{startup_ms}ms: every sample kept in order"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_failure_never_shows_the_recording_cue() {
+        struct FailingCapture;
+        impl AudioCapture for FailingCapture {
+            fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Err(TalkError::Audio("stream on 'test.mic' failed".into())));
+                crate::audio::CaptureReadiness::Pending(rx)
+            }
+            fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
+                Ok(tokio::sync::mpsc::channel(1).1)
+            }
+            fn stop(&mut self) -> Result<(), TalkError> {
+                Ok(())
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&events), true);
+        feedback.prepare_recording();
+        let error = start_capture_with_feedback(&mut feedback, &mut FailingCapture)
+            .await
+            .expect_err("missing proof must fail");
+        assert!(error.to_string().contains("test.mic"));
+        let log = events.lock().map(|e| e.clone()).unwrap_or_default();
+        assert_eq!(log, vec!["badge-arming", "boop-cancel", "badge-hide"]);
     }
 
     #[test]

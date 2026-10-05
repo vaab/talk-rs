@@ -302,20 +302,18 @@ pub(crate) async fn dictate_oneshot(
             }
         }
 
-        // Restore the Bluetooth headset to its high-quality profile
-        // (typically A2DP) the instant the microphone capture stops,
-        // in parallel with transcription + paste.  The user hears
-        // their music / system audio in stereo again within ~1 s of
-        // pressing the toggle, instead of waiting for the entire
-        // dictation pipeline to finish.  Drop on the empty guard at
-        // function exit is then a no-op.
-        bt_guard.restore_now_async();
-
         // Immediate audible + visual feedback: the user hears the
         // stop sound and sees the "transcribing" badge the instant
         // they toggle, not after the API call finishes.
         feedback.teardown_recording(RecordingBadgeTeardown::KeepVisible);
         feedback.play_stop().await;
+        // Restore the Bluetooth headset to its high-quality profile
+        // (typically A2DP) right after the stop tone, in parallel with
+        // transcription + paste.  The tone must play first: the profile
+        // switch tears down the voice link carrying it, which made it
+        // inaudible.  Drop on the empty guard at function exit is then a
+        // no-op.
+        bt_guard.restore_now_async();
         if let Some(viz) = visualizer {
             viz.hide();
         }
@@ -570,6 +568,11 @@ mod tests {
         let cache = dir.path().join("busy.ogg");
         struct StopNotifyingCapture(Option<oneshot::Sender<()>>);
         impl AudioCapture for StopNotifyingCapture {
+            /// Produces its own samples: no device start-up to prove.
+            fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+                crate::audio::CaptureReadiness::NotApplicable
+            }
+
             fn start(&mut self) -> Result<mpsc::Receiver<Vec<i16>>, TalkError> {
                 Err(TalkError::Audio("test capture is already started".into()))
             }
@@ -962,6 +965,11 @@ mod perf_single_encode {
         // pipeline to the live loop.
         struct StopNotifying(Option<tokio::sync::oneshot::Sender<()>>);
         impl AudioCapture for StopNotifying {
+            /// Produces its own samples: no device start-up to prove.
+            fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+                crate::audio::CaptureReadiness::NotApplicable
+            }
+
             fn start(&mut self) -> Result<mpsc::Receiver<Vec<i16>>, TalkError> {
                 Err(TalkError::Audio("already started".into()))
             }

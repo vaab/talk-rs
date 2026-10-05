@@ -645,6 +645,11 @@ mod paced {
     }
 
     impl AudioCapture for PacedWavSource {
+        /// Produces its own samples: no device start-up to prove.
+        fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+            crate::audio::CaptureReadiness::NotApplicable
+        }
+
         fn start(&mut self) -> Result<mpsc::Receiver<Vec<i16>>, TalkError> {
             let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
             let samples = Arc::clone(&self.samples);

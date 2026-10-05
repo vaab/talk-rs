@@ -152,15 +152,54 @@ impl RecordingFeedback {
         }
     }
 
-    /// Show the recording badge before the start tone.
+    /// Show the neutral "starting" badge as soon as the shortcut is handled.
     ///
-    /// The badge is the user's immediate visual acknowledgement of the
-    /// shortcut, so it must not wait for the tone (~0.4 s) or capture.
-    /// Capture itself still starts only after [`play_start`](Self::play_start)
-    /// so the tone never enters the recording.
+    /// This is the user's immediate visual acknowledgement; it is NOT the
+    /// recording cue.  The red recording badge is only shown by
+    /// [`announce_recording`](Self::announce_recording) once capture has
+    /// proven it is delivering audio and the start tone was emitted.
     pub fn prepare_recording(&mut self) {
         self.initialize_display();
+        #[cfg(test)]
+        if self.test_badge_available {
+            self.record_test_event("badge-arming");
+        }
+        #[cfg(feature = "ui")]
+        if let Some(overlay) = &self.overlay {
+            log::debug!("showing arming overlay");
+            overlay.show(crate::x11::overlay::IndicatorKind::Arming);
+        }
+    }
+
+    /// Give the "speak now" cue, but only on proven capture readiness.
+    ///
+    /// `proof` is the outcome of waiting for the capture's readiness
+    /// (`Ok(None)` for sources that produce their own samples, such as
+    /// file replay).  On success: play the start tone and wait until the
+    /// output device reports it emitted, then show the red recording badge
+    /// and start the boop loop.  On failure nothing is cued and the error
+    /// is returned; the caller tears the feedback down.
+    ///
+    /// Capture is already running while the tone plays, so every sample
+    /// from the first buffer on is kept (the tone may be faintly captured).
+    pub async fn announce_recording(
+        &mut self,
+        proof: Result<Option<crate::audio::CaptureReady>, crate::error::TalkError>,
+    ) -> Result<Option<crate::audio::CaptureReady>, crate::error::TalkError> {
+        let proof = proof?;
+        self.record_test_event("capture-ready");
+        if let Some(ready) = &proof {
+            log::info!(
+                "capture proven on '{}' ({:.0}ms ago)",
+                ready.source,
+                ready.first_buffer_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        self.play_start().await;
+        self.record_test_event("tone-emitted");
         self.show_recording_badge();
+        self.start_boop();
+        Ok(proof)
     }
 
     /// Initialize display resources (overlay thread).  Idempotent.
@@ -172,7 +211,7 @@ impl RecordingFeedback {
     pub fn show_recording_badge(&self) {
         #[cfg(test)]
         if self.test_badge_available {
-            self.record_test_event("badge-show");
+            self.record_test_event("badge-recording");
         }
 
         #[cfg(feature = "ui")]
@@ -239,15 +278,6 @@ impl RecordingFeedback {
         if let Some(player) = &self.player {
             log::debug!("playing stop sound");
             player.play_stop().await;
-        }
-    }
-
-    /// Start the stop tone without waiting for device drain.  Realtime
-    /// dictation historically starts this tone before capture shutdown, then
-    /// performs its awaited stop feedback after the WebSocket closes.
-    pub fn play_stop_now(&self) {
-        if let Some(player) = &self.player {
-            player.play(&player.sounds.stop);
         }
     }
 
@@ -382,19 +412,69 @@ mod tests {
         let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&log), true);
 
         feedback.prepare_recording();
-        feedback.play_start().await;
-        feedback.start_boop();
+        feedback
+            .announce_recording(Ok(None))
+            .await
+            .expect("file source needs no proof");
         feedback.teardown_recording(RecordingBadgeTeardown::Hide);
 
         assert_eq!(
             events(&log),
             vec![
-                "badge-show",
+                "badge-arming",
+                "capture-ready",
                 "start-tone",
+                "tone-emitted",
+                "badge-recording",
                 "boop-start",
                 "boop-cancel",
                 "badge-hide"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_cue_follows_capture_proof_and_tone_emission() {
+        let log = event_log();
+        let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&log), true);
+        feedback.prepare_recording();
+        feedback
+            .announce_recording(Ok(Some(crate::audio::CaptureReady {
+                source: "test.microphone".into(),
+                first_buffer_at: std::time::Instant::now(),
+            })))
+            .await
+            .expect("proof permits the recording cue");
+
+        assert_eq!(
+            events(&log),
+            vec![
+                "badge-arming",
+                "capture-ready",
+                "start-tone",
+                "tone-emitted",
+                "badge-recording",
+                "boop-start"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_capture_proof_never_shows_recording_cue() {
+        let log = event_log();
+        let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&log), true);
+        feedback.prepare_recording();
+        let failure = feedback
+            .announce_recording(Err(crate::error::TalkError::Audio(
+                "test.microphone: first buffer not delivered".into(),
+            )))
+            .await;
+        feedback.teardown_recording(RecordingBadgeTeardown::Hide);
+
+        assert!(failure.is_err());
+        assert_eq!(
+            events(&log),
+            vec!["badge-arming", "boop-cancel", "badge-hide"]
         );
     }
 
@@ -415,14 +495,23 @@ mod tests {
         let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&log), false);
 
         feedback.prepare_recording();
-        feedback.play_start().await;
-        feedback.start_boop();
+        feedback
+            .announce_recording(Ok(None))
+            .await
+            .expect("file source needs no proof");
         feedback.teardown_recording(RecordingBadgeTeardown::Hide);
         feedback.play_stop().await;
 
         assert_eq!(
             events(&log),
-            vec!["start-tone", "boop-start", "boop-cancel", "stop-tone"]
+            vec![
+                "capture-ready",
+                "start-tone",
+                "tone-emitted",
+                "boop-start",
+                "boop-cancel",
+                "stop-tone"
+            ]
         );
     }
 
@@ -432,13 +521,25 @@ mod tests {
         let mut feedback = RecordingFeedback::new_for_test(Arc::clone(&log), true);
 
         feedback.prepare_recording();
-        feedback.start_boop();
+        feedback
+            .announce_recording(Ok(None))
+            .await
+            .expect("file source needs no proof");
         feedback.teardown_recording(RecordingBadgeTeardown::KeepVisible);
         feedback.play_stop().await;
 
         assert_eq!(
             events(&log),
-            vec!["badge-show", "boop-start", "boop-cancel", "stop-tone"]
+            vec![
+                "badge-arming",
+                "capture-ready",
+                "start-tone",
+                "tone-emitted",
+                "badge-recording",
+                "boop-start",
+                "boop-cancel",
+                "stop-tone"
+            ]
         );
     }
 

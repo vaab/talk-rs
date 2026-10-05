@@ -240,6 +240,46 @@ pub enum IndicatorKind {
     /// overlay on top.  The three states (Recording, Transcribing,
     /// DownloadingModel) are mutually exclusive.
     DownloadingModel,
+    /// Neutral badge shown from the shortcut until capture readiness is
+    /// proven and the start tone has been emitted.
+    ///
+    /// Rendered like [`IndicatorKind::DownloadingModel`] (dimmed
+    /// background, static grey "STARTING" text, no red dot) so it can
+    /// never be mistaken for the red "speak now" recording cue.
+    Arming,
+}
+
+impl IndicatorKind {
+    /// Static text badge drawn for non-live states, with its BGRA colour.
+    ///
+    /// `None` for states that are not a static text badge.
+    fn static_badge(self) -> Option<StaticBadge> {
+        match self {
+            Self::DownloadingModel => Some(StaticBadge {
+                text: "DOWNLOADING MODEL",
+                color: [0xFF, 0xCC, 0x66, 0xFF], // light blue BGRA
+                live: false,
+            }),
+            // Capture already runs while arming: the dimmed waterfall
+            // shows the live microphone under the grey text.
+            Self::Arming => Some(StaticBadge {
+                text: "STARTING",
+                color: [0xA0, 0xA0, 0xA0, 0xFF], // neutral grey BGRA
+                live: true,
+            }),
+            Self::Recording | Self::Transcribing => None,
+        }
+    }
+}
+
+/// Text and colour of a static (non-live) badge state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticBadge {
+    text: &'static str,
+    color: [u8; 4],
+    /// Whether the dimmed waterfall shows live audio (true) or keeps
+    /// scrolling with empty columns (false).
+    live: bool,
 }
 
 /// Commands sent from the main thread to the overlay thread.
@@ -1848,34 +1888,22 @@ fn render_transcribing_text(
     render_badge_text(pb, font, "TRANSCRIBING", color, x0, y0, w, h, font_size);
 }
 
-/// Render "DOWNLOADING MODEL" text, centred in the SPEC area.
+/// Render a static badge text (e.g. "DOWNLOADING MODEL", "STARTING"),
+/// centred in the SPEC area.
 ///
-/// Same rendering path as [`render_transcribing_text`]; reuses the
-/// light-blue colour so the static-badge family stays
-/// theme-consistent.  Used while the local speech model is
-/// downloading (a one-time, multi-second operation that blocks the
-/// first recording).
-fn render_downloading_text(
+/// Same rendering path as [`render_transcribing_text`].
+#[allow(clippy::too_many_arguments)] // mirrors render_badge_text's geometry arguments
+fn render_static_badge_text(
     pb: &mut PixelBuffer,
     font: &fontdue::Font,
+    badge: StaticBadge,
     x0: usize,
     y0: usize,
     w: usize,
     h: usize,
     font_size: f32,
 ) {
-    let color: [u8; 4] = [0xFF, 0xCC, 0x66, 0xFF]; // light blue BGRA
-    render_badge_text(
-        pb,
-        font,
-        "DOWNLOADING MODEL",
-        color,
-        x0,
-        y0,
-        w,
-        h,
-        font_size,
-    );
+    render_badge_text(pb, font, badge.text, badge.color, x0, y0, w, h, font_size);
 }
 
 /// Font size for the retry-attempt counter.  Smaller than the
@@ -2352,7 +2380,9 @@ fn overlay_thread(
     // the render path treats it identically to `is_transcribing`
     // (dimmed background + static text overlay) but draws
     // "DOWNLOADING MODEL" instead of "TRANSCRIBING".
-    let mut is_downloading: bool = false;
+    // Generalised to every static text badge (`IndicatorKind::Arming`
+    // shows "STARTING" the same way).
+    let mut static_badge: Option<StaticBadge> = None;
 
     // ── Byte throughput state (Layer 3b) ─────────────────────────
     //
@@ -2463,7 +2493,7 @@ fn overlay_thread(
                     current_gc = Some(gc);
                     is_recording = true;
                     is_transcribing = false;
-                    is_downloading = false;
+                    static_badge = None;
                     analysis.reset();
                     phase_history.clear();
                     upload_history.clear();
@@ -2489,7 +2519,7 @@ fn overlay_thread(
                 Command::Show(IndicatorKind::Transcribing) => {
                     destroy_current(&conn, &mut current_window, &mut current_gc);
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
-                    is_downloading = false;
+                    static_badge = None;
                     show_transcribing(
                         &conn,
                         screen,
@@ -2502,13 +2532,13 @@ fn overlay_thread(
                     )?;
                 }
 
-                Command::Show(IndicatorKind::DownloadingModel) => {
+                Command::Show(kind @ (IndicatorKind::DownloadingModel | IndicatorKind::Arming)) => {
                     // Mirror Show(Recording)'s window-creation path so the
                     // 60 fps render loop kicks in and draws the
                     // "DOWNLOADING MODEL" static text badge.  The three
                     // states (Recording / Transcribing / DownloadingModel)
                     // are mutually exclusive flags inside the render
-                    // loop; here we set is_downloading=true and
+                    // loop; here we set static_badge and
                     // is_transcribing=false.
                     destroy_current(&conn, &mut current_window, &mut current_gc);
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
@@ -2573,7 +2603,7 @@ fn overlay_thread(
                     current_gc = Some(gc);
                     is_recording = true;
                     is_transcribing = false;
-                    is_downloading = true;
+                    static_badge = kind.static_badge();
                     analysis.reset();
                     phase_history.clear();
                     upload_history.clear();
@@ -2621,7 +2651,7 @@ fn overlay_thread(
             match rx.try_recv() {
                 Ok(Command::Show(IndicatorKind::Recording)) => {
                     is_transcribing = false;
-                    is_downloading = false;
+                    static_badge = None;
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
                     analysis.reset();
                     phase_history.clear();
@@ -2651,10 +2681,12 @@ fn overlay_thread(
                     // recording has stopped), and the phase colour
                     // layer renders the HTTP lifecycle on top.
                     is_transcribing = true;
-                    is_downloading = false;
+                    static_badge = None;
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
                 }
-                Ok(Command::Show(IndicatorKind::DownloadingModel)) => {
+                Ok(Command::Show(
+                    kind @ (IndicatorKind::DownloadingModel | IndicatorKind::Arming),
+                )) => {
                     // Mutually exclusive with the other two states:
                     // the render loop keeps running, the waterfall
                     // keeps scrolling with empty columns, and the
@@ -2662,7 +2694,7 @@ fn overlay_thread(
                     // the place of "TRANSCRIBING" for the duration
                     // of the model download.
                     is_transcribing = false;
-                    is_downloading = true;
+                    static_badge = kind.static_badge();
                     destroy_current(&conn, &mut centered_window, &mut centered_gc);
                 }
                 Ok(Command::Hide) => {
@@ -2906,7 +2938,11 @@ fn overlay_thread(
         // normalization adapts smoothly even when the column rate
         // is slower.
         // (Column cadence and histories: see `FrameAnalysis::advance_column`.)
-        if analysis.advance_column(viz, sample_rate, is_transcribing || is_downloading) {
+        if analysis.advance_column(
+            viz,
+            sample_rate,
+            is_transcribing || static_badge.is_some_and(|badge| !badge.live),
+        ) {
             // Every column push — even empty columns during pause —
             // advances the absolute-column counter the time-grid
             // overlay uses to space its vertical marks one per
@@ -2980,7 +3016,7 @@ fn overlay_thread(
         // stale and the dead-signal detector fires, but we WANT to
         // keep rendering the waterfall + phase line + throughput bars
         // rather than showing the NO SOUND prohibit icon.
-        if is_transcribing || is_downloading {
+        if is_transcribing || static_badge.is_some() {
             // ── TRANSCRIBING / DOWNLOADING MODEL mode:
             //    dimmed waterfall + phase ──────────────────────
             //
@@ -3085,13 +3121,14 @@ fn overlay_thread(
             // "TRANSCRIBING" / "DOWNLOADING MODEL" text over the
             // dimmed waterfall (same pattern as "LISTENING" during
             // auto-pause).  The three flags is_recording (live),
-            // is_transcribing, and is_downloading are mutually
+            // is_transcribing, and static_badge are mutually
             // exclusive; only one static-badge text fires here.
             if let Some(ref f) = badge_font {
-                if is_downloading {
-                    render_downloading_text(
+                if let Some(badge) = static_badge {
+                    render_static_badge_text(
                         &mut pb,
                         f,
+                        badge,
                         layout.spec_left,
                         layout.spec_top,
                         layout.spec_w,

@@ -59,8 +59,11 @@ fern = "0.6"
 colored = "2"
 thiserror = "1"
 cpal = { version = "0.15", optional = true }
-pipewire = { version = "0.9", features = ["v0_3_43"], optional = true }
+pipewire = { version = "0.9", features = ["v0_3_44"], optional = true }
 libpulse-binding = { version = "2.30", optional = true }
+# Bluetooth voice-link (SCO/eSCO) state via the HCI `HCIGETCONNLIST` ioctl
+# (capture readiness proof for HFP headset microphones).
+libc = { version = "0.2", optional = true }
 rubato = "1.0"
 audioadapter-buffers = "2.0"
 opus = "0.3"
@@ -141,7 +144,7 @@ playback = ["dep:cpal"]
 # auto-switch, and the audio indicator (start/stop tones).  Required
 # by the `record` and `dictate` commands.  Pulls `playback` because
 # the capture path shares cpal.
-capture = ["playback", "dep:pipewire", "dep:libpulse-binding"]
+capture = ["playback", "dep:pipewire", "dep:libpulse-binding", "dep:libc"]
 
 # `perf-counters`: observational work counters for the performance
 # harness (``tests/perf/``, ``bin/perf-report``).  Counts HTTP

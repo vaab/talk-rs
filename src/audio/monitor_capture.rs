@@ -2,7 +2,7 @@
 //!
 //! Opens two PipeWire streams on a single main loop:
 //!
-//! - **Mic** – default audio source (microphone).
+//! - **Mic** – the explicitly targeted microphone source.
 //! - **Monitor** – monitor port of the default audio sink (system
 //!   playback, e.g. conference call audio).
 //!
@@ -14,11 +14,15 @@
 //! callbacks never run concurrently, so the shared state uses
 //! `Rc<RefCell<>>` instead of a mutex.
 
-use super::pipewire_capture::serialize_audio_info;
-use super::{AudioCapture, CHANNEL_CAPACITY, CHUNK_DURATION_MS};
+use super::pipewire_capture::{
+    capture_properties, serialize_audio_info, ChunkForwarder, ReadinessProbe,
+};
+use super::{
+    AudioCapture, CaptureReadiness, CaptureReadyReceiver, CHANNEL_CAPACITY, CHUNK_DURATION_MS,
+};
 use crate::config::AudioConfig;
 use crate::error::TalkError;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use pipewire as pw;
 use pw::spa;
@@ -42,7 +46,7 @@ struct Terminate;
 struct MixerState {
     mic_buf: Vec<i16>,
     mon_buf: Vec<i16>,
-    audio_tx: mpsc::Sender<Vec<i16>>,
+    forwarder: ChunkForwarder,
     samples_per_chunk: usize,
 }
 
@@ -51,7 +55,7 @@ impl MixerState {
         Self {
             mic_buf: Vec::with_capacity(samples_per_chunk * 2),
             mon_buf: Vec::with_capacity(samples_per_chunk * 2),
-            audio_tx,
+            forwarder: ChunkForwarder::new(audio_tx),
             samples_per_chunk,
         }
     }
@@ -71,6 +75,7 @@ impl MixerState {
     /// Mix and emit chunks while both buffers have enough data.
     fn try_emit(&mut self) {
         let n = self.samples_per_chunk;
+        self.forwarder.drain();
         while self.mic_buf.len() >= n && self.mon_buf.len() >= n {
             let mixed: Vec<i16> = self
                 .mic_buf
@@ -78,9 +83,7 @@ impl MixerState {
                 .zip(self.mon_buf.drain(..n))
                 .map(|(m, s)| m.saturating_add(s))
                 .collect();
-            if self.audio_tx.try_send(mixed).is_err() {
-                log::warn!("audio channel full, dropped {} samples", n);
-            }
+            self.forwarder.push(mixed);
         }
     }
 
@@ -94,17 +97,20 @@ impl MixerState {
         for buf in [&mut self.mic_buf, &mut self.mon_buf] {
             while buf.len() >= n {
                 let chunk: Vec<i16> = buf.drain(..n).collect();
-                if self.audio_tx.try_send(chunk).is_err() {
-                    log::warn!("audio channel full during flush");
-                }
+                self.forwarder.push(chunk);
             }
             // Send any remaining partial chunk.
             if !buf.is_empty() {
                 let partial: Vec<i16> = std::mem::take(buf);
-                if self.audio_tx.try_send(partial).is_err() {
-                    log::warn!("audio channel full during partial flush");
-                }
+                self.forwarder.push(partial);
             }
+        }
+        let pending = self.forwarder.pending();
+        if pending > 0 {
+            log::warn!(
+                "audio channel full at capture stop, dropped {} trailing chunks",
+                pending
+            );
         }
     }
 }
@@ -112,15 +118,22 @@ impl MixerState {
 /// Audio capture that mixes microphone and system-audio monitor.
 pub struct MonitorCapture {
     config: AudioConfig,
+    /// Microphone source (node name) the mic stream is linked to.
+    source: String,
+    /// Readiness proof of the mic stream, taken by `readiness()`.
+    ready_rx: Option<CaptureReadyReceiver>,
     thread_handle: Option<std::thread::JoinHandle<()>>,
     quit_sender: Option<pw::channel::Sender<Terminate>>,
 }
 
 impl MonitorCapture {
-    /// Create a new monitor capture with the given audio configuration.
-    pub fn new(config: AudioConfig) -> Self {
+    /// Create a monitor capture whose microphone stream is explicitly
+    /// targeted at `source`.
+    pub fn new(config: AudioConfig, source: String) -> Self {
         Self {
             config,
+            source,
+            ready_rx: None,
             thread_handle: None,
             quit_sender: None,
         }
@@ -140,13 +153,23 @@ impl AudioCapture for MonitorCapture {
         let channels = self.config.channels;
         let frames_per_chunk = (rate as usize * CHUNK_DURATION_MS as usize) / 1000;
         let samples_per_chunk = frames_per_chunk * channels as usize;
+        // Readiness is the MIC stream's proof: the monitor may
+        // legitimately be silent or suspended.
+        let (probe, ready_rx) = ReadinessProbe::for_source(self.source.clone());
+        let source = self.source.clone();
 
         let handle = std::thread::Builder::new()
             .name("pipewire-monitor".into())
             .spawn(move || {
-                if let Err(e) =
-                    run_monitor_loop(quit_rx, audio_tx, rate, channels, samples_per_chunk)
-                {
+                if let Err(e) = run_monitor_loop(
+                    quit_rx,
+                    audio_tx,
+                    rate,
+                    channels,
+                    samples_per_chunk,
+                    &source,
+                    probe,
+                ) {
                     log::error!("PipeWire monitor capture error: {}", e);
                 }
             })
@@ -156,8 +179,20 @@ impl AudioCapture for MonitorCapture {
 
         self.thread_handle = Some(handle);
         self.quit_sender = Some(quit_tx);
+        self.ready_rx = Some(ready_rx);
 
         Ok(audio_rx)
+    }
+
+    fn readiness(&mut self) -> CaptureReadiness {
+        match self.ready_rx.take() {
+            Some(rx) => CaptureReadiness::Pending(rx),
+            None => {
+                // Not started: a closed channel makes the waiter fail.
+                let (_, rx) = oneshot::channel();
+                CaptureReadiness::Pending(rx)
+            }
+        }
     }
 
     fn stop(&mut self) -> Result<(), TalkError> {
@@ -186,6 +221,8 @@ fn run_monitor_loop(
     rate: u32,
     channels: u8,
     samples_per_chunk: usize,
+    source: &str,
+    probe: ReadinessProbe,
 ) -> Result<(), TalkError> {
     let mainloop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| TalkError::Audio(format!("PipeWire MainLoop: {}", e)))?;
@@ -217,21 +254,24 @@ fn run_monitor_loop(
     let mic_pod_bytes = format_bytes.clone();
     let mon_pod_bytes = format_bytes;
 
-    // ── Stream 1: Microphone (default source) ───────────────────────
-    let mic_props = pw::properties::properties! {
-        *pw::keys::MEDIA_TYPE     => "Audio",
-        *pw::keys::MEDIA_CATEGORY => "Capture",
-        *pw::keys::MEDIA_ROLE     => "Speech",
-    };
+    // ── Stream 1: Microphone (explicit target) ──────────────────────
+    let mic_props = capture_properties("Speech", source);
+    let probe = Rc::new(RefCell::new(probe));
 
     let mic_stream = pw::stream::StreamRc::new(core.clone(), "talk-rs-mic", mic_props)
         .map_err(|e| TalkError::Audio(format!("PipeWire mic stream: {}", e)))?;
 
     let mic_state = Rc::clone(&state);
+    let mic_probe = Rc::clone(&probe);
     let _mic_listener = mic_stream
         .add_local_listener()
+        .state_changed({
+            let probe = Rc::clone(&probe);
+            move |_, _: &mut (), old, new| probe.borrow_mut().on_state(&old, &new)
+        })
         .process(move |stream_ref, _: &mut ()| {
-            decode_and_push(stream_ref, &mic_state, true);
+            let delivered = decode_and_push(stream_ref, &mic_state, true);
+            mic_probe.borrow_mut().on_buffer(&delivered);
         })
         .register()
         .map_err(|e| TalkError::Audio(format!("PipeWire mic listener: {}", e)))?;
@@ -249,7 +289,8 @@ fn run_monitor_loop(
         .map_err(|e| TalkError::Audio(format!("PipeWire mic connect: {}", e)))?;
 
     log::info!(
-        "PipeWire mic capture started: {}Hz, {} ch, s16le",
+        "PipeWire mic capture started on '{}': {}Hz, {} ch, s16le",
+        source,
         rate,
         channels
     );
@@ -305,19 +346,23 @@ fn run_monitor_loop(
 }
 
 /// Decode s16le bytes from a PipeWire buffer and push them into the
-/// shared [`MixerState`].
-fn decode_and_push(stream_ref: &pw::stream::Stream, state: &Rc<RefCell<MixerState>>, is_mic: bool) {
+/// shared [`MixerState`].  Returns the delivered samples.
+fn decode_and_push(
+    stream_ref: &pw::stream::Stream,
+    state: &Rc<RefCell<MixerState>>,
+    is_mic: bool,
+) -> Vec<i16> {
     let Some(mut pw_buf) = stream_ref.dequeue_buffer() else {
-        return;
+        return Vec::new();
     };
     let datas = pw_buf.datas_mut();
     if datas.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let size = datas[0].chunk().size() as usize;
     let Some(raw) = datas[0].data() else {
-        return;
+        return Vec::new();
     };
     let pcm = &raw[..size];
 
@@ -332,6 +377,7 @@ fn decode_and_push(stream_ref: &pw::stream::Stream, state: &Rc<RefCell<MixerStat
     } else {
         s.push_mon(&samples);
     }
+    samples
 }
 
 #[cfg(test)]

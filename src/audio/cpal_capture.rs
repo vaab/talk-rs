@@ -122,6 +122,19 @@ impl CpalCapture {
 }
 
 impl AudioCapture for CpalCapture {
+    /// cpal opens the *default* input device and cannot be pinned to a
+    /// named source, so it can never prove which microphone it records:
+    /// readiness is reported as an explicit failure, never assumed.
+    fn readiness(&mut self) -> super::CaptureReadiness {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Err(TalkError::Audio(
+            "cpal capture records the default input device and cannot prove \
+             readiness of a targeted source; use PipeWireCapture"
+                .into(),
+        )));
+        super::CaptureReadiness::Pending(rx)
+    }
+
     fn start(&mut self) -> Result<mpsc::Receiver<Vec<i16>>, TalkError> {
         if self.running.load(Ordering::Acquire) {
             return Err(TalkError::Audio("Capture already running".to_string()));

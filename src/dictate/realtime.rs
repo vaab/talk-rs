@@ -226,8 +226,10 @@ async fn finish_live_recording(
         Ok(())
     } else {
         feedback.teardown_recording(RecordingBadgeTeardown::KeepVisible);
-        feedback.play_stop_now();
         let result = capture.stop();
+        // Stop tone before restoring the headset profile: the switch
+        // tears down the voice link that carries the tone.
+        feedback.play_stop().await;
         bt_guard.restore_now_async();
         result
     };
@@ -586,10 +588,12 @@ pub(crate) async fn dictate_realtime(
             // stop sound the instant they toggle, not after the
             // transcription WebSocket finishes.
             feedback.teardown_recording(RecordingBadgeTeardown::KeepVisible);
-            feedback.play_stop_now();
 
             capture.stop()?;
             capture_stopped = true;
+            // Stop tone before restoring the headset profile: the
+            // switch tears down the voice link that carries the tone.
+            feedback.play_stop().await;
             // Restore the Bluetooth headset to its high-quality
             // profile (typically A2DP) the instant the microphone
             // capture stops, in parallel with the WebSocket finishing
@@ -921,6 +925,11 @@ mod tests {
     }
 
     impl AudioCapture for HoldingCapture {
+        /// Produces its own samples: no device start-up to prove.
+        fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+            crate::audio::CaptureReadiness::NotApplicable
+        }
+
         fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<Vec<i16>>, TalkError> {
             let (sender, receiver) = tokio::sync::mpsc::channel(1);
             self.sender = Some(sender);

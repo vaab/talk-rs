@@ -58,6 +58,12 @@ const PREFERRED_HFP_PROFILES: &[&str] = &[
     "headset-head-unit",
 ];
 
+/// Error limit for the headset's HFP microphone source to appear once the
+/// card is on an HFP profile.  Not a readiness assumption: the source is
+/// awaited through PulseAudio change events, and exceeding this bound
+/// aborts the recording instead of capturing from another microphone.
+pub const HEADSET_SOURCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Application name reported to the PulseAudio server when we connect.
 const PA_APP_NAME: &str = "talk-rs";
 
@@ -83,6 +89,8 @@ pub struct SavedProfile {
 /// Snapshot of a PulseAudio sound card, used internally by detection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CardSnapshot {
+    /// PulseAudio card index (what sources refer to as their `card`).
+    index: u32,
     /// PulseAudio card name (stable identifier).
     name: String,
     /// `device.form_factor` property, if set ("headset", "speaker", …).
@@ -336,9 +344,68 @@ impl Drop for HeadsetGuard {
     }
 }
 
+/// Resolve the microphone source a live capture must explicitly target.
+///
+/// When `use_headset` is set and a Bluetooth headset card is on an HFP
+/// profile (switched by [`activate_headset`] or already there), wait —
+/// driven by PulseAudio source events, bounded by
+/// [`HEADSET_SOURCE_LIMIT`] as an error limit — until that card's
+/// microphone source exists, and return its name.  Otherwise return the
+/// server's current default source.
+///
+/// Errors when the headset's source never appears (capturing another
+/// microphone instead would silently lose the user's speech) or when
+/// the server reports no default source.
+pub fn resolve_capture_source(use_headset: bool) -> Result<String, TalkError> {
+    with_pulse_context(|mainloop, context| {
+        if use_headset {
+            let cards = list_cards_in(&mainloop, &context)?;
+            if let Some(card) = find_headset_card(&cards) {
+                if is_hfp_profile(&card.active_profile) {
+                    let source =
+                        wait_for_card_source(&mainloop, &context, card, HEADSET_SOURCE_LIMIT)?;
+                    log::info!(
+                        "bt_profile: headset '{}' microphone source ready: '{}'",
+                        card.name,
+                        source
+                    );
+                    return Ok(source);
+                }
+            }
+        }
+        let default = default_source_name(&mainloop, &context)?;
+        log::info!("capture source: default source '{}'", default);
+        Ok(default)
+    })
+}
+
 // ---------------------------------------------------------------------
 // Detection logic (pure functions, unit-testable)
 // ---------------------------------------------------------------------
+
+/// Snapshot of a PulseAudio source, used to find a card's microphone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSnapshot {
+    /// Source name (equal to the PipeWire node name under pipewire-pulse).
+    name: String,
+    /// Index of the card owning this source, if any.
+    card: Option<u32>,
+    /// Set when this source is the monitor of a sink (not a microphone).
+    monitor_of_sink: Option<u32>,
+}
+
+/// Whether `profile` is one of the HFP profiles carrying a microphone.
+fn is_hfp_profile(profile: &str) -> bool {
+    PREFERRED_HFP_PROFILES.contains(&profile)
+}
+
+/// The microphone source (not a sink monitor) owned by card `card_index`.
+fn select_card_source(sources: &[SourceSnapshot], card_index: u32) -> Option<&str> {
+    sources
+        .iter()
+        .find(|s| s.card == Some(card_index) && s.monitor_of_sink.is_none())
+        .map(|s| s.name.as_str())
+}
 
 /// Pick the best HFP profile from a list of available profile names.
 ///
@@ -507,15 +574,25 @@ where
 
 /// List all PulseAudio sound cards.
 fn list_cards() -> Result<Vec<CardSnapshot>, TalkError> {
-    with_pulse_context(|mainloop, context| {
-        let cards: Rc<RefCell<Vec<CardSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
-        let cards_inner = cards.clone();
+    with_pulse_context(|mainloop, context| list_cards_in(&mainloop, &context))
+}
 
-        let done = Rc::new(RefCell::new(false));
-        let done_inner = done.clone();
+/// List all PulseAudio sound cards on an already-connected context.
+fn list_cards_in(
+    mainloop: &Rc<RefCell<Mainloop>>,
+    context: &Rc<RefCell<Context>>,
+) -> Result<Vec<CardSnapshot>, TalkError> {
+    let cards: Rc<RefCell<Vec<CardSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
+    let cards_inner = cards.clone();
 
-        let op = context.borrow().introspect().get_card_info_list(
-            move |result: ListResult<&CardInfo>| match result {
+    let done = Rc::new(RefCell::new(false));
+    let done_inner = done.clone();
+
+    let op =
+        context
+            .borrow()
+            .introspect()
+            .get_card_info_list(move |result: ListResult<&CardInfo>| match result {
                 ListResult::Item(card) => {
                     if let Some(snap) = card_info_to_snapshot(card) {
                         cards_inner.borrow_mut().push(snap);
@@ -524,33 +601,148 @@ fn list_cards() -> Result<Vec<CardSnapshot>, TalkError> {
                 ListResult::End | ListResult::Error => {
                     *done_inner.borrow_mut() = true;
                 }
-            },
-        );
+            });
 
-        // Drive the mainloop until the operation completes OR the
-        // End/Error callback fires.
-        loop {
-            match mainloop.borrow_mut().iterate(false) {
-                IterateResult::Quit(_) | IterateResult::Err(_) => {
-                    return Err(TalkError::Audio(
-                        "bt_profile: PA mainloop terminated during list_cards".to_string(),
-                    ));
-                }
-                IterateResult::Success(_) => {}
-            }
-            if *done.borrow() || op.get_state() == OperationState::Done {
-                break;
-            }
-            if op.get_state() == OperationState::Cancelled {
+    // Drive the mainloop until the operation completes OR the
+    // End/Error callback fires.
+    loop {
+        match mainloop.borrow_mut().iterate(false) {
+            IterateResult::Quit(_) | IterateResult::Err(_) => {
                 return Err(TalkError::Audio(
-                    "bt_profile: list_cards operation cancelled".to_string(),
+                    "bt_profile: PA mainloop terminated during list_cards".to_string(),
                 ));
             }
+            IterateResult::Success(_) => {}
         }
+        if *done.borrow() || op.get_state() == OperationState::Done {
+            break;
+        }
+        if op.get_state() == OperationState::Cancelled {
+            return Err(TalkError::Audio(
+                "bt_profile: list_cards operation cancelled".to_string(),
+            ));
+        }
+    }
 
-        let snapshots = cards.borrow().clone();
-        Ok(snapshots)
+    let snapshots = cards.borrow().clone();
+    Ok(snapshots)
+}
+
+/// List all PulseAudio sources on an already-connected context.
+fn list_sources_in(
+    mainloop: &Rc<RefCell<Mainloop>>,
+    context: &Rc<RefCell<Context>>,
+) -> Result<Vec<SourceSnapshot>, TalkError> {
+    let sources: Rc<RefCell<Vec<SourceSnapshot>>> = Rc::new(RefCell::new(Vec::new()));
+    let done = Rc::new(RefCell::new(false));
+    let sources_cb = sources.clone();
+    let done_cb = done.clone();
+    let _op = context.borrow().introspect().get_source_info_list(
+        move |result: ListResult<&pulse::context::introspect::SourceInfo>| match result {
+            ListResult::Item(source) => {
+                if let Some(name) = source.name.as_deref() {
+                    sources_cb.borrow_mut().push(SourceSnapshot {
+                        name: name.to_string(),
+                        card: source.card,
+                        monitor_of_sink: source.monitor_of_sink,
+                    });
+                }
+            }
+            ListResult::End | ListResult::Error => *done_cb.borrow_mut() = true,
+        },
+    );
+    drive_until(mainloop, "get_source_info_list", || *done.borrow())?;
+    let snapshots = sources.borrow().clone();
+    Ok(snapshots)
+}
+
+/// Name of the server's current default source.
+fn default_source_name(
+    mainloop: &Rc<RefCell<Mainloop>>,
+    context: &Rc<RefCell<Context>>,
+) -> Result<String, TalkError> {
+    let name: Rc<RefCell<Option<Option<String>>>> = Rc::new(RefCell::new(None));
+    let name_cb = name.clone();
+    let _op = context.borrow().introspect().get_server_info(move |info| {
+        *name_cb.borrow_mut() = Some(info.default_source_name.as_deref().map(str::to_string));
+    });
+    drive_until(mainloop, "get_server_info", || name.borrow().is_some())?;
+    let resolved = name.borrow().clone().flatten();
+    resolved.ok_or_else(|| {
+        TalkError::Audio("no default audio source: no microphone to record from".to_string())
     })
+}
+
+/// Wait until the microphone source of `card` exists and return its name.
+///
+/// Subscribes to source events BEFORE each listing, so a source created
+/// between a listing and the wait cannot be missed.  The wait blocks on
+/// the PulseAudio connection (no polling interval); `limit` only bounds
+/// it as an error.
+fn wait_for_card_source(
+    mainloop: &Rc<RefCell<Mainloop>>,
+    context: &Rc<RefCell<Context>>,
+    card: &CardSnapshot,
+    limit: std::time::Duration,
+) -> Result<String, TalkError> {
+    use pulse::context::subscribe::InterestMaskSet;
+    use std::cell::Cell;
+
+    let changed = Rc::new(Cell::new(false));
+    let changed_cb = changed.clone();
+    context
+        .borrow_mut()
+        .set_subscribe_callback(Some(Box::new(move |_, _, _| changed_cb.set(true))));
+    let subscribed = Rc::new(Cell::new(None::<bool>));
+    let subscribed_cb = subscribed.clone();
+    let _op = context
+        .borrow_mut()
+        .subscribe(InterestMaskSet::SOURCE, move |ok| {
+            subscribed_cb.set(Some(ok))
+        });
+    drive_until(mainloop, "subscribe", || subscribed.get().is_some())?;
+    if subscribed.get() != Some(true) {
+        return Err(TalkError::Audio(
+            "bt_profile: PulseAudio refused the source-event subscription".to_string(),
+        ));
+    }
+
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        changed.set(false);
+        let sources = list_sources_in(mainloop, context)?;
+        if let Some(name) = select_card_source(&sources, card.index) {
+            return Ok(name.to_string());
+        }
+        log::debug!(
+            "bt_profile: waiting for the microphone source of card '{}'",
+            card.name
+        );
+        while !changed.get() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(TalkError::Audio(format!(
+                    "headset '{}' is on profile '{}' but its microphone source did not \
+                     appear within {:?}; refusing to record from another microphone",
+                    card.name, card.active_profile, limit
+                )));
+            }
+            iterate_bounded(mainloop, deadline - now)?;
+        }
+    }
+}
+
+/// Run one mainloop iteration, blocking at most `max_wait` for events.
+fn iterate_bounded(
+    mainloop: &Rc<RefCell<Mainloop>>,
+    max_wait: std::time::Duration,
+) -> Result<(), TalkError> {
+    let micros = u64::try_from(max_wait.as_micros()).unwrap_or(u64::MAX);
+    let mut ml = mainloop.borrow_mut();
+    ml.prepare(Some(pulse::time::MicroSeconds(micros)))
+        .and_then(|()| ml.poll().map(|_| ()))
+        .and_then(|()| ml.dispatch().map(|_| ()))
+        .map_err(|err| TalkError::Audio(format!("bt_profile: PA mainloop failed: {}", err)))
 }
 
 /// Convert a libpulse `CardInfo` into our internal `CardSnapshot`.
@@ -576,6 +768,7 @@ fn card_info_to_snapshot(card: &CardInfo) -> Option<CardSnapshot> {
         .collect();
 
     Some(CardSnapshot {
+        index: card.index,
         name,
         form_factor,
         active_profile,
@@ -760,11 +953,52 @@ mod tests {
         profiles: &[&str],
     ) -> CardSnapshot {
         CardSnapshot {
+            index: 0,
             name: name.to_string(),
             form_factor: form_factor.map(str::to_string),
             active_profile: active.to_string(),
             profiles: profiles.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    // -- capture source selection ------------------------------------
+
+    fn source(name: &str, card: Option<u32>, monitor_of_sink: Option<u32>) -> SourceSnapshot {
+        SourceSnapshot {
+            name: name.to_string(),
+            card,
+            monitor_of_sink,
+        }
+    }
+
+    #[test]
+    fn select_card_source_returns_the_cards_microphone_not_its_monitor() {
+        let sources = vec![
+            source("alsa_input.laptop", Some(1), None),
+            source("bluez_output.AA.1.monitor", Some(7), Some(3)),
+            source("bluez_input.AA.0", Some(7), None),
+        ];
+        assert_eq!(select_card_source(&sources, 7), Some("bluez_input.AA.0"));
+    }
+
+    #[test]
+    fn select_card_source_is_none_until_the_cards_microphone_exists() {
+        // Right after the HFP switch: only the old monitor and the
+        // laptop mic exist.  Never fall back to another card's source.
+        let sources = vec![
+            source("alsa_input.laptop", Some(1), None),
+            source("bluez_output.AA.1.monitor", Some(7), Some(3)),
+        ];
+        assert_eq!(select_card_source(&sources, 7), None);
+    }
+
+    #[test]
+    fn hfp_profiles_are_recognized_and_a2dp_is_not() {
+        assert!(is_hfp_profile("headset-head-unit-msbc"));
+        assert!(is_hfp_profile("headset-head-unit-cvsd"));
+        assert!(is_hfp_profile("headset-head-unit"));
+        assert!(!is_hfp_profile("a2dp_sink"));
+        assert!(!is_hfp_profile("off"));
     }
 
     // -- pick_hfp_profile ---------------------------------------------

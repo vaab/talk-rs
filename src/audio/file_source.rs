@@ -38,6 +38,11 @@ impl WavFileSource {
 }
 
 impl AudioCapture for WavFileSource {
+    /// Produces its own samples: no device start-up to prove.
+    fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+        crate::audio::CaptureReadiness::NotApplicable
+    }
+
     fn start(&mut self) -> Result<mpsc::Receiver<Vec<i16>>, TalkError> {
         if self.running.load(Ordering::Acquire) {
             return Err(TalkError::Audio("File source already running".to_string()));
@@ -349,6 +354,11 @@ impl OggFileSource {
 }
 
 impl AudioCapture for OggFileSource {
+    /// Produces its own samples: no device start-up to prove.
+    fn readiness(&mut self) -> crate::audio::CaptureReadiness {
+        crate::audio::CaptureReadiness::NotApplicable
+    }
+
     fn start(&mut self) -> Result<mpsc::Receiver<Vec<i16>>, TalkError> {
         if self.running.load(Ordering::Acquire) {
             return Err(TalkError::Audio("File source already running".to_string()));

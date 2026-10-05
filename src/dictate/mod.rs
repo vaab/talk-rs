@@ -215,6 +215,10 @@ fn copy_output(source: &std::path::Path, destination: &std::path::Path) -> Resul
     Ok(())
 }
 
+/// Live microphone capture rate (PipeWire native); resampled to 16 kHz
+/// downstream with an anti-aliasing filter.
+const LIVE_CAPTURE_RATE: u32 = 48_000;
+
 /// Start-side counterpart of the `timing: stop +Nms <step>` log lines:
 /// logs `timing: start +Nms <step>` relative to the moment `dictate`
 /// began, so startup latency can be attributed per step.
@@ -653,7 +657,7 @@ async fn dictate_loaded(
     let source = select_input_source(input_audio_file.as_deref(), opts.monitor);
     let feedback_capture_rate = match source {
         InputSource::Ogg | InputSource::Wav => AudioConfig::new().sample_rate,
-        InputSource::Monitor | InputSource::PipeWire => 48_000,
+        InputSource::Monitor | InputSource::PipeWire => LIVE_CAPTURE_RATE,
     };
     let viz_mode = opts.viz.or_else(|| {
         config
@@ -763,7 +767,9 @@ async fn dictate_loaded(
     // input is decoded by `OggFileSource`.
     let encode_config = AudioConfig::new(); // 16 kHz target for encoder
     let from_file = input_audio_file.is_some();
-    let (mut capture, capture_rate): (Box<dyn AudioCapture>, u32) =
+    // Live microphone captures are built later, once the microphone
+    // source to target is resolved (after the headset switch).
+    let (file_capture, capture_rate): (Option<Box<dyn AudioCapture>>, u32) =
         if let Some(ref path) = input_audio_file {
             log::info!("using audio file input: {}", path.display());
             let capture: Box<dyn AudioCapture> = match source {
@@ -771,43 +777,15 @@ async fn dictate_loaded(
                 InputSource::Wav => Box::new(WavFileSource::new(path, &encode_config)?),
                 _ => unreachable!("file path selects file source"),
             };
-            (capture, encode_config.sample_rate)
-        } else if let Some(paced) = crate::perf_counters::paced_input()? {
+            (Some(capture), encode_config.sample_rate)
+        } else if let Some((paced, rate)) = crate::perf_counters::paced_input()? {
             // Performance-harness only (`perf-counters` feature):
             // a file replayed at real-time pace stands in for the
             // microphone.  Always `None` in normal builds.
-            paced
+            (Some(paced), rate)
         } else {
-            // Prefer PipeWire native capture — matches pw-cat's audio
-            // routing (including Bluetooth devices) exactly.  Fall back
-            // to cpal/ALSA if PipeWire is unavailable.
-            let rate = 48_000u32; // PipeWire native rate; resampled to 16 kHz downstream
-            let capture_config = AudioConfig {
-                sample_rate: rate,
-                channels: encode_config.channels,
-                bitrate: encode_config.bitrate,
-            };
-            if source == InputSource::Monitor {
-                log::info!(
-                    "capture at {}Hz (PipeWire, mic+monitor), target {}Hz",
-                    rate,
-                    encode_config.sample_rate
-                );
-                (
-                    Box::new(MonitorCapture::new(capture_config)) as Box<dyn AudioCapture>,
-                    rate,
-                )
-            } else {
-                log::info!(
-                    "capture at {}Hz (PipeWire), target {}Hz",
-                    rate,
-                    encode_config.sample_rate
-                );
-                (
-                    Box::new(PipeWireCapture::new(capture_config)) as Box<dyn AudioCapture>,
-                    rate,
-                )
-            }
+            // PipeWire native rate; resampled to 16 kHz downstream.
+            (None, LIVE_CAPTURE_RATE)
         };
 
     // Register SIGINT handler early — before any long-running resources
@@ -841,6 +819,42 @@ async fn dictate_loaded(
         },
         if from_file { " (from file)" } else { "" }
     );
+
+    // Neutral "starting" badge as soon as possible: instant visual
+    // acknowledgement of the shortcut.  It is NOT the recording cue,
+    // which waits for proven capture readiness (see below).
+    feedback.prepare_recording();
+    t_start.mark("badge_arming");
+
+    // Parakeet is a local backend whose model must be downloaded once
+    // (~640 MB).  The transcribe pipeline never downloads silently, so
+    // for the toggle/dictate flow we download it HERE — before the
+    // headset switch and capture start — showing a "downloading model"
+    // badge.  For this non-interactive surface, selecting the Parakeet
+    // provider is the consent (user-confirmed).  No-op once installed.
+    // A chain that lands on Parakeet is not such a selection: it never
+    // downloads, and a missing model fails over like a busy provider.
+    #[cfg(feature = "parakeet")]
+    if provider == Provider::Parakeet && chain.is_none() {
+        let status = crate::transcription::parakeet::consent::resolve(&config)?;
+        if !status.present {
+            if let Some(o) = feedback.overlay() {
+                o.show(IndicatorKind::DownloadingModel);
+            }
+            log::info!(
+                "parakeet model not found at {}; downloading before recording",
+                status.model_dir.display()
+            );
+            crate::transcription::parakeet::model::download_model(
+                &status.model_dir,
+                status.variant,
+            )
+            .await?;
+            if let Some(o) = feedback.overlay() {
+                o.show(IndicatorKind::Arming);
+            }
+        }
+    }
 
     // Bluetooth headset profile auto-switching.
     //
@@ -892,62 +906,50 @@ async fn dictate_loaded(
     };
     t_start.mark("bt_profile_done");
 
-    // The badge is shown first so the shortcut is acknowledged visually
-    // without waiting for the tone.  The start sound is awaited before
-    // capture so it cannot enter the recording.  Boop begins after
-    // capture starts.
-    feedback.prepare_recording();
-    t_start.mark("badge_requested");
-    feedback.play_start().await;
-    t_start.mark("start_tone_done");
+    // Resolve the microphone the capture must target (the headset's HFP
+    // source once it exists), then build the live capture pinned to it.
+    // A missing source is fatal: recording another microphone would
+    // silently lose the user's speech.
+    let mut capture: Box<dyn AudioCapture> = match file_capture {
+        Some(capture) => capture,
+        None => {
+            let source_name = match bt_profile::resolve_capture_source(bt_auto_switch_enabled) {
+                Ok(name) => name,
+                Err(error) => {
+                    feedback.teardown_recording(RecordingBadgeTeardown::Hide);
+                    return Err(error);
+                }
+            };
+            t_start.mark(&format!("capture_source_resolved ({})", source_name));
+            let capture_config = AudioConfig {
+                sample_rate: capture_rate,
+                channels: encode_config.channels,
+                bitrate: encode_config.bitrate,
+            };
+            if source == InputSource::Monitor {
+                log::info!(
+                    "capture at {}Hz (PipeWire, mic '{}' + monitor), target {}Hz",
+                    capture_rate,
+                    source_name,
+                    encode_config.sample_rate
+                );
+                Box::new(MonitorCapture::new(capture_config, source_name))
+            } else {
+                log::info!(
+                    "capture at {}Hz (PipeWire, '{}'), target {}Hz",
+                    capture_rate,
+                    source_name,
+                    encode_config.sample_rate
+                );
+                Box::new(PipeWireCapture::new(capture_config, source_name))
+            }
+        }
+    };
+
+    // Capture starts BEFORE any cue and is routed into the pipeline at
+    // once: everything it delivers from its first buffer on is kept.
     let raw_audio_rx = capture.start()?;
     t_start.mark("capture_started");
-
-    // Parakeet is a local backend whose model must be downloaded once
-    // (~640 MB).  The transcribe pipeline never downloads silently, so
-    // for the toggle/dictate flow we download it HERE — before
-    // recording starts — showing a "downloading model" badge.  For
-    // this non-interactive surface, selecting the Parakeet provider is
-    // the consent (user-confirmed).  No-op once the model is installed.
-    // A chain that lands on Parakeet is not such a selection: it never
-    // downloads, and a missing model fails over like a busy provider.
-    #[cfg(feature = "parakeet")]
-    if provider == Provider::Parakeet && chain.is_none() {
-        let status = crate::transcription::parakeet::consent::resolve(&config)?;
-        if !status.present {
-            if let Some(o) = feedback.overlay() {
-                o.show(IndicatorKind::DownloadingModel);
-            }
-            log::info!(
-                "parakeet model not found at {}; downloading before recording",
-                status.model_dir.display()
-            );
-            crate::transcription::parakeet::model::download_model(
-                &status.model_dir,
-                status.variant,
-            )
-            .await?;
-        }
-    }
-
-    // Show visualizer text panel (positioned relative to recording badge).
-    // The badge itself was requested before the start tone; re-requesting
-    // it here restores it after a model-download badge and is otherwise a
-    // cheap state reset in the overlay thread.
-    feedback.show_recording_badge();
-    if let Some(ref viz) = visualizer {
-        log::debug!("showing visualizer text panel");
-        viz.show();
-        // A chain whose primary model sits in outage memory starts on a
-        // fallback: say so for the whole dictation, not just in the log.
-        if let Some(notice) = chain
-            .as_ref()
-            .and_then(|chain| chain.fallback_notice(provider, &effective_model))
-        {
-            viz.pin_message(&notice);
-        }
-    }
-    feedback.start_boop();
 
     // Tee audio through the shared feedback component.  Dictate keeps its
     // existing auto-pause forwarding policy; record selects pass-through.
@@ -1011,8 +1013,48 @@ async fn dictate_loaded(
         raw_audio_rx
     };
 
+    // The "speak now" cue (start tone, then red badge) is given only on
+    // the capture's readiness proof: stream Streaming on the targeted
+    // source AND first buffer delivered.  CAPTURE_READY_LIMIT is an
+    // error limit, never a readiness assumption.
+    let proof = capture
+        .readiness()
+        .wait(crate::audio::CAPTURE_READY_LIMIT)
+        .await;
+    match &proof {
+        Ok(Some(ready)) => t_start.mark(&format!("capture_ready ({})", ready.source)),
+        Ok(None) => t_start.mark("capture_ready (file source)"),
+        Err(_) => {}
+    }
+    if let Err(error) = feedback.announce_recording(proof).await {
+        log::error!("recording not started: {}", error);
+        feedback.teardown_recording(RecordingBadgeTeardown::Hide);
+        if let Err(stop_error) = capture.stop() {
+            log::warn!(
+                "failed to stop capture after readiness failure: {}",
+                stop_error
+            );
+        }
+        return Err(error);
+    }
+    t_start.mark("recording_cue");
+
+    // Show visualizer text panel (positioned relative to recording badge).
+    if let Some(ref viz) = visualizer {
+        log::debug!("showing visualizer text panel");
+        viz.show();
+        // A chain whose primary model sits in outage memory starts on a
+        // fallback: say so for the whole dictation, not just in the log.
+        if let Some(notice) = chain
+            .as_ref()
+            .and_then(|chain| chain.fallback_notice(provider, &effective_model))
+        {
+            viz.pin_message(&notice);
+        }
+    }
+
     // Set up the resample pipeline (common to both modes).  Audio has
-    // been buffering in the capture channel since capture.start() above.
+    // been buffering in the pipeline since capture.start() above.
     let capture_chunk = (capture_rate as usize * CHUNK_DURATION_MS as usize) / 1000;
     let audio_rx = resample::spawn_resample_task(
         capture_rate,
